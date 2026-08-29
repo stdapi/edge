@@ -104,28 +104,25 @@ func (r *Interceptor) String() string {
 
 // noFastMethod is what an interceptor carries when the method fast path cannot serve it. Left at
 // its zero value the field would be the empty string, and a lookup carrying an empty method
-// would then match the interceptor outright, skipping the matchers that narrow it.
+// would then match the interceptor outright, skipping the port and the matchers that narrow it.
 //
 // A NUL byte is not a valid HTTP token character, so validMethod rejects this value and no
 // route can be registered with it. TestMethodSentinels holds both properties.
-//
-// An authority lookup used to need a second sentinel to pass here, since it has no method of
-// its own. It no longer reaches this code at all: it stops at the hostname and selects on
-// matchers alone, which is one hole fewer to keep closed.
 const noFastMethod = "\x00none"
 
-// match reports whether the request satisfies this interceptor's method constraint and every
-// attached matcher.
+// match reports whether the request satisfies this interceptor's method constraint, the port
+// it names, and every attached matcher.
 func (r *Interceptor) match(method string, c *Context) bool {
-	// Fast path: an interceptor with exactly one method and no matcher caches it in methodFast.
+	// Fast path: an interceptor with exactly one method, no port and no matcher caches it in
+	// methodFast.
 	if r.methodFast == method {
 		return true
 	}
 	return r.matchSlow(method, c)
 }
 
-// matchSlow covers what match's fast path does not: zero or many methods, and matchers.
-// It is kept out of line so match stays inlinable.
+// matchSlow covers what match's fast path does not: zero or many methods, a port, and
+// matchers. It is kept out of line so match stays inlinable.
 //
 //go:noinline
 func (r *Interceptor) matchSlow(method string, c *Context) bool {
@@ -135,7 +132,7 @@ func (r *Interceptor) matchSlow(method string, c *Context) bool {
 		// No method constraint.
 	case 1:
 		// Avoid the slices.Contains call for the single-method case, which the fast path
-		// leaves to us when matchers are present.
+		// leaves to us when a port or a matcher narrows the interceptor.
 		if methods[0] != method {
 			return false
 		}
@@ -144,21 +141,10 @@ func (r *Interceptor) matchSlow(method string, c *Context) bool {
 			return false
 		}
 	}
-	return r.acceptsPort(c) && r.matchersAccept(c)
-}
+	if !r.acceptsPort(c) {
+		return false
+	}
 
-// acceptsPort reports whether the target port is the one this interceptor names. A pattern
-// naming none accepts every port, which is why the port is kept beside the tree key rather
-// than folded into it.
-func (r *Interceptor) acceptsPort(c *Context) bool {
-	return r.pattern.port == "" || r.pattern.port == c.port
-}
-
-// matchersAccept reports whether every matcher on r accepts c. It is the matcher half of
-// matchSlow without the method check, which an authority lookup has nothing to feed: an
-// authority carries no method, and skipping the method logic outright is what spares the
-// tree a sentinel method value it would otherwise have to invent.
-func (r *Interceptor) matchersAccept(c *Context) bool {
 	sealed := onlyRequestContext{c}
 	for _, m := range r.matchers {
 		if !m.Match(sealed) {
@@ -166,6 +152,13 @@ func (r *Interceptor) matchersAccept(c *Context) bool {
 		}
 	}
 	return true
+}
+
+// acceptsPort reports whether the target port is the one this interceptor names. A pattern
+// naming none accepts every port, which is why the port is kept beside the tree key rather
+// than folded into it.
+func (r *Interceptor) acceptsPort(c *Context) bool {
+	return r.pattern.port == "" || r.pattern.port == c.port
 }
 
 // samePort reports whether two interceptors name the same port. It is part of what identifies

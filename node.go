@@ -1021,13 +1021,16 @@ func (n *node) isLeaf() bool {
 	return len(n.entries) > 0
 }
 
-// findAuthority returns the index of the authority entry on n whose matchers accept c.
-// An authority entry is the only kind that can sit on a hostname node: an interceptor's tokens
-// always end in its path, so an interceptor is never a leaf before the '/'. The path test is what
+// findAuthority returns the index of the authority entry on n that accepts the port of c.
+// An authority entry carries nothing else to select on: it has no method, and only an
+// interceptor carries matchers.
+//
+// It is also the only kind of entry that can sit on a hostname node, since an interceptor's
+// tokens always end in its path and it is never a leaf before the '/'. The path test is what
 // keeps that structural fact checked rather than assumed.
 func findAuthority(n *node, c *Context) (int, bool) {
 	for i, entry := range n.entries {
-		if entry.pattern.path == "" && entry.acceptsPort(c) && entry.matchersAccept(c) {
+		if entry.pattern.path == "" && entry.acceptsPort(c) {
 			return i, true
 		}
 	}
