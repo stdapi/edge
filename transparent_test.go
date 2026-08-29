@@ -54,12 +54,12 @@ func TestTransparent_TLSInterceptRoutesOnServerName(t *testing.T) {
 	// pretends to reach.
 	tr.InsecureSkipVerify = true
 
-	p, err := New(WithCA(ca), WithIntercept("api.example.test"), WithTransport(tr))
+	p, err := New(WithCA(ca), WithTransport(tr))
 	require.NoError(t, err)
 
 	var seenTarget Target
-	p.MustHandle([]string{http.MethodGet}, "api.example.test/v1/charges", func(c *Context) (*http.Response, error) {
-		seenTarget = c.Target()
+	p.MustAddInterceptor([]string{http.MethodGet}, "api.example.test/v1/charges", func(c *Context) (*http.Response, error) {
+		seenTarget = Target{Scheme: c.Scheme(), Host: c.Host(), Port: c.Port()}
 		return c.Forward()
 	})
 
@@ -102,6 +102,9 @@ func TestTransparent_TLSTunnelLeavesTheHandshakeAlone(t *testing.T) {
 
 	p, err := New(WithCA(ca), WithTransport(tr))
 	require.NoError(t, err)
+	// The authority comes from the ClientHello, so it is the name the client asked for,
+	// not the address the upstream transport is pinned to.
+	require.NoError(t, p.AddTunnel("example.com"))
 
 	addr := startTransparent(t, p)
 
@@ -141,8 +144,8 @@ func TestTransparent_PlaintextRoutesOnHostHeader(t *testing.T) {
 	require.NoError(t, err)
 
 	var seen Target
-	p.MustHandle([]string{http.MethodGet}, "api.example.test/ping", func(c *Context) (*http.Response, error) {
-		seen = c.Target()
+	p.MustAddInterceptor([]string{http.MethodGet}, "api.example.test/ping", func(c *Context) (*http.Response, error) {
+		seen = Target{Scheme: c.Scheme(), Host: c.Host(), Port: c.Port()}
 		return c.Forward()
 	})
 
@@ -165,10 +168,10 @@ func TestTransparent_PlaintextRoutesOnHostHeader(t *testing.T) {
 
 func TestTransparent_PeekClientHelloDoesNotConsume(t *testing.T) {
 	ca, _ := GenerateCA()
-	p, err := New(WithCA(ca), WithIntercept("peek.example.test"))
+	p, err := New(WithCA(ca))
 	require.NoError(t, err)
 
-	p.MustHandle(nil, "peek.example.test/", func(c *Context) (*http.Response, error) {
+	p.MustAddInterceptor(nil, "peek.example.test/", func(c *Context) (*http.Response, error) {
 		hello := c.Session().ClientHello()
 		require.NotNil(t, hello)
 		return Text(http.StatusOK, "sni="+hello.ServerName), nil
@@ -196,7 +199,7 @@ func TestTransparent_PeekClientHelloDoesNotConsume(t *testing.T) {
 
 func TestTransparent_RejectClosesTheConnection(t *testing.T) {
 	ca, _ := GenerateCA()
-	p, err := New(WithCA(ca), WithReject("blocked.example.test"))
+	p, err := New(WithCA(ca))
 	require.NoError(t, err)
 
 	addr := startTransparent(t, p)
@@ -255,6 +258,7 @@ func TestTransparent_OriginalDestinationPlacesTheConnection(t *testing.T) {
 		WithOriginalDestination(func(net.Conn) (netip.AddrPort, error) { return originAddr, nil }),
 	)
 	require.NoError(t, err)
+	require.NoError(t, p.AddTunnel(originURL.Host))
 
 	addr := startTransparent(t, p)
 
@@ -262,8 +266,8 @@ func TestTransparent_OriginalDestinationPlacesTheConnection(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = conn.Close() }()
 
-	// No SNI, and the rules say nothing: the connection is tunneled to the address the
-	// client was headed to, so the origin certificate reaches the client untouched.
+	// No SNI, and the authority is only tunneled: the connection is relayed to the address
+	// the client was headed to, so the origin certificate reaches the client untouched.
 	tlsConn := tls.Client(conn, &tls.Config{
 		ServerName:         "127.0.0.1",
 		InsecureSkipVerify: true,

@@ -17,7 +17,7 @@ import (
 	"github.com/fox-toolkit/edge/internal/stringsutil"
 )
 
-// serveConnect handles a CONNECT request. The rule set decides whether the connection is
+// serveConnect handles a CONNECT request. The authority decides whether the connection is
 // relayed byte for byte, terminated so its requests can be routed, or refused.
 func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 	target, ok := targetFromConnect(r)
@@ -28,7 +28,7 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 
 	action := p.Decide(target)
 	if action == Reject {
-		http.Error(w, "edge: connection rejected by rule", http.StatusForbidden)
+		http.Error(w, "edge: connection rejected, no interceptor or tunnel names this authority", http.StatusForbidden)
 		return
 	}
 

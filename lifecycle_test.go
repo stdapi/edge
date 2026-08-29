@@ -32,8 +32,9 @@ func TestLifecycle_ShutdownStopsAccepting(t *testing.T) {
 	tr := DefaultTransport()
 	tr.RootCAs = originPool(t, origin)
 
-	p, err := New(WithCA(ca), WithIntercept(originHost(originURL)), WithTransport(tr))
+	p, err := New(WithCA(ca), WithTransport(tr))
 	require.NoError(t, err)
+	p.MustAddInterceptor(nil, originHost(originURL)+"/*{any}", DefaultNoInterceptorHandler)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -73,8 +74,9 @@ func TestLifecycle_ShutdownStopsAccepting(t *testing.T) {
 
 func TestLifecycle_RejectOnExplicitProxy(t *testing.T) {
 	ca, _ := GenerateCA()
-	p, err := New(WithCA(ca), WithReject("blocked.example.test"))
+	p, err := New(WithCA(ca))
 	require.NoError(t, err)
+	// Nothing names this authority, so it is refused: rejection is the default, not an authority entry.
 
 	addr := startProxy(t, p)
 	client := proxyClient(addr, ca.CertPool())
@@ -134,15 +136,15 @@ func TestLifecycle_AmbiguousLengthIsNormalized(t *testing.T) {
 
 	originURL, _ := url.Parse(origin.URL)
 	ca, _ := GenerateCA()
-	p, err := New(WithCA(ca), WithIntercept(originHost(originURL)))
+	p, err := New(WithCA(ca))
 	require.NoError(t, err)
 
 	proxySeen := new(recorder)
-	p.MustHandle(nil, originHost(originURL)+"/+{any}", func(c *Context) (*http.Response, error) {
+	p.MustAddInterceptor(nil, originHost(originURL)+"/+{any}", func(c *Context) (*http.Response, error) {
 		proxySeen.add(c.Method() + " " + c.RoutingPath())
 		return c.Forward()
 	})
-	p.MustHandle(nil, originHost(originURL)+"/", func(c *Context) (*http.Response, error) {
+	p.MustAddInterceptor(nil, originHost(originURL)+"/", func(c *Context) (*http.Response, error) {
 		proxySeen.add(c.Method() + " " + c.RoutingPath())
 		return c.Forward()
 	})
@@ -191,9 +193,12 @@ func TestLifecycle_TunnelOnlyProxyNeedsNoCA(t *testing.T) {
 	defer origin.Close()
 
 	// A proxy that only relays never mints a certificate, so it never needs an authority.
+	// It still has to be told what to relay: nothing crosses a proxy that was not asked.
+	originURL, _ := url.Parse(origin.URL)
 	p, err := New()
 	require.NoError(t, err)
-	require.Nil(t, p.Config().CA())
+	require.Nil(t, p.cfg.ca)
+	require.NoError(t, p.AddTunnel(originHost(originURL)))
 
 	addr := startProxy(t, p)
 	client := proxyClient(addr, originPool(t, origin))

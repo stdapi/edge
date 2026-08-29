@@ -6,12 +6,13 @@ package edge
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 )
 
 // FuzzParsePattern checks that no input makes the pattern parser panic, and that a pattern
 // it accepts is indexed under itself. The tree key is the pattern byte for byte, which is
-// what makes a registered route findable again by the string it was registered with.
+// what makes a registered interceptor findable again by the string it was registered with.
 func FuzzParsePattern(f *testing.F) {
 	seeds := []string{
 		"api.stripe.com/v1/charges",
@@ -64,7 +65,7 @@ func FuzzParsePattern(f *testing.F) {
 	})
 }
 
-// FuzzRoundTripRegistration checks that a route the proxy accepts can be found again by the
+// FuzzRoundTripRegistration checks that an interceptor the proxy accepts can be found again by the
 // pattern it was registered with, and deleted by it.
 func FuzzRoundTripRegistration(f *testing.F) {
 	seeds := []string{
@@ -81,33 +82,33 @@ func FuzzRoundTripRegistration(f *testing.F) {
 	f.Fuzz(func(t *testing.T, raw string) {
 		p := mustFuzzProxy(t)
 
-		rte, err := p.Handle([]string{http.MethodGet}, raw, noopHandler)
+		rte, err := p.AddInterceptor([]string{http.MethodGet}, raw, noopHandler)
 		if err != nil {
 			return
 		}
 
-		found := p.Route([]string{http.MethodGet}, raw)
+		found := p.Interceptor([]string{http.MethodGet}, raw)
 		if found == nil {
 			t.Fatalf("route registered as %q cannot be found again", raw)
 		}
 		if found != rte {
-			t.Fatalf("Route returned a different route for %q", raw)
+			t.Fatalf("Interceptor returned a different entry for %q", raw)
 		}
 
-		deleted, err := p.Delete([]string{http.MethodGet}, raw)
+		deleted, err := p.DeleteInterceptor([]string{http.MethodGet}, raw)
 		if err != nil {
 			t.Fatalf("delete %q: %v", raw, err)
 		}
 		if deleted != rte {
 			t.Fatalf("Delete returned a different route for %q", raw)
 		}
-		if p.Len() != 0 {
-			t.Fatalf("tree still holds %d routes after deleting %q", p.Len(), raw)
+		if p.InterceptorsLen() != 0 {
+			t.Fatalf("tree still holds %d routes after deleting %q", p.InterceptorsLen(), raw)
 		}
 	})
 }
 
-// FuzzParseAuthorityPattern does the same for interception rules, which carry an authority
+// FuzzParseAuthorityPattern does the same for interception authorities, which carry an authority
 // and no path.
 func FuzzParseAuthorityPattern(f *testing.F) {
 	seeds := []string{
@@ -133,11 +134,16 @@ func FuzzParseAuthorityPattern(f *testing.F) {
 		if err != nil {
 			return
 		}
-		if pat.path != "/" {
-			t.Fatalf("rule path = %q, want /", pat.path)
+		// The empty path is what tells an authority entry from an interceptor once both are in
+		// the same tree, and the key holding no '/' is what keeps the two lookups apart.
+		if pat.path != "" {
+			t.Fatalf("authority path = %q, want empty", pat.path)
 		}
-		if pat.key != pat.host+"/" {
-			t.Fatalf("rule key %q is not host %q plus /", pat.key, pat.host)
+		if pat.key != pat.host {
+			t.Fatalf("authority key %q is not the host %q", pat.key, pat.host)
+		}
+		if strings.Contains(pat.key, "/") {
+			t.Fatalf("authority key %q must hold no path separator", pat.key)
 		}
 	})
 }

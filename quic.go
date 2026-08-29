@@ -169,6 +169,11 @@ func (d *quicDemux) startInterception() error {
 		Logger:         d.p.cfg.logger,
 		ConnContext: func(ctx context.Context, c *quic.Conn) context.Context {
 			if sess := d.sessionFor(c.RemoteAddr()); sess != nil {
+				// The session is created before the handshake, so this is the first point
+				// where the TLS state exists. It runs before any request is read off the
+				// connection, which is what lets it be written without synchronization.
+				state := c.ConnectionState().TLS
+				sess.tlsState = &state
 				return context.WithValue(ctx, sessionKey{}, sess)
 			}
 			return ctx
@@ -316,7 +321,7 @@ func (d *quicDemux) sniff(addr net.Addr, key string, peer *quicPeer, datagram []
 
 	switch d.p.Decide(target) {
 	case Reject:
-		d.reject(key, addr, "rejected by rule")
+		d.reject(key, addr, "no interceptor or tunnel names this authority")
 	case Intercept:
 		d.beginIntercept(key, addr, target, pending)
 	default:

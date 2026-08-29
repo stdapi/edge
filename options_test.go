@@ -22,16 +22,15 @@ func TestOptions_Defaults(t *testing.T) {
 	p, err := New()
 	require.NoError(t, err)
 
-	cfg := p.Config()
-	assert.Nil(t, cfg.CA())
-	assert.Equal(t, Tunnel, cfg.DefaultAction(), "traffic the proxy was not asked about stays opaque to it")
-	assert.Equal(t, 255, cfg.MaxRouteParams())
-	assert.Equal(t, 255, cfg.MaxRouteParamKeyBytes())
-	assert.Equal(t, 255, cfg.MaxRouteMatchers())
-	assert.Equal(t, ExactSlash, cfg.TrailingSlash())
-	assert.False(t, cfg.AllowRegexpParam(), "a regexp runs on every candidate segment, so it is opt in")
-	assert.NotNil(t, cfg.Logger())
-	assert.NotNil(t, cfg.Transport())
+	cfg := p.cfg
+	assert.Nil(t, cfg.ca)
+	assert.Equal(t, 255, cfg.maxParams)
+	assert.Equal(t, 255, cfg.maxParamKeyBytes)
+	assert.Equal(t, 255, cfg.maxMatchers)
+	assert.Equal(t, ExactSlash, cfg.handleSlash)
+	assert.False(t, cfg.allowRegexp, "a regexp runs on every candidate segment, so it is opt in")
+	assert.NotNil(t, cfg.logger)
+	assert.NotNil(t, cfg.transport)
 }
 
 func TestOptions_Rejected(t *testing.T) {
@@ -43,20 +42,19 @@ func TestOptions_Rejected(t *testing.T) {
 		opt  Option
 	}{
 		{"nil CA", WithCA(nil)},
-		{"nil no route handler", WithNoRouteHandler(nil)},
+		{"nil no route handler", WithNoInterceptorHandler(nil)},
 		{"nil error handler", WithErrorHandler(nil)},
 		{"nil middleware", WithMiddleware(nil)},
 		{"nil transport", WithTransport(nil)},
 		{"nil logger", WithLogger(nil)},
 		{"nil original destination", WithOriginalDestination(nil)},
 		{"nil packet original destination", WithPacketOriginalDestination(nil)},
-		{"zero max params", WithMaxRouteParams(0)},
-		{"zero max param key bytes", WithMaxRouteParamKeyBytes(0)},
+		{"zero max params", WithMaxPatternParams(0)},
+		{"zero max param key bytes", WithMaxPatternParamKeyBytes(0)},
 		{"negative read header timeout", WithReadHeaderTimeout(-time.Second)},
 		{"negative idle timeout", WithIdleTimeout(-time.Second)},
 		{"negative tunnel idle timeout", WithTunnelIdleTimeout(-time.Second)},
 		{"zero max header bytes", WithMaxHeaderBytes(0)},
-		{"unknown default action", WithDefaultAction(Action(99))},
 		{"unknown trailing slash", WithTrailingSlash(TrailingSlashOption(99))},
 	}
 
@@ -79,59 +77,57 @@ func TestOptions_Applied(t *testing.T) {
 
 	p, err := New(
 		WithCA(ca),
-		WithMaxRouteParams(4),
-		WithMaxRouteParamKeyBytes(8),
-		WithMaxRouteMatchers(2),
+		WithMaxPatternParams(4),
+		WithMaxPatternParamKeyBytes(8),
+		WithMaxMatchers(2),
 		WithTrailingSlash(RelaxedSlash),
 		WithRegexpParam(true),
-		WithDefaultAction(Intercept),
 		WithLogger(slog.New(slog.DiscardHandler)),
 		WithOriginalDestination(func(net.Conn) (netip.AddrPort, error) { return netip.AddrPort{}, nil }),
 		WithPacketOriginalDestination(func(net.Addr, net.Addr) (netip.AddrPort, error) { return netip.AddrPort{}, nil }),
 	)
 	require.NoError(t, err)
 
-	cfg := p.Config()
-	assert.Same(t, ca, cfg.CA())
-	assert.Equal(t, 4, cfg.MaxRouteParams())
-	assert.Equal(t, 8, cfg.MaxRouteParamKeyBytes())
-	assert.Equal(t, 2, cfg.MaxRouteMatchers())
-	assert.Equal(t, RelaxedSlash, cfg.TrailingSlash())
-	assert.True(t, cfg.AllowRegexpParam())
-	assert.Equal(t, Intercept, cfg.DefaultAction())
+	cfg := p.cfg
+	assert.Same(t, ca, cfg.ca)
+	assert.Equal(t, 4, cfg.maxParams)
+	assert.Equal(t, 8, cfg.maxParamKeyBytes)
+	assert.Equal(t, 2, cfg.maxMatchers)
+	assert.Equal(t, RelaxedSlash, cfg.handleSlash)
+	assert.True(t, cfg.allowRegexp)
 }
 
 func TestOptions_LimitsAreEnforced(t *testing.T) {
 	ca, _ := GenerateCA()
 
 	t.Run("max params", func(t *testing.T) {
-		p, err := New(WithCA(ca), WithMaxRouteParams(2))
+		p, err := New(WithCA(ca), WithMaxPatternParams(2))
 		require.NoError(t, err)
 
-		_, err = p.Handle([]string{http.MethodGet}, "api.test/{a}/{b}", noopHandler)
+		_, err = p.AddInterceptor([]string{http.MethodGet}, "api.test/{a}/{b}", noopHandler)
 		require.NoError(t, err)
 
-		_, err = p.Handle([]string{http.MethodGet}, "api.test/{a}/{b}/{c}", noopHandler)
+		_, err = p.AddInterceptor([]string{http.MethodGet}, "api.test/{a}/{b}/{c}", noopHandler)
 		var pe *PatternError
 		require.ErrorAs(t, err, &pe)
 		assert.Contains(t, pe.Error(), "too many parameters")
 	})
 
 	t.Run("max param key bytes", func(t *testing.T) {
-		p, err := New(WithCA(ca), WithMaxRouteParamKeyBytes(4))
+		p, err := New(WithCA(ca), WithMaxPatternParamKeyBytes(4))
 		require.NoError(t, err)
 
-		_, err = p.Handle([]string{http.MethodGet}, "api.test/{abcde}", noopHandler)
+		_, err = p.AddInterceptor([]string{http.MethodGet}, "api.test/{abcde}", noopHandler)
 		var pe *PatternError
 		require.ErrorAs(t, err, &pe)
 		assert.Contains(t, pe.Error(), "key too large")
 	})
 
 	t.Run("max matchers", func(t *testing.T) {
-		p, err := New(WithCA(ca), WithMaxRouteMatchers(1))
+		p, err := New(WithCA(ca), WithMaxMatchers(1))
 		require.NoError(t, err)
 
-		_, err = p.Handle([]string{http.MethodGet}, "api.test/v1", noopHandler,
+		_, err = p.AddInterceptor([]string{http.MethodGet}, "api.test/v1", noopHandler,
 			WithScheme("https"), WithPort("8443"))
 		require.ErrorIs(t, err, ErrTooManyMatchers)
 	})
@@ -140,7 +136,7 @@ func TestOptions_LimitsAreEnforced(t *testing.T) {
 		p, err := New(WithCA(ca))
 		require.NoError(t, err)
 
-		_, err = p.Handle([]string{http.MethodGet}, "api.test/{id:[0-9]+}", noopHandler)
+		_, err = p.AddInterceptor([]string{http.MethodGet}, "api.test/{id:[0-9]+}", noopHandler)
 		var pe *PatternError
 		require.ErrorAs(t, err, &pe)
 		assert.Contains(t, pe.Error(), "feature not enabled")
@@ -149,7 +145,7 @@ func TestOptions_LimitsAreEnforced(t *testing.T) {
 
 func TestOptions_RegexpParam(t *testing.T) {
 	p := testProxy(t, WithRegexpParam(true))
-	p.MustHandle([]string{http.MethodGet}, "api.test/v1/{id:ch_[0-9]+}", noopHandler)
+	p.MustAddInterceptor([]string{http.MethodGet}, "api.test/v1/{id:ch_[0-9]+}", noopHandler)
 
 	assert.NotNil(t, match(t, p, http.MethodGet, "https", "api.test:443", "/v1/ch_123"))
 	assert.Nil(t, match(t, p, http.MethodGet, "https", "api.test:443", "/v1/re_123"))
@@ -158,7 +154,7 @@ func TestOptions_RegexpParam(t *testing.T) {
 func TestPatternError_PointsAtTheOffendingSegment(t *testing.T) {
 	p := testProxy(t)
 
-	_, err := p.Handle([]string{http.MethodGet}, "api.test/v1/{}", noopHandler)
+	_, err := p.AddInterceptor([]string{http.MethodGet}, "api.test/v1/{}", noopHandler)
 	var pe *PatternError
 	require.ErrorAs(t, err, &pe)
 
@@ -186,11 +182,9 @@ func TestSession_Accessors(t *testing.T) {
 	sess.localAddr = local
 
 	assert.Positive(t, sess.ID())
-	assert.Same(t, remote, sess.RemoteAddr())
-	assert.Same(t, local, sess.LocalAddr())
-	assert.Equal(t, "192.0.2.10", sess.RemoteIP().String())
+	assert.Equal(t, "192.0.2.10:4242", sess.RemoteAddr().String())
+	assert.Equal(t, "127.0.0.1:8080", sess.LocalAddr().String())
 	assert.Equal(t, "https://api.test:443", sess.Target().String())
-	assert.Equal(t, Intercept, sess.Action())
 	assert.Equal(t, HTTP2, sess.Protocol())
 	assert.Nil(t, sess.TLS())
 	assert.Nil(t, sess.ClientHello())
@@ -198,13 +192,6 @@ func TestSession_Accessors(t *testing.T) {
 	assert.False(t, sess.Upstream().IsValid())
 	assert.WithinDuration(t, time.Now(), sess.CreatedAt(), time.Minute)
 	assert.NotNil(t, sess.Context())
-
-	assert.Nil(t, sess.Value("k"))
-	sess.SetValue("k", "v")
-	assert.Equal(t, "v", sess.Value("k"))
-	sess.SetValue("k2", 2)
-	assert.Equal(t, "v", sess.Value("k"), "an existing value must survive a later write")
-	assert.Equal(t, 2, sess.Value("k2"))
 }
 
 func TestProtocol_String(t *testing.T) {
@@ -233,4 +220,45 @@ func TestAction_String(t *testing.T) {
 	assert.Equal(t, "intercept", Intercept.String())
 	assert.Equal(t, "reject", Reject.String())
 	assert.Equal(t, "unknown", Action(0).String())
+}
+
+// A scope naming no handler would register middleware that never fires. Fox validates this
+// and edge did not, so the value was accepted and the middleware silently dropped.
+func TestOptions_MiddlewareScopeMustWrapSomething(t *testing.T) {
+	ca, _ := GenerateCA()
+	noop := func(next HandlerFunc) HandlerFunc { return next }
+
+	for _, scope := range []HandlerScope{0, 1 << 6} {
+		_, err := New(WithCA(ca), WithMiddlewareFor(scope, noop))
+		require.ErrorIs(t, err, ErrInvalidConfig, "scope %d", scope)
+	}
+
+	_, err := New(WithCA(ca), WithMiddlewareFor(AllHandlers, noop))
+	require.NoError(t, err)
+}
+
+// One option, both placements: the same WithMiddleware works proxy-wide and on a single
+// interceptor, which is the shape Fox uses and edge had split in two.
+func TestOptions_MiddlewareIsComposable(t *testing.T) {
+	var seen []string
+	tag := func(name string) MiddlewareFunc {
+		return func(next HandlerFunc) HandlerFunc {
+			return func(c *Context) (*http.Response, error) {
+				seen = append(seen, name)
+				return next(c)
+			}
+		}
+	}
+
+	p := testProxy(t, WithMiddleware(tag("proxy")))
+	rte := p.MustAddInterceptor(nil, "api.test/v1", func(c *Context) (*http.Response, error) {
+		seen = append(seen, "handler")
+		return Status(http.StatusOK), nil
+	}, WithMiddleware(tag("interceptor")))
+
+	c := &Context{}
+	_, err := rte.hall(c)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"proxy", "interceptor", "handler"}, seen,
+		"the proxy-wide middleware wraps the interceptor's")
 }

@@ -27,7 +27,7 @@ type Iter struct {
 
 // Methods returns a range iterator over all HTTP methods registered in the routing tree. The iterator reflect a snapshot
 // of the routing tree at the time [Iter] is created. This function is safe for concurrent use by multiple goroutine and
-// while mutation on routes are ongoing.
+// while mutation on interceptors are ongoing.
 func (it Iter) Methods() iter.Seq[string] {
 	return func(yield func(string) bool) {
 		for k := range it.methods {
@@ -38,17 +38,17 @@ func (it Iter) Methods() iter.Seq[string] {
 	}
 }
 
-// Routes returns a range iterator over all registered routes in the routing tree that exactly match the provided route
+// Interceptors returns a range iterator over all registered interceptors in the routing tree that exactly match the provided route
 // pattern. The iterator reflect a snapshot of the routing tree at the time [Iter] is created. This function is safe for
-// concurrent use by multiple goroutine and while mutation on routes are ongoing.
-func (it Iter) Routes(pattern string) iter.Seq[*Route] {
-	return func(yield func(*Route) bool) {
+// concurrent use by multiple goroutine and while mutation on interceptors are ongoing.
+func (it Iter) Interceptors(pattern string) iter.Seq[*Interceptor] {
+	return func(yield func(*Interceptor) bool) {
 		matched := it.patterns.searchPattern(pattern)
 		if matched == nil || !matched.isLeaf() {
 			return
 		}
 
-		for _, route := range matched.routes {
+		for _, route := range matched.entries {
 			if route.pattern.str == pattern {
 				if !yield(route) {
 					return
@@ -58,11 +58,11 @@ func (it Iter) Routes(pattern string) iter.Seq[*Route] {
 	}
 }
 
-// NamePrefix returns a range iterator over all routes in the routing tree that match a given name prefix. The iterator
+// NamePrefix returns a range iterator over all interceptors in the routing tree that match a given name prefix. The iterator
 // reflect a snapshot of the routing tree at the time [Iter] is created. This function is safe for concurrent use by
-// multiple goroutine and while mutation on routes are ongoing.
-func (it Iter) NamePrefix(prefix string) iter.Seq[*Route] {
-	return func(yield func(*Route) bool) {
+// multiple goroutine and while mutation on interceptors are ongoing.
+func (it Iter) NamePrefix(prefix string) iter.Seq[*Interceptor] {
+	return func(yield func(*Interceptor) bool) {
 		var stacks []stack
 		if it.maxDepth < stackSizeThreshold {
 			stacks = make([]stack, 0, stackSizeThreshold) // stack allocation
@@ -95,7 +95,7 @@ func (it Iter) NamePrefix(prefix string) iter.Seq[*Route] {
 			}
 
 			if elem.isLeaf() {
-				if !yield(elem.routes[0]) {
+				if !yield(elem.entries[0]) {
 					return
 				}
 			}
@@ -103,12 +103,19 @@ func (it Iter) NamePrefix(prefix string) iter.Seq[*Route] {
 	}
 }
 
-// PatternPrefix returns a range iterator over all routes in the routing tree that match a given pattern prefix.
+// PatternPrefix returns a range iterator over all interceptors in the routing tree that match a given pattern prefix.
 // The iterator reflect a snapshot of the routing tree at the time [Iter] is created. This function is safe for
-// concurrent use by multiple goroutine and while mutation on routes are ongoing.
+// concurrent use by multiple goroutine and while mutation on interceptors are ongoing.
 // Note: Partial parameter syntax (e.g., /users/{name:) is not supported and will not match any routes.
-func (it Iter) PatternPrefix(prefix string) iter.Seq[*Route] {
-	return func(yield func(*Route) bool) {
+func (it Iter) PatternPrefix(prefix string) iter.Seq[*Interceptor] {
+	return it.patternPrefix(prefix, false)
+}
+
+// patternPrefix walks the tree yielding either the routes or the authority entries, never
+// both. They share the tree but nothing else: an authority has no handler to call and no
+// method to report, so handing one to a caller asking for routes would be a trap.
+func (it Iter) patternPrefix(prefix string, authorities bool) iter.Seq[*Interceptor] {
+	return func(yield func(*Interceptor) bool) {
 		var stacks []stack
 		if it.maxDepth < stackSizeThreshold {
 			stacks = make([]stack, 0, stackSizeThreshold) // stack allocation
@@ -147,7 +154,10 @@ func (it Iter) PatternPrefix(prefix string) iter.Seq[*Route] {
 			}
 
 			if elem.isLeaf() {
-				for _, route := range elem.routes {
+				for _, route := range elem.entries {
+					if (route.pattern.path == "") != authorities {
+						continue
+					}
 					if len(route.params) > 0 && !strings.HasPrefix(route.pattern.str, prefix) {
 						continue
 					}
@@ -161,11 +171,11 @@ func (it Iter) PatternPrefix(prefix string) iter.Seq[*Route] {
 	}
 }
 
-// All returns a range iterator over all routes registered in the routing tree. The iterator reflect a snapshot
+// All returns a range iterator over all interceptors registered in the routing tree. The iterator reflect a snapshot
 // of the routing tree at the time [Iter] is created. This function is safe for concurrent use by multiple goroutine
-// and while mutation on routes are ongoing. See also [Iter.PatternPrefix] as an alternative.
-func (it Iter) All() iter.Seq[*Route] {
-	return func(yield func(*Route) bool) {
+// and while mutation on interceptors are ongoing. See also [Iter.PatternPrefix] as an alternative.
+func (it Iter) All() iter.Seq[*Interceptor] {
+	return func(yield func(*Interceptor) bool) {
 		for route := range it.PatternPrefix("") {
 			if !yield(route) {
 				return
@@ -174,11 +184,11 @@ func (it Iter) All() iter.Seq[*Route] {
 	}
 }
 
-// Names returns a range iterator over all routes registered in the routing tree with a name. The iterator reflect a snapshot
+// Names returns a range iterator over all interceptors registered in the routing tree with a name. The iterator reflect a snapshot
 // of the routing tree at the time [Iter] is created. This function is safe for concurrent use by multiple goroutine
-// and while mutation on routes are ongoing. See also [Iter.NamePrefix] as an alternative.
-func (it Iter) Names() iter.Seq[*Route] {
-	return func(yield func(*Route) bool) {
+// and while mutation on interceptors are ongoing. See also [Iter.NamePrefix] as an alternative.
+func (it Iter) Names() iter.Seq[*Interceptor] {
+	return func(yield func(*Interceptor) bool) {
 		for route := range it.NamePrefix("") {
 			if !yield(route) {
 				return

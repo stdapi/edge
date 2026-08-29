@@ -72,14 +72,13 @@ func TestPath_NormalizationIsMatchTimeOnly(t *testing.T) {
 	p, err := New(
 		WithCA(ca),
 		WithTransport(tr),
-		WithIntercept(originHost(originURL)),
 		WithMergeSlashes(true),
 		WithCollapseDotSegments(true),
 	)
 	require.NoError(t, err)
 
 	var routed string
-	p.MustHandle([]string{http.MethodGet}, originHost(originURL)+"/v1/charges", func(c *Context) (*http.Response, error) {
+	p.MustAddInterceptor([]string{http.MethodGet}, originHost(originURL)+"/v1/charges", func(c *Context) (*http.Response, error) {
 		routed = c.RoutingPath()
 		return c.Forward()
 	})
@@ -102,7 +101,7 @@ func TestPath_NormalizationIsMatchTimeOnly(t *testing.T) {
 
 func TestPath_EscapingDotSegmentMatchesNothing(t *testing.T) {
 	p := testProxy(t, WithCollapseDotSegments(true))
-	p.MustHandle([]string{http.MethodGet}, "api.test/v1/charges", noopHandler)
+	p.MustAddInterceptor([]string{http.MethodGet}, "api.test/v1/charges", noopHandler)
 
 	// A ".." that walks above the root has no meaning, so it reaches no handler rather than
 	// reaching one for a path it never asked for.
@@ -140,7 +139,7 @@ func TestPath_PatternIsTheTreeKey(t *testing.T) {
 		"api.stripe.com/v1/charges",
 		"127.0.0.1/health",
 		"::1/health",
-		"/v1/charges",
+		"+{any}/v1/charges",
 		"+{sub}.stripe.com/v1/{id}",
 	} {
 		pat, _, err := p.parsePattern(raw)
@@ -150,23 +149,57 @@ func TestPath_PatternIsTheTreeKey(t *testing.T) {
 	}
 }
 
-func TestPath_SchemeAndPortAreRefusedInARoutePattern(t *testing.T) {
+func TestPath_SchemeAndPortAreRefusedInAnInterceptorPattern(t *testing.T) {
 	p := testProxy(t)
 
 	cases := []struct{ pattern, hint string }{
-		{"https://api.test/v1", "use WithScheme"},
-		{"http://api.test/v1", "use WithScheme"},
-		{"api.test:8443/v1", "use WithPort"},
-		{"localhost:8080/api", "use WithPort"},
+		{"https://api.test/v1", "it carries no scheme"},
+		{"http://api.test/v1", "it carries no scheme"},
+		{"api.test:8443/v1", "a port is not part of an interceptor pattern"},
+		{"localhost:8080/api", "a port is not part of an interceptor pattern"},
 	}
 
 	for _, tc := range cases {
-		_, err := p.Handle([]string{http.MethodGet}, tc.pattern, noopHandler)
+		_, err := p.AddInterceptor([]string{http.MethodGet}, tc.pattern, noopHandler)
 		var pe *PatternError
 		require.ErrorAs(t, err, &pe, tc.pattern)
 		assert.Contains(t, pe.Error(), tc.hint,
-			"the error for %q must say where the component belongs", tc.pattern)
+			"the error for %q must name what is refused", tc.pattern)
 	}
+}
+
+func TestPath_RegexpConstraintMayHoldAColon(t *testing.T) {
+	p := testProxy(t, WithRegexpParam(true))
+
+	// A colon inside a brace belongs to the constraint, not to a port. Both scans that name
+	// a port have to skip the brace, or every regexp constrained hostname is refused.
+	for _, pattern := range []string{
+		`{sub:[a-z]+}.example.com/health`,
+		`+{any:[a-z.]+}/health`,
+	} {
+		_, err := p.AddInterceptor(nil, pattern, noopHandler)
+		require.NoError(t, err, pattern)
+	}
+	// Tunnels go on authorities no interceptor claims, since an interceptor and a tunnel cannot disagree
+	// on the same authority.
+	for _, pattern := range []string{
+		`{sub:[a-z]+}.tunnelled.test`,
+		`+{any:[a-z.]+}.also-tunnelled.test`,
+	} {
+		require.NoError(t, p.AddTunnel(pattern), pattern)
+	}
+
+	// Past the last brace the colon is a port again, and an authority still splits on it.
+	require.NoError(t, p.AddTunnel(`{sub:[a-z]+}.other.com:8080`))
+	pat, _, err := p.parseAuthorityPattern(`{sub:[a-z]+}.other.com:8080`)
+	require.NoError(t, err)
+	assert.Equal(t, `{sub:[a-z]+}.other.com`, pat.host)
+	assert.Equal(t, "8080", pat.port)
+
+	_, err = p.AddInterceptor(nil, `{sub:[a-z]+}.other.com:8080/health`, noopHandler)
+	var pe *PatternError
+	require.ErrorAs(t, err, &pe)
+	assert.Contains(t, pe.Error(), "a port is not part of an interceptor pattern")
 }
 
 func TestPath_AddressLiteralMustBeCanonical(t *testing.T) {

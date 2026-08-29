@@ -36,12 +36,12 @@ func TestContext_Accessors(t *testing.T) {
 		pattern                                            string
 		proto                                              Protocol
 		hasTLS                                             bool
-		remoteIP                                           string
+		remoteAddr                                         string
 		scope                                              HandlerScope
 	}
 	var got observed
 
-	p.MustHandle([]string{http.MethodPost}, host+"/v1/{id}/refunds", func(c *Context) (*http.Response, error) {
+	p.MustAddInterceptor([]string{http.MethodPost}, host+"/v1/{id}/refunds", func(c *Context) (*http.Response, error) {
 		got = observed{
 			method:      c.Method(),
 			scheme:      c.Scheme(),
@@ -54,18 +54,19 @@ func TestContext_Accessors(t *testing.T) {
 			params:      slices.Collect(c.Params()),
 			pattern:     c.Pattern(),
 			proto:       c.Protocol(),
-			hasTLS:      c.TLS() != nil,
-			remoteIP:    c.RemoteIP().String(),
+			hasTLS:      c.Request().TLS != nil,
+			remoteAddr:  c.RemoteAddr().Addr().String(),
 			scope:       c.Scope(),
 		}
 
 		require.Same(t, p, c.Proxy())
 		require.NotNil(t, c.Session())
-		require.NotNil(t, c.Context())
 		require.Equal(t, "ch_1", c.Param("id"))
 		require.Empty(t, c.Param("missing"))
-		require.Equal(t, Target{Scheme: "https", Host: host, Port: port}, c.Target())
-		require.NotNil(t, c.Route())
+		require.NotNil(t, c.Interceptor())
+
+		// The connection reports the same client as the request it carries.
+		require.Equal(t, c.Session().RemoteAddr(), c.RemoteAddr())
 
 		return Text(http.StatusOK, "done"), nil
 	})
@@ -92,11 +93,11 @@ func TestContext_Accessors(t *testing.T) {
 	assert.Equal(t, host+"/v1/{id}/refunds", got.pattern)
 	assert.Equal(t, HTTP11, got.proto)
 	assert.True(t, got.hasTLS, "an intercepted TLS connection must report its state")
-	assert.Equal(t, "127.0.0.1", got.remoteIP)
-	assert.Equal(t, RouteHandler, got.scope)
+	assert.Equal(t, "127.0.0.1", got.remoteAddr)
+	assert.Equal(t, InterceptorHandler, got.scope)
 }
 
-func TestContext_NoRouteScope(t *testing.T) {
+func TestContext_NoInterceptorScope(t *testing.T) {
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "origin")
 	}))
@@ -104,16 +105,22 @@ func TestContext_NoRouteScope(t *testing.T) {
 
 	var scope HandlerScope
 	var pattern string
-	var route *Route
+	var route *Interceptor
 
 	originURL := origin.URL
-	p, _, client := interceptingProxy(t, origin, WithNoRouteHandler(func(c *Context) (*http.Response, error) {
+	p, host, client := interceptingProxy(t, origin, WithNoInterceptorHandler(func(c *Context) (*http.Response, error) {
 		scope = c.Scope()
 		pattern = c.Pattern()
-		route = c.Route()
+		route = c.Interceptor()
 		return Text(http.StatusOK, "no route"), nil
 	}))
-	_ = p
+
+	// The helper arms the authority with a catch-all, which would match here and leave the
+	// no-interceptor handler unreachable. A narrow route keeps the authority armed while
+	// letting an unregistered path fall through, which is what this test is about.
+	_, err := p.DeleteInterceptor(nil, host+"/*{any}")
+	require.NoError(t, err)
+	p.MustAddInterceptor(nil, host+"/registered", noopHandler)
 
 	resp, err := client.Get(originURL + "/anything")
 	require.NoError(t, err)
@@ -121,7 +128,7 @@ func TestContext_NoRouteScope(t *testing.T) {
 	_ = resp.Body.Close()
 
 	assert.Equal(t, "no route", string(body))
-	assert.Equal(t, NoRouteHandler, scope)
+	assert.Equal(t, NoInterceptorHandler, scope)
 	assert.Empty(t, pattern, "there is no pattern outside of a route")
 	assert.Nil(t, route)
 }
@@ -135,8 +142,8 @@ func TestContext_SetRequest(t *testing.T) {
 	defer origin.Close()
 
 	p, authority, client := interceptingProxy(t, origin)
-	p.MustHandle([]string{http.MethodGet}, authority+"/old", func(c *Context) (*http.Response, error) {
-		req := c.Request().Clone(c.Context())
+	p.MustAddInterceptor([]string{http.MethodGet}, authority+"/old", func(c *Context) (*http.Response, error) {
+		req := c.Request().Clone(c.Request().Context())
 		req.URL.Path = "/new"
 		c.SetRequest(req)
 		return c.Forward()
@@ -149,36 +156,14 @@ func TestContext_SetRequest(t *testing.T) {
 	assert.Equal(t, "/new", seen, "the handler must be able to retarget the request")
 }
 
-func TestContext_Clone(t *testing.T) {
-	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	defer origin.Close()
-
-	p, authority, client := interceptingProxy(t, origin)
-
-	kept := make(chan *Context, 1)
-	p.MustHandle([]string{http.MethodGet}, authority+"/v1/{id}", func(c *Context) (*http.Response, error) {
-		kept <- c.Clone()
-		return Text(http.StatusOK, "ok"), nil
-	})
-
-	resp, err := client.Get(origin.URL + "/v1/ch_9")
-	require.NoError(t, err)
-	_ = resp.Body.Close()
-
-	// The clone stays readable after the handler returned and its context went back to the
-	// pool, which is what makes it safe to hand to a recorder.
-	c := <-kept
-	assert.Equal(t, "ch_9", c.Param("id"))
-	assert.Equal(t, authority+"/v1/{id}", c.Pattern())
-	assert.NotNil(t, c.Request())
-	c.Close()
-	assert.Equal(t, "ch_9", c.Param("id"), "closing a clone must not recycle it")
-}
-
-func TestContext_RemoteIPOfAnAddresslessConnection(t *testing.T) {
+func TestContext_RemoteAddrOfAnAddresslessRequest(t *testing.T) {
 	c := &Context{params: new([]string)}
-	assert.False(t, c.RemoteIP().IsValid(), "a context with no session has no client address")
+	assert.False(t, c.RemoteAddr().IsValid(), "a context with no request has no client address")
 
-	c.sess = &Session{remoteAddr: &net.UnixAddr{Name: "/tmp/sock", Net: "unix"}}
-	assert.False(t, c.RemoteIP().IsValid(), "a unix socket has no IP")
+	c.req = httptest.NewRequest(http.MethodGet, "/v1/charges", nil)
+	c.req.RemoteAddr = "/tmp/sock"
+	assert.False(t, c.RemoteAddr().IsValid(), "a unix socket has no IP")
+
+	sess := &Session{remoteAddr: &net.UnixAddr{Name: "/tmp/sock", Net: "unix"}}
+	assert.False(t, sess.RemoteAddr().IsValid(), "neither does the connection it arrived on")
 }

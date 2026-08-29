@@ -15,10 +15,10 @@ import (
 	"github.com/fox-toolkit/edge/internal/stringsutil"
 )
 
-// pattern is a parsed route pattern: a hostname followed by a path. key is what the radix
-// tree is indexed on, which for a route is the pattern itself, byte for byte.
+// pattern is a parsed interceptor pattern: a hostname followed by a path. key is what the radix
+// tree is indexed on, which for an interceptor is the pattern itself, byte for byte.
 //
-// The scheme and the port are deliberately not part of a route pattern. Neither is a tree
+// The scheme and the port are deliberately not part of an interceptor pattern. Neither is a tree
 // dimension: folding a scheme into the key would put it ahead of the path in the priority
 // order, so a scheme qualified parameter would outrank a static segment, and folding a port
 // into the hostname would turn "any port" into a host that no request could ever match.
@@ -29,7 +29,7 @@ type pattern struct {
 	key  string
 	host string
 	// port is set only for an interception rule, whose pattern is an authority and may
-	// carry one. A route pattern never does; it uses [WithPort].
+	// carry one. An interceptor pattern never does; it uses [WithPort].
 	port             string
 	path             string
 	tokens           []token
@@ -38,11 +38,13 @@ type pattern struct {
 	endHost          int
 }
 
-// parsePattern parses a route pattern of the form host/path. The hostname is optional; an
-// omitted one matches every authority.
+// parsePattern parses an interceptor pattern of the form host/path. The hostname is required: a
+// route arms the interception of the authority it names, and one that names none would arm
+// nothing, leaving a handler registered that no connection can ever reach. Matching every
+// authority is spelled with a wildcard, which says so.
 func (p *Proxy) parsePattern(raw string) (pattern, int, error) {
 	if len(raw) == 0 {
-		return pattern{}, 0, fmt.Errorf("%w: empty pattern", ErrInvalidRoute)
+		return pattern{}, 0, fmt.Errorf("%w: empty pattern", ErrInvalidInterceptor)
 	}
 
 	if i := strings.Index(raw, "://"); i >= 0 {
@@ -50,7 +52,7 @@ func (p *Proxy) parsePattern(raw string) (pattern, int, error) {
 			Pattern: raw,
 			Type:    "hostname",
 			Reason:  "syntax",
-			Hint:    "a route pattern is a hostname and a path, use WithScheme to match a scheme",
+			Hint:    "an interceptor pattern is a hostname and a path, it carries no scheme",
 			Start:   0,
 			End:     i + 3,
 		}
@@ -71,7 +73,18 @@ func (p *Proxy) parsePattern(raw string) (pattern, int, error) {
 	host := raw[:endHost]
 	path := raw[endHost:]
 
-	hostTokens, paramCount, pe := p.parseRouteHostname(host)
+	if host == "" {
+		return pattern{}, 0, &PatternError{
+			Pattern: raw,
+			Type:    "hostname",
+			Reason:  "syntax",
+			Hint:    "an interceptor pattern names the authority it intercepts, write +{any} to match every one",
+			Start:   0,
+			End:     1,
+		}
+	}
+
+	hostTokens, paramCount, pe := p.parseInterceptorHostname(host)
 	if pe != nil {
 		pe.Pattern = raw
 		pe.Type = "hostname"
@@ -103,24 +116,19 @@ func (p *Proxy) parsePattern(raw string) (pattern, int, error) {
 	}, paramCount, nil
 }
 
-// parseRouteHostname parses the hostname half of a route pattern. An empty hostname matches
-// every authority and yields no token.
+// parseInterceptorHostname parses the hostname half of an interceptor pattern.
 //
 // A port here is a mistake worth naming: the hostname is the tree key, and a port in it would
-// make the route unreachable rather than narrow. The error says where the port belongs.
-func (p *Proxy) parseRouteHostname(host string) ([]token, int, *PatternError) {
-	if host == "" {
-		return nil, 0, nil
-	}
-
+// make the interceptor unreachable rather than narrow, so it is refused instead of folded in.
+func (p *Proxy) parseInterceptorHostname(host string) ([]token, int, *PatternError) {
 	if host[0] == '[' {
 		// Brackets exist in an authority to tell the colons of an address from the one
-		// before a port. A route pattern carries no port, so they separate nothing.
+		// before a port. An interceptor pattern carries no port, so they separate nothing.
 		end := strings.IndexByte(host, ']')
 		if end > 0 {
 			if canonical, ok := canonicalIP(host[1:end]); ok {
 				return nil, 0, newPatternError("syntax", 0, len(host),
-					"a route pattern takes an address literal without brackets, write "+canonical)
+					"an interceptor pattern takes an address literal without brackets, write "+canonical)
 			}
 		}
 		return nil, 0, newPatternError("syntax", 0, len(host), "illegal character in label")
@@ -137,30 +145,35 @@ func (p *Proxy) parseRouteHostname(host string) ([]token, int, *PatternError) {
 		return []token{{typ: nodeStatic, value: host, hsplit: true}}, 0, nil
 	}
 
-	if i := strings.IndexByte(host, ':'); i >= 0 {
-		return nil, 0, newPatternError("syntax", i, len(host),
-			"a port is not part of a route pattern, use WithPort")
+	// Only a colon outside every brace can be a port: inside one it belongs to a regexp
+	// constraint, which parseHostname hands to parseBrace.
+	start := afterLastBrace(host)
+	if i := strings.IndexByte(host[start:], ':'); i >= 0 {
+		return nil, 0, newPatternError("syntax", start+i, len(host),
+			"a port is not part of an interceptor pattern")
 	}
 
 	return p.parseHostname(host)
 }
 
-// parseAuthorityPattern parses an interception rule, which is an authority with no path.
-// The rule is stored in the rule tree under the key host + "/" so it shares the hostname
-// matching of the routing tree.
+// parseAuthorityPattern parses an authority pattern: a host with an optional port and no
+// path. The tokens stop at the hostname, so the key holds no '/' while an interceptor key always
+// does. That is what lets both live in one tree without ever colliding: the walk that
+// answers a CONNECT cannot reach an interceptor, and the walk that answers a request cannot reach
+// an authority.
 func (p *Proxy) parseAuthorityPattern(raw string) (pattern, int, error) {
 	if len(raw) == 0 {
-		return pattern{}, 0, fmt.Errorf("%w: empty authority", ErrInvalidRule)
+		return pattern{}, 0, fmt.Errorf("%w: empty authority", ErrInvalidAuthority)
 	}
 	if i := strings.Index(raw, "://"); i >= 0 {
 		// The decision to intercept is taken before the connection is established, when
 		// nothing has revealed whether it carries TLS. A scheme here would be a promise
-		// the rule cannot keep.
+		// the authority entry cannot keep.
 		return pattern{}, 0, &PatternError{
 			Pattern: raw,
 			Type:    "authority",
 			Reason:  "syntax",
-			Hint:    "a rule matches an authority, the scheme is not known when it is evaluated",
+			Hint:    "an authority pattern is evaluated before the connection exists, when no scheme is known",
 			Start:   0,
 			End:     i + 3,
 		}
@@ -170,7 +183,7 @@ func (p *Proxy) parseAuthorityPattern(raw string) (pattern, int, error) {
 			Pattern: raw,
 			Type:    "authority",
 			Reason:  "syntax",
-			Hint:    "a rule matches an authority and must not carry a path",
+			Hint:    "an authority pattern must not carry a path",
 			Start:   i,
 			End:     len(raw),
 		}
@@ -214,15 +227,12 @@ func (p *Proxy) parseAuthorityPattern(raw string) (pattern, int, error) {
 		}
 	}
 
-	tokens := append(hostTokens, token{typ: nodeStatic, value: "/"})
-
 	return pattern{
 		str:     raw,
-		key:     host + "/",
+		key:     host,
 		host:    host,
 		port:    port,
-		path:    "/",
-		tokens:  tokens,
+		tokens:  hostTokens,
 		endHost: len(host),
 	}, paramCount, nil
 }
@@ -257,11 +267,16 @@ func splitHostPortPattern(authority string) (host, port string, pe *PatternError
 		return canonical, port, nil
 	}
 
-	i := strings.LastIndexByte(authority, ':')
-	if i < 0 {
+	// A regexp constraint holds its own colons, so the port separator is looked for past the
+	// last brace. An address literal never carries a brace, which is what keeps the check
+	// below sound: reaching it means the authority is unparameterized.
+	start := afterLastBrace(authority)
+	k := strings.LastIndexByte(authority[start:], ':')
+	if k < 0 {
 		return authority, "", nil
 	}
-	if strings.IndexByte(authority[:i], ':') >= 0 {
+	i := start + k
+	if start == 0 && strings.IndexByte(authority[:i], ':') >= 0 {
 		return "", "", newPatternError("syntax", 0, len(authority), "IPv6 literal must be bracketed")
 	}
 	port, pe = parsePort(authority[i+1:], i+1)
@@ -269,6 +284,16 @@ func splitHostPortPattern(authority string) (host, port string, pe *PatternError
 		return "", "", pe
 	}
 	return authority[:i], port, nil
+}
+
+// afterLastBrace returns the index just past the last closing brace of s, or zero when it
+// carries none. A parameter's regexp constraint may hold a colon, so any scan looking for a
+// port separator has to start here rather than at the beginning.
+func afterLastBrace(s string) int {
+	if i := strings.LastIndexByte(s, '}'); i >= 0 {
+		return i + 1
+	}
+	return 0
 }
 
 // canonicalIP reports whether host is an IP literal and returns the form the lookup will
@@ -279,7 +304,7 @@ func canonicalIP(host string) (string, bool) {
 		return "", false
 	}
 	// A domain name never starts with a digit-only label followed by a dot in a way that
-	// parses as an address, so the cheap first-byte test rules out the common case.
+	// parses as an address, so the cheap first-byte test authorities out the common case.
 	if c := host[0]; (c < '0' || c > '9') && c != ':' {
 		return "", false
 	}

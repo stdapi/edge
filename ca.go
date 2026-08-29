@@ -429,4 +429,4 @@ func publicKeyMatches(certPub, keyPub crypto.PublicKey) bool {
 	return ok && eq.Equal(keyPub)
 }
 
-var errNoCA = errors.New("interception requires a certificate authority, see WithCA")
+var errNoCA = errors.New("interception requires a certificate authority")

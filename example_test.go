@@ -27,7 +27,7 @@ func Example() {
 		log.Fatal(err)
 	}
 
-	p.MustHandle([]string{http.MethodPost}, "api.stripe.com/v1/charges", func(c *edge.Context) (*http.Response, error) {
+	p.MustAddInterceptor([]string{http.MethodPost}, "api.stripe.com/v1/charges", func(c *edge.Context) (*http.Response, error) {
 		if c.Request().Header.Get("Idempotency-Key") == "" {
 			return edge.Text(http.StatusBadRequest, "missing idempotency key"), nil
 		}
@@ -47,7 +47,7 @@ func ExampleRewrite() {
 	ca, _ := edge.GenerateCA()
 	p, _ := edge.New(edge.WithCA(ca))
 
-	p.MustHandle([]string{http.MethodGet}, "api.example.test/v1/status", func(c *edge.Context) (*http.Response, error) {
+	p.MustAddInterceptor([]string{http.MethodGet}, "api.example.test/v1/status", func(c *edge.Context) (*http.Response, error) {
 		resp, err := c.Forward()
 		if err != nil {
 			return nil, err
@@ -69,27 +69,34 @@ func ExampleRewrite() {
 // usually made of. The port is a matcher, not part of the pattern.
 func ExampleWithPort() {
 	ca, _ := edge.GenerateCA()
-	p, _ := edge.New(edge.WithCA(ca), edge.WithIntercept("localhost:8080"))
+	p, _ := edge.New(edge.WithCA(ca))
 
-	p.MustHandle([]string{http.MethodGet}, "localhost/api/health", func(c *edge.Context) (*http.Response, error) {
+	p.MustAddInterceptor([]string{http.MethodGet}, "localhost/api/health", func(c *edge.Context) (*http.Response, error) {
 		return edge.Text(http.StatusOK, "stubbed"), nil
 	}, edge.WithPort("8080"))
 
-	fmt.Println(p.Len())
+	fmt.Println(p.InterceptorsLen())
 	// Output: 1
 }
 
-// Carve a tunnel out of a broader interception rule. Rules are evaluated most specific
-// first, so a static authority beats a wildcard.
-func ExampleWithTunnel() {
+// Carve a tunnel out of a broader interception. Authorities are evaluated most specific
+// first, so a static authority beats a wildcard. Nothing about traffic policy is decided at
+// construction: authorities change while the proxy is serving. An authority named by neither is
+// refused, so an application reaching somewhere the test did not plan for says so.
+func ExampleProxy_AddTunnel() {
 	ca, _ := edge.GenerateCA()
 
-	p, err := edge.New(
-		edge.WithCA(ca),
-		edge.WithIntercept("+{sub}.stripe.com"),
-		edge.WithTunnel("checkout.stripe.com"),
-	)
+	p, err := edge.New(edge.WithCA(ca))
 	if err != nil {
+		log.Fatal(err)
+	}
+
+	// An interceptor names the authority it intercepts, so registering one arms it. Here nothing
+	// is rewritten, the catch-all just forwards, which is enough to observe the traffic.
+	if _, err := p.AddInterceptor(nil, "+{sub}.stripe.com/*{any}", edge.DefaultNoInterceptorHandler); err != nil {
+		log.Fatal(err)
+	}
+	if err := p.AddTunnel("checkout.stripe.com"); err != nil {
 		log.Fatal(err)
 	}
 
@@ -99,7 +106,7 @@ func ExampleWithTunnel() {
 	// Output:
 	// intercept
 	// tunnel
-	// tunnel
+	// reject
 }
 
 // Record every request that crosses the proxy, whatever it is routed to.
@@ -109,7 +116,7 @@ func ExampleWithMiddleware() {
 	var recorded []string
 	record := func(next edge.HandlerFunc) edge.HandlerFunc {
 		return func(c *edge.Context) (*http.Response, error) {
-			recorded = append(recorded, c.Method()+" "+c.Target().String()+c.RoutingPath())
+			recorded = append(recorded, c.Method()+" "+c.Scheme()+"://"+c.Authority()+c.RoutingPath())
 			return next(c)
 		}
 	}
@@ -117,11 +124,10 @@ func ExampleWithMiddleware() {
 	p, _ := edge.New(
 		edge.WithCA(ca),
 		edge.WithMiddleware(record),
-		// Interception without a matching route forwards the request unchanged, so this
-		// records the traffic of an authority nothing else touches.
-		edge.WithIntercept("api.example.test"),
 	)
-	_ = p
+	// A catch-all that forwards untouched: it arms the authority and records its traffic
+	// without changing a byte of it.
+	_, _ = p.AddInterceptor(nil, "api.example.test/*{any}", edge.DefaultNoInterceptorHandler)
 }
 
 // Change routes while traffic is flowing. Lookups never block on a write.
@@ -130,17 +136,17 @@ func ExampleProxy_Updates() {
 	p, _ := edge.New(edge.WithCA(ca))
 
 	err := p.Updates(func(txn *edge.Txn) error {
-		if _, err := txn.Add([]string{http.MethodGet}, "api.example.test/v1/health", failOnce()); err != nil {
+		if _, err := txn.AddInterceptor([]string{http.MethodGet}, "api.example.test/v1/health", failOnce()); err != nil {
 			return err
 		}
-		_, err := txn.Add([]string{http.MethodPost}, "api.example.test/v1/orders", failOnce())
+		_, err := txn.AddInterceptor([]string{http.MethodPost}, "api.example.test/v1/orders", failOnce())
 		return err
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	fmt.Println(p.Len())
+	fmt.Println(p.InterceptorsLen())
 	// Output: 2
 }
 

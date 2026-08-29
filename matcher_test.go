@@ -5,7 +5,6 @@
 package edge
 
 import (
-	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -24,12 +23,14 @@ func matchCtx(t *testing.T, method, target, path string, headers http.Header) Re
 		req.Header = headers
 	}
 
-	sess := &Session{proto: HTTP2, remoteAddr: &net.TCPAddr{IP: net.ParseIP("192.0.2.10"), Port: 4242}}
-	host, port := splitHostPort(target)
+	// No session: everything a matcher reads has to come off the request, or the same matcher
+	// would answer differently here and under Proxy.Match.
+	req.RemoteAddr = "192.0.2.10:4242"
+	req.Proto, req.ProtoMajor, req.ProtoMinor = "HTTP/2.0", 2, 0
 
+	host, port := splitHostPort(target)
 	c := &Context{
 		req:    req,
-		sess:   sess,
 		scheme: "https",
 		host:   host,
 		port:   port,
@@ -143,19 +144,19 @@ func TestMatcher_Func(t *testing.T) {
 	m := MatcherFunc(func(c RequestContext) bool { return c.Method() == http.MethodPost })
 	assert.True(t, m.Match(matchCtx(t, http.MethodPost, "a.test:443", "/", nil)))
 	assert.False(t, m.Match(matchCtx(t, http.MethodGet, "a.test:443", "/", nil)))
-	// Two function matchers are never equal, so a route carrying one cannot be identified
+	// Two function matchers are never equal, so an interceptor carrying one cannot be identified
 	// by its matchers.
 	assert.False(t, m.Equal(m))
 }
 
-func TestMatcher_NarrowsARoute(t *testing.T) {
+func TestMatcher_NarrowsAnInterceptor(t *testing.T) {
 	p := testProxy(t)
 
 	beta, err := MatchHeader("X-Channel", "beta")
 	require.NoError(t, err)
 
-	special := p.MustHandle([]string{http.MethodGet}, "api.test/v1/charges", noopHandler, WithMatcher(beta))
-	fallback := p.MustHandle([]string{http.MethodGet}, "api.test/v1/charges", noopHandler)
+	special := p.MustAddInterceptor([]string{http.MethodGet}, "api.test/v1/charges", noopHandler, WithMatcher(beta))
+	fallback := p.MustAddInterceptor([]string{http.MethodGet}, "api.test/v1/charges", noopHandler)
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/charges", nil)
 	req.Header.Set("X-Channel", "beta")
@@ -166,7 +167,34 @@ func TestMatcher_NarrowsARoute(t *testing.T) {
 	got, _ = p.Match(Target{Scheme: "https", Host: "api.test", Port: "443"}, plain)
 	assert.Same(t, fallback, got)
 
-	// A route carrying matchers is identified by them.
-	assert.Same(t, special, p.Route([]string{http.MethodGet}, "api.test/v1/charges", beta))
-	assert.Same(t, fallback, p.Route([]string{http.MethodGet}, "api.test/v1/charges"))
+	// An interceptor carrying matchers is identified by them.
+	assert.Same(t, special, p.Interceptor([]string{http.MethodGet}, "api.test/v1/charges", beta))
+	assert.Same(t, fallback, p.Interceptor([]string{http.MethodGet}, "api.test/v1/charges"))
+}
+
+func TestMatcher_ConnectionMatchersAreReadableUnderMatch(t *testing.T) {
+	p := testProxy(t)
+
+	h3, err := MatchProtocol(HTTP3)
+	require.NoError(t, err)
+	lan, err := MatchRemoteIP("192.0.2.0/24")
+	require.NoError(t, err)
+
+	narrow := p.MustAddInterceptor([]string{http.MethodGet}, "api.test/v1/charges", noopHandler, WithMatchers(h3, lan))
+	fallback := p.MustAddInterceptor([]string{http.MethodGet}, "api.test/v1/charges", noopHandler)
+
+	target := Target{Scheme: "https", Host: "api.test", Port: "443"}
+
+	// Match runs without a session, so a matcher reading the connection instead of the request
+	// would never select this interceptor and Match would disagree with what serve does.
+	req := httptest.NewRequest(http.MethodGet, "/v1/charges", nil)
+	req.Proto, req.ProtoMajor, req.ProtoMinor = "HTTP/3.0", 3, 0
+	req.RemoteAddr = "192.0.2.10:4242"
+	got, _ := p.Match(target, req)
+	assert.Same(t, narrow, got)
+
+	off := httptest.NewRequest(http.MethodGet, "/v1/charges", nil)
+	off.RemoteAddr = "198.51.100.10:4242"
+	got, _ = p.Match(target, off)
+	assert.Same(t, fallback, got)
 }

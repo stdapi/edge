@@ -15,16 +15,16 @@ import (
 	"github.com/fox-toolkit/edge/internal/netutil"
 )
 
-// Matcher narrows a route beyond its pattern and method. Every matcher on a route must
-// match for the route to be selected. A route carrying matchers is evaluated before one
-// without at the same pattern, so a route with no matcher is the fallback.
+// Matcher narrows an interceptor beyond its pattern and method. Every matcher on an interceptor must
+// match for the interceptor to be selected. An interceptor carrying matchers is evaluated before one
+// without at the same pattern, so an interceptor with no matcher is the fallback.
 //
 // Match must be free of side effects and must not retain the [RequestContext], whose
 // lifetime ends when Match returns.
 type Matcher interface {
 	// Match reports whether the request satisfies this matcher.
 	Match(c RequestContext) bool
-	// Equal reports whether matcher is this matcher. It identifies a route for lookup and
+	// Equal reports whether matcher is this matcher. It identifies an interceptor for lookup and
 	// deletion, so it must be a value comparison, not identity.
 	Equal(matcher Matcher) bool
 }
@@ -260,7 +260,7 @@ func MatchRemoteIP(prefix string) (RemoteIPMatcher, error) {
 func (m RemoteIPMatcher) Prefix() netip.Prefix { return m.prefix }
 
 func (m RemoteIPMatcher) Match(c RequestContext) bool {
-	addr := c.RemoteIP()
+	addr := c.RemoteAddr().Addr()
 	return addr.IsValid() && m.prefix.Contains(addr.WithZone(""))
 }
 
@@ -300,8 +300,8 @@ func (m ProtocolMatcher) Equal(matcher Matcher) bool {
 func (m ProtocolMatcher) String() string { return "proto=" + m.proto.String() }
 
 // MatcherFunc adapts a function to the [Matcher] interface. Two MatcherFunc values are never
-// equal, so a route carrying one cannot be identified by its matchers: give it a name with
-// [WithName] and delete it with [Proxy.DeleteRoute].
+// equal, so an interceptor carrying one cannot be identified by its matchers: give it a name with
+// [WithName] and delete it with [Proxy.removeInterceptor].
 type MatcherFunc func(c RequestContext) bool
 
 func (f MatcherFunc) Match(c RequestContext) bool { return f(c) }

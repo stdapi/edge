@@ -17,24 +17,24 @@ import (
 // serve routes one intercepted request, runs its handler and writes the result back to the
 // client.
 func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, sess *Session, target Target) {
-	tree := p.getRoutes()
+	tree := p.getTree()
 	c := tree.pool.Get().(*Context)
-	defer c.release()
+	defer tree.pool.Put(c)
 	c.reset(sess, r, target.Scheme, target.Host, target.Port)
 
-	handler := p.noRoute
+	handler := p.noInterceptor
 	path, ok := p.normalizeForMatch(routingPath(r))
 	if ok && r.Method != "" {
 		if idx, n, _ := tree.lookup(r.Method, target.Host, path, c, false); n != nil {
-			c.route = n.routes[idx]
-			handler = c.route.hall
+			c.interceptor = n.entries[idx]
+			handler = c.interceptor.hall
 		}
 	}
-	if c.route == nil {
+	if c.interceptor == nil {
 		// A lookup that failed may have left captures behind from a branch it backtracked
-		// out of, and no route means no names to read them under.
+		// out of, and no interceptor means no names to read them under.
 		*c.params = (*c.params)[:0]
-		c.scope = NoRouteHandler
+		c.scope = NoInterceptorHandler
 	}
 
 	resp, err := p.runHandler(c, handler)
@@ -53,13 +53,13 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, sess *Session, tar
 	}
 }
 
-// relay forwards a request the rules asked the proxy not to look at. No route is consulted
+// relay forwards a request a tunnel asked the proxy not to look at. No interceptor is consulted
 // and no middleware runs: a tunneled authority stays unobserved even when it arrives as a
 // plain request the proxy had to parse to route it at all.
 func (p *Proxy) relay(w http.ResponseWriter, r *http.Request, sess *Session, target Target) {
-	tree := p.getRoutes()
+	tree := p.getTree()
 	c := tree.pool.Get().(*Context)
-	defer c.release()
+	defer tree.pool.Put(c)
 	c.reset(sess, r, target.Scheme, target.Host, target.Port)
 
 	resp, err := c.Forward()

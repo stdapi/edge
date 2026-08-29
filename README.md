@@ -1,21 +1,18 @@
 # Edge
 
-Edge is a forward HTTP proxy library for Go. It tunnels the traffic it was not asked to look at and intercepts the rest, terminating TLS with a local certificate authority so your code can inspect and rewrite requests and responses in flight.
+Edge is a forward HTTP proxy library for Go. It intercepts the authorities you name, terminating TLS with a local certificate authority so your code can inspect and rewrite requests and responses in flight, tunnels the ones you want left alone, and refuses everything else.
 
 It was built to capture the outbound traffic of an application under end-to-end test without the application being able to tell. What goes upstream is what the client sent, byte for byte, minus only the hop-by-hop headers a proxy must not relay. The HTTP version is mirrored in both directions. Bodies are never decompressed on the way through. Nothing is added: no `Via`, no `X-Forwarded-For`, no `Accept-Encoding` of the proxy's own.
 
-Routing uses an immutable radix tree with lock-free reads and single-writer semantics, adapted from [Fox](https://github.com/fox-toolkit/fox). Routes and interception rules change while traffic flows, without blocking a lookup.
+Routing uses an immutable radix tree with lock-free reads and single-writer semantics, adapted from [Fox](https://github.com/fox-toolkit/fox). Nothing is configured at construction: interceptors and tunnels are added and removed while traffic flows, without blocking a lookup.
 
 ```go
 ca, _ := edge.GenerateCA()
 
-p, _ := edge.New(
-    edge.WithCA(ca),
-    // MITM these authorities, tunnel everything else end to end
-    edge.WithIntercept("+{sub}.stripe.com", "api.internal.corp"),
-)
+p, _ := edge.New(edge.WithCA(ca))
 
-p.MustHandle([]string{"POST"}, "api.stripe.com/v1/charges", func(c *edge.Context) (*http.Response, error) {
+// An interceptor names the authority it intercepts, so this arms api.stripe.com on its own.
+p.MustAddInterceptor([]string{"POST"}, "api.stripe.com/v1/charges", func(c *edge.Context) (*http.Response, error) {
     // 1. inspect the request, block it or change it
     if c.Request().Header.Get("Idempotency-Key") == "" {
         return edge.Text(400, "missing idempotency key"), nil
@@ -35,6 +32,9 @@ p.MustHandle([]string{"POST"}, "api.stripe.com/v1/charges", func(c *edge.Context
     }
     return edge.Rewrite(resp, injectFault(body)), nil
 })
+
+// Leave this one alone: its TLS stays end to end and the proxy never sees the plaintext.
+p.AddTunnel("checkout.stripe.com")
 
 log.Fatal(p.ListenAndServe(":8080"))
 ```
@@ -64,35 +64,41 @@ It is worth separating two things that both get called "transparent":
 
 The two combine freely. Most test setups want an explicit proxy that intercepts a handful of authorities and tunnels the rest. An application that ignores proxy environment variables needs the transparent listener instead.
 
-## Interception rules
+## What happens to a connection
 
-A connection is placed by its authority, before any request is parsed. Rules live in their own tree and are evaluated most specific first: a static authority beats a parameter, which beats a wildcard.
+The decision is taken from the authority alone, before any request is parsed, and the most specific pattern wins: a static authority beats a parameter, which beats a wildcard.
 
 ```go
-p, _ := edge.New(
-    edge.WithCA(ca),
-    edge.WithIntercept("+{sub}.stripe.com"),  // every subdomain
-    edge.WithTunnel("checkout.stripe.com"),   // except this one, static wins
-    edge.WithReject("telemetry.vendor.test"), // refuse outright
-)
+// Watch every Stripe subdomain, forwarding untouched unless a narrower interceptor matches.
+p.MustAddInterceptor(nil, "+{sub}.stripe.com/*{any}", edge.DefaultNoInterceptorHandler)
+
+// Except this one, whose TLS must stay end to end. Static beats the wildcard.
+p.AddTunnel("checkout.stripe.com")
 ```
 
-Registering a handler implicitly marks its authority for interception, so a route always sees the traffic it was written for. Those implicit rules are reference counted and disappear with the last route that needed them. An explicit rule always wins over an implicit one.
+There are only these two ways to admit an authority, and both name it explicitly. An interceptor arms the authority in its own pattern, so a handler always sees the traffic it was written for; the entry it implies is reference counted and disappears with the last interceptor that needed it.
 
-Without a rule and without a route, the default is to tunnel: traffic the proxy was not asked about stays opaque to it. `WithDefaultAction(edge.Intercept)` flips that.
+**Everything else is refused.** A proxy that captures the traffic of an application under test should say what it expects that application to reach, and hear about it when the application reaches somewhere else. One line restores a permissive proxy, and it is visible in the code:
 
-`p.Decide(target)` answers what would happen to an authority without opening a connection.
+```go
+p.AddTunnel("+{any}") // relay anything not named above
+```
+
+An authority cannot be both tunneled and intercepted by the same pattern. Declaring the second is an error rather than a silent no-op, in either order, because one of the two would otherwise be dead.
+
+`p.Decide(target)` answers what would happen to an authority without opening a connection, and `p.Authorities()` iterates what is registered.
 
 ## Patterns
 
-A pattern is a hostname and a path.
+A pattern is a hostname and a path. The hostname is required: it is the authority the interceptor arms.
 
 ```
 api.stripe.com/v1/charges           any scheme, any port
 +{sub}.corp.internal/health         every subdomain
++{any}/v1/charges                   every authority
+api.stripe.com/*{any}               every path on one host, which is how to just watch it
 127.0.0.1/health                    address literal
 ::1/health                          IPv6, no brackets
-/v1/charges                         every authority
 ```
 
 Parameters use Fox's syntax:
@@ -109,14 +115,14 @@ An address literal has one spelling, the one a request presents: `::1`, not `[::
 They are matchers, not part of the pattern:
 
 ```go
-p.MustHandle([]string{"GET"}, "localhost/api", api, edge.WithPort("8080"))
-p.MustHandle([]string{"GET"}, "localhost/", ui, edge.WithPort("3000"))
-p.MustHandle([]string{"POST"}, "api.test/v1", h, edge.WithScheme("https"))
+p.MustAddInterceptor([]string{"GET"}, "localhost/api", api, edge.WithPort("8080"))
+p.MustAddInterceptor([]string{"GET"}, "localhost/", ui, edge.WithPort("3000"))
+p.MustAddInterceptor([]string{"POST"}, "api.test/v1", h, edge.WithScheme("https"))
 ```
 
-A route with no port matches every port. The port compared against is always explicit, so `WithPort("443")` matches a plain `https://` target. Writing either in a pattern is an error naming the option to use.
+An interceptor with no port matches every port. The port compared against is always explicit, so `WithPort("443")` matches a plain `https://` target. Writing either in a pattern is an error describing what is refused.
 
-Rules are authorities, so they do carry a port: `edge.WithIntercept("localhost:8080")`.
+An authority pattern does carry a port, since there is no path to confuse it with: `p.AddTunnel("localhost:8080")`.
 
 ## Message framing
 
@@ -130,11 +136,11 @@ Tunneled traffic is relayed byte for byte and is not parsed at all, which is wha
 type HandlerFunc func(c *edge.Context) (*http.Response, error)
 ```
 
-A route is registered for a set of methods. An empty or nil set matches every method, which is the only way to say it: there is no separate constant for it and no single-method form of the call.
+An interceptor is registered for a set of methods. An empty or nil set matches every method, which is the only way to say it: there is no separate constant for it and no single-method form of the call.
 
 Returning a response from `c.Forward()` relays the upstream answer without buffering it. Returning one built locally short-circuits the upstream entirely and the request never leaves the proxy. Returning an error hands it to the configured `ErrorHandler`, which answers 502 by default.
 
-A request that matches no route is forwarded unchanged, so interception without a matching route is observable but not disruptive. `WithNoRouteHandler` changes that.
+A request matching no interceptor is forwarded unchanged, so watching an authority without rewriting anything stays non-disruptive. `WithNoInterceptorHandler` changes that.
 
 Response helpers: `Text`, `Textf`, `HTML`, `JSON`, `Bytes`, `Stream`, `Status`, `Redirect`. Body helpers: `ReadBody` returns the bytes as they came off the wire, `DecodeBody` decompresses first and drops the `Content-Encoding`, and `Rewrite` puts a new body back with the length headers fixed up.
 
@@ -145,7 +151,7 @@ p, _ := edge.New(
     edge.WithCA(ca),
     edge.WithMiddleware(logging, recordToHAR),
 )
-p.MustHandle([]string{"GET"}, "api.stripe.com/v1/charges", h, edge.WithRouteMiddleware(retry))
+p.MustAddInterceptor([]string{"GET"}, "api.stripe.com/v1/charges", h, edge.WithMiddleware(retry))
 ```
 
 This is also where anything protocol-specific goes. A gRPC decoder is middleware that recognizes `application/grpc` and unwraps the length-prefixed frames before the handler sees them; edge itself stays an HTTP proxy.
@@ -155,7 +161,7 @@ This is also where anything protocol-specific goes. A gRPC decoder is middleware
 A `Session` is the client connection a request arrived on, shared by every request multiplexed onto it. It carries the peer address, the negotiated protocol, the TLS state, what the client offered in its ClientHello, and a key-value store for middleware that needs to correlate requests across one connection.
 
 ```go
-p.MustHandle([]string{"GET"}, "api.stripe.com/v1/charges", func(c *edge.Context) (*http.Response, error) {
+p.MustAddInterceptor([]string{"GET"}, "api.stripe.com/v1/charges", func(c *edge.Context) (*http.Response, error) {
     log.Printf("%s over %s, client offered ALPN %v",
         c.Authority(), c.Protocol(), c.Session().ClientHello().ALPN)
     return c.Forward()
@@ -178,7 +184,6 @@ Leaf certificates are minted on demand for the name the client asked for, cached
 ```go
 p, _ := edge.New(
     edge.WithCA(ca),
-    edge.WithIntercept("api.stripe.com"),
     edge.WithOriginalDestination(edge.OriginalDestinationSocket),
 )
 
@@ -194,19 +199,19 @@ For QUIC, the proxy reads the server name out of the Initial packets by deriving
 
 ## Runtime changes
 
-Routes and rules are transactional and can change under load:
+Interceptors and tunnels are transactional and can change together under load:
 
 ```go
 p.Updates(func(txn *edge.Txn) error {
-    if _, err := txn.Add([]string{"POST"}, "api.stripe.com/v1/charges", failOnce); err != nil {
+    if _, err := txn.AddInterceptor([]string{"POST"}, "api.stripe.com/v1/charges", failOnce); err != nil {
         return err
     }
-    _, err := txn.Delete([]string{"GET"}, "api.stripe.com/v1/health")
+    _, err := txn.DeleteInterceptor([]string{"GET"}, "api.stripe.com/v1/health")
     return err
 })
 ```
 
-A write transaction takes the proxy write lock; lookups never take it and never block. The rule tree is committed before the routing tree, so a route is never visible before the rule that makes its authority intercepted.
+A write transaction takes the proxy write lock; lookups never take it and never block. Interceptors and authorities share one tree, so an interceptor and the authority entry it implies are published together and cannot disagree.
 
 ## Performance
 

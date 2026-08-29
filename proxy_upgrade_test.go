@@ -54,11 +54,11 @@ func TestProxy_ProtocolUpgrade(t *testing.T) {
 	tr := DefaultTransport()
 	tr.RootCAs = originPool(t, origin)
 
-	p, err := New(WithCA(ca), WithIntercept(originHost(originURL)), WithTransport(tr))
+	p, err := New(WithCA(ca), WithTransport(tr))
 	require.NoError(t, err)
 
 	var sawUpgrade string
-	p.MustHandle([]string{http.MethodGet}, originHost(originURL)+"/ws", func(c *Context) (*http.Response, error) {
+	p.MustAddInterceptor([]string{http.MethodGet}, originHost(originURL)+"/ws", func(c *Context) (*http.Response, error) {
 		sawUpgrade = c.Request().Header.Get("Upgrade")
 		return c.Forward()
 	})

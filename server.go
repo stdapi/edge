@@ -233,7 +233,7 @@ func (s *server) closeActive() {
 //
 // It makes a Proxy an [http.Handler], so it can be mounted in a server you already own
 // rather than given a listener of its own. The server must leave hijacking available, which
-// rules out anything that wraps the response writer without forwarding [http.Hijacker].
+// authorities out anything that wraps the response writer without forwarding [http.Hijacker].
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.serveProxyRequest(w, r)
 }
@@ -243,19 +243,25 @@ var _ http.Handler = (*Proxy)(nil)
 // serveProxyRequest is the explicit forward proxy entry point: a CONNECT opens a tunnel,
 // anything else is a plain HTTP request carrying an absolute target.
 func (p *Proxy) serveProxyRequest(w http.ResponseWriter, r *http.Request) {
+	if sess := sessionFromRequest(r); sess != nil {
+		// The front listener builds its session from ConnContext, which runs before the
+		// protocol of the connection is known and can only assume HTTP/1.1.
+		sess.setProtocol(protoOfRequest(r))
+	}
+
 	if r.Method == http.MethodConnect {
 		p.serveConnect(w, r)
 		return
 	}
 
-	if !r.URL.IsAbs() {
+	target, ok := proxyTarget(r)
+	if !ok {
 		// An origin-form target on the proxy port means the client is not configured to use
 		// a proxy. Answering with the target it should have sent is the only useful reply.
 		http.Error(w, "edge: expected an absolute request target or CONNECT, this is a forward proxy", http.StatusBadRequest)
 		return
 	}
 
-	target := targetFromURL(r.URL)
 	sess := sessionFromRequest(r)
 	if sess == nil {
 		sess = newSession(r.Context(), nil, target, Intercept, protoOfRequest(r))
@@ -263,7 +269,7 @@ func (p *Proxy) serveProxyRequest(w http.ResponseWriter, r *http.Request) {
 
 	switch p.Decide(target) {
 	case Reject:
-		http.Error(w, "edge: connection rejected by rule", http.StatusForbidden)
+		http.Error(w, "edge: connection rejected, no interceptor or tunnel names this authority", http.StatusForbidden)
 	case Tunnel:
 		// Nothing to tunnel at the byte level: the request is already parsed. Relay it
 		// without consulting the routing tree so no handler observes it.
@@ -271,6 +277,33 @@ func (p *Proxy) serveProxyRequest(w http.ResponseWriter, r *http.Request) {
 	default:
 		p.serve(w, r, sess, target)
 	}
+}
+
+// proxyTarget resolves the authority an explicit proxy request names, reporting false when
+// the request names none.
+//
+// HTTP/1.1 carries it in an absolute-form request target. HTTP/2 has no absolute form: RFC
+// 9113 splits the target across :scheme, :authority and :path, which reach a handler as a
+// relative URL, Host, and a TLS state net/http fills in only when :scheme is https. So an
+// HTTP/2 request is indistinguishable from an origin-form one, and since a proxy connection
+// carries nothing but proxy requests, it is read as one rather than refused.
+func proxyTarget(r *http.Request) (Target, bool) {
+	if r.URL != nil && r.URL.IsAbs() {
+		return targetFromURL(r.URL), true
+	}
+	if r.ProtoMajor < 2 || r.Host == "" {
+		return Target{}, false
+	}
+
+	scheme := "http"
+	if r.TLS != nil {
+		scheme = "https"
+	}
+	host, port := splitHostPort(r.Host)
+	if port == "" {
+		port = defaultPort(scheme)
+	}
+	return Target{Scheme: scheme, Host: stringsutil.ToLowerASCIIString(host), Port: port}, true
 }
 
 func targetFromURL(u *url.URL) Target {
@@ -306,16 +339,22 @@ func newSession(ctx context.Context, c net.Conn, target Target, action Action, p
 		id:        sessionSeq.Add(1),
 		target:    target,
 		action:    action,
-		proto:     proto,
 		createdAt: time.Now(),
 		ctx:       ctx,
 	}
+	s.setProtocol(proto)
 	if c != nil {
 		s.remoteAddr = c.RemoteAddr()
 		s.localAddr = c.LocalAddr()
 		if tc, ok := c.(*tls.Conn); ok {
-			state := tc.ConnectionState()
-			s.tlsState = &state
+			if state := tc.ConnectionState(); state.HandshakeComplete {
+				s.tlsState = &state
+			} else {
+				// http.Server calls ConnContext before it performs the handshake, so the
+				// state read here would be the zero one. Keeping the connection lets it be
+				// read once it exists, which is any time a request is being served.
+				s.tlsConn = tc
+			}
 		}
 	}
 	return s

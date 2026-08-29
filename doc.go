@@ -6,20 +6,32 @@
 // intercept it, terminating TLS with a local certificate authority so handlers can
 // inspect and rewrite requests and responses in flight.
 //
-// The proxy routes on the full request target, scheme, authority and path, using an
-// immutable radix tree with lock-free reads and single-writer semantics. Routes can be
-// added and removed while traffic is flowing without blocking any lookup.
+// The proxy routes on the full request target, authority and path, using an immutable radix
+// tree with lock-free reads and single-writer semantics. Interceptors and tunnels can be
+// added and removed while traffic is flowing without blocking any lookup. Nothing is
+// configured at construction: the whole traffic policy is set and changed at runtime.
 //
 // # Interception
 //
-// A connection is either tunneled or intercepted. Tunneled connections are relayed
-// byte for byte and the proxy never sees the plaintext. Intercepted connections are
-// terminated by the proxy, which mints a leaf certificate for the requested authority
-// and speaks the negotiated protocol on both sides.
+// A connection is tunneled, intercepted, or refused. A tunneled connection is relayed byte
+// for byte and the proxy never sees the plaintext. An intercepted connection is terminated
+// by the proxy, which mints a leaf certificate for the requested authority and speaks the
+// negotiated protocol on both sides.
 //
-// The decision is made per authority by a rule set, evaluated most specific first.
-// Registering a handler implicitly adds an intercept rule for the route's authority,
-// so a route always sees the traffic it was written for.
+// The decision is taken per authority, most specific first, before a single byte of the
+// request exists. There are two ways to declare one, and neither is a policy applied
+// globally:
+//
+//   - [Proxy.AddInterceptor] registers a handler for an authority and a path. The authority
+//     it names is the one it intercepts, so a handler always sees the traffic it was written
+//     for.
+//   - [Proxy.AddTunnel] names an authority to relay untouched, which is how a host that
+//     pins its certificate is carved out of a broader interception.
+//
+// Anything else is refused. A proxy meant to capture the traffic of an application under
+// test should say what it expects that application to reach, and hear about it when the
+// application reaches somewhere else. [Proxy.AddTunnel] with a wildcard authority is the
+// one line that restores a permissive proxy, and it says so in the code.
 //
 // # Message framing
 //

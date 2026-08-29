@@ -21,89 +21,84 @@ import (
 type Txn struct {
 	p       *Proxy
 	rootTxn *tXn
-	// ruleTxn is created on the first route registration that implies an interception
-	// rule, and committed with the routing tree so the two never disagree.
-	ruleTxn *tXn
 	write   bool
 }
 
-// rules returns the rule transaction, starting it on first use.
-func (txn *Txn) rules() *tXn {
-	if txn.ruleTxn == nil {
-		txn.ruleTxn = txn.p.getRules().txn()
-	}
-	return txn.ruleTxn
-}
-
-// addImplicitRule registers the interception rule a route implies, or bumps the reference
-// count of the one already there. A route that names no authority implies nothing.
-func (txn *Txn) addImplicitRule(route *Route) error {
-	rule, err := txn.p.implicitRuleFor(route)
-	if err != nil || rule == nil {
+// addImpliedAuthority registers the authority entry an interceptor implies, or bumps the
+// reference count of the one already there.
+func (txn *Txn) addImpliedAuthority(ic *Interceptor) error {
+	authority, err := txn.p.impliedAuthorityFor(ic)
+	if err != nil {
 		return err
 	}
 	if txn.p.cfg.ca == nil {
-		return fmt.Errorf("%w: route %s needs to intercept %s, configure one with WithCA",
-			ErrNoCertificateAuthority, route.pattern.str, rule.pattern.str)
+		return fmt.Errorf("%w: interceptor %s needs to intercept %s",
+			ErrNoCertificateAuthority, ic.pattern.str, authority.pattern.str)
 	}
 
-	t := txn.rules()
-	existing := t.findRule(rule)
+	t := txn.rootTxn
+	existing := t.searchAuthority(authority)
 	switch {
 	case existing == nil:
-		rule.refs = 1
-		return t.insert(rule, modeInsert)
-	case !existing.implicit:
-		// An explicit rule already decides this authority, whatever it decides.
+		authority.refs = 1
+		return t.insert(authority, modeInsert)
+	case !existing.implicit && existing.action == Intercept:
+		// The authority is already intercepted by a declaration the caller owns. The
+		// interceptor rides on it and takes no reference on a decision it did not create.
 		return nil
+	case !existing.implicit:
+		// The tunnel says do not look at this authority, the interceptor says handle its requests.
+		// Nothing can honour both, and the interceptor is the one that would silently never run.
+		return fmt.Errorf("%w: %s is %s, so interceptor %s would never run",
+			ErrAuthorityConflict, existing.pattern.str, existing.action, ic.pattern.str)
 	default:
-		return replaceRuleRefs(t, existing, existing.refs+1)
+		return replaceAuthorityRefs(t, existing, existing.refs+1)
 	}
 }
 
-// dropImplicitRule releases one reference on the rule a route implied, removing it once the
-// last route that needed it is gone.
-func (txn *Txn) dropImplicitRule(route *Route) {
-	rule, err := txn.p.implicitRuleFor(route)
-	if err != nil || rule == nil {
+// dropImpliedAuthority releases one reference on the authority an interceptor implied,
+// removing it once the last interceptor that needed it is gone.
+func (txn *Txn) dropImpliedAuthority(ic *Interceptor) {
+	authority, err := txn.p.impliedAuthorityFor(ic)
+	if err != nil {
 		return
 	}
 
-	t := txn.rules()
-	existing := t.findRule(rule)
+	t := txn.rootTxn
+	existing := t.searchAuthority(authority)
 	if existing == nil || !existing.implicit {
 		return
 	}
 	if existing.refs > 1 {
-		_ = replaceRuleRefs(t, existing, existing.refs-1)
+		_ = replaceAuthorityRefs(t, existing, existing.refs-1)
 		return
 	}
 	t.delete(existing)
 }
 
-// replaceRuleRefs swaps a rule for a copy holding a different reference count. Routes are
+// replaceAuthorityRefs swaps an entry for a copy holding a different reference count. Entries are
 // immutable once published, so the count cannot be bumped in place.
-func replaceRuleRefs(t *tXn, existing *Route, refs uint32) error {
+func replaceAuthorityRefs(t *tXn, existing *Interceptor, refs uint32) error {
 	next := *existing
 	next.refs = refs
 	if _, ok := t.delete(existing); !ok {
-		return fmt.Errorf("internal error: rule %s vanished during refcount update", existing.pattern.str)
+		return fmt.Errorf("internal error: authority %s vanished during refcount update", existing.pattern.str)
 	}
 	return t.insert(&next, modeInsert)
 }
 
-// Add registers a new route for the given methods, pattern and matchers. On success, it returns the newly registered [Route].
+// AddInterceptor registers a new route for the given methods, pattern and matchers. On success, it returns the newly registered [Interceptor].
 // If an error occurs, it returns one of the following:
 //   - [*PatternError]: If the pattern syntax is invalid.
-//   - [*RouteConflictError]: If the route conflict with others.
-//   - [*RouteNameConflictError]: If the route name is already registered.
-//   - [ErrInvalidRoute]: If the method is invalid, the handler is nil or the pattern is empty.
-//   - [ErrInvalidConfig]: If the provided route options are invalid.
+//   - [*InterceptorConflictError]: If the interceptor conflict with others.
+//   - [*InterceptorNameConflictError]: If the interceptor name is already registered.
+//   - [ErrInvalidInterceptor]: If the method is invalid, the handler is nil or the pattern is empty.
+//   - [ErrInvalidConfig]: If the provided option are invalid.
 //   - [ErrInvalidMatcher]: If the provided matcher options are invalid.
 //   - [ErrReadOnlyTxn]: On write in a read-only transaction.
 //
-// To override an existing handler, use [Txn.Update].
-func (txn *Txn) Add(methods []string, pattern string, handler HandlerFunc, opts ...RouteOption) (*Route, error) {
+// To override an existing handler, use [Txn.UpdateInterceptor].
+func (txn *Txn) AddInterceptor(methods []string, pattern string, handler HandlerFunc, opts ...InterceptorOption) (*Interceptor, error) {
 	if txn.rootTxn == nil {
 		panic(ErrSettledTxn)
 	}
@@ -111,12 +106,12 @@ func (txn *Txn) Add(methods []string, pattern string, handler HandlerFunc, opts 
 		return nil, ErrReadOnlyTxn
 	}
 
-	rte, err := txn.p.NewRoute(methods, pattern, handler, opts...)
+	rte, err := txn.p.newInterceptor(methods, pattern, handler, opts...)
 	if err != nil {
 		return nil, err
 	}
 
-	if err = txn.addImplicitRule(rte); err != nil {
+	if err = txn.addImpliedAuthority(rte); err != nil {
 		return nil, err
 	}
 	if err = txn.rootTxn.insert(rte, modeInsert); err != nil {
@@ -125,44 +120,20 @@ func (txn *Txn) Add(methods []string, pattern string, handler HandlerFunc, opts 
 	return rte, nil
 }
 
-// AddRoute registers a new [Route]. If an error occurs, it returns one of the following:
-//   - [*RouteConflictError]: If the route conflict with others.
-//   - [*RouteNameConflictError]: If the route name is already registered.
-//   - [ErrInvalidRoute]: If the route is missing.
-//   - [ErrReadOnlyTxn]: On write in a read-only transaction.
-//
-// To override an existing route, use [Txn.UpdateRoute].
-func (txn *Txn) AddRoute(route *Route) error {
-	if txn.rootTxn == nil {
-		panic(ErrSettledTxn)
-	}
-	if !txn.write {
-		return ErrReadOnlyTxn
-	}
-	if route == nil || route.hbase == nil {
-		return ErrInvalidRoute
-	}
-
-	if err := txn.addImplicitRule(route); err != nil {
-		return err
-	}
-	return txn.rootTxn.insert(route, modeInsert)
-}
-
-// Update override an existing route for the given methods, pattern and matchers. On success, it returns the newly registered [Route].
+// UpdateInterceptor override an existing route for the given methods, pattern and matchers. On success, it returns the newly registered [Interceptor].
 // If an error occurs, it returns one of the following:
 //   - [*PatternError]: If the pattern syntax is invalid.
-//   - [ErrRouteNotFound]: If the route does not exist.
-//   - [*RouteNameConflictError]: If the route name is already registered.
-//   - [ErrInvalidRoute]: If the method is invalid, the handler is nil or the pattern is empty.
-//   - [ErrInvalidConfig]: If the provided route options are invalid.
+//   - [ErrInterceptorNotFound]: If the interceptor does not exist.
+//   - [*InterceptorNameConflictError]: If the interceptor name is already registered.
+//   - [ErrInvalidInterceptor]: If the method is invalid, the handler is nil or the pattern is empty.
+//   - [ErrInvalidConfig]: If the provided option are invalid.
 //   - [ErrInvalidMatcher]: If the provided matcher options are invalid.
 //   - [ErrReadOnlyTxn]: On write in a read-only transaction.
 //
-// Route-specific option and middleware must be reapplied when updating a route. if not, any middleware and option will
-// be removed (or reset to their default value), and the route will fall back to using global configuration (if any).
-// To add a new handler, use [Txn.Add].
-func (txn *Txn) Update(methods []string, pattern string, handler HandlerFunc, opts ...RouteOption) (*Route, error) {
+// Interceptor-specific options and middleware must be reapplied when updating one. If not, any middleware and option will
+// be removed (or reset to their default value), and the interceptor will fall back to using global configuration (if any).
+// To add a new handler, use [Txn.AddInterceptor].
+func (txn *Txn) UpdateInterceptor(methods []string, pattern string, handler HandlerFunc, opts ...InterceptorOption) (*Interceptor, error) {
 	if txn.rootTxn == nil {
 		panic(ErrSettledTxn)
 	}
@@ -171,7 +142,7 @@ func (txn *Txn) Update(methods []string, pattern string, handler HandlerFunc, op
 		return nil, ErrReadOnlyTxn
 	}
 
-	rte, err := txn.p.NewRoute(methods, pattern, handler, opts...)
+	rte, err := txn.p.newInterceptor(methods, pattern, handler, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -183,37 +154,15 @@ func (txn *Txn) Update(methods []string, pattern string, handler HandlerFunc, op
 	return rte, nil
 }
 
-// UpdateRoute override an existing [Route] for the given new [Route].
-// If an error occurs, it returns one of the following:
-//   - [ErrRouteNotFound]: If the route does not exist.
-//   - [*RouteNameConflictError]: If the route name is already registered.
-//   - [ErrInvalidRoute]: If the route is missing.
-//   - [ErrReadOnlyTxn]: On write in a read-only transaction.
-//
-// To add a new route, use [Txn.AddRoute].
-func (txn *Txn) UpdateRoute(route *Route) error {
-	if txn.rootTxn == nil {
-		panic(ErrSettledTxn)
-	}
-	if !txn.write {
-		return ErrReadOnlyTxn
-	}
-	if route == nil || route.hbase == nil {
-		return ErrInvalidRoute
-	}
-
-	return txn.rootTxn.insert(route, modeUpdate)
-}
-
-// Delete deletes an existing route for the given methods, pattern and matchers. On success, it returns the deleted [Route].
+// DeleteInterceptor deletes an existing route for the given methods, pattern and matchers. On success, it returns the deleted [Interceptor].
 // If an error occurs, it returns one of the following:
 //   - [*PatternError]: If the pattern syntax is invalid.
-//   - [ErrRouteNotFound]: If the route does not exist.
-//   - [ErrInvalidRoute]: If the method is invalid or the pattern is empty.
+//   - [ErrInterceptorNotFound]: If the interceptor does not exist.
+//   - [ErrInvalidInterceptor]: If the method is invalid or the pattern is empty.
 //   - [ErrInvalidConfig]: If the provided options are invalid.
 //   - [ErrInvalidMatcher]: If the provided matcher options are invalid.
 //   - [ErrReadOnlyTxn]: On write in a read-only transaction.
-func (txn *Txn) Delete(methods []string, pattern string, opts ...MatcherOption) (*Route, error) {
+func (txn *Txn) DeleteInterceptor(methods []string, pattern string, opts ...MatcherOption) (*Interceptor, error) {
 	if txn.rootTxn == nil {
 		panic(ErrSettledTxn)
 	}
@@ -223,7 +172,7 @@ func (txn *Txn) Delete(methods []string, pattern string, opts ...MatcherOption) 
 
 	for _, method := range methods {
 		if !validMethod(method) {
-			return nil, fmt.Errorf("%w: invalid method '%s'", ErrInvalidRoute, method)
+			return nil, fmt.Errorf("%w: invalid method '%s'", ErrInvalidInterceptor, method)
 		}
 	}
 
@@ -232,19 +181,19 @@ func (txn *Txn) Delete(methods []string, pattern string, opts ...MatcherOption) 
 		return nil, err
 	}
 
-	rte := &Route{pattern: pat}
+	rte := &Interceptor{pattern: pat}
 
 	for _, opt := range opts {
-		if err = opt.applyMatcher(sealedOption{route: rte, cfg: txn.p.cfg}); err != nil {
+		if err = opt.applyMatcher(sealedOption{proxy: txn.p, interceptor: rte}); err != nil {
 			return nil, err
 		}
 	}
 
 	if len(rte.matchers) > txn.p.cfg.maxMatchers {
-		return nil, fmt.Errorf("%w: %w", ErrInvalidRoute, ErrTooManyMatchers)
+		return nil, fmt.Errorf("%w: %w", ErrInvalidInterceptor, ErrTooManyMatchers)
 	}
 
-	// If this route is registered with methods, push the internal matcher at first position.
+	// If this interceptor is registered with methods, push the internal matcher at first position.
 	if len(methods) > 0 {
 		// As a defensive mesure, keep our own copy of the provided slice.
 		rte.methods = make([]string, len(methods))
@@ -255,19 +204,19 @@ func (txn *Txn) Delete(methods []string, pattern string, opts ...MatcherOption) 
 
 	route, deleted := txn.rootTxn.delete(rte)
 	if !deleted {
-		return nil, newRouteNotFoundError(rte)
+		return nil, newInterceptorNotFoundError(rte)
 	}
-	txn.dropImplicitRule(route)
+	txn.dropImpliedAuthority(route)
 
 	return route, nil
 }
 
-// DeleteRoute deletes an existing route that match the provided [Route] pattern and matchers. On success, it returns
-// the deleted [Route]. If an error occurs, it returns one of the following:
-//   - [ErrRouteNotFound]: If the route does not exist.
-//   - [ErrInvalidRoute]: If the route is missing.
+// removeInterceptor deletes an existing route that match the provided [Interceptor] pattern and matchers. On success, it returns
+// the deleted [Interceptor]. If an error occurs, it returns one of the following:
+//   - [ErrInterceptorNotFound]: If the interceptor does not exist.
+//   - [ErrInvalidInterceptor]: If the interceptor is missing.
 //   - [ErrReadOnlyTxn]: On write in a read-only transaction.
-func (txn *Txn) DeleteRoute(route *Route) (*Route, error) {
+func (txn *Txn) removeInterceptor(route *Interceptor) (*Interceptor, error) {
 	if txn.rootTxn == nil {
 		panic(ErrSettledTxn)
 	}
@@ -276,19 +225,21 @@ func (txn *Txn) DeleteRoute(route *Route) (*Route, error) {
 	}
 
 	if route == nil || route.hbase == nil {
-		return nil, ErrInvalidRoute
+		return nil, ErrInvalidInterceptor
 	}
 
 	rte, deleted := txn.rootTxn.delete(route)
 	if !deleted {
-		return nil, newRouteNotFoundError(route)
+		return nil, newInterceptorNotFoundError(route)
 	}
-	txn.dropImplicitRule(rte)
+	txn.dropImpliedAuthority(rte)
 
 	return rte, nil
 }
 
-// Truncate remove all routes registered in the router. Truncating on a read-only transaction returns ErrReadOnlyTxn.
+// Truncate removes everything registered on the proxy, routes and authority entries alike.
+// They share one tree, so there is no half of it to keep. Truncating on a read-only
+// transaction returns ErrReadOnlyTxn.
 func (txn *Txn) Truncate() error {
 	if txn.rootTxn == nil {
 		panic(ErrSettledTxn)
@@ -298,38 +249,22 @@ func (txn *Txn) Truncate() error {
 		return ErrReadOnlyTxn
 	}
 	txn.rootTxn.truncate()
-	txn.dropAllImplicitRules()
 	return nil
 }
 
-// dropAllImplicitRules removes every rule derived from a route, leaving the explicit ones.
-func (txn *Txn) dropAllImplicitRules() {
-	t := txn.rules()
-	var implicit []*Route
-	it := Iter{patterns: t.patterns, names: t.names, methods: t.methods, maxDepth: t.maxDepth}
-	for rule := range it.All() {
-		if rule.implicit {
-			implicit = append(implicit, rule)
-		}
-	}
-	for _, rule := range implicit {
-		t.delete(rule)
-	}
-}
-
-// Has allows to check if the given methods, pattern and matchers exactly match a registered route.
-// See also [Txn.Route] as an alternative.
+// Has allows to check if the given methods, pattern and matchers exactly match a registered interceptor.
+// See also [Txn.Interceptor] as an alternative.
 func (txn *Txn) Has(methods []string, pattern string, matchers ...Matcher) bool {
 	if txn.rootTxn == nil {
 		panic(ErrSettledTxn)
 	}
 
-	return txn.Route(methods, pattern, matchers...) != nil
+	return txn.Interceptor(methods, pattern, matchers...) != nil
 }
 
-// Route performs a lookup for a registered route matching the given methods, pattern and matchers. It returns the [Route] if a
-// match is found or nil otherwise. See also [Txn.Has] or [Iter.Routes] as an alternative.
-func (txn *Txn) Route(methods []string, pattern string, matchers ...Matcher) *Route {
+// Interceptor performs a lookup for a registered interceptor matching the given methods, pattern and matchers. It returns the [Interceptor] if a
+// match is found or nil otherwise. See also [Txn.Has] or [Iter.Interceptors] as an alternative.
+func (txn *Txn) Interceptor(methods []string, pattern string, matchers ...Matcher) *Interceptor {
 	if txn.rootTxn == nil {
 		panic(ErrSettledTxn)
 	}
@@ -340,35 +275,35 @@ func (txn *Txn) Route(methods []string, pattern string, matchers ...Matcher) *Ro
 		return nil
 	}
 
-	idx := slices.IndexFunc(matched.routes, func(r *Route) bool {
+	idx := slices.IndexFunc(matched.entries, func(r *Interceptor) bool {
 		return r.pattern.str == pattern && slicesutil.EqualUnsorted(r.methods, methods) && r.matchersEqual(matchers)
 	})
 	if idx < 0 {
 		return nil
 	}
-	return matched.routes[idx]
+	return matched.entries[idx]
 }
 
-// Name performs a lookup for a registered route matching the given route name. It returns
-// the [Route] if a match is found or nil otherwise. See also [Txn.Route] as an alternative.
-func (txn *Txn) Name(name string) *Route {
+// Name performs a lookup for a registered interceptor matching the given name. It returns
+// the [Interceptor] if a match is found or nil otherwise. See also [Txn.Interceptor] as an alternative.
+func (txn *Txn) Name(name string) *Interceptor {
 	if txn.rootTxn == nil {
 		panic(ErrSettledTxn)
 	}
 
 	root := txn.rootTxn.names
 	matched := root.searchName(name)
-	if matched == nil || !matched.isLeaf() || matched.routes[0].name != name {
+	if matched == nil || !matched.isLeaf() || matched.entries[0].name != name {
 		return nil
 	}
 
-	return matched.routes[0]
+	return matched.entries[0]
 }
 
-// Match performs a route lookup for the given target and request, returning the matching
-// [Route] if there is one. No handler runs and no parameter is captured; use [Txn.Lookup]
+// Match performs an interceptor lookup for the given target and request, returning the matching
+// [Interceptor] if there is one. No handler runs and no parameter is captured; use [Txn.Lookup]
 // when the captures are needed.
-func (txn *Txn) Match(target Target, r *http.Request) (route *Route, tsr bool) {
+func (txn *Txn) Match(target Target, r *http.Request) (interceptor *Interceptor, tsr bool) {
 	if txn.rootTxn == nil {
 		panic(ErrSettledTxn)
 	}
@@ -390,50 +325,26 @@ func (txn *Txn) Match(target Target, r *http.Request) (route *Route, tsr bool) {
 
 	idx, n, tsr := txn.rootTxn.patterns.lookup(r.Method, target.Host, path, c, true)
 	if n != nil {
-		return n.routes[idx], tsr
+		return n.entries[idx], tsr
 	}
 	return nil, false
 }
 
-// Lookup performs a route lookup for the given target and request, returning the matched
-// [Route] along with a [Context] holding the captured parameters. The returned [Context]
-// must be released with [Context.Close] once it is no longer used.
-func (txn *Txn) Lookup(target Target, r *http.Request) (route *Route, cc *Context, tsr bool) {
+// InterceptorsLen returns the number of registered interceptors.
+func (txn *Txn) InterceptorsLen() int {
 	if txn.rootTxn == nil {
 		panic(ErrSettledTxn)
 	}
-	if r == nil || r.Method == "" {
-		return nil, nil, false
-	}
-
-	tree := txn.rootTxn.tree
-	c := tree.pool.Get().(*Context)
-
-	target = target.normalized()
-	c.reset(nil, r, target.Scheme, target.Host, target.Port)
-
-	path, ok := txn.p.normalizeForMatch(routingPath(r))
-	if !ok {
-		tree.pool.Put(c)
-		return nil, nil, false
-	}
-
-	idx, n, tsr := txn.rootTxn.patterns.lookup(r.Method, target.Host, path, c, false)
-	if n != nil {
-		c.route = n.routes[idx]
-		return c.route, c, tsr
-	}
-
-	tree.pool.Put(c)
-	return nil, nil, false
+	return txn.rootTxn.interceptors
 }
 
-// Len returns the number of registered route.
-func (txn *Txn) Len() int {
+// AuthoritiesLen returns the number of registered authority entries. See
+// [Proxy.AuthoritiesLen].
+func (txn *Txn) AuthoritiesLen() int {
 	if txn.rootTxn == nil {
 		panic(ErrSettledTxn)
 	}
-	return txn.rootTxn.size
+	return txn.rootTxn.authorities
 }
 
 // Commit finalize the transaction. This is a noop for read transactions, already aborted or
@@ -450,14 +361,10 @@ func (txn *Txn) Commit() {
 	}
 
 	newRoot := txn.rootTxn.commit()
-	// Rules are published first. A route visible before the rule that intercepts its
-	// authority would never fire; a rule visible before its route only means the authority
+	// Authorities are published first. An interceptor visible before the authority entry that intercepts its
+	// authority would never fire; an authority entry visible before its route only means the authority
 	// is intercepted and forwarded unchanged for an instant.
-	if txn.ruleTxn != nil {
-		txn.p.rules.Store(txn.ruleTxn.commit())
-		txn.ruleTxn = nil
-	}
-	txn.p.routes.Store(newRoot)
+	txn.p.tree.Store(newRoot)
 
 	// Clear the txn
 	txn.rootTxn = nil
@@ -479,7 +386,6 @@ func (txn *Txn) Abort() {
 
 	// Clear the txn
 	txn.rootTxn = nil
-	txn.ruleTxn = nil
 	txn.p.mu.Unlock()
 }
 

@@ -13,11 +13,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestRoute_Accessors(t *testing.T) {
+func TestInterceptor_Accessors(t *testing.T) {
 	p := testProxy(t)
 
 	type annotationKey struct{}
-	rte := p.MustHandle([]string{http.MethodGet}, "api.stripe.com/v1/{id}/refunds/*{rest}", noopHandler,
+	rte := p.MustAddInterceptor([]string{http.MethodGet}, "api.stripe.com/v1/{id}/refunds/*{rest}", noopHandler,
 		WithName("refunds"),
 		WithAnnotation(annotationKey{}, "recorded"),
 		WithTrailingSlash(RelaxedSlash),
@@ -46,27 +46,27 @@ func TestRoute_Accessors(t *testing.T) {
 	assert.Contains(t, rte.String(), "port=8443")
 }
 
-func TestRoute_NoMethodHasNoConstraint(t *testing.T) {
+func TestInterceptor_NoMethodHasNoConstraint(t *testing.T) {
 	p := testProxy(t)
-	rte := p.MustHandle(nil, "api.test/v1", noopHandler)
+	rte := p.MustAddInterceptor(nil, "api.test/v1", noopHandler)
 
 	assert.Empty(t, slices.Collect(rte.Methods()))
 	assert.Contains(t, rte.String(), "method:*")
 }
 
-func TestRoute_NameLookup(t *testing.T) {
+func TestInterceptor_NameLookup(t *testing.T) {
 	p := testProxy(t)
-	rte := p.MustHandle([]string{http.MethodGet}, "api.test/v1/charges", noopHandler, WithName("charges"))
+	rte := p.MustAddInterceptor([]string{http.MethodGet}, "api.test/v1/charges", noopHandler, WithName("charges"))
 
 	assert.Same(t, rte, p.Name("charges"))
 	assert.Nil(t, p.Name("nothing"))
 
-	_, err := p.Handle([]string{http.MethodPost}, "api.test/v1/refunds", noopHandler, WithName("charges"))
-	var conflict *RouteNameConflictError
+	_, err := p.AddInterceptor([]string{http.MethodPost}, "api.test/v1/refunds", noopHandler, WithName("charges"))
+	var conflict *InterceptorNameConflictError
 	require.ErrorAs(t, err, &conflict, "a name identifies one route")
 }
 
-func TestRoute_HandleRunsWithoutMiddleware(t *testing.T) {
+func TestInterceptor_HandleRunsWithoutMiddleware(t *testing.T) {
 	p := testProxy(t)
 
 	var seen []string
@@ -79,10 +79,10 @@ func TestRoute_HandleRunsWithoutMiddleware(t *testing.T) {
 		}
 	}
 
-	rte, err := p.NewRoute([]string{http.MethodGet}, "api.test/v1", func(c *Context) (*http.Response, error) {
+	rte, err := p.newInterceptor([]string{http.MethodGet}, "api.test/v1", func(c *Context) (*http.Response, error) {
 		seen = append(seen, "handler")
 		return Status(http.StatusOK), nil
-	}, WithRouteMiddleware(mw("route")))
+	}, WithMiddleware(mw("route")))
 	require.NoError(t, err)
 
 	_, err = rte.Handle(nil)
@@ -95,57 +95,54 @@ func TestRoute_HandleRunsWithoutMiddleware(t *testing.T) {
 	assert.Equal(t, []string{"route", "handler"}, seen)
 }
 
-func TestRoute_UpdateReplacesTheHandler(t *testing.T) {
+func TestInterceptor_UpdateReplacesTheHandler(t *testing.T) {
 	p := testProxy(t)
-	p.MustHandle([]string{http.MethodGet}, "api.test/v1", func(c *Context) (*http.Response, error) {
+	p.MustAddInterceptor([]string{http.MethodGet}, "api.test/v1", func(c *Context) (*http.Response, error) {
 		return Text(http.StatusOK, "first"), nil
 	})
 
-	updated, err := p.Update([]string{http.MethodGet}, "api.test/v1", func(c *Context) (*http.Response, error) {
+	updated, err := p.UpdateInterceptor([]string{http.MethodGet}, "api.test/v1", func(c *Context) (*http.Response, error) {
 		return Text(http.StatusOK, "second"), nil
 	})
 	require.NoError(t, err)
-	assert.Equal(t, 1, p.Len(), "an update must not add a route")
+	assert.Equal(t, 1, p.InterceptorsLen(), "an update must not add a route")
 
 	resp, err := updated.Handle(nil)
 	require.NoError(t, err)
 	assert.Equal(t, "second", readAll(t, resp))
 
-	_, err = p.Update([]string{http.MethodGet}, "api.test/missing", noopHandler)
-	assert.ErrorIs(t, err, ErrRouteNotFound)
+	_, err = p.UpdateInterceptor([]string{http.MethodGet}, "api.test/missing", noopHandler)
+	assert.ErrorIs(t, err, ErrInterceptorNotFound)
 }
 
-func TestRoute_NewRouteValidation(t *testing.T) {
+func TestInterceptor_NewInterceptorValidation(t *testing.T) {
 	p := testProxy(t)
 
-	_, err := p.NewRoute([]string{http.MethodGet}, "api.test/v1", nil)
-	assert.ErrorIs(t, err, ErrInvalidRoute, "a nil handler must be refused")
+	_, err := p.newInterceptor([]string{http.MethodGet}, "api.test/v1", nil)
+	assert.ErrorIs(t, err, ErrInvalidInterceptor, "a nil handler must be refused")
 
-	_, err = p.NewRoute([]string{"BAD METHOD"}, "api.test/v1", noopHandler)
-	assert.ErrorIs(t, err, ErrInvalidRoute)
+	_, err = p.newInterceptor([]string{"BAD METHOD"}, "api.test/v1", noopHandler)
+	assert.ErrorIs(t, err, ErrInvalidInterceptor)
 
-	_, err = p.NewRoute(nil, "api.test/v1", noopHandler, WithMatchersPriority(5))
-	assert.ErrorIs(t, err, ErrInvalidRoute, "a priority with no matcher has nothing to order")
+	_, err = p.newInterceptor(nil, "api.test/v1", noopHandler, WithMatchersPriority(5))
+	assert.ErrorIs(t, err, ErrInvalidInterceptor, "a priority with no matcher has nothing to order")
 
-	_, err = p.NewRoute(nil, "", noopHandler)
-	assert.ErrorIs(t, err, ErrInvalidRoute)
+	_, err = p.newInterceptor(nil, "", noopHandler)
+	assert.ErrorIs(t, err, ErrInvalidInterceptor)
 }
 
-// TestMethodSentinels holds the two properties the method fast path depends on. Both are
-// invisible at runtime and silent when broken: a route would match without evaluating the
+// TestMethodSentinel holds the two properties the method fast path depends on. Both are
+// invisible at runtime and silent when broken: an interceptor would match without evaluating the
 // matchers that narrow it.
-func TestMethodSentinels(t *testing.T) {
-	assert.NotEqual(t, noFastMethod, ruleLookupMethod,
-		"the fast path compares them, so equal sentinels would match every rule outright")
-
-	for _, s := range []string{noFastMethod, ruleLookupMethod} {
-		assert.False(t, validMethod(s), "%q must never be registrable as a method", s)
-		assert.NotEmpty(t, s, "an empty sentinel would equal the zero value of methodFast")
-	}
+func TestMethodSentinel(t *testing.T) {
+	assert.False(t, validMethod(noFastMethod),
+		"%q must never be registrable as a method", noFastMethod)
+	assert.NotEmpty(t, noFastMethod,
+		"an empty sentinel would equal the zero value of methodFast")
 }
 
 // TestMethodFastNeverMatchesAnEmptyMethod covers the shape of the bug the sentinels exist
-// for: a route that cannot use the fast path must not be claimed by a lookup carrying no
+// for: an interceptor that cannot use the fast path must not be claimed by a lookup carrying no
 // method, whatever the caller passes.
 func TestMethodFastNeverMatchesAnEmptyMethod(t *testing.T) {
 	p := testProxy(t, WithRegexpParam(true))
@@ -155,11 +152,11 @@ func TestMethodFastNeverMatchesAnEmptyMethod(t *testing.T) {
 
 	cases := []struct {
 		name  string
-		route *Route
+		route *Interceptor
 	}{
-		{name: "many methods", route: p.MustHandle([]string{http.MethodGet, http.MethodPost}, "a.test/many", noopHandler)},
-		{name: "with matchers", route: p.MustHandle([]string{http.MethodGet}, "a.test/matched", noopHandler, WithMatcher(beta))},
-		{name: "no method", route: p.MustHandle(nil, "a.test/any", noopHandler)},
+		{name: "many methods", route: p.MustAddInterceptor([]string{http.MethodGet, http.MethodPost}, "a.test/many", noopHandler)},
+		{name: "with matchers", route: p.MustAddInterceptor([]string{http.MethodGet}, "a.test/matched", noopHandler, WithMatcher(beta))},
+		{name: "no method", route: p.MustAddInterceptor(nil, "a.test/any", noopHandler)},
 	}
 
 	c := &Context{params: new([]string)}

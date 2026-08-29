@@ -137,13 +137,13 @@ func TestConformance_CurlThroughInterceptingProxy(t *testing.T) {
 	tr := DefaultTransport()
 	tr.RootCAs = originPool(t, origin)
 
-	p, err := New(WithCA(ca), WithIntercept(originHost(originURL)), WithTransport(tr))
+	p, err := New(WithCA(ca), WithTransport(tr))
 	if err != nil {
 		t.Fatalf("new proxy: %v", err)
 	}
 
 	seen := new(recorder)
-	p.MustHandle(nil, originHost(originURL)+"/+{any}", func(c *Context) (*http.Response, error) {
+	p.MustAddInterceptor(nil, originHost(originURL)+"/+{any}", func(c *Context) (*http.Response, error) {
 		seen.add(c.Protocol().String() + " " + c.Request().URL.RequestURI())
 		return c.Forward()
 	})
@@ -190,13 +190,20 @@ func TestConformance_CurlTunnel(t *testing.T) {
 	originURL, _ := url.Parse(origin.URL)
 
 	ca, _ := GenerateCA()
-	p, err := New(WithCA(ca), WithTunnel(originHost(originURL)))
+	p, err := New(WithCA(ca))
 	if err != nil {
 		t.Fatalf("new proxy: %v", err)
 	}
+	if err := p.AddTunnel(originHost(originURL)); err != nil {
+		t.Fatalf("tunnel %s: %v", originHost(originURL), err)
+	}
 
+	// A catch-all on every other authority. The tunnel is registered on a static host, so
+	// it is the more precise of the two and decides first. Registering this interceptor on the
+	// tunneled authority itself would be refused, which is the point of the authority entry: an interceptor
+	// that could never run is a mistake, not a silent no-op.
 	routed := new(atomic.Bool)
-	p.MustHandle(nil, originHost(originURL)+"/+{any}", func(c *Context) (*http.Response, error) {
+	p.MustAddInterceptor(nil, "+{any}/+{rest}", func(c *Context) (*http.Response, error) {
 		routed.Store(true)
 		return c.Forward()
 	})
@@ -253,10 +260,11 @@ func TestConformance_CurlChunkedResponse(t *testing.T) {
 	tr := DefaultTransport()
 	tr.RootCAs = originPool(t, origin)
 
-	p, err := New(WithCA(ca), WithIntercept(originHost(originURL)), WithTransport(tr))
+	p, err := New(WithCA(ca), WithTransport(tr))
 	if err != nil {
 		t.Fatalf("new proxy: %v", err)
 	}
+	p.MustAddInterceptor(nil, originHost(originURL)+"/*{any}", DefaultNoInterceptorHandler)
 	addr := startProxy(t, p)
 	caFile := writeCAFile(t, ca)
 
@@ -284,10 +292,11 @@ func TestConformance_CurlOverHTTPSProxy(t *testing.T) {
 	tr := DefaultTransport()
 	tr.RootCAs = originPool(t, origin)
 
-	p, err := New(WithCA(ca), WithIntercept(originHost(originURL)), WithTransport(tr))
+	p, err := New(WithCA(ca), WithTransport(tr))
 	if err != nil {
 		t.Fatalf("new proxy: %v", err)
 	}
+	p.MustAddInterceptor(nil, originHost(originURL)+"/*{any}", DefaultNoInterceptorHandler)
 
 	// The proxy port itself speaks TLS, so curl reaches it with an HTTPS proxy URL. The
 	// certificate authenticating the proxy is minted by the same CA curl already trusts.

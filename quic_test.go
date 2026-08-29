@@ -100,7 +100,6 @@ func TestQUIC_InterceptWithCurl(t *testing.T) {
 	p, err := New(
 		WithCA(proxyCA),
 		WithTransport(tr),
-		WithIntercept(h3Authority),
 		// Standing in for the redirect that would send the client's datagrams here.
 		WithPacketOriginalDestination(func(net.Addr, net.Addr) (netip.AddrPort, error) {
 			return origin, nil
@@ -109,7 +108,7 @@ func TestQUIC_InterceptWithCurl(t *testing.T) {
 	require.NoError(t, err)
 
 	seen := new(recorder)
-	p.MustHandle(nil, h3Authority+"/+{any}", func(c *Context) (*http.Response, error) {
+	p.MustAddInterceptor(nil, h3Authority+"/+{any}", func(c *Context) (*http.Response, error) {
 		seen.add(c.Protocol().String() + " " + c.Request().URL.Path)
 		return c.Forward()
 	})
@@ -143,15 +142,17 @@ func TestQUIC_TunnelWithCurl(t *testing.T) {
 
 	p, err := New(
 		WithCA(proxyCA),
-		WithTunnel(h3Authority),
 		WithPacketOriginalDestination(func(net.Addr, net.Addr) (netip.AddrPort, error) {
 			return origin, nil
 		}),
 	)
 	require.NoError(t, err)
+	require.NoError(t, p.AddTunnel(h3Authority))
 
+	// On every other authority: the tunnel is the more precise entry and decides first.
+	// An interceptor on the tunneled authority itself is refused, since it could never run.
 	handlerRan := new(atomic.Bool)
-	p.MustHandle(nil, h3Authority+"/+{any}", func(c *Context) (*http.Response, error) {
+	p.MustAddInterceptor(nil, "+{any}/+{rest}", func(c *Context) (*http.Response, error) {
 		handlerRan.Store(true)
 		return c.Forward()
 	})
@@ -180,10 +181,10 @@ func TestQUIC_HandlerCanShortCircuit(t *testing.T) {
 	proxyCA, err := GenerateCA()
 	require.NoError(t, err)
 
-	p, err := New(WithCA(proxyCA), WithIntercept(h3Authority))
+	p, err := New(WithCA(proxyCA))
 	require.NoError(t, err)
 
-	p.MustHandle([]string{http.MethodGet}, h3Authority+"/blocked", func(c *Context) (*http.Response, error) {
+	p.MustAddInterceptor([]string{http.MethodGet}, h3Authority+"/blocked", func(c *Context) (*http.Response, error) {
 		return Text(http.StatusForbidden, "blocked by edge over "+c.Protocol().String()), nil
 	})
 
@@ -206,7 +207,7 @@ func TestQUIC_RejectDropsTheConnection(t *testing.T) {
 	proxyCA, err := GenerateCA()
 	require.NoError(t, err)
 
-	p, err := New(WithCA(proxyCA), WithReject(h3Authority))
+	p, err := New(WithCA(proxyCA))
 	require.NoError(t, err)
 
 	proxyAddr := startQUIC(t, p)

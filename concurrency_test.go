@@ -18,10 +18,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestConcurrency_RouteMutationDuringTraffic changes the routing tree while requests are in
+// TestConcurrency_InterceptorMutationDuringTraffic changes the routing tree while requests are in
 // flight. Lookups take no lock, so what this checks is that a reader never observes a
 // partially applied write and that a writer never blocks one.
-func TestConcurrency_RouteMutationDuringTraffic(t *testing.T) {
+func TestConcurrency_InterceptorMutationDuringTraffic(t *testing.T) {
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "origin %s", r.URL.Path)
 	}))
@@ -30,7 +30,7 @@ func TestConcurrency_RouteMutationDuringTraffic(t *testing.T) {
 	p, authority, client := interceptingProxy(t, origin)
 
 	var served atomic.Int64
-	p.MustHandle([]string{http.MethodGet}, authority+"/stable", func(c *Context) (*http.Response, error) {
+	p.MustAddInterceptor([]string{http.MethodGet}, authority+"/stable", func(c *Context) (*http.Response, error) {
 		served.Add(1)
 		return Text(http.StatusOK, "stable"), nil
 	})
@@ -48,20 +48,20 @@ func TestConcurrency_RouteMutationDuringTraffic(t *testing.T) {
 			}
 
 			pattern := fmt.Sprintf("%s/churn/%d", authority, i%16)
-			rte, err := p.Handle([]string{http.MethodGet}, pattern, func(c *Context) (*http.Response, error) {
+			rte, err := p.AddInterceptor([]string{http.MethodGet}, pattern, func(c *Context) (*http.Response, error) {
 				return Text(http.StatusOK, "churn"), nil
 			})
 			if err != nil {
 				continue
 			}
-			if _, err := p.DeleteRoute(rte); err != nil {
+			if _, err := p.removeInterceptor(rte); err != nil {
 				t.Errorf("delete %s: %v", pattern, err)
 				return
 			}
 		}
 	})
 
-	// Readers hammering a route the writer never touches.
+	// Readers hammering an interceptor the writer never touches.
 	const readers = 8
 	for range readers {
 		wg.Go(func() {
@@ -92,12 +92,12 @@ func TestConcurrency_RouteMutationDuringTraffic(t *testing.T) {
 	wg.Wait()
 
 	assert.Positive(t, served.Load(), "no request was served")
-	assert.Equal(t, Intercept, p.Decide(target(authority)), "the rule the stable route implies must have survived the churn")
+	assert.Equal(t, Intercept, p.Decide(target(authority)), "the authority the stable interceptor implies must have survived the churn")
 }
 
-// TestConcurrency_RuleMutationDuringTraffic does the same for the rule set, which decides
+// TestConcurrency_AuthorityMutationDuringTraffic does the same for the authority entry set, which decides
 // what happens to a connection before any request is parsed.
-func TestConcurrency_RuleMutationDuringTraffic(t *testing.T) {
+func TestConcurrency_AuthorityMutationDuringTraffic(t *testing.T) {
 	p := testProxy(t)
 
 	stop := make(chan struct{})
@@ -111,17 +111,17 @@ func TestConcurrency_RuleMutationDuringTraffic(t *testing.T) {
 			default:
 			}
 			pattern := fmt.Sprintf("churn-%d.example.test", i%32)
-			if err := p.Intercept(pattern); err != nil {
+			if err := p.AddTunnel(pattern); err != nil {
 				continue
 			}
-			if _, err := p.DeleteRule(pattern); err != nil {
-				t.Errorf("delete rule %s: %v", pattern, err)
+			if _, err := p.DeleteTunnel(pattern); err != nil {
+				t.Errorf("delete tunnel %s: %v", pattern, err)
 				return
 			}
 		}
 	})
 
-	require.NoError(t, p.Intercept("stable.example.test"))
+	p.MustAddInterceptor(nil, "stable.example.test/*{any}", noopHandler)
 
 	for range 8 {
 		wg.Go(func() {
@@ -135,8 +135,9 @@ func TestConcurrency_RuleMutationDuringTraffic(t *testing.T) {
 					t.Errorf("decide = %v, want intercept", got)
 					return
 				}
-				if got := p.Decide(target("other.example.test:443")); got != Tunnel {
-					t.Errorf("decide = %v, want tunnel", got)
+				// Named by nothing, so it stays refused however the authority entry set churns.
+				if got := p.Decide(target("other.example.test:443")); got != Reject {
+					t.Errorf("decide = %v, want reject", got)
 					return
 				}
 			}

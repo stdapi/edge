@@ -18,7 +18,7 @@ import (
 	"time"
 )
 
-// originHost returns the hostname of a test server, without its port. A route pattern is a
+// originHost returns the hostname of a test server, without its port. An interceptor pattern is a
 // hostname and a path, so the port never appears in one.
 func originHost(u *url.URL) string {
 	host, _ := splitHostPort(u.Host)
@@ -82,7 +82,7 @@ func TestProxy_InterceptHTTPS(t *testing.T) {
 	}
 
 	var seenPattern string
-	p.MustHandle([]string{http.MethodGet}, originHost(originURL)+"/v1/charges", func(c *Context) (*http.Response, error) {
+	p.MustAddInterceptor([]string{http.MethodGet}, originHost(originURL)+"/v1/charges", func(c *Context) (*http.Response, error) {
 		seenPattern = c.Pattern()
 		c.Request().Header.Set("Idempotency-Key", "abc-123")
 
@@ -143,7 +143,7 @@ func TestProxy_ShortCircuit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new proxy: %v", err)
 	}
-	p.MustHandle([]string{http.MethodPost}, originHost(originURL)+"/v1/charges", func(c *Context) (*http.Response, error) {
+	p.MustAddInterceptor([]string{http.MethodPost}, originHost(originURL)+"/v1/charges", func(c *Context) (*http.Response, error) {
 		if c.Request().Header.Get("Idempotency-Key") == "" {
 			return Text(http.StatusBadRequest, "missing idempotency key"), nil
 		}
@@ -180,13 +180,19 @@ func TestProxy_TunnelKeepsOriginCertificate(t *testing.T) {
 	originURL, _ := url.Parse(origin.URL)
 	ca, _ := GenerateCA()
 
-	p, err := New(WithCA(ca), WithTunnel(originHost(originURL)))
+	p, err := New(WithCA(ca))
 	if err != nil {
 		t.Fatalf("new proxy: %v", err)
 	}
+	if err := p.AddTunnel(originHost(originURL)); err != nil {
+		t.Fatalf("tunnel %s: %v", originHost(originURL), err)
+	}
 
+	// Registered on every other authority: the tunnel names a static host, so it is the
+	// more precise of the two and wins. Putting this interceptor on the tunneled authority is
+	// refused outright, since it could never run.
 	var handlerRan bool
-	p.MustHandle([]string{http.MethodGet}, originHost(originURL)+"/", func(c *Context) (*http.Response, error) {
+	p.MustAddInterceptor([]string{http.MethodGet}, "+{any}/", func(c *Context) (*http.Response, error) {
 		handlerRan = true
 		return c.Forward()
 	})
@@ -226,7 +232,7 @@ func TestProxy_PlainHTTPAbsoluteTarget(t *testing.T) {
 		t.Fatalf("new proxy: %v", err)
 	}
 
-	p.MustHandle([]string{http.MethodGet}, originHost(originURL)+"/hello", func(c *Context) (*http.Response, error) {
+	p.MustAddInterceptor([]string{http.MethodGet}, originHost(originURL)+"/hello", func(c *Context) (*http.Response, error) {
 		if c.Scheme() != "http" {
 			return nil, fmt.Errorf("scheme = %q, want http", c.Scheme())
 		}

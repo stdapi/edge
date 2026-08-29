@@ -34,9 +34,13 @@ func interceptingProxy(t *testing.T, origin *httptest.Server, opts ...Option) (*
 	tr.RootCAs = originPool(t, origin)
 
 	host := originHost(originURL)
-	all := append([]Option{WithCA(ca), WithTransport(tr), WithIntercept(host)}, opts...)
+	all := append([]Option{WithCA(ca), WithTransport(tr)}, opts...)
 	p, err := New(all...)
 	require.NoError(t, err)
+
+	// Observing an authority without changing anything is a catch-all that forwards. It is
+	// what arms the interception: nothing crosses a proxy that was not asked for it.
+	p.MustAddInterceptor(nil, host+"/*{any}", DefaultNoInterceptorHandler)
 
 	addr := startProxy(t, p)
 	return p, host, proxyClient(addr, ca.CertPool())
@@ -180,10 +184,10 @@ func TestSemantics_HandlerPanicBecomesAnError(t *testing.T) {
 	defer origin.Close()
 
 	p, authority, client := interceptingProxy(t, origin)
-	p.MustHandle([]string{http.MethodGet}, authority+"/boom", func(c *Context) (*http.Response, error) {
+	p.MustAddInterceptor([]string{http.MethodGet}, authority+"/boom", func(c *Context) (*http.Response, error) {
 		panic("handler exploded")
 	})
-	p.MustHandle([]string{http.MethodGet}, authority+"/fine", func(c *Context) (*http.Response, error) {
+	p.MustAddInterceptor([]string{http.MethodGet}, authority+"/fine", func(c *Context) (*http.Response, error) {
 		return Text(http.StatusOK, "still alive"), nil
 	})
 
@@ -215,7 +219,7 @@ func TestSemantics_ErrorHandler(t *testing.T) {
 		}
 		return Status(http.StatusBadGateway)
 	}))
-	p.MustHandle([]string{http.MethodGet}, authority+"/fail", func(c *Context) (*http.Response, error) {
+	p.MustAddInterceptor([]string{http.MethodGet}, authority+"/fail", func(c *Context) (*http.Response, error) {
 		return nil, sentinel
 	})
 
@@ -245,10 +249,10 @@ func TestSemantics_MiddlewareOrder(t *testing.T) {
 	}
 
 	p, authority, client := interceptingProxy(t, origin, WithMiddleware(record("outer"), record("inner")))
-	p.MustHandle([]string{http.MethodGet}, authority+"/x", func(c *Context) (*http.Response, error) {
+	p.MustAddInterceptor([]string{http.MethodGet}, authority+"/x", func(c *Context) (*http.Response, error) {
 		order = append(order, "handler")
 		return Status(http.StatusOK), nil
-	}, WithRouteMiddleware(record("route")))
+	}, WithMiddleware(record("route")))
 
 	resp, err := client.Get(origin.URL + "/x")
 	require.NoError(t, err)
@@ -257,14 +261,14 @@ func TestSemantics_MiddlewareOrder(t *testing.T) {
 	assert.Equal(t, []string{"→outer", "→inner", "→route", "handler", "←route", "←inner", "←outer"}, order)
 }
 
-func TestSemantics_NoRouteForwardsUnchanged(t *testing.T) {
+func TestSemantics_NoInterceptorForwardsUnchanged(t *testing.T) {
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "origin got %s", r.URL.Path)
 	}))
 	defer origin.Close()
 
 	p, authority, client := interceptingProxy(t, origin)
-	p.MustHandle([]string{http.MethodGet}, authority+"/known", func(c *Context) (*http.Response, error) {
+	p.MustAddInterceptor([]string{http.MethodGet}, authority+"/known", func(c *Context) (*http.Response, error) {
 		return Text(http.StatusOK, "handled"), nil
 	})
 
@@ -287,7 +291,7 @@ func TestSemantics_RawPathIsPreserved(t *testing.T) {
 	p, authority, client := interceptingProxy(t, origin)
 
 	var routed string
-	p.MustHandle([]string{http.MethodGet}, authority+"/files/+{path}", func(c *Context) (*http.Response, error) {
+	p.MustAddInterceptor([]string{http.MethodGet}, authority+"/files/+{path}", func(c *Context) (*http.Response, error) {
 		routed = c.RoutingPath()
 		return c.Forward()
 	})

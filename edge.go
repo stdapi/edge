@@ -54,35 +54,32 @@ type middleware struct {
 // intercepts the rest, terminating TLS with its certificate authority so registered
 // handlers can inspect and rewrite traffic.
 //
-// A Proxy is safe for concurrent use. Routes and interception rules can be changed while
+// A Proxy is safe for concurrent use. Interceptors and tunnels can be changed while
 // traffic is flowing: lookups are lock-free and never observe a partially applied write.
 type Proxy struct {
-	cfg    *Config
-	routes atomic.Pointer[iTree]
-	rules  atomic.Pointer[iTree]
+	cfg  *config
+	tree atomic.Pointer[iTree]
 
-	noRoute HandlerFunc
-	onError ErrorHandler
+	noInterceptor HandlerFunc
+	onError       ErrorHandler
 
 	// srv owns the accepted connections and the upstream transports.
 	srv *server
 
 	mws []middleware
 
-	// mu serializes write transactions on both trees. Reads never take it.
+	// mu serializes write transactions. Reads never take it.
 	mu sync.Mutex
 }
 
-// Config holds the resolved configuration of a [Proxy]. It is read-only once the proxy
-// is built and is reported by [Proxy.Config].
-type Config struct {
+// config holds the resolved configuration of a [Proxy], read-only once it is built.
+type config struct {
 	ca     *CA
 	logger *slog.Logger
 
 	transport         *Transport
 	originalDst       OriginalDestination
 	packetOriginalDst PacketOriginalDestination
-	rules             []ruleSpec
 
 	server serverConfig
 
@@ -94,50 +91,19 @@ type Config struct {
 	mergeSlash   bool
 	collapseDots bool
 	allowRegexp  bool
-
-	defaultAction Action
 }
 
-func newConfig() *Config {
-	return &Config{
+func newConfig() *config {
+	return &config{
 		logger:           slog.Default(),
 		maxParams:        math.MaxUint8,
 		maxParamKeyBytes: math.MaxUint8,
 		maxMatchers:      math.MaxUint8,
 		handleSlash:      ExactSlash,
-		defaultAction:    Tunnel,
 		transport:        DefaultTransport(),
 		server:           defaultServerConfig(),
 	}
 }
-
-// Logger returns the logger used for connection level errors.
-func (c *Config) Logger() *slog.Logger { return c.logger }
-
-// Transport returns the upstream transport configuration.
-func (c *Config) Transport() *Transport { return c.transport }
-
-// CA returns the certificate authority used to mint leaf certificates for intercepted
-// authorities, or nil when the proxy can only tunnel.
-func (c *Config) CA() *CA { return c.ca }
-
-// MaxRouteParams returns the maximum number of parameters allowed in a route pattern.
-func (c *Config) MaxRouteParams() int { return c.maxParams }
-
-// MaxRouteParamKeyBytes returns the maximum length of a route parameter name.
-func (c *Config) MaxRouteParamKeyBytes() int { return c.maxParamKeyBytes }
-
-// MaxRouteMatchers returns the maximum number of matchers allowed on a route.
-func (c *Config) MaxRouteMatchers() int { return c.maxMatchers }
-
-// TrailingSlash returns the default [TrailingSlashOption] applied to new routes.
-func (c *Config) TrailingSlash() TrailingSlashOption { return c.handleSlash }
-
-// DefaultAction returns the [Action] applied to an authority matched by no rule.
-func (c *Config) DefaultAction() Action { return c.defaultAction }
-
-// AllowRegexpParam reports whether regular expression constraints are enabled in patterns.
-func (c *Config) AllowRegexpParam() bool { return c.allowRegexp }
 
 // Must returns a ready to use [Proxy] and panics on error. It is a convenience wrapper
 // for [New].
@@ -153,34 +119,25 @@ func Must(opts ...Option) *Proxy {
 //
 // A proxy with no certificate authority can still tunnel and observe connections, but it
 // cannot intercept: anything that would require minting a leaf certificate, an intercept
-// rule or a route, is reported as [ErrNoCertificateAuthority]. Use [NewCA], [LoadCA] or
+// an interceptor, is reported as [ErrNoCertificateAuthority]. Use [NewCA], [LoadCA] or
 // [GenerateCA] with [WithCA] to provide one.
 func New(opts ...Option) (*Proxy, error) {
 	cfg := newConfig()
 	p := &Proxy{cfg: cfg}
-	p.noRoute = DefaultNoRouteHandler
+	p.noInterceptor = DefaultNoInterceptorHandler
 	p.onError = DefaultErrorHandler
 
 	for _, opt := range opts {
-		if err := opt.applyProxy(sealedOption{proxy: p, cfg: cfg}); err != nil {
+		if err := opt.applyProxy(sealedOption{proxy: p}); err != nil {
 			return nil, err
 		}
 	}
 
 	// Clip so NewRoute's append(p.mws, rte.mws...) can never write into the shared backing array.
 	p.mws = slices.Clip(p.mws)
-	p.noRoute = applyMiddleware(NoRouteHandler, p.mws, p.noRoute)
+	p.noInterceptor = applyMiddleware(NoInterceptorHandler, p.mws, p.noInterceptor)
 
-	p.routes.Store(p.newTree())
-	p.rules.Store(p.newTree())
-
-	if cfg.defaultAction == Intercept && cfg.ca == nil {
-		return nil, fmt.Errorf("%w: the default action intercepts every authority, configure one with WithCA", ErrNoCertificateAuthority)
-	}
-
-	if err := p.applyRuleOptions(); err != nil {
-		return nil, err
-	}
+	p.tree.Store(p.newTree())
 
 	srv, err := newServer(p)
 	if err != nil {
@@ -190,9 +147,6 @@ func New(opts ...Option) (*Proxy, error) {
 
 	return p, nil
 }
-
-// Config returns the resolved configuration of this [Proxy].
-func (p *Proxy) Config() *Config { return p.cfg }
 
 func (p *Proxy) newTree() *iTree {
 	tree := new(iTree)
@@ -208,45 +162,48 @@ func (p *Proxy) newTree() *iTree {
 	return tree
 }
 
-func (p *Proxy) getRoutes() *iTree { return p.routes.Load() }
-func (p *Proxy) getRules() *iTree  { return p.rules.Load() }
+func (p *Proxy) getTree() *iTree { return p.tree.Load() }
 
-// MustHandle registers handler for the given methods and pattern and panics on error. It is
-// a convenience wrapper for [Proxy.Handle].
-func (p *Proxy) MustHandle(methods []string, pattern string, handler HandlerFunc, opts ...RouteOption) *Route {
-	rte, err := p.Handle(methods, pattern, handler, opts...)
+// MustAddInterceptor registers handler for the given methods and pattern and panics on error. It is
+// a convenience wrapper for [Proxy.AddInterceptor].
+func (p *Proxy) MustAddInterceptor(methods []string, pattern string, handler HandlerFunc, opts ...InterceptorOption) *Interceptor {
+	rte, err := p.AddInterceptor(methods, pattern, handler, opts...)
 	if err != nil {
 		panic(err)
 	}
 	return rte
 }
 
-// Handle registers handler for the given methods and pattern. An empty or nil set of methods
-// matches every method. On success it returns the newly registered [Route].
+// AddInterceptor registers handler for the given methods and pattern. An empty or nil set of
+// methods matches every method. On success it returns the newly registered [Interceptor].
 //
-// A pattern is a request target: an optional scheme, an authority, and a path.
+// A pattern is an authority and a path. The authority is required: it is the one the
+// interceptor arms, and interception is what makes the handler reachable at all.
 //
-//	api.stripe.com/v1/charges           any scheme, any port
-//	https://api.stripe.com/v1/charges   https only
-//	localhost:8080/api/+{rest}          port 8080 only
-//	+{sub}.corp.internal/health         every subdomain
-//	/v1/charges                         every authority
+//	api.stripe.com/v1/charges       one host
+//	+{sub}.corp.internal/health     every subdomain
+//	+{any}/health                   every authority
+//	api.stripe.com/*{any}           every path on one host, which is how to just watch it
 //
-// Registering a route implicitly marks its authority for interception, unless an explicit
-// [WithTunnel] rule matches it more specifically.
+// The scheme and the port are matchers, not pattern syntax: see [WithScheme] and [WithPort].
+//
+// Registering an interceptor marks its authority for interception, so nothing else has to be
+// declared. An authority already tunneled is a conflict rather than a silent no-op, since the
+// handler could never run.
 //
 // If an error occurs, it returns one of the following:
 //   - [*PatternError]: the pattern syntax is invalid.
-//   - [*RouteConflictError]: the route conflicts with an existing one.
-//   - [*RouteNameConflictError]: the route name is already registered.
-//   - [ErrInvalidRoute]: a method is invalid, the handler is nil or the pattern is empty.
-//   - [ErrInvalidConfig]: a route option is invalid.
+//   - [*InterceptorConflictError]: it conflicts with an existing interceptor.
+//   - [*InterceptorNameConflictError]: the name is already registered.
+//   - [ErrInvalidInterceptor]: a method is invalid, the handler is nil or the pattern is empty.
+//   - [ErrInvalidConfig]: an option is invalid.
 //   - [ErrInvalidMatcher]: a matcher option is invalid.
-//   - [ErrNoCertificateAuthority]: the route needs interception and no CA is configured.
-func (p *Proxy) Handle(methods []string, pattern string, handler HandlerFunc, opts ...RouteOption) (*Route, error) {
+//   - [ErrAuthorityConflict]: the authority is tunneled, so the handler could never run.
+//   - [ErrNoCertificateAuthority]: interception needs a CA and none is configured.
+func (p *Proxy) AddInterceptor(methods []string, pattern string, handler HandlerFunc, opts ...InterceptorOption) (*Interceptor, error) {
 	txn := p.Txn(true)
 	defer txn.Abort()
-	rte, err := txn.Add(methods, pattern, handler, opts...)
+	rte, err := txn.AddInterceptor(methods, pattern, handler, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -254,23 +211,12 @@ func (p *Proxy) Handle(methods []string, pattern string, handler HandlerFunc, op
 	return rte, nil
 }
 
-// AddRoute registers a [Route] built with [Proxy.NewRoute].
-func (p *Proxy) AddRoute(route *Route) error {
-	txn := p.Txn(true)
-	defer txn.Abort()
-	if err := txn.AddRoute(route); err != nil {
-		return err
-	}
-	txn.Commit()
-	return nil
-}
-
-// Update overrides the handler and options of an existing route. Route options and middleware
+// UpdateInterceptor overrides the handler and options of an existing interceptor. Options and middleware
 // must be reapplied: anything not provided falls back to the proxy default.
-func (p *Proxy) Update(methods []string, pattern string, handler HandlerFunc, opts ...RouteOption) (*Route, error) {
+func (p *Proxy) UpdateInterceptor(methods []string, pattern string, handler HandlerFunc, opts ...InterceptorOption) (*Interceptor, error) {
 	txn := p.Txn(true)
 	defer txn.Abort()
-	rte, err := txn.Update(methods, pattern, handler, opts...)
+	rte, err := txn.UpdateInterceptor(methods, pattern, handler, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -278,23 +224,12 @@ func (p *Proxy) Update(methods []string, pattern string, handler HandlerFunc, op
 	return rte, nil
 }
 
-// UpdateRoute overrides an existing route with the provided one.
-func (p *Proxy) UpdateRoute(route *Route) error {
-	txn := p.Txn(true)
-	defer txn.Abort()
-	if err := txn.UpdateRoute(route); err != nil {
-		return err
-	}
-	txn.Commit()
-	return nil
-}
-
-// Delete removes the route registered for the given methods, pattern and matchers, and
+// DeleteInterceptor removes the interceptor registered for the given methods, pattern and matchers, and
 // returns it.
-func (p *Proxy) Delete(methods []string, pattern string, opts ...MatcherOption) (*Route, error) {
+func (p *Proxy) DeleteInterceptor(methods []string, pattern string, opts ...MatcherOption) (*Interceptor, error) {
 	txn := p.Txn(true)
 	defer txn.Abort()
-	rte, err := txn.Delete(methods, pattern, opts...)
+	rte, err := txn.DeleteInterceptor(methods, pattern, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -302,11 +237,11 @@ func (p *Proxy) Delete(methods []string, pattern string, opts ...MatcherOption) 
 	return rte, nil
 }
 
-// DeleteRoute removes the provided [Route] and returns the deleted route.
-func (p *Proxy) DeleteRoute(route *Route) (*Route, error) {
+// removeInterceptor removes the provided [Interceptor] and returns the deleted route.
+func (p *Proxy) removeInterceptor(route *Interceptor) (*Interceptor, error) {
 	txn := p.Txn(true)
 	defer txn.Abort()
-	rte, err := txn.DeleteRoute(route)
+	rte, err := txn.removeInterceptor(route)
 	if err != nil {
 		return nil, err
 	}
@@ -314,45 +249,41 @@ func (p *Proxy) DeleteRoute(route *Route) (*Route, error) {
 	return rte, nil
 }
 
-// Has reports whether a route is registered for the given methods, pattern and matchers.
+// Has reports whether an interceptor is registered for the given methods, pattern and matchers.
 func (p *Proxy) Has(methods []string, pattern string, matchers ...Matcher) bool {
-	return p.Route(methods, pattern, matchers...) != nil
+	return p.Interceptor(methods, pattern, matchers...) != nil
 }
 
-// Route returns the [Route] registered for the given methods, pattern and matchers, or nil.
-func (p *Proxy) Route(methods []string, pattern string, matchers ...Matcher) *Route {
-	return p.getRoutes().route(methods, pattern, matchers)
+// Interceptor returns the [Interceptor] registered for the given methods, pattern and matchers, or nil.
+func (p *Proxy) Interceptor(methods []string, pattern string, matchers ...Matcher) *Interceptor {
+	return p.getTree().interceptor(methods, pattern, matchers)
 }
 
-// Name returns the [Route] registered under the given name, or nil.
-func (p *Proxy) Name(name string) *Route {
-	tree := p.getRoutes()
+// Name returns the [Interceptor] registered under the given name, or nil.
+func (p *Proxy) Name(name string) *Interceptor {
+	tree := p.getTree()
 	return tree.byName(name)
 }
 
-// Match looks up the [Route] that would serve r for target, without running any handler and
+// Match looks up the [Interceptor] that would serve r for target, without running any handler and
 // without capturing parameters. It reports tsr when the match only holds with the trailing
 // slash of the path added or removed.
-func (p *Proxy) Match(target Target, r *http.Request) (route *Route, tsr bool) {
+func (p *Proxy) Match(target Target, r *http.Request) (interceptor *Interceptor, tsr bool) {
 	txn := p.Txn(false)
 	defer txn.Abort()
 	return txn.Match(target, r)
 }
 
-// Lookup looks up the [Route] that would serve r for target and returns a [Context] holding
-// the captured parameters. The context must be released with [Context.Close].
-func (p *Proxy) Lookup(target Target, r *http.Request) (route *Route, cc *Context, tsr bool) {
-	txn := p.Txn(false)
-	defer txn.Abort()
-	return txn.Lookup(target, r)
-}
+// AuthoritiesLen returns the number of registered authority entries, the ones declared with
+// [Proxy.AddTunnel] and the ones implied by interceptors alike.
+func (p *Proxy) AuthoritiesLen() int { return p.getTree().authorities }
 
-// Len returns the number of registered routes.
-func (p *Proxy) Len() int { return p.getRoutes().size }
+// InterceptorsLen returns the number of registered interceptors.
+func (p *Proxy) InterceptorsLen() int { return p.getTree().interceptors }
 
 // Iter returns a set of range iterators over a point-in-time snapshot of the routing tree.
 func (p *Proxy) Iter() Iter {
-	tree := p.getRoutes()
+	tree := p.getTree()
 	return Iter{patterns: tree.patterns, names: tree.names, methods: tree.methods, maxDepth: tree.maxDepth}
 }
 
@@ -381,27 +312,27 @@ func (p *Proxy) View(fn func(txn *Txn) error) error {
 func (p *Proxy) Txn(write bool) *Txn {
 	if write {
 		p.mu.Lock()
-		return &Txn{p: p, write: true, rootTxn: p.getRoutes().txn()}
+		return &Txn{p: p, write: true, rootTxn: p.getTree().txn()}
 	}
-	return &Txn{p: p, rootTxn: p.getRoutes().txn()}
+	return &Txn{p: p, rootTxn: p.getTree().txn()}
 }
 
-// NewRoute creates a [Route] without registering it. If an error occurs, it returns one of:
+// newInterceptor creates a [Interceptor] without registering it. If an error occurs, it returns one of:
 //   - [*PatternError]: the pattern syntax is invalid.
-//   - [ErrInvalidRoute]: the method is invalid, the handler is nil or the pattern is empty.
-//   - [ErrInvalidConfig]: a route option is invalid.
+//   - [ErrInvalidInterceptor]: the method is invalid, the handler is nil or the pattern is empty.
+//   - [ErrInvalidConfig]: an interceptor option is invalid.
 //   - [ErrInvalidMatcher]: a matcher option is invalid.
-func (p *Proxy) NewRoute(methods []string, pattern string, handler HandlerFunc, opts ...RouteOption) (*Route, error) {
+func (p *Proxy) newInterceptor(methods []string, pattern string, handler HandlerFunc, opts ...InterceptorOption) (*Interceptor, error) {
 	if handler == nil {
-		return nil, fmt.Errorf("%w: nil handler", ErrInvalidRoute)
+		return nil, fmt.Errorf("%w: nil handler", ErrInvalidInterceptor)
 	}
 
 	for _, method := range methods {
 		if !validMethod(method) {
-			return nil, fmt.Errorf("%w: invalid method %q", ErrInvalidRoute, method)
+			return nil, fmt.Errorf("%w: invalid method %q", ErrInvalidInterceptor, method)
 		}
 		if method == http.MethodConnect {
-			return nil, fmt.Errorf("%w: CONNECT is handled by the tunnel layer, use WithIntercept or WithTunnel", ErrInvalidRoute)
+			return nil, fmt.Errorf("%w: CONNECT is handled by the tunnel layer, not by an interceptor", ErrInvalidInterceptor)
 		}
 	}
 
@@ -410,7 +341,7 @@ func (p *Proxy) NewRoute(methods []string, pattern string, handler HandlerFunc, 
 		return nil, err
 	}
 
-	rte := &Route{
+	rte := &Interceptor{
 		hbase:       handler,
 		pattern:     pat,
 		handleSlash: p.cfg.handleSlash,
@@ -425,20 +356,20 @@ func (p *Proxy) NewRoute(methods []string, pattern string, handler HandlerFunc, 
 	}
 
 	for _, opt := range opts {
-		if err = opt.applyRoute(sealedOption{route: rte, cfg: p.cfg}); err != nil {
+		if err = opt.applyInterceptor(sealedOption{proxy: p, interceptor: rte}); err != nil {
 			return nil, err
 		}
 	}
 
 	if len(rte.matchers) > p.cfg.maxMatchers {
-		return nil, fmt.Errorf("%w: %w", ErrInvalidRoute, ErrTooManyMatchers)
+		return nil, fmt.Errorf("%w: %w", ErrInvalidInterceptor, ErrTooManyMatchers)
 	}
 	if len(rte.matchers) == 0 && rte.priority > 0 {
-		return nil, fmt.Errorf("%w: priority requires matchers", ErrInvalidRoute)
+		return nil, fmt.Errorf("%w: priority requires matchers", ErrInvalidInterceptor)
 	}
 
 	rte.priority = cmp.Or(rte.priority, uint(len(rte.matchers)))
-	rte.hself, rte.hall = applyRouteMiddleware(append(p.mws, rte.mws...), handler)
+	rte.hself, rte.hall = applyInterceptorMiddleware(append(p.mws, rte.mws...), handler)
 
 	if len(methods) > 0 {
 		// Defensive copy: the caller keeps ownership of the slice it passed.
@@ -454,10 +385,10 @@ func (p *Proxy) NewRoute(methods []string, pattern string, handler HandlerFunc, 
 	return rte, nil
 }
 
-// DefaultNoRouteHandler forwards the request upstream unchanged. It is the handler used for
-// intercepted requests that match no route, which makes interception without a matching route
+// DefaultNoInterceptorHandler forwards the request upstream unchanged. It is the handler used for
+// intercepted requests that match no interceptor, which makes interception without a matching route
 // observable but not disruptive.
-func DefaultNoRouteHandler(c *Context) (*http.Response, error) {
+func DefaultNoInterceptorHandler(c *Context) (*http.Response, error) {
 	return c.Forward()
 }
 
@@ -476,10 +407,10 @@ func applyMiddleware(scope HandlerScope, mws []middleware, h HandlerFunc) Handle
 	return m
 }
 
-func applyRouteMiddleware(mws []middleware, base HandlerFunc) (self, all HandlerFunc) {
+func applyInterceptorMiddleware(mws []middleware, base HandlerFunc) (self, all HandlerFunc) {
 	self, all = base, base
 	for i := len(mws) - 1; i >= 0; i-- {
-		if mws[i].scope&RouteHandler != 0 {
+		if mws[i].scope&InterceptorHandler != 0 {
 			all = mws[i].m(all)
 			if !mws[i].g {
 				self = mws[i].m(self)

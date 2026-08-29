@@ -22,7 +22,7 @@ func benchProxy(b *testing.B, patterns ...string) *Proxy {
 		b.Fatal(err)
 	}
 	for _, pattern := range patterns {
-		if _, err := p.Handle([]string{http.MethodGet}, pattern, noopHandler); err != nil {
+		if _, err := p.AddInterceptor([]string{http.MethodGet}, pattern, noopHandler); err != nil {
 			b.Fatalf("register %s: %v", pattern, err)
 		}
 	}
@@ -40,17 +40,17 @@ func BenchmarkLookup(b *testing.B) {
 		{name: "param", pattern: "api.stripe.com/v1/{id}/refunds", host: "api.stripe.com", path: "/v1/ch_1234567890/refunds"},
 		{name: "wildcard path", pattern: "api.stripe.com/files/+{path}", host: "api.stripe.com", path: "/files/a/b/c/d"},
 		{name: "wildcard host", pattern: "+{sub}.stripe.com/v1/charges", host: "eu.west.stripe.com", path: "/v1/charges"},
-		{name: "no authority", pattern: "/v1/charges", host: "anything.example.test", path: "/v1/charges"},
+		{name: "any authority", pattern: "+{any}/v1/charges", host: "anything.example.test", path: "/v1/charges"},
 	}
 
 	for _, tc := range cases {
 		b.Run(tc.name, func(b *testing.B) {
 			p := benchProxy(b, tc.pattern)
-			tree := p.getRoutes()
+			tree := p.getTree()
 			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
 
 			c := tree.pool.Get().(*Context)
-			defer c.release()
+			defer tree.pool.Put(c)
 			c.reset(nil, req, "https", tc.host, "443")
 
 			b.ReportAllocs()
@@ -83,14 +83,14 @@ func BenchmarkLookupDeepTree(b *testing.B) {
 		"+{sub}.internal.corp/metrics",
 	}
 	p := benchProxy(b, patterns...)
-	tree := p.getRoutes()
+	tree := p.getTree()
 
 	const host = "api.stripe.com"
 	const path = "/v1/subscriptions/sub_123/items/si_456"
 	req := httptest.NewRequest(http.MethodGet, path, nil)
 
 	c := tree.pool.Get().(*Context)
-	defer c.release()
+	defer tree.pool.Put(c)
 	c.reset(nil, req, "https", host, "443")
 
 	b.ReportAllocs()
@@ -104,13 +104,13 @@ func BenchmarkLookupDeepTree(b *testing.B) {
 
 func BenchmarkDecide(b *testing.B) {
 	cases := []struct {
-		name  string
-		rules []string
-		host  string
+		name        string
+		authorities []string
+		host        string
 	}{
-		{name: "hit static", rules: []string{"api.stripe.com"}, host: "api.stripe.com"},
-		{name: "hit wildcard", rules: []string{"+{sub}.stripe.com"}, host: "eu.west.stripe.com"},
-		{name: "miss", rules: []string{"api.stripe.com"}, host: "example.test"},
+		{name: "hit static", authorities: []string{"api.stripe.com"}, host: "api.stripe.com"},
+		{name: "hit wildcard", authorities: []string{"+{sub}.stripe.com"}, host: "eu.west.stripe.com"},
+		{name: "miss", authorities: []string{"api.stripe.com"}, host: "example.test"},
 	}
 
 	for _, tc := range cases {
@@ -119,9 +119,14 @@ func BenchmarkDecide(b *testing.B) {
 			if err != nil {
 				b.Fatal(err)
 			}
-			p, err := New(WithCA(ca), WithIntercept(tc.rules...))
+			p, err := New(WithCA(ca))
 			if err != nil {
 				b.Fatal(err)
+			}
+			for _, authority := range tc.authorities {
+				if _, err := p.AddInterceptor(nil, authority+"/*{any}", noopHandler); err != nil {
+					b.Fatalf("intercept %s: %v", authority, err)
+				}
 			}
 			t := Target{Scheme: "https", Host: tc.host, Port: "443"}
 

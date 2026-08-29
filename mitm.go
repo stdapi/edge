@@ -59,9 +59,9 @@ func (p *Proxy) intercept(ctx context.Context, conn *peekConn, sess *Session) er
 	if state.ServerName != "" {
 		sess.target.Host = state.ServerName
 	}
-	sess.proto = protocolFromALPN(state.NegotiatedProtocol)
+	sess.setProtocol(protocolFromALPN(state.NegotiatedProtocol))
 
-	return p.serveIntercepted(ctx, tlsConn, sess, sess.proto)
+	return p.serveIntercepted(ctx, tlsConn, sess, sess.Protocol())
 }
 
 // serverTLSConfig builds the configuration the proxy presents to an intercepted client. The
@@ -126,7 +126,7 @@ func (p *Proxy) serveIntercepted(ctx context.Context, conn net.Conn, sess *Sessi
 	}
 
 	if proto == HTTP2 {
-		sess.proto = HTTP2
+		sess.setProtocol(HTTP2)
 		p.srv.h2.ServeConn(conn, &http2.ServeConnOpts{
 			Context:    context.WithValue(ctx, sessionKey{}, sess),
 			BaseConfig: p.srv.mitm,
@@ -135,7 +135,7 @@ func (p *Proxy) serveIntercepted(ctx context.Context, conn net.Conn, sess *Sessi
 		return nil
 	}
 
-	sess.proto = HTTP11
+	sess.setProtocol(HTTP11)
 	ln := newSingleConnListener(conn, sess)
 	err := p.srv.mitm.Serve(ln)
 	if errors.Is(err, net.ErrClosed) || errors.Is(err, http.ErrServerClosed) {

@@ -12,21 +12,21 @@ import (
 )
 
 var (
-	// ErrRouteNotFound is returned when no route matches the lookup.
-	ErrRouteNotFound = errors.New("route not found")
-	// ErrInvalidRoute is returned when a route cannot be built from the given arguments.
-	ErrInvalidRoute = errors.New("invalid route")
-	// ErrRuleNotFound is returned when no interception rule matches the lookup.
-	ErrRuleNotFound = errors.New("rule not found")
-	// ErrInvalidRule is returned when an interception rule cannot be built.
-	ErrInvalidRule = errors.New("invalid rule")
+	// ErrInterceptorNotFound is returned when no interceptor matches the lookup.
+	ErrInterceptorNotFound = errors.New("interceptor not found")
+	// ErrInvalidInterceptor is returned when an interceptor cannot be built from the given arguments.
+	ErrInvalidInterceptor = errors.New("invalid interceptor")
+	// ErrTunnelNotFound is returned when no tunnel is registered for an authority.
+	ErrTunnelNotFound = errors.New("tunnel not found")
+	// ErrInvalidAuthority is returned when an authority pattern cannot be parsed.
+	ErrInvalidAuthority = errors.New("invalid authority")
 	// ErrReadOnlyTxn is returned on a write in a read-only transaction.
 	ErrReadOnlyTxn = errors.New("write on read-only transaction")
 	// ErrSettledTxn is the panic value of an operation on a committed or aborted transaction.
 	ErrSettledTxn = errors.New("transaction settled")
-	// ErrTooManyMatchers is returned when a route carries more matchers than configured.
+	// ErrTooManyMatchers is returned when an interceptor carries more matchers than configured.
 	ErrTooManyMatchers = errors.New("too many matchers")
-	// ErrInvalidConfig is returned when a proxy or route option is invalid.
+	// ErrInvalidConfig is returned when a proxy or option is invalid.
 	ErrInvalidConfig = errors.New("invalid config")
 	// ErrInvalidMatcher is returned when a matcher cannot be built.
 	ErrInvalidMatcher = errors.New("invalid matcher")
@@ -34,25 +34,28 @@ var (
 	ErrNoCertificateAuthority = errors.New("no certificate authority")
 	// ErrProxyClosed is returned by the serving methods after Shutdown or Close.
 	ErrProxyClosed = errors.New("proxy closed")
-	// ErrConnectionRejected is returned when a rule refuses a connection.
+	// ErrConnectionRejected is returned when the proxy refuses a connection.
 	ErrConnectionRejected = errors.New("connection rejected")
+	// ErrAuthorityConflict is returned when a tunnel and the interceptors registered under
+	// the same authority disagree on what should happen to its connections.
+	ErrAuthorityConflict = errors.New("authority conflict")
 )
 
-// RouteConflictError represents a conflict that occurred during route registration.
-// It contains the route being registered, and the existing routes that caused the conflict.
-type RouteConflictError struct {
-	// New is the route that was being registered when the conflict was detected.
-	New *Route
-	// Conflicts contains the previously registered routes that conflict with New.
-	Conflicts []*Route
-	// isShadowed indicate that the New route shadow other routes.
+// InterceptorConflictError represents a conflict that occurred during route registration.
+// It contains the interceptor being registered, and the existing interceptors that caused the conflict.
+type InterceptorConflictError struct {
+	// New is the interceptor that was being registered when the conflict was detected.
+	New *Interceptor
+	// Conflicts contains the previously registered interceptors that conflict with New.
+	Conflicts []*Interceptor
+	// isShadowed indicate that the New route shadow other interceptors.
 	isShadowed bool
 }
 
-func (e *RouteConflictError) Error() string {
+func (e *InterceptorConflictError) Error() string {
 	sb := new(strings.Builder)
-	sb.WriteString("route conflict: new route\n")
-	routef(sb, e.New, 4, true)
+	sb.WriteString("interceptor conflict: new interceptor\n")
+	entryf(sb, e.New, 4, true)
 
 	if e.isShadowed {
 		if e.New.pattern.optionalCatchAll {
@@ -66,36 +69,36 @@ func (e *RouteConflictError) Error() string {
 
 	for _, conflict := range e.Conflicts {
 		sb.WriteByte('\n')
-		routef(sb, conflict, 4, true)
+		entryf(sb, conflict, 4, true)
 	}
 
 	return sb.String()
 }
 
-// RouteNameConflictError represents a conflict that occurred during route name registration.
-// It contains the route being registered, and the existing route that caused the conflict.
-type RouteNameConflictError struct {
-	// New is the route that was being registered when the conflict was detected.
-	New *Route
-	// Conflict is the previously registered route that conflict with New.
-	Conflict *Route
+// InterceptorNameConflictError represents a conflict that occurred during interceptor name registration.
+// It contains the interceptor being registered, and the existing route that caused the conflict.
+type InterceptorNameConflictError struct {
+	// New is the interceptor that was being registered when the conflict was detected.
+	New *Interceptor
+	// Conflict is the previously registered interceptor that conflicts with New.
+	Conflict *Interceptor
 }
 
-func (e *RouteNameConflictError) Error() string {
+func (e *InterceptorNameConflictError) Error() string {
 	sb := new(strings.Builder)
-	sb.WriteString("route name already registered: new route\n")
-	routef(sb, e.New, 4, true)
+	sb.WriteString("interceptor name already registered: new interceptor\n")
+	entryf(sb, e.New, 4, true)
 	sb.WriteString("\nconflicts with\n")
-	routef(sb, e.Conflict, 4, true)
+	entryf(sb, e.Conflict, 4, true)
 	return sb.String()
 }
 
-func newRouteNotFoundError(route *Route) error {
+func newInterceptorNotFoundError(route *Interceptor) error {
 	sb := new(strings.Builder)
-	sb.WriteString("route\n")
-	routef(sb, route, 4, false)
+	sb.WriteString("interceptor\n")
+	entryf(sb, route, 4, false)
 	sb.WriteString("\nis not registered")
-	return fmt.Errorf("%w: %s", ErrRouteNotFound, sb.String())
+	return fmt.Errorf("%w: %s", ErrInterceptorNotFound, sb.String())
 }
 
 type PatternError struct {

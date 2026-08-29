@@ -148,7 +148,7 @@ func (c *Context) upstreamProtocol() Protocol {
 	if c.sess == nil {
 		return HTTP11
 	}
-	return c.sess.proto
+	return c.sess.Protocol()
 }
 
 // outboundRequest turns the request the proxy received into one the upstream transport can

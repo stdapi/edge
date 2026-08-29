@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/netip"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -72,7 +71,7 @@ type Action uint8
 
 const (
 	// Tunnel relays the connection byte for byte. The proxy never sees the plaintext and
-	// no route is consulted.
+	// no interceptor is consulted.
 	Tunnel Action = iota + 1
 	// Intercept terminates TLS with a minted leaf certificate and routes every request on
 	// the connection.
@@ -139,48 +138,60 @@ var sessionSeq atomic.Uint64
 //
 // A Session is safe for concurrent use by the goroutines serving its requests.
 type Session struct {
-	createdAt   time.Time
-	remoteAddr  net.Addr
-	localAddr   net.Addr
-	ctx         context.Context
-	tlsState    *tls.ConnectionState
+	createdAt  time.Time
+	remoteAddr net.Addr
+	localAddr  net.Addr
+	ctx        context.Context
+	tlsState   *tls.ConnectionState
+	// tlsConn is set instead of tlsState when the session is created before the handshake,
+	// so TLS() can read the state once it exists.
+	tlsConn     *tls.Conn
 	clientHello *ClientHello
-	values      atomic.Pointer[map[any]any]
 	target      Target
 	// upstream is the address a transparently redirected connection was headed to. It is
 	// preferred over resolving the authority again, which may not even resolve outside the
 	// client's own network.
-	upstream    netip.AddrPort
-	id          uint64
-	mu          sync.Mutex
+	upstream netip.AddrPort
+	id       uint64
+	// proto is the protocol of the connection. The front listener builds its session from
+	// ConnContext, before the protocol is known, so unlike every other field it is written
+	// once a request has been read, from a goroutine serving one of them.
+	proto       atomic.Uint32
 	action      Action
-	proto       Protocol
 	transparent bool
 }
 
 // ID returns a process-unique identifier for this session.
 func (s *Session) ID() uint64 { return s.id }
 
-// RemoteAddr returns the address of the client.
-func (s *Session) RemoteAddr() net.Addr { return s.remoteAddr }
+// RemoteAddr returns the address of the client, or the zero value when the connection has
+// none. Unlike [Context.RemoteAddr] it describes the connection, so it is the same for every
+// request multiplexed on it and no handler can rewrite it.
+func (s *Session) RemoteAddr() netip.AddrPort { return addrPort(s.remoteAddr) }
 
-// LocalAddr returns the proxy-side address of the connection.
-func (s *Session) LocalAddr() net.Addr { return s.localAddr }
+// LocalAddr returns the proxy-side address of the connection, or the zero value when it has
+// none.
+func (s *Session) LocalAddr() netip.AddrPort { return addrPort(s.localAddr) }
 
-// RemoteIP returns the client IP, or the zero value when the connection has none.
-func (s *Session) RemoteIP() netip.Addr {
-	if s.remoteAddr == nil {
-		return netip.Addr{}
+// addrPort converts a connection address to a netip.AddrPort. The two concrete types the
+// listeners produce are converted without parsing; anything else, a test harness address or
+// a unix socket, falls back to parsing and yields the zero value when it is not an IP.
+func addrPort(a net.Addr) netip.AddrPort {
+	var ap netip.AddrPort
+	switch v := a.(type) {
+	case nil:
+		return netip.AddrPort{}
+	case *net.TCPAddr:
+		ap = v.AddrPort()
+	case *net.UDPAddr:
+		ap = v.AddrPort()
+	default:
+		var err error
+		if ap, err = netip.ParseAddrPort(a.String()); err != nil {
+			return netip.AddrPort{}
+		}
 	}
-	host, _, err := net.SplitHostPort(s.remoteAddr.String())
-	if err != nil {
-		return netip.Addr{}
-	}
-	addr, err := netip.ParseAddr(host)
-	if err != nil {
-		return netip.Addr{}
-	}
-	return addr.Unmap()
+	return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
 }
 
 // Target returns the authority the client asked for. For an explicit proxy this is the
@@ -188,15 +199,32 @@ func (s *Session) RemoteIP() netip.Addr {
 // is derived from the TLS server name or the Host header.
 func (s *Session) Target() Target { return s.target }
 
-// Action returns how the proxy decided to handle this connection.
-func (s *Session) Action() Action { return s.action }
+// Protocol returns the protocol negotiated with the client. It describes the connection, so
+// it is the same for every request multiplexed on it.
+func (s *Session) Protocol() Protocol {
+	//nolint:gosec // the field is only ever written by setProtocol, from a Protocol.
+	return Protocol(s.proto.Load())
+}
 
-// Protocol returns the protocol negotiated with the client.
-func (s *Session) Protocol() Protocol { return s.proto }
+// setProtocol records the protocol of the connection. Every request on one connection
+// carries the same protocol, so writing it from each of them stores the same value.
+func (s *Session) setProtocol(p Protocol) { s.proto.Store(uint32(p)) }
 
-// TLS returns the state of the intercepted TLS connection, or nil when the client is not
+// TLS returns the state of the TLS connection with the client, or nil when the client is not
 // speaking TLS to the proxy.
-func (s *Session) TLS() *tls.ConnectionState { return s.tlsState }
+func (s *Session) TLS() *tls.ConnectionState {
+	if s.tlsState != nil {
+		return s.tlsState
+	}
+	if s.tlsConn != nil {
+		// The handshake had not run when the session was created. tls.Conn guards its own
+		// state, so reading it now is safe from any of the goroutines serving the connection.
+		if state := s.tlsConn.ConnectionState(); state.HandshakeComplete {
+			return &state
+		}
+	}
+	return nil
+}
 
 // ClientHello returns what the client offered in its TLS handshake with the proxy, or nil
 // for a plaintext session. It is the ground truth for mirroring a client's capabilities
@@ -220,31 +248,6 @@ func (s *Session) Context() context.Context {
 		return context.Background()
 	}
 	return s.ctx
-}
-
-// Value returns the value stored on this session under key, or nil. Session values let
-// middleware carry state across every request multiplexed on one connection.
-func (s *Session) Value(key any) any {
-	m := s.values.Load()
-	if m == nil {
-		return nil
-	}
-	return (*m)[key]
-}
-
-// SetValue stores a value on this session under key. It is safe for concurrent use.
-func (s *Session) SetValue(key, val any) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	old := s.values.Load()
-	next := make(map[any]any, 1)
-	if old != nil {
-		for k, v := range *old {
-			next[k] = v
-		}
-	}
-	next[key] = val
-	s.values.Store(&next)
 }
 
 // ClientHello is the part of a TLS ClientHello the proxy needs to mirror a client upstream.
@@ -283,7 +286,7 @@ func joinHostPort(host, port string) string {
 // authority, and bracketing it would put a second "]" in a string the split cuts at the
 // first one, so the pair would not survive a rejoin. Left alone it does.
 //
-// The rule is exactly what makes splitting and rejoining stable for every pair splitHostPort
+// The authority entry is exactly what makes splitting and rejoining stable for every pair splitHostPort
 // can produce, which FuzzSplitHostPort checks. Authorities arrive off the wire, and a proxy
 // that reads one back differently than it wrote it is how routing gets bypassed.
 func needsBrackets(host string) bool {

@@ -16,8 +16,8 @@ import (
 const offsetZero = 0
 
 type node struct {
-	// routes holds the registered handlers if this node is a leaf.
-	routes []*Route
+	// entries holds the registered handlers if this node is a leaf.
+	entries []*Interceptor
 
 	// regexp is an optional compiled regular expression constraint for param and wildcard nodes.
 	// When present, captured segments must match this pattern during lookup.
@@ -30,7 +30,7 @@ type node struct {
 	// Param nodes without regex: Contains "?" as a canonical placeholder.
 	// This allows routes with different param names (/foo/{bar} and /foo/{fizz})
 	// to share the same tree node while preventing duplicate route registration.
-	// The actual placeholder names are stored in the route definition.
+	// The actual placeholder names are stored in the interceptor definition.
 	//
 	// Wildcard nodes without regex: Contains "*" as a canonical placeholder,
 	// following the same sharing semantics as params.
@@ -55,7 +55,7 @@ type node struct {
 	// Set to 0x00 for param and wildcard nodes.
 	label byte
 
-	// host indicates this node's key belongs to the hostname portion of the route.
+	// host indicates this node's key belongs to the hostname portion of the interceptor.
 	// A node that belong to a host cannot be merged with a child key that start with a '/'.
 	host bool
 }
@@ -72,7 +72,7 @@ func (n *node) lookup(method, hostPort, path string, c *Context, lazy bool) (int
 		return lookupByPath(n, method, path, c, lazy, offsetZero)
 	}
 
-	idx, nd, tsr := lookupByHostname(n, method, host, path, c, lazy)
+	idx, nd, tsr := lookupByHostname(n, method, host, path, c, lazy, false)
 	if nd == nil {
 		// No match with hostname, fallback to path-only.
 		*c.skipStack = (*c.skipStack)[:0]
@@ -86,7 +86,11 @@ func (n *node) lookup(method, hostPort, path string, c *Context, lazy bool) (int
 	return idx, nd, tsr
 }
 
-func lookupByHostname(root *node, method, host, path string, c *Context, lazy bool) (index int, n *node, tsr bool) {
+// lookupByHostname walks the hostname half of the key. With authority set it stops there
+// and answers with the entry sitting on the node the hostname ended on, instead of
+// descending into the path: an authority key carries no path at all, which is what keeps
+// the two kinds of entry from ever reaching each other.
+func lookupByHostname(root *node, method, host, path string, c *Context, lazy, authority bool) (index int, n *node, tsr bool) {
 	var (
 		charsMatched     int
 		skipStatic       bool
@@ -264,6 +268,14 @@ Walk:
 					*c.params = append(*c.params, search)
 				}
 
+				if authority {
+					if i, ok := findAuthority(wildcardNode, c); ok {
+						return i, wildcardNode, false
+					}
+					*c.params = (*c.params)[:paramCnt]
+					continue
+				}
+
 				stackOffset := len(*c.skipStack)
 				if idx, subNode, subTsr := lookupByPath(wildcardNode, method, path, c, lazy, stackOffset); subNode != nil {
 					return idx, subNode, subTsr
@@ -277,7 +289,11 @@ Walk:
 		goto Backtrack
 	}
 
-	if _, pathChild := matched.getStaticEdge(slashDelim); pathChild != nil {
+	if authority {
+		if i, ok := findAuthority(matched, c); ok {
+			return i, matched, false
+		}
+	} else if _, pathChild := matched.getStaticEdge(slashDelim); pathChild != nil {
 		stackOffset := len(*c.skipStack)
 		idx, subNode, subTsr := lookupByPath(matched, method, path, c, lazy, stackOffset)
 		if subNode != nil {
@@ -311,9 +327,9 @@ Backtrack:
 
 // lookupByPath returns the node matching path. When tsr is true, the returned node matches the
 // path with its trailing slash added or removed. Only routes not registered with ExactSlash are
-// eligible for a tsr match, and the node is nil when no route matches either form.
+// eligible for a tsr match, and the node is nil when no interceptor matches either form.
 //
-// A route registered with RelaxedSlash or RedirectSlash matches with and without its trailing
+// An interceptor registered with RelaxedSlash or RedirectSlash matches with and without its trailing
 // slash. A tsr candidate therefore counts as a direct match and keeps the priority of the
 // branch where it was found (static > regex param > param > regex wildcard > wildcard). The
 // lookup returns it without exploring lower priority alternatives on the skip stack, even when
@@ -330,7 +346,7 @@ Backtrack:
 //
 // A tsr candidate never crosses a "//" boundary, so /foo// and /foo/ stay distinct.
 //
-// A route registered with ExactSlash is never used as a tsr candidate, but a slash correction
+// An interceptor registered with ExactSlash is never used as a tsr candidate, but a slash correction
 // triggered by another route can still redirect traffic to it, for example /foo/ registered with
 // ExactSlash and /{a}/ registered with RedirectSlash. A request for /foo finds no direct match
 // and the param branch offers /{a}/ as a tsr candidate, so the router redirects to /foo/. The
@@ -464,14 +480,14 @@ Walk:
 					if idx < 0 {
 						if len(path[searchStart:]) > 0 {
 							if _, child := wildcardNode.getStaticEdge(slashDelim); child != nil && child.isLeaf() && child.key == "/" {
-								// We have the path /foo/x/y/z for the route /foo/+{any:[A-z]}/ that may be matched with a ts,
+								// We have the path /foo/x/y/z for the interceptor /foo/+{any:[A-z]}/ that may be matched with a ts,
 								// but we need to make sure that the regexp match too.
 								if wildcardNode.regexp != nil && !wildcardNode.regexp.MatchString(path[offset:]) {
 									break
 								}
-								for j, route := range child.routes {
+								for j, route := range child.entries {
 									if route.handleSlash != ExactSlash && route.match(method, c) {
-										// This is the only case where we don't return a TSR match immediately. Routes like
+										// This is the only case where we don't return a TSR match immediately. Interceptors like
 										// /+{args}/ (with TSR enabled) and /+{args} can coexist. For a request like /a/b/c,
 										// the infix /+{args}/ would match with TSR (adding a trailing slash), but we must
 										// first check whether a suffix catch-all directly matches. We capture the node here
@@ -553,7 +569,7 @@ Walk:
 					continue
 				}
 
-				for i, route := range wildcardNode.routes {
+				for i, route := range wildcardNode.entries {
 					if route.match(method, c) {
 						if !lazy {
 							*c.params = append(*c.params, search)
@@ -576,7 +592,7 @@ Walk:
 	}
 
 	if matched.isLeaf() {
-		for i, route := range matched.routes {
+		for i, route := range matched.entries {
 			if route.match(method, c) {
 				return i, matched, false
 			}
@@ -585,7 +601,7 @@ Walk:
 
 	// Try to catch empty for wildcard supporting it.
 	for _, wildcardNode := range matched.wildcards {
-		for i, route := range wildcardNode.routes {
+		for i, route := range wildcardNode.entries {
 			if route.pattern.optionalCatchAll && route.match(method, c) {
 				if !lazy {
 					*c.params = append(*c.params, "")
@@ -600,7 +616,7 @@ Walk:
 			return i, tsrNode, true
 		}
 	} else if matched.key == "/" && parent != nil && parent.isLeaf() && !strings.HasSuffix(path, "//") {
-		for i, route := range parent.routes {
+		for i, route := range parent.entries {
 			if route.handleSlash != ExactSlash && !route.pattern.catchAll && route.match(method, c) {
 				return i, parent, true
 			}
@@ -609,7 +625,7 @@ Walk:
 
 Backtrack:
 	if search == "/" && matched.isLeaf() && !strings.HasSuffix(path, "//") {
-		for i, route := range matched.routes {
+		for i, route := range matched.entries {
 			if route.handleSlash != ExactSlash && !route.pattern.catchAll && route.match(method, c) {
 				return i, matched, true
 			}
@@ -642,7 +658,7 @@ Backtrack:
 // an empty match on one of its optional catch-all. Returns (-1, nil) when none match.
 func matchTrailingSlash(child *node, method string, c *Context, lazy bool) (int, *node) {
 	if child.isLeaf() {
-		for i, route := range child.routes {
+		for i, route := range child.entries {
 			if route.handleSlash != ExactSlash && route.match(method, c) {
 				return i, child
 			}
@@ -651,7 +667,7 @@ func matchTrailingSlash(child *node, method string, c *Context, lazy bool) (int,
 	// Since /foo/ and /foo/*{any} are permitted with different set of matchers and methods,
 	// we still need to search for a matching empty catch-all.
 	for _, wildcardNode := range child.wildcards {
-		for i, route := range wildcardNode.routes {
+		for i, route := range wildcardNode.entries {
 			if route.handleSlash != ExactSlash && route.pattern.optionalCatchAll && route.match(method, c) {
 				if !lazy {
 					// record empty match
@@ -664,35 +680,35 @@ func matchTrailingSlash(child *node, method string, c *Context, lazy bool) (int,
 	return -1, nil
 }
 
-func (n *node) addRoute(route *Route) {
+func (n *node) addEntry(route *Interceptor) {
 	// Method-less and no matchers is always evaluated last.
 	if len(route.methods) == 0 && len(route.matchers) == 0 {
-		n.routes = append(n.routes, route)
+		n.entries = append(n.entries, route)
 		return
 	}
 
 	pos := n.findInsertPosition(route)
-	n.routes = slices.Insert(n.routes, pos, route)
+	n.entries = slices.Insert(n.entries, pos, route)
 }
 
-func (n *node) replaceRoute(idx int, route *Route) {
+func (n *node) replaceEntry(idx int, route *Interceptor) {
 	// Priority unchanged or no matchers, replace in place
-	if n.routes[idx].priority == route.priority || len(route.matchers) == 0 {
-		n.routes[idx] = route
+	if n.entries[idx].priority == route.priority || len(route.matchers) == 0 {
+		n.entries[idx] = route
 		return
 	}
 
-	// Priority changed with matchers, we need to reposition the route.
-	n.routes = slices.Delete(n.routes, idx, idx+1)
+	// Priority changed with matchers, we need to reposition the interceptor.
+	n.entries = slices.Delete(n.entries, idx, idx+1)
 	pos := n.findInsertPosition(route)
-	n.routes = slices.Insert(n.routes, pos, route)
+	n.entries = slices.Insert(n.entries, pos, route)
 }
 
-func (n *node) findInsertPosition(route *Route) int {
+func (n *node) findInsertPosition(route *Interceptor) int {
 	hasMethods := len(route.methods) > 0
 	hasMatchers := len(route.matchers) > 0
 
-	for i, existing := range n.routes {
+	for i, existing := range n.entries {
 		existingHasMethods := len(existing.methods) > 0
 		existingHasMatchers := len(existing.matchers) > 0
 
@@ -715,15 +731,15 @@ func (n *node) findInsertPosition(route *Route) int {
 		}
 	}
 
-	return len(n.routes)
+	return len(n.entries)
 }
 
 func (n *node) delRoute(idx int) {
 	if idx >= 0 {
-		copy(n.routes[idx:], n.routes[idx+1:])
-		last := len(n.routes) - 1
-		n.routes[last] = nil
-		n.routes = n.routes[:last:last]
+		copy(n.entries[idx:], n.entries[idx+1:])
+		last := len(n.entries) - 1
+		n.entries[last] = nil
+		n.entries = n.entries[:last:last]
 	}
 }
 
@@ -942,7 +958,7 @@ func (n *node) searchName(key string) (matched *node) {
 	return current
 }
 
-// parseBraceSegment extracts the node key from a param or wildcard segment in a route pattern.
+// parseBraceSegment extracts the node key from a param or wildcard segment in an interceptor pattern.
 // It returns the index of the closing brace and the corresponding node key used for tree lookups:
 //   - For params {name}: returns (end, "?")
 //   - For wildcards *{name} or +{name}: returns (end, "*")
@@ -986,7 +1002,20 @@ func parseBraceSegment(pattern string) (int, string) {
 }
 
 func (n *node) isLeaf() bool {
-	return len(n.routes) > 0
+	return len(n.entries) > 0
+}
+
+// findAuthority returns the index of the authority entry on n whose matchers accept c.
+// An authority entry is the only kind that can sit on a hostname node: an interceptor's tokens
+// always end in its path, so an interceptor is never a leaf before the '/'. The path test is what
+// keeps that structural fact checked rather than assumed.
+func findAuthority(n *node, c *Context) (int, bool) {
+	for i, entry := range n.entries {
+		if entry.pattern.path == "" && entry.matchersAccept(c) {
+			return i, true
+		}
+	}
+	return -1, false
 }
 
 func (n *node) String() string {
@@ -1018,7 +1047,7 @@ func (n *node) string(space int) string {
 		sb.WriteByte(']')
 	}
 
-	for _, route := range n.routes {
+	for _, route := range n.entries {
 		sb.WriteByte('\n')
 		sb.WriteString(strings.Repeat(" ", space+8))
 		sb.WriteString("=> ")
