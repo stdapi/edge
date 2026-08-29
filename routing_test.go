@@ -46,7 +46,7 @@ func matchRequest(t *testing.T, p *Proxy, scheme, authority string, req *http.Re
 	if !ok {
 		return nil
 	}
-	idx, n, _ := tree.lookup(req.Method, target.Host, path, c, false)
+	idx, n := tree.lookup(req.Method, target.Host, path, c, false)
 	if n == nil {
 		return nil
 	}
@@ -131,7 +131,7 @@ func TestRouting_CapturesParams(t *testing.T) {
 	defer tree.pool.Put(c)
 	c.reset(nil, req, "https", "a.b.stripe.com", "443")
 
-	idx, n, _ := tree.lookup(http.MethodGet, "a.b.stripe.com", "/v1/ch_123/refunds/a/b", c, false)
+	idx, n := tree.lookup(http.MethodGet, "a.b.stripe.com", "/v1/ch_123/refunds/a/b", c, false)
 	require.NotNil(t, n)
 	c.interceptor = n.entries[idx]
 

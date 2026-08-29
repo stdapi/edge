@@ -56,7 +56,7 @@ func BenchmarkLookup(b *testing.B) {
 			b.ReportAllocs()
 			for b.Loop() {
 				*c.params = (*c.params)[:0]
-				if _, n, _ := tree.lookup(http.MethodGet, tc.host, tc.path, c, false); n == nil {
+				if _, n := tree.lookup(http.MethodGet, tc.host, tc.path, c, false); n == nil {
 					b.Fatal("no match")
 				}
 			}
@@ -96,7 +96,7 @@ func BenchmarkLookupDeepTree(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		*c.params = (*c.params)[:0]
-		if _, n, _ := tree.lookup(http.MethodGet, host, path, c, false); n == nil {
+		if _, n := tree.lookup(http.MethodGet, host, path, c, false); n == nil {
 			b.Fatal("no match")
 		}
 	}

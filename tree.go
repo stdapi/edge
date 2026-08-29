@@ -39,7 +39,7 @@ func (t *iTree) txn() *tXn {
 	}
 }
 
-func (t *iTree) lookup(method, hostPort, path string, c *Context, lazy bool) (int, *node, bool) {
+func (t *iTree) lookup(method, hostPort, path string, c *Context, lazy bool) (int, *node) {
 	return t.patterns.lookup(method, hostPort, path, c, lazy)
 }
 
@@ -48,8 +48,7 @@ func (t *iTree) lookup(method, hostPort, path string, c *Context, lazy bool) (in
 // no method because an authority has none to be compared against.
 func (t *iTree) lookupAuthority(host string, c *Context) (int, *node) {
 	*c.skipStack = (*c.skipStack)[:0]
-	idx, n, _ := lookupByHostname(t.patterns, "", host, "", c, true, true)
-	return idx, n
+	return lookupByHostname(t.patterns, "", host, "", c, true, true)
 }
 
 func (t *iTree) allocateContext() *Context {

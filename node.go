@@ -13,8 +13,6 @@ import (
 	"github.com/fox-toolkit/edge/internal/stringsutil"
 )
 
-const offsetZero = 0
-
 type node struct {
 	// entries holds the registered handlers if this node is a leaf.
 	entries []*Interceptor
@@ -60,37 +58,19 @@ type node struct {
 	host bool
 }
 
-func (n *node) lookup(method, hostPort, path string, c *Context, lazy bool) (int, *node, bool) {
+// lookup walks the hostname, then the path under it. Every key names a hostname before its
+// path, so the walk always starts on the hostname half and lookupByHostname is the only way
+// into lookupByPath.
+func (n *node) lookup(method, hostPort, path string, c *Context, lazy bool) (int, *node) {
 	*c.skipStack = (*c.skipStack)[:0]
-	// The tree for this method, we only have path registered
-	if len(n.params) == 0 && len(n.wildcards) == 0 && len(n.statics) == 1 && n.statics[0].label == slashDelim {
-		return lookupByPath(n, method, path, c, lazy, offsetZero)
-	}
-
-	host := netutil.StripHostPort(hostPort)
-	if host == "" {
-		return lookupByPath(n, method, path, c, lazy, offsetZero)
-	}
-
-	idx, nd, tsr := lookupByHostname(n, method, host, path, c, lazy, false)
-	if nd == nil {
-		// No match with hostname, fallback to path-only.
-		*c.skipStack = (*c.skipStack)[:0]
-		*c.params = (*c.params)[:0]
-		if i, pathNode, pathTsr := lookupByPath(n, method, path, c, lazy, offsetZero); pathNode != nil {
-			return i, pathNode, pathTsr
-		}
-	}
-	// Hostname match, direct or tsr. A tsr match counts as a direct match and hostname
-	// routes always have priority, so a hostname tsr beats a path-only direct match.
-	return idx, nd, tsr
+	return lookupByHostname(n, method, netutil.StripHostPort(hostPort), path, c, lazy, false)
 }
 
 // lookupByHostname walks the hostname half of the key. With authority set it stops there
 // and answers with the entry sitting on the node the hostname ended on, instead of
 // descending into the path: an authority key carries no path at all, which is what keeps
 // the two kinds of entry from ever reaching each other.
-func lookupByHostname(root *node, method, host, path string, c *Context, lazy, authority bool) (index int, n *node, tsr bool) {
+func lookupByHostname(root *node, method, host, path string, c *Context, lazy, authority bool) (index int, n *node) {
 	var (
 		charsMatched     int
 		skipStatic       bool
@@ -270,15 +250,15 @@ Walk:
 
 				if authority {
 					if i, ok := findAuthority(wildcardNode, c); ok {
-						return i, wildcardNode, false
+						return i, wildcardNode
 					}
 					*c.params = (*c.params)[:paramCnt]
 					continue
 				}
 
 				stackOffset := len(*c.skipStack)
-				if idx, subNode, subTsr := lookupByPath(wildcardNode, method, path, c, lazy, stackOffset); subNode != nil {
-					return idx, subNode, subTsr
+				if idx, subNode := lookupByPath(wildcardNode, method, path, c, lazy, stackOffset); subNode != nil {
+					return idx, subNode
 				}
 
 				*c.skipStack = (*c.skipStack)[:stackOffset]
@@ -291,13 +271,13 @@ Walk:
 
 	if authority {
 		if i, ok := findAuthority(matched, c); ok {
-			return i, matched, false
+			return i, matched
 		}
 	} else if _, pathChild := matched.getStaticEdge(slashDelim); pathChild != nil {
 		stackOffset := len(*c.skipStack)
-		idx, subNode, subTsr := lookupByPath(matched, method, path, c, lazy, stackOffset)
+		idx, subNode := lookupByPath(matched, method, path, c, lazy, stackOffset)
 		if subNode != nil {
-			return idx, subNode, subTsr
+			return idx, subNode
 		}
 
 		// Remove any unused skip nodes added during the path lookup.
@@ -325,31 +305,26 @@ Backtrack:
 	goto Walk
 }
 
-// lookupByPath returns the node matching path. When tsr is true, the returned node matches the
-// path with its trailing slash added or removed. Only routes not registered with ExactSlash are
-// eligible for a tsr match, and the node is nil when no interceptor matches either form.
+// lookupByPath returns the node matching path, or nil when nothing matches. An interceptor
+// registered with RelaxedSlash also matches the path with its trailing slash added or removed;
+// one registered with ExactSlash is never a candidate for that. The request is forwarded as the
+// client sent it either way, so nothing outside this walk needs to know which form matched.
 //
-// An interceptor registered with RelaxedSlash matches with and without its trailing slash.
-// A tsr candidate therefore counts as a direct match and keeps the priority of the
-// branch where it was found (static > regex param > param > regex wildcard > wildcard). The
-// lookup returns it without exploring lower priority alternatives on the skip stack, even when
-// one of them matches the path exactly. For example with /foo/ registered as RelaxedSlash and
-// /{a}, a request for /foo matches /foo/ because the static branch has priority over the
-// param branch.
+// A slash candidate counts as a direct match and keeps the priority of the branch where it was
+// found (static > regex param > param > regex wildcard > wildcard). The lookup returns it
+// without exploring lower priority alternatives on the skip stack, even when one of them
+// matches the path exactly. For example with /foo/ registered as RelaxedSlash and /{a}, a
+// request for /foo matches /foo/ because the static branch has priority over the param branch.
 //
 // When both slash variants of the same pattern are registered, each request form is served by
 // its exact variant. Static and param patterns need no special handling since the exact leaf
-// is checked before any tsr candidate. Catch-alls need special handling because the infix
+// is checked before any slash candidate. Catch-alls need special handling because the infix
 // wildcard (/+{x}/) is always walked before the suffix (/+{x}) to favor the longest match,
-// otherwise the suffix would always win as it matches any remainder. The infix tsr candidate
-// is recorded and only used when no suffix catch-all at the same node matches directly.
+// otherwise the suffix would always win as it matches any remainder. The infix candidate is
+// recorded and only used when no suffix catch-all at the same node matches directly.
 //
-// A tsr candidate never crosses a "//" boundary, so /foo// and /foo/ stay distinct.
-//
-// An interceptor registered with ExactSlash is never used as a tsr candidate. A proxy forwards
-// the target the client sent, so a slash correction is never acted on: tsr says the match only
-// held with the slash adjusted, and nothing rewrites the request because of it.
-func lookupByPath(root *node, method, path string, c *Context, lazy bool, stackOffset int) (index int, n *node, tsr bool) {
+// A slash candidate never crosses a "//" boundary, so /foo// and /foo/ stay distinct.
+func lookupByPath(root *node, method, path string, c *Context, lazy bool, stackOffset int) (index int, n *node) {
 
 	var (
 		charsMatched     int
@@ -358,6 +333,7 @@ func lookupByPath(root *node, method, path string, c *Context, lazy bool, stackO
 		childWildcardIdx int
 		wildcardOffset   int
 		parent           *node
+		deferredSlash    bool
 	)
 
 	matched := root
@@ -398,8 +374,8 @@ Walk:
 				// Child key is exactly search plus a trailing slash (e.g. search /foo, key /foo/),
 				// excluding keys ending in "//". The length check keeps the common mismatch cheap.
 				if keyLen == len(search)+1 && child.key[keyLen-1] == '/' && child.key[keyLen-2] != '/' && strings.HasPrefix(child.key, search) {
-					if i, tsrNode := matchTrailingSlash(child, method, c, lazy); tsrNode != nil {
-						return i, tsrNode, true
+					if i, slashNode := matchTrailingSlash(child, method, c, lazy); slashNode != nil {
+						return i, slashNode
 					}
 				}
 			}
@@ -485,13 +461,13 @@ Walk:
 								}
 								for j, route := range child.entries {
 									if route.handleSlash != ExactSlash && route.match(method, c) {
-										// This is the only case where we don't return a TSR match immediately. Interceptors like
-										// /+{args}/ (with TSR enabled) and /+{args} can coexist. For a request like /a/b/c,
-										// the infix /+{args}/ would match with TSR (adding a trailing slash), but we must
+										// This is the only case where we don't return a slash match immediately. Interceptors
+										// like /+{args}/ (with RelaxedSlash) and /+{args} can coexist. For a request like
+										// /a/b/c, the infix /+{args}/ would match with a trailing slash added, but we must
 										// first check whether a suffix catch-all directly matches. We capture the node here
 										// but defer parameter recording as a fallback.
 										n = child
-										tsr = true
+										deferredSlash = true
 										index = j
 										break WalkWildcard
 									}
@@ -572,13 +548,13 @@ Walk:
 						if !lazy {
 							*c.params = append(*c.params, search)
 						}
-						return i, wildcardNode, false
+						return i, wildcardNode
 					}
 				}
 			}
 
-			// fallback to tsr if any recorded
-			if tsr {
+			// fallback to the deferred slash candidate if any recorded
+			if deferredSlash {
 				if !lazy {
 					*c.params = append(*c.params, path[offset:])
 				}
@@ -592,7 +568,7 @@ Walk:
 	if matched.isLeaf() {
 		for i, route := range matched.entries {
 			if route.match(method, c) {
-				return i, matched, false
+				return i, matched
 			}
 		}
 	}
@@ -604,19 +580,19 @@ Walk:
 				if !lazy {
 					*c.params = append(*c.params, "")
 				}
-				return i, wildcardNode, false
+				return i, wildcardNode
 			}
 		}
 	}
 
 	if _, child := matched.getStaticEdge(slashDelim); child != nil && child.key == "/" && !strings.HasSuffix(path, "/") {
-		if i, tsrNode := matchTrailingSlash(child, method, c, lazy); tsrNode != nil {
-			return i, tsrNode, true
+		if i, slashNode := matchTrailingSlash(child, method, c, lazy); slashNode != nil {
+			return i, slashNode
 		}
 	} else if matched.key == "/" && parent != nil && parent.isLeaf() && !strings.HasSuffix(path, "//") {
 		for i, route := range parent.entries {
 			if route.handleSlash != ExactSlash && !route.pattern.catchAll && route.match(method, c) {
-				return i, parent, true
+				return i, parent
 			}
 		}
 	}
@@ -625,7 +601,7 @@ Backtrack:
 	if search == "/" && matched.isLeaf() && !strings.HasSuffix(path, "//") {
 		for i, route := range matched.entries {
 			if route.handleSlash != ExactSlash && !route.pattern.catchAll && route.match(method, c) {
-				return i, matched, true
+				return i, matched
 			}
 		}
 	}
