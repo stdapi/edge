@@ -1,0 +1,10 @@
+.idea
+*.prof
+*.test
+*.out
+go.work
+go.work.sum
+qodana.yaml
+new.txt
+old.txt
+CLAUDE.md

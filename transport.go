@@ -1,0 +1,148 @@
+// Copyright 2025 Sylvain Müller. All rights reserved.
+// Mount of this source code is governed by a Apache-2.0 license that can be found
+// at https://github.com/fox-toolkit/edge/blob/master/LICENSE.txt.
+
+package edge
+
+import (
+	"context"
+	"crypto/tls"
+	"crypto/x509"
+	"net"
+	"net/http"
+	"net/netip"
+	"net/url"
+	"time"
+)
+
+// Transport configures how the proxy reaches upstream servers. The zero value is not usable;
+// start from [DefaultTransport] and change what you need.
+type Transport struct {
+	// DialContext dials an upstream. It defaults to a net.Dialer with a 30s timeout and
+	// keep-alives enabled. Override it to pin a resolver, force a source address, or route
+	// upstream traffic through a tunnel.
+	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
+
+	// Proxy selects an upstream proxy for a request, chaining this proxy behind another.
+	// A nil Proxy, the default, connects directly.
+	Proxy func(*http.Request) (*url.URL, error)
+
+	// TLSClientConfig is the base configuration for upstream TLS handshakes. The proxy
+	// clones it and fills in the server name and the ALPN list per connection, so setting
+	// those here has no effect.
+	TLSClientConfig *tls.Config
+
+	// RootCAs verifies upstream certificates. A nil pool uses the host trust store.
+	RootCAs *x509.CertPool
+
+	TLSHandshakeTimeout   time.Duration
+	ResponseHeaderTimeout time.Duration
+	ExpectContinueTimeout time.Duration
+	IdleConnTimeout       time.Duration
+
+	MaxIdleConns        int
+	MaxIdleConnsPerHost int
+	MaxConnsPerHost     int
+
+	// InsecureSkipVerify disables upstream certificate verification. Interception already
+	// breaks the end to end guarantee for the client, so leaving verification on is what
+	// keeps the proxy from turning a broken upstream certificate into a silent success.
+	InsecureSkipVerify bool
+
+	// AllowHTTP2 lets the proxy negotiate h2 with upstreams. It defaults to true.
+	AllowHTTP2 bool
+
+	// AllowHTTP3 lets the proxy speak h3 to upstreams that advertise it. It defaults to
+	// false: an h3 upstream is only reachable over UDP, which is not always allowed where
+	// the proxy runs.
+	AllowHTTP3 bool
+
+	// DisableKeepAlives closes every upstream connection after a single request.
+	DisableKeepAlives bool
+}
+
+// DefaultTransport returns the upstream configuration the proxy uses when none is given.
+func DefaultTransport() *Transport {
+	return &Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		AllowHTTP2:            true,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: time.Second,
+		IdleConnTimeout:       90 * time.Second,
+		MaxIdleConns:          256,
+		MaxIdleConnsPerHost:   32,
+	}
+}
+
+// withUpstreamOverride lets a transparently redirected request reach the exact address the
+// client had resolved, instead of whatever resolving the authority again would produce.
+//
+// Connections are still pooled per authority, so two redirects to different members of the
+// same pool may share one upstream connection. Both are legitimate origins for that
+// authority, which makes the sharing harmless.
+func withUpstreamOverride(dial func(context.Context, string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
+	return func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if ap, ok := ctx.Value(upstreamAddrKey{}).(netip.AddrPort); ok && ap.IsValid() {
+			addr = ap.String()
+		}
+		return dial(ctx, network, addr)
+	}
+}
+
+// httpTransport builds a net/http transport for TCP upstreams. allowH2 decides whether it
+// may negotiate HTTP/2, which is how the proxy mirrors upstream the version the client chose
+// downstream: an app that asked for HTTP/1.1 must not have its request delivered over h2.
+//
+// Compression is deliberately left off. A proxy must put back on the wire the body the
+// origin produced, encoded the way the client asked for it: letting net/http add its own
+// Accept-Encoding and transparently gunzip would change both the request the origin sees and
+// the bytes the client gets, and would hide Content-Encoding from handlers.
+func (t *Transport) httpTransport(allowH2 bool) *http.Transport {
+	tlsCfg := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+	}
+	if t.TLSClientConfig != nil {
+		tlsCfg = t.TLSClientConfig.Clone()
+	}
+	if t.RootCAs != nil {
+		tlsCfg.RootCAs = t.RootCAs
+	}
+	if t.InsecureSkipVerify {
+		tlsCfg.InsecureSkipVerify = true
+	}
+
+	if allowH2 {
+		tlsCfg.NextProtos = []string{"h2", "http/1.1"}
+	} else {
+		tlsCfg.NextProtos = []string{"http/1.1"}
+	}
+
+	tr := &http.Transport{
+		Proxy:                 t.Proxy,
+		DialContext:           t.DialContext,
+		TLSClientConfig:       tlsCfg,
+		TLSHandshakeTimeout:   t.TLSHandshakeTimeout,
+		ResponseHeaderTimeout: t.ResponseHeaderTimeout,
+		ExpectContinueTimeout: t.ExpectContinueTimeout,
+		IdleConnTimeout:       t.IdleConnTimeout,
+		MaxIdleConns:          t.MaxIdleConns,
+		MaxIdleConnsPerHost:   t.MaxIdleConnsPerHost,
+		MaxConnsPerHost:       t.MaxConnsPerHost,
+		DisableKeepAlives:     t.DisableKeepAlives,
+		DisableCompression:    true,
+		ForceAttemptHTTP2:     allowH2,
+	}
+	if !allowH2 {
+		// A non-nil map is what tells net/http never to hand the connection to the HTTP/2
+		// implementation, whatever ALPN ends up negotiating.
+		tr.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	}
+	if tr.DialContext == nil {
+		tr.DialContext = (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+	}
+	tr.DialContext = withUpstreamOverride(tr.DialContext)
+	return tr
+}

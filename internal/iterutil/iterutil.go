@@ -1,0 +1,149 @@
+// The code in this package is derivative of https://github.com/jub0bs/iterutil (all credit to jub0bs).
+// Mount of this source code is governed by a MIT License that can be found
+// at https://github.com/jub0bs/iterutil/blob/main/LICENSE.
+
+package iterutil
+
+import (
+	"bytes"
+	"iter"
+	"strings"
+
+	"github.com/fox-toolkit/edge/internal/constraints"
+)
+
+func SeqOf[E any](elems ...E) iter.Seq[E] {
+	return func(yield func(E) bool) {
+		for _, e := range elems {
+			if !yield(e) {
+				return
+			}
+		}
+	}
+}
+
+func Map[A, B any](seq iter.Seq[A], f func(A) B) iter.Seq[B] {
+	return func(yield func(B) bool) {
+		for a := range seq {
+			if !yield(f(a)) {
+				return
+			}
+		}
+	}
+}
+
+func Len[E any](seq iter.Seq[E]) int {
+	var n int
+	for range seq {
+		n++
+	}
+	return n
+}
+
+func Take[I constraints.Integer, E any](seq iter.Seq[E], count I) iter.Seq[E] {
+	return func(yield func(E) bool) {
+		for e := range seq {
+			if count > 0 {
+				if !yield(e) {
+					return
+				}
+				count--
+				continue
+			}
+			return
+		}
+	}
+}
+
+func First[E any](seq iter.Seq[E]) E {
+	var zero E
+	for e := range seq {
+		return e
+	}
+	return zero
+}
+
+func At[I constraints.Integer, E any](seq iter.Seq[E], n I) (e E, ok bool) {
+	if n < 0 {
+		panic("cannot be negative")
+	}
+	for v := range seq {
+		if 0 < n {
+			n--
+			continue
+		}
+		e = v
+		ok = true
+		return
+	}
+	return
+}
+
+// SplitBytesSeq returns an iterator over all subslices of s separated by sep.
+// sep must not be empty, otherwise the iterator never terminates.
+func SplitBytesSeq(s, sep []byte) iter.Seq[[]byte] {
+	return splitBytesSeq(s, sep)
+}
+
+func splitBytesSeq(s, sep []byte) iter.Seq[[]byte] {
+	return func(yield func([]byte) bool) {
+		for {
+			i := bytes.Index(s, sep)
+			if i < 0 {
+				break
+			}
+			frag := s[:i]
+			if !yield(frag) {
+				return
+			}
+			s = s[i+len(sep):]
+		}
+		yield(s)
+	}
+}
+
+// SplitStringSeq returns an iterator over all substrings of s separated by sep.
+// sep must not be empty, otherwise the iterator never terminates.
+func SplitStringSeq(s, sep string) iter.Seq[string] {
+	return splitStringSeq(s, sep)
+}
+
+func splitStringSeq(s, sep string) iter.Seq[string] {
+	return func(yield func(string) bool) {
+		for {
+			i := strings.Index(s, sep)
+			if i < 0 {
+				break
+			}
+			frag := s[:i]
+			if !yield(frag) {
+				return
+			}
+			s = s[i+len(sep):]
+		}
+		yield(s)
+	}
+}
+
+// BackwardSplitStringSeq returns an iterator over all substrings of s separated
+// by sep, in reverse order. sep must not be empty, otherwise the iterator never terminates.
+func BackwardSplitStringSeq(s, sep string) iter.Seq[string] {
+	return backwardSplitSeq(s, sep)
+}
+
+func backwardSplitSeq(s, sep string) iter.Seq[string] {
+	return func(yield func(string) bool) {
+		for {
+			i := strings.LastIndex(s, sep)
+			if i < 0 {
+				break
+			}
+			frag := s[i+len(sep):]
+			if !yield(frag) {
+				return
+			}
+			s = s[:i]
+		}
+		yield(s)
+	}
+}

@@ -1,0 +1,93 @@
+name: Tests
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+          check-latest: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -count=1 -coverprofile=coverage.txt -covermode=atomic ./...
+
+      - name: Test with race detector
+        run: go test -race -count=1 ./...
+
+      - name: Upload coverage
+        if: matrix.os == 'ubuntu-latest'
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage.txt
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  conformance:
+    # The conformance suite drives the proxy with curl rather than a Go client, so a bug the
+    # proxy and a Go client would share cannot hide.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+          check-latest: true
+
+      - name: Check curl supports HTTP/3
+        run: |
+          curl --version
+          curl --version | grep -q HTTP3 || echo "no HTTP/3 in this curl, those tests will be skipped"
+
+      - name: Conformance
+        run: go test -count=1 -run 'TestConformance|TestQUIC' -v ./...
+
+  fuzz:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+          check-latest: true
+
+      - name: Fuzz the pattern parser
+        run: |
+          go test -run=^$ -fuzz=FuzzParsePattern -fuzztime=60s .
+          go test -run=^$ -fuzz=FuzzRoundTripRegistration -fuzztime=60s .
+          go test -run=^$ -fuzz=FuzzParseAuthorityPattern -fuzztime=60s .
+          go test -run=^$ -fuzz=FuzzSplitHostPort -fuzztime=60s .
+
+      - name: Fuzz the QUIC Initial parser
+        run: go test -run=^$ -fuzz=FuzzReassembler -fuzztime=120s ./internal/quicsniff/
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.26'
+          check-latest: true
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: latest
