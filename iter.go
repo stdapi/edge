@@ -43,7 +43,7 @@ func (it Iter) Methods() iter.Seq[string] {
 // concurrent use by multiple goroutine and while mutation on interceptors are ongoing.
 func (it Iter) Interceptors(pattern string) iter.Seq[*Interceptor] {
 	return func(yield func(*Interceptor) bool) {
-		matched := it.patterns.searchPattern(pattern)
+		matched := it.patterns.searchPattern(patternKey(pattern))
 		if matched == nil || !matched.isLeaf() {
 			return
 		}

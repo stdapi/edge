@@ -66,14 +66,14 @@ func ExampleRewrite() {
 }
 
 // Tell apart two local services that share a host, which is what a test environment is
-// usually made of. The port is a matcher, not part of the pattern.
-func ExampleWithPort() {
+// usually made of. The port belongs to the pattern.
+func Example_port() {
 	ca, _ := edge.GenerateCA()
 	p, _ := edge.New(edge.WithCA(ca))
 
-	p.MustAddInterceptor([]string{http.MethodGet}, "localhost/api/health", func(c *edge.Context) (*http.Response, error) {
+	p.MustAddInterceptor([]string{http.MethodGet}, "localhost:8080/api/health", func(c *edge.Context) (*http.Response, error) {
 		return edge.Text(http.StatusOK, "stubbed"), nil
-	}, edge.WithPort("8080"))
+	})
 
 	fmt.Println(p.InterceptorsLen())
 	// Output: 1

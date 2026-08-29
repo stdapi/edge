@@ -185,7 +185,7 @@ func (p *Proxy) MustAddInterceptor(methods []string, pattern string, handler Han
 //	+{any}/health                   every authority
 //	api.stripe.com/*{any}           every path on one host, which is how to just watch it
 //
-// The scheme and the port are matchers, not pattern syntax: see [WithScheme] and [WithPort].
+// The port belongs to the pattern, as "host:port/path". The scheme is a matcher: see [WithScheme].
 //
 // Registering an interceptor marks its authority for interception, so nothing else has to be
 // declared. An authority already tunneled is a conflict rather than a silent no-op, since the
@@ -263,15 +263,6 @@ func (p *Proxy) Interceptor(methods []string, pattern string, matchers ...Matche
 func (p *Proxy) Name(name string) *Interceptor {
 	tree := p.getTree()
 	return tree.byName(name)
-}
-
-// Match looks up the [Interceptor] that would serve r for target, without running any handler and
-// without capturing parameters. It reports tsr when the match only holds with the trailing
-// slash of the path added or removed.
-func (p *Proxy) Match(target Target, r *http.Request) (interceptor *Interceptor, tsr bool) {
-	txn := p.Txn(false)
-	defer txn.Abort()
-	return txn.Match(target, r)
 }
 
 // AuthoritiesLen returns the number of registered authority entries, the ones declared with
@@ -378,7 +369,9 @@ func (p *Proxy) newInterceptor(methods []string, pattern string, handler Handler
 		rte.methods = slices.Compact(rte.methods)
 	}
 
-	if len(rte.methods) == 1 && len(rte.matchers) == 0 {
+	if len(rte.methods) == 1 && len(rte.matchers) == 0 && rte.pattern.port == "" {
+		// A port is compared in matchSlow, so an interceptor naming one cannot take the fast
+		// path any more than one carrying a matcher can.
 		rte.methodFast = rte.methods[0]
 	}
 

@@ -74,34 +74,6 @@ func (m SchemeMatcher) Equal(matcher Matcher) bool {
 
 func (m SchemeMatcher) String() string { return "scheme=" + m.scheme }
 
-// PortMatcher matches the port of the request target. Attach one with [WithPort]. The port
-// compared against is always explicit: a request that carries none is given the default for
-// its scheme before the lookup.
-type PortMatcher struct {
-	port string
-}
-
-// MatchPort returns a [PortMatcher] for the given port.
-func MatchPort(port string) (PortMatcher, error) {
-	p, pe := parsePort(port, 0)
-	if pe != nil {
-		return PortMatcher{}, fmt.Errorf("%w: invalid port %q: %s", ErrInvalidMatcher, port, pe.Hint)
-	}
-	return PortMatcher{port: p}, nil
-}
-
-// Port returns the port this matcher requires.
-func (m PortMatcher) Port() string { return m.port }
-
-func (m PortMatcher) Match(c RequestContext) bool { return c.Port() == m.port }
-
-func (m PortMatcher) Equal(matcher Matcher) bool {
-	other, ok := matcher.(PortMatcher)
-	return ok && other.port == m.port
-}
-
-func (m PortMatcher) String() string { return "port=" + m.port }
-
 // QueryMatcher matches an exact query parameter value.
 type QueryMatcher struct {
 	key   string
@@ -310,7 +282,6 @@ func (f MatcherFunc) Equal(Matcher) bool { return false }
 
 var (
 	_ Matcher = SchemeMatcher{}
-	_ Matcher = PortMatcher{}
 	_ Matcher = QueryMatcher{}
 	_ Matcher = QueryRegexpMatcher{}
 	_ Matcher = HeaderMatcher{}

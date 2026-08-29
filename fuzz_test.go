@@ -18,10 +18,11 @@ func FuzzParsePattern(f *testing.F) {
 		"api.stripe.com/v1/charges",
 		"https://api.stripe.com/v1/charges",
 		"localhost:8080/api",
+		"[::1]:8443/health",
+		"[::1]/health",
 		"+{sub}.stripe.com/v1/{id}",
 		"/v1/charges",
 		"127.0.0.1/health",
-		"::1/health",
 		"api.stripe.com/files/*{path}",
 		"api.stripe.com/files/+{path}/meta",
 		"://",
@@ -50,17 +51,16 @@ func FuzzParsePattern(f *testing.F) {
 		if pat.str != raw {
 			t.Fatalf("pattern.str = %q, want the input %q", pat.str, raw)
 		}
-		if pat.key != raw {
-			t.Fatalf("pattern.key = %q, want the input %q", pat.key, raw)
+		// The key is the pattern minus its port and the brackets of an address literal, so
+		// two patterns differing only by their port share one node.
+		if pat.key != pat.host+pat.path {
+			t.Fatalf("pattern.key = %q, want host %q plus path %q", pat.key, pat.host, pat.path)
 		}
-		if pat.host+pat.path != raw {
-			t.Fatalf("host %q plus path %q is not the pattern %q", pat.host, pat.path, raw)
+		if pat.key != patternKey(raw) {
+			t.Fatalf("patternKey(%q) = %q, want the parsed key %q", raw, patternKey(raw), pat.key)
 		}
-		if pat.port != "" {
-			t.Fatalf("a route pattern must carry no port, got %q", pat.port)
-		}
-		if pat.endHost != len(pat.host) {
-			t.Fatalf("endHost = %d, host is %d bytes", pat.endHost, len(pat.host))
+		if pat.port != "" && strings.Index(raw, ":"+pat.port) < 0 {
+			t.Fatalf("pattern.port = %q, which the input %q does not carry", pat.port, raw)
 		}
 	})
 }
@@ -71,7 +71,6 @@ func FuzzRoundTripRegistration(f *testing.F) {
 	seeds := []string{
 		"api.stripe.com/v1/charges",
 		"127.0.0.1/health",
-		"::1/health",
 		"+{sub}.corp.internal/health",
 		"/v1/charges",
 	}

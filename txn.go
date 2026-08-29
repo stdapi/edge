@@ -2,7 +2,6 @@ package edge
 
 import (
 	"fmt"
-	"net/http"
 	"slices"
 	"strings"
 
@@ -270,7 +269,7 @@ func (txn *Txn) Interceptor(methods []string, pattern string, matchers ...Matche
 	}
 
 	root := txn.rootTxn.patterns
-	matched := root.searchPattern(pattern)
+	matched := root.searchPattern(patternKey(pattern))
 	if matched == nil || !matched.isLeaf() {
 		return nil
 	}
@@ -298,36 +297,6 @@ func (txn *Txn) Name(name string) *Interceptor {
 	}
 
 	return matched.entries[0]
-}
-
-// Match performs an interceptor lookup for the given target and request, returning the matching
-// [Interceptor] if there is one. No handler runs and no parameter is captured; use [Txn.Lookup]
-// when the captures are needed.
-func (txn *Txn) Match(target Target, r *http.Request) (interceptor *Interceptor, tsr bool) {
-	if txn.rootTxn == nil {
-		panic(ErrSettledTxn)
-	}
-	if r == nil || r.Method == "" {
-		return nil, false
-	}
-
-	tree := txn.rootTxn.tree
-	c := tree.pool.Get().(*Context)
-	defer tree.pool.Put(c)
-
-	target = target.normalized()
-	c.reset(nil, r, target.Scheme, target.Host, target.Port)
-
-	path, ok := txn.p.normalizeForMatch(routingPath(r))
-	if !ok {
-		return nil, false
-	}
-
-	idx, n, tsr := txn.rootTxn.patterns.lookup(r.Method, target.Host, path, c, true)
-	if n != nil {
-		return n.entries[idx], tsr
-	}
-	return nil, false
 }
 
 // InterceptorsLen returns the number of registered interceptors.

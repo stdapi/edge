@@ -24,13 +24,33 @@ func testProxy(t *testing.T, opts ...Option) *Proxy {
 
 func noopHandler(*Context) (*http.Response, error) { return Status(http.StatusOK), nil }
 
-// match resolves the interceptor that would serve method and rawURL.
+// match resolves the interceptor that would serve method and path on authority.
 func match(t *testing.T, p *Proxy, method, scheme, authority, path string) *Interceptor {
 	t.Helper()
-	req := httptest.NewRequest(method, path, nil)
+	return matchRequest(t, p, scheme, authority, httptest.NewRequest(method, path, nil))
+}
+
+// matchRequest runs the lookup serve runs, without running a handler. It is the routing
+// oracle the tests assert on: a real request, resolved the way a served one is.
+func matchRequest(t *testing.T, p *Proxy, scheme, authority string, req *http.Request) *Interceptor {
+	t.Helper()
 	host, port := splitHostPort(authority)
-	rte, _ := p.Match(Target{Scheme: scheme, Host: host, Port: port}, req)
-	return rte
+	target := Target{Scheme: scheme, Host: host, Port: port}.normalized()
+
+	tree := p.getTree()
+	c := tree.pool.Get().(*Context)
+	defer tree.pool.Put(c)
+	c.reset(nil, req, target.Scheme, target.Host, target.Port)
+
+	path, ok := p.normalizeForMatch(routingPath(req))
+	if !ok {
+		return nil
+	}
+	idx, n, _ := tree.lookup(req.Method, target.Host, path, c, false)
+	if n == nil {
+		return nil
+	}
+	return n.entries[idx]
 }
 
 func TestRouting_SchemeIsOptional(t *testing.T) {
@@ -64,7 +84,7 @@ func TestRouting_SchemeQualifiedBeatsUnqualified(t *testing.T) {
 
 func TestRouting_PortIsOptional(t *testing.T) {
 	p := testProxy(t)
-	p.MustAddInterceptor([]string{http.MethodGet}, "localhost/api", noopHandler, WithPort("8080"))
+	p.MustAddInterceptor([]string{http.MethodGet}, "localhost:8080/api", noopHandler)
 
 	assert.NotNil(t, match(t, p, http.MethodGet, "http", "localhost:8080", "/api"))
 	assert.Nil(t, match(t, p, http.MethodGet, "http", "localhost:9090", "/api"))
@@ -146,8 +166,8 @@ func TestRouting_HostnameIsRequired(t *testing.T) {
 
 func TestRouting_IPLiteralHost(t *testing.T) {
 	p := testProxy(t)
-	p.MustAddInterceptor([]string{http.MethodGet}, "127.0.0.1/health", noopHandler, WithPort("8080"))
-	p.MustAddInterceptor([]string{http.MethodGet}, "::1/health", noopHandler, WithPort("8080"))
+	p.MustAddInterceptor([]string{http.MethodGet}, "127.0.0.1:8080/health", noopHandler)
+	p.MustAddInterceptor([]string{http.MethodGet}, "[::1]:8080/health", noopHandler)
 
 	assert.NotNil(t, match(t, p, http.MethodGet, "http", "127.0.0.1:8080", "/health"))
 	assert.NotNil(t, match(t, p, http.MethodGet, "http", "[::1]:8080", "/health"))
@@ -203,4 +223,67 @@ func countAuthorities(p *Proxy) int {
 		n++
 	}
 	return n
+}
+
+// Two interceptors differing only by their port share a tree key and are told apart by the
+// port alone. They are two entries, not a conflict and not one another's update.
+func TestRouting_PortDiscriminatesTwoInterceptors(t *testing.T) {
+	p := testProxy(t)
+
+	api := p.MustAddInterceptor([]string{http.MethodGet}, "localhost:8080/api", noopHandler)
+	ui := p.MustAddInterceptor([]string{http.MethodGet}, "localhost:3000/api", noopHandler)
+	assert.Equal(t, 2, p.InterceptorsLen())
+
+	assert.Same(t, api, match(t, p, http.MethodGet, "http", "localhost:8080", "/api"))
+	assert.Same(t, ui, match(t, p, http.MethodGet, "http", "localhost:3000", "/api"))
+	assert.Nil(t, match(t, p, http.MethodGet, "http", "localhost:9090", "/api"))
+
+	// Each one arms only its own authority.
+	assert.Equal(t, Intercept, p.Decide(target("localhost:8080")))
+	assert.Equal(t, Intercept, p.Decide(target("localhost:3000")))
+	assert.Equal(t, Reject, p.Decide(target("localhost:9090")))
+
+	// The pattern identifies them, so no matcher has to be passed back to find one.
+	assert.Same(t, api, p.Interceptor([]string{http.MethodGet}, "localhost:8080/api"))
+	assert.Same(t, ui, p.Interceptor([]string{http.MethodGet}, "localhost:3000/api"))
+	assert.Nil(t, p.Interceptor([]string{http.MethodGet}, "localhost/api"))
+
+	deleted, err := p.DeleteInterceptor([]string{http.MethodGet}, "localhost:8080/api")
+	require.NoError(t, err)
+	assert.Same(t, api, deleted)
+	assert.Same(t, ui, match(t, p, http.MethodGet, "http", "localhost:3000", "/api"))
+	assert.Equal(t, Reject, p.Decide(target("localhost:8080")))
+}
+
+// An interceptor naming a port is more narrowly targeted than one accepting every port, so it
+// is tried first whatever else narrows the other.
+func TestRouting_PortOutranksTheRest(t *testing.T) {
+	p := testProxy(t)
+
+	beta, err := MatchHeader("X-Channel", "beta")
+	require.NoError(t, err)
+
+	// Registered least specific first, so only the ordering can put them back in order.
+	any := p.MustAddInterceptor(nil, "localhost/api", noopHandler)
+	header := p.MustAddInterceptor(nil, "localhost/api", noopHandler, WithMatcher(beta))
+	get := p.MustAddInterceptor([]string{http.MethodGet}, "localhost/api", noopHandler)
+	port := p.MustAddInterceptor(nil, "localhost:8080/api", noopHandler)
+
+	req := httptest.NewRequest(http.MethodGet, "/api", nil)
+	req.Header.Set("X-Channel", "beta")
+
+	got := matchRequest(t, p, "http", joinHostPort("localhost", "8080"), req)
+	assert.Same(t, port, got, "the port beats a method and a matcher")
+
+	got = matchRequest(t, p, "http", joinHostPort("localhost", "9090"), req)
+	assert.Same(t, get, got, "off that port, the method tier decides")
+
+	post := httptest.NewRequest(http.MethodPost, "/api", nil)
+	post.Header.Set("X-Channel", "beta")
+	got = matchRequest(t, p, "http", joinHostPort("localhost", "9090"), post)
+	assert.Same(t, header, got, "off the method, the matcher tier decides")
+
+	plain := httptest.NewRequest(http.MethodPost, "/api", nil)
+	got = matchRequest(t, p, "http", joinHostPort("localhost", "9090"), plain)
+	assert.Same(t, any, got, "with nothing left, the fallback")
 }

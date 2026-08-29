@@ -84,7 +84,7 @@ func TestAuthority_StaticBeatsWildcard(t *testing.T) {
 // nothing, so an interceptor scoped to a port arms only that port.
 func TestAuthority_PortScoped(t *testing.T) {
 	p := testProxy(t)
-	p.MustAddInterceptor([]string{http.MethodGet}, "localhost/api", noopHandler, WithPort("8080"))
+	p.MustAddInterceptor([]string{http.MethodGet}, "localhost:8080/api", noopHandler)
 
 	assert.Equal(t, Intercept, p.Decide(target("localhost:8080")))
 	assert.Equal(t, Reject, p.Decide(target("localhost:9090")))

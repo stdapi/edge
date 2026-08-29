@@ -90,15 +90,16 @@ An authority cannot be both tunneled and intercepted by the same pattern. Declar
 
 ## Patterns
 
-A pattern is a hostname and a path. The hostname is required: it is the authority the interceptor arms.
+A pattern is an authority and a path. The authority is required: it is what the interceptor arms.
 
 ```
 api.stripe.com/v1/charges           any scheme, any port
+api.stripe.com:8443/v1/charges      one port
 +{sub}.corp.internal/health         every subdomain
 +{any}/v1/charges                   every authority
 api.stripe.com/*{any}               every path on one host, which is how to just watch it
 127.0.0.1/health                    address literal
-::1/health                          IPv6, no brackets
+[::1]:8080/health                   IPv6, bracketed
 ```
 
 Parameters use Fox's syntax:
@@ -108,21 +109,30 @@ Parameters use Fox's syntax:
 
 Matching priority is static, then regex parameter, then parameter, then regex wildcard, then wildcard, with backtracking to the last decision point.
 
-An address literal has one spelling, the one a request presents: `::1`, not `[::1]` or `::0001`.
+An address literal has one spelling, the one an authority carries: `[::1]`, not `::1` or `[::0001]`.
 
-### Scheme and port
+### Port
 
-They are matchers, not part of the pattern:
+The port is part of the pattern:
 
 ```go
-p.MustAddInterceptor([]string{"GET"}, "localhost/api", api, edge.WithPort("8080"))
-p.MustAddInterceptor([]string{"GET"}, "localhost/", ui, edge.WithPort("3000"))
+p.MustAddInterceptor([]string{"GET"}, "localhost:8080/api", api)
+p.MustAddInterceptor([]string{"GET"}, "localhost:3000/", ui)
+```
+
+Two patterns differing only by their port are two interceptors, and each arms only its own authority. An interceptor naming no port matches every port, and one naming a port is tried first, ahead of a method or a matcher. The port compared against is always explicit, so `api.test:443/v1` matches a plain `https://api.test/v1` target.
+
+An authority pattern carries its port the same way: `p.AddTunnel("localhost:8080")`.
+
+### Scheme
+
+The scheme is a matcher, not part of the pattern:
+
+```go
 p.MustAddInterceptor([]string{"POST"}, "api.test/v1", h, edge.WithScheme("https"))
 ```
 
-An interceptor with no port matches every port. The port compared against is always explicit, so `WithPort("443")` matches a plain `https://` target. Writing either in a pattern is an error describing what is refused.
-
-An authority pattern does carry a port, since there is no path to confuse it with: `p.AddTunnel("localhost:8080")`.
+Writing one in a pattern is an error describing what is refused.
 
 ## Message framing
 

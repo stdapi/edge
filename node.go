@@ -329,8 +329,8 @@ Backtrack:
 // path with its trailing slash added or removed. Only routes not registered with ExactSlash are
 // eligible for a tsr match, and the node is nil when no interceptor matches either form.
 //
-// An interceptor registered with RelaxedSlash or RedirectSlash matches with and without its trailing
-// slash. A tsr candidate therefore counts as a direct match and keeps the priority of the
+// An interceptor registered with RelaxedSlash matches with and without its trailing slash.
+// A tsr candidate therefore counts as a direct match and keeps the priority of the
 // branch where it was found (static > regex param > param > regex wildcard > wildcard). The
 // lookup returns it without exploring lower priority alternatives on the skip stack, even when
 // one of them matches the path exactly. For example with /foo/ registered as RelaxedSlash and
@@ -346,11 +346,9 @@ Backtrack:
 //
 // A tsr candidate never crosses a "//" boundary, so /foo// and /foo/ stay distinct.
 //
-// An interceptor registered with ExactSlash is never used as a tsr candidate, but a slash correction
-// triggered by another route can still redirect traffic to it, for example /foo/ registered with
-// ExactSlash and /{a}/ registered with RedirectSlash. A request for /foo finds no direct match
-// and the param branch offers /{a}/ as a tsr candidate, so the router redirects to /foo/. The
-// client follows the redirect and the new request is a direct match for the static /foo/ route.
+// An interceptor registered with ExactSlash is never used as a tsr candidate. A proxy forwards
+// the target the client sent, so a slash correction is never acted on: tsr says the match only
+// held with the slash adjusted, and nothing rewrites the request because of it.
 func lookupByPath(root *node, method, path string, c *Context, lazy bool, stackOffset int) (index int, n *node, tsr bool) {
 
 	var (
@@ -682,7 +680,8 @@ func matchTrailingSlash(child *node, method string, c *Context, lazy bool) (int,
 
 func (n *node) addEntry(route *Interceptor) {
 	// Method-less and no matchers is always evaluated last.
-	if len(route.methods) == 0 && len(route.matchers) == 0 {
+	if len(route.methods) == 0 && len(route.matchers) == 0 && route.pattern.port == "" {
+		// Nothing narrows it, so it is the fallback and belongs last.
 		n.entries = append(n.entries, route)
 		return
 	}
@@ -692,8 +691,9 @@ func (n *node) addEntry(route *Interceptor) {
 }
 
 func (n *node) replaceEntry(idx int, route *Interceptor) {
-	// Priority unchanged or no matchers, replace in place
-	if n.entries[idx].priority == route.priority || len(route.matchers) == 0 {
+	// Priority unchanged or nothing to order on, replace in place. A port is part of the
+	// pattern, so an update never changes it: the two would be different entries.
+	if n.entries[idx].priority == route.priority || (len(route.matchers) == 0 && route.pattern.port == "") {
 		n.entries[idx] = route
 		return
 	}
@@ -704,13 +704,29 @@ func (n *node) replaceEntry(idx int, route *Interceptor) {
 	n.entries = slices.Insert(n.entries, pos, route)
 }
 
+// findInsertPosition orders the entries of a node from the most narrowly targeted to the
+// least, so a lookup takes the first one that accepts and never has to look further.
+//
+// The tiers run from what a request is addressed to toward how it is shaped: the port, which
+// is the last piece of the target that stays out of the key, then the method, then the
+// matchers, which are arbitrary predicates. Within the matcher tier, priority decides.
 func (n *node) findInsertPosition(route *Interceptor) int {
+	hasPort := route.pattern.port != ""
 	hasMethods := len(route.methods) > 0
 	hasMatchers := len(route.matchers) > 0
 
 	for i, existing := range n.entries {
+		existingHasPort := existing.pattern.port != ""
 		existingHasMethods := len(existing.methods) > 0
 		existingHasMatchers := len(existing.matchers) > 0
+
+		// Routes naming a port before routes accepting every one
+		if hasPort && !existingHasPort {
+			return i
+		}
+		if hasPort != existingHasPort {
+			continue
+		}
 
 		// Routes with methods before routes without
 		if hasMethods && !existingHasMethods {
@@ -1011,7 +1027,7 @@ func (n *node) isLeaf() bool {
 // keeps that structural fact checked rather than assumed.
 func findAuthority(n *node, c *Context) (int, bool) {
 	for i, entry := range n.entries {
-		if entry.pattern.path == "" && entry.matchersAccept(c) {
+		if entry.pattern.path == "" && entry.acceptsPort(c) && entry.matchersAccept(c) {
 			return i, true
 		}
 	}

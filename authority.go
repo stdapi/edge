@@ -241,11 +241,6 @@ func (p *Proxy) newAuthority(pattern string, action Action, implicit bool) (*Int
 		}
 	}
 
-	if pat.port != "" {
-		rte.matchers = append(rte.matchers, PortMatcher{port: pat.port})
-	}
-	rte.priority = uint(len(rte.matchers))
-
 	return rte, nil
 }
 
@@ -258,17 +253,5 @@ func (p *Proxy) newAuthority(pattern string, action Action, implicit bool) (*Int
 // interception terminates TLS, and doing that on a port no interceptor can serve would be
 // visible to the client for nothing.
 func (p *Proxy) impliedAuthorityFor(ic *Interceptor) (*Interceptor, error) {
-	return p.newAuthority(joinHostPort(ic.pattern.host, interceptorPort(ic)), Intercept, true)
-}
-
-// interceptorPort returns the port an interceptor restricts itself to, or an empty string
-// when it accepts any. An interceptor says so with [WithPort], which attaches a
-// [PortMatcher].
-func interceptorPort(ic *Interceptor) string {
-	for _, m := range ic.matchers {
-		if pm, ok := m.(PortMatcher); ok {
-			return pm.port
-		}
-	}
-	return ""
+	return p.newAuthority(joinHostPort(ic.pattern.host, ic.pattern.port), Intercept, true)
 }

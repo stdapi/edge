@@ -81,8 +81,11 @@ func (r *Interceptor) Params() iter.Seq[string] {
 	return slices.Values(r.params)
 }
 
-// MatchersLen returns the number of matchers attached to this interceptor, including the implicit
-// scheme and port matchers derived from the pattern.
+// Port returns the port this interceptor is restricted to, or an empty string when it accepts
+// every port.
+func (r *Interceptor) Port() string { return r.pattern.port }
+
+// MatchersLen returns the number of matchers attached to this interceptor.
 func (r *Interceptor) MatchersLen() int { return len(r.matchers) }
 
 // Matchers returns an iterator over the matchers attached to this interceptor.
@@ -141,7 +144,14 @@ func (r *Interceptor) matchSlow(method string, c *Context) bool {
 			return false
 		}
 	}
-	return r.matchersAccept(c)
+	return r.acceptsPort(c) && r.matchersAccept(c)
+}
+
+// acceptsPort reports whether the target port is the one this interceptor names. A pattern
+// naming none accepts every port, which is why the port is kept beside the tree key rather
+// than folded into it.
+func (r *Interceptor) acceptsPort(c *Context) bool {
+	return r.pattern.port == "" || r.pattern.port == c.port
 }
 
 // matchersAccept reports whether every matcher on r accepts c. It is the matcher half of
@@ -156,6 +166,13 @@ func (r *Interceptor) matchersAccept(c *Context) bool {
 		}
 	}
 	return true
+}
+
+// samePort reports whether two interceptors name the same port. It is part of what identifies
+// an entry: two patterns differing only by their port are two entries on one node, not a
+// conflict and not one another's update.
+func (r *Interceptor) samePort(other *Interceptor) bool {
+	return r.pattern.port == other.pattern.port
 }
 
 // matchersEqual reports whether this interceptor's matchers are equal to the provided ones.
@@ -187,7 +204,7 @@ func entryf(sb *strings.Builder, route *Interceptor, pad int, showName bool) {
 		sb.WriteString("authority:")
 		sb.WriteString(route.pattern.str)
 		sb.WriteString(" action:")
-		sb.WriteString(route.pattern.str)
+		sb.WriteString(route.action.String())
 		return
 	}
 

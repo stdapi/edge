@@ -20,10 +20,9 @@ type Param struct {
 // RequestContext is the read-only view of a [Context] handed to a [Matcher]. Its lifetime is
 // the [Matcher.Match] call; the underlying context is reused once that call returns.
 //
-// It exposes what the request itself carries and nothing else. A matcher selects one request,
+// It exposes what the request itself carries and nothing else. A matcher selects one request
 // while a connection carries many, so reading the connection here would let an interceptor be
-// chosen on state its request does not describe. It is also what makes a matcher answer the
-// same way under [Proxy.Match], which routes a request with no connection behind it.
+// chosen on state its own request does not describe.
 type RequestContext interface {
 	// Request returns the request being routed.
 	Request() *http.Request
@@ -186,9 +185,8 @@ func (c *Context) Header(key string) string {
 }
 
 // RemoteAddr returns the address the request was received from, or the zero value when it
-// carries none. It reads the request rather than the connection, so a matcher answers the
-// same way here and under [Proxy.Match]. Use [Session.RemoteAddr] for the address of the
-// connection itself, which no handler can rewrite.
+// carries none. Use [Session.RemoteAddr] for the address of the connection, which is the same
+// for every request multiplexed on it and which no handler can rewrite.
 func (c *Context) RemoteAddr() netip.AddrPort {
 	if c.req == nil {
 		return netip.AddrPort{}

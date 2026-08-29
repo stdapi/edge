@@ -66,7 +66,7 @@ func (t *iTree) allocateContext() *Context {
 // interceptor returns the interceptor registered for the exact combination of methods, pattern and
 // matchers, or nil.
 func (t *iTree) interceptor(methods []string, pattern string, matchers []Matcher) *Interceptor {
-	matched := t.patterns.searchPattern(pattern)
+	matched := t.patterns.searchPattern(patternKey(pattern))
 	if matched == nil || !matched.isLeaf() {
 		return nil
 	}
@@ -310,6 +310,7 @@ func (t *tXn) insert(route *Interceptor, mode insertMode) error {
 	return nil
 }
 
+// TODO renommer route -> interceptor
 func (t *tXn) insertTokens(p, n *node, tokens []token, route *Interceptor) (*node, error) {
 	// Base case: no tokens left, attach route
 	if len(tokens) == 0 {
@@ -318,7 +319,7 @@ func (t *tXn) insertTokens(p, n *node, tokens []token, route *Interceptor) (*nod
 			if n.isLeaf() {
 				var conflicts []*Interceptor
 				for _, r := range n.entries {
-					if r.matchersEqual(route.matchers) && slicesutil.Overlap(r.methods, route.methods) {
+					if r.samePort(route) && r.matchersEqual(route.matchers) && slicesutil.Overlap(r.methods, route.methods) {
 						conflicts = append(conflicts, r)
 					}
 				}
@@ -344,7 +345,7 @@ func (t *tXn) insertTokens(p, n *node, tokens []token, route *Interceptor) (*nod
 			var conflicts []*Interceptor
 			if route.pattern.optionalCatchAll && p != nil {
 				for _, r := range p.entries {
-					if (len(r.matchers) == 0 || r.matchersEqual(route.matchers)) && (len(r.methods) == 0 || slicesutil.Overlap(r.methods, route.methods)) {
+					if r.samePort(route) && (len(r.matchers) == 0 || r.matchersEqual(route.matchers)) && (len(r.methods) == 0 || slicesutil.Overlap(r.methods, route.methods)) {
 						conflicts = append(conflicts, r)
 					}
 				}
@@ -355,7 +356,7 @@ func (t *tXn) insertTokens(p, n *node, tokens []token, route *Interceptor) (*nod
 
 			for _, wildcard := range n.wildcards {
 				for _, r := range wildcard.entries {
-					if r.pattern.optionalCatchAll && (len(route.matchers) == 0 || route.matchersEqual(r.matchers)) && (len(route.methods) == 0 || slicesutil.Overlap(route.methods, r.methods)) {
+					if r.pattern.optionalCatchAll && r.samePort(route) && (len(route.matchers) == 0 || route.matchersEqual(r.matchers)) && (len(route.methods) == 0 || slicesutil.Overlap(route.methods, r.methods)) {
 						conflicts = append(conflicts, r)
 					}
 				}

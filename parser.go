@@ -15,33 +15,34 @@ import (
 	"github.com/fox-toolkit/edge/internal/stringsutil"
 )
 
-// pattern is a parsed interceptor pattern: a hostname followed by a path. key is what the radix
-// tree is indexed on, which for an interceptor is the pattern itself, byte for byte.
+// pattern is a parsed pattern: an authority, and for an interceptor a path after it. key is
+// what the radix tree is indexed on, which is the pattern minus its port.
 //
-// The scheme and the port are deliberately not part of an interceptor pattern. Neither is a tree
-// dimension: folding a scheme into the key would put it ahead of the path in the priority
-// order, so a scheme qualified parameter would outrank a static segment, and folding a port
-// into the hostname would turn "any port" into a host that no request could ever match.
-// They are expressed with [WithScheme] and [WithPort], which attach a matcher evaluated once
-// the walk has reached a leaf.
+// The port is deliberately not a tree dimension: folded into the hostname it would turn "any
+// port" into a host no request could ever match. It is kept beside the key and compared once
+// the walk has reached a leaf, which is what lets two entries share a key and differ only by
+// the port they name.
+//
+// The scheme is not in a pattern at all. Folding it into the key would put it ahead of the
+// path in the priority order, so a scheme qualified parameter would outrank a static segment.
+// It is expressed with [WithScheme], which attaches a matcher.
 type pattern struct {
 	str  string
 	key  string
 	host string
-	// port is set only for an interception rule, whose pattern is an authority and may
-	// carry one. An interceptor pattern never does; it uses [WithPort].
+	// port is the port the pattern names, empty when it names none and therefore matches
+	// every port. It is never part of key.
 	port             string
 	path             string
 	tokens           []token
 	optionalCatchAll bool
 	catchAll         bool
-	endHost          int
 }
 
-// parsePattern parses an interceptor pattern of the form host/path. The hostname is required: a
-// route arms the interception of the authority it names, and one that names none would arm
-// nothing, leaving a handler registered that no connection can ever reach. Matching every
-// authority is spelled with a wildcard, which says so.
+// parsePattern parses an interceptor pattern of the form host[:port]/path. The hostname is
+// required: a route arms the interception of the authority it names, and one that names none
+// would arm nothing, leaving a handler registered that no connection can ever reach. Matching
+// every authority is spelled with a wildcard, which says so.
 func (p *Proxy) parsePattern(raw string) (pattern, int, error) {
 	if len(raw) == 0 {
 		return pattern{}, 0, fmt.Errorf("%w: empty pattern", ErrInvalidInterceptor)
@@ -70,8 +71,8 @@ func (p *Proxy) parsePattern(raw string) (pattern, int, error) {
 		}
 	}
 
-	host := raw[:endHost]
 	path := raw[endHost:]
+	host := raw[:endHost]
 
 	if host == "" {
 		return pattern{}, 0, &PatternError{
@@ -84,7 +85,7 @@ func (p *Proxy) parsePattern(raw string) (pattern, int, error) {
 		}
 	}
 
-	hostTokens, paramCount, pe := p.parseInterceptorHostname(host)
+	host, port, hostTokens, paramCount, pe := p.parseAuthorityHost(host)
 	if pe != nil {
 		pe.Pattern = raw
 		pe.Type = "hostname"
@@ -104,56 +105,60 @@ func (p *Proxy) parsePattern(raw string) (pattern, int, error) {
 	tokens = append(tokens, hostTokens...)
 	tokens = append(tokens, pathTokens...)
 
+	// The key drops the port and the brackets of an address literal, so a pattern naming a
+	// port and one naming none land on the same node and are told apart by their port alone.
 	return pattern{
 		str:              raw,
-		key:              raw,
+		key:              host + path,
 		host:             host,
+		port:             port,
 		path:             path,
 		tokens:           tokens,
-		endHost:          endHost,
 		optionalCatchAll: optCatchAll,
 		catchAll:         pathTokens[len(pathTokens)-1].typ == nodeWildcard,
 	}, paramCount, nil
 }
 
-// parseInterceptorHostname parses the hostname half of an interceptor pattern.
+// parseAuthorityHost parses the authority half of a pattern: a hostname or an address
+// literal, optionally followed by a port. An interceptor pattern and an authority pattern
+// name an authority the same way, so they share this and differ only in what may follow.
 //
-// A port here is a mistake worth naming: the hostname is the tree key, and a port in it would
-// make the interceptor unreachable rather than narrow, so it is refused instead of folded in.
-func (p *Proxy) parseInterceptorHostname(host string) ([]token, int, *PatternError) {
-	if host[0] == '[' {
-		// Brackets exist in an authority to tell the colons of an address from the one
-		// before a port. An interceptor pattern carries no port, so they separate nothing.
-		end := strings.IndexByte(host, ']')
-		if end > 0 {
-			if canonical, ok := canonicalIP(host[1:end]); ok {
-				return nil, 0, newPatternError("syntax", 0, len(host),
-					"an interceptor pattern takes an address literal without brackets, write "+canonical)
-			}
-		}
-		return nil, 0, newPatternError("syntax", 0, len(host), "illegal character in label")
+// An address literal is written the way an authority carries it, which for IPv6 means
+// bracketed. The brackets tell the colons of the address from the one before a port, and a
+// host that could be spelled two ways would reach the tree under one key from two patterns.
+func (p *Proxy) parseAuthorityHost(raw string) (host, port string, tokens []token, params int, pe *PatternError) {
+	host, port, pe = splitHostPortPattern(raw)
+	if pe != nil {
+		return "", "", nil, 0, pe
+	}
+	if host == "" {
+		return "", "", nil, 0, newPatternError("syntax", 0, len(raw), "missing host")
 	}
 
 	if canonical, ok := canonicalIP(host); ok {
-		// An address is not a domain name: it has no labels to validate, no case to fold
-		// and no parameter to capture. It must be written the way a request will present
-		// it, since the pattern is what the tree is indexed on.
+		// An address is not a domain name: it has no labels to validate, no case to fold and
+		// no parameter to capture. It must be written the way a request will present it,
+		// since the hostname is what the tree is indexed on.
 		if canonical != host {
-			return nil, 0, newPatternError("syntax", 0, len(host),
-				"non-canonical address literal, write "+canonical)
+			return "", "", nil, 0, newPatternError("syntax", 0, len(raw),
+				"non-canonical address literal, write "+bracketed(canonical))
 		}
-		return []token{{typ: nodeStatic, value: host, hsplit: true}}, 0, nil
+		return host, port, []token{{typ: nodeStatic, value: host, hsplit: true}}, 0, nil
 	}
 
-	// Only a colon outside every brace can be a port: inside one it belongs to a regexp
-	// constraint, which parseHostname hands to parseBrace.
-	start := afterLastBrace(host)
-	if i := strings.IndexByte(host[start:], ':'); i >= 0 {
-		return nil, 0, newPatternError("syntax", start+i, len(host),
-			"a port is not part of an interceptor pattern")
+	tokens, params, pe = p.parseHostname(host)
+	if pe != nil {
+		return "", "", nil, 0, pe
 	}
+	return host, port, tokens, params, nil
+}
 
-	return p.parseHostname(host)
+// bracketed renders an address literal the way a pattern must spell it.
+func bracketed(addr string) string {
+	if strings.IndexByte(addr, ':') >= 0 {
+		return "[" + addr + "]"
+	}
+	return addr
 }
 
 // parseAuthorityPattern parses an authority pattern: a host with an optional port and no
@@ -189,56 +194,24 @@ func (p *Proxy) parseAuthorityPattern(raw string) (pattern, int, error) {
 		}
 	}
 
-	offset := 0
-	host, port, pe := splitHostPortPattern(raw)
+	host, port, hostTokens, paramCount, pe := p.parseAuthorityHost(raw)
 	if pe != nil {
 		pe.Pattern = raw
 		pe.Type = "authority"
-		pe.Start += offset
-		pe.End += offset
 		return pattern{}, 0, pe
-	}
-	if host == "" {
-		return pattern{}, 0, &PatternError{
-			Pattern: raw,
-			Type:    "authority",
-			Reason:  "syntax",
-			Hint:    "missing host",
-			Start:   0,
-			End:     len(raw),
-		}
-	}
-
-	var (
-		hostTokens []token
-		paramCount int
-	)
-	if canonical, ok := canonicalIP(host); ok {
-		host = canonical
-		hostTokens = []token{{typ: nodeStatic, value: host, hsplit: true}}
-	} else {
-		hostTokens, paramCount, pe = p.parseHostname(host)
-		if pe != nil {
-			pe.Pattern = raw
-			pe.Type = "hostname"
-			pe.Start += offset
-			pe.End += offset
-			return pattern{}, 0, pe
-		}
 	}
 
 	return pattern{
-		str:     raw,
-		key:     host,
-		host:    host,
-		port:    port,
-		tokens:  hostTokens,
-		endHost: len(host),
+		str:    raw,
+		key:    host,
+		host:   host,
+		port:   port,
+		tokens: hostTokens,
 	}, paramCount, nil
 }
 
-// splitHostPortPattern splits an authority into its host and port. The host of an IPv6
-// literal is returned without its brackets so it matches the form the lookup is given.
+// splitHostPortPattern splits an authority pattern into its host and port. The host of an
+// IPv6 literal is returned without its brackets, so it matches the form the lookup is given.
 func splitHostPortPattern(authority string) (host, port string, pe *PatternError) {
 	if authority == "" {
 		return "", "", nil
@@ -260,11 +233,19 @@ func splitHostPortPattern(authority string) (host, port string, pe *PatternError
 		default:
 			return "", "", newPatternError("syntax", end+1, len(authority), "illegal character after IPv6 literal")
 		}
+		// The inner text is returned as written. Refusing a non-canonical literal is
+		// parseAuthorityHost's job, and rewriting one here would let two spellings of the
+		// same address reach the tree under one key.
 		canonical, ok := canonicalIP(host)
-		if !ok || !strings.Contains(canonical, ":") {
+		if !ok {
 			return "", "", newPatternError("syntax", 1, end, "invalid IPv6 literal")
 		}
-		return canonical, port, nil
+		if strings.IndexByte(canonical, ':') < 0 {
+			// An IPv4-mapped literal unmaps to an address the brackets do not belong to.
+			return "", "", newPatternError("syntax", 0, end+1,
+				"non-canonical address literal, write "+canonical)
+		}
+		return host, port, nil
 	}
 
 	// A regexp constraint holds its own colons, so the port separator is looked for past the
@@ -284,6 +265,27 @@ func splitHostPortPattern(authority string) (host, port string, pe *PatternError
 		return "", "", pe
 	}
 	return authority[:i], port, nil
+}
+
+// patternKey returns the tree key of a raw pattern: the pattern minus its port, and minus the
+// brackets of an address literal. A lookup by pattern has to walk on this rather than on what
+// the caller wrote, since two patterns differing only by their port share one key.
+//
+// A malformed pattern is returned unchanged. It indexes nothing, so the walk finds nothing,
+// which is the answer a lookup by an unregistrable pattern deserves.
+func patternKey(raw string) string {
+	host, path := raw, ""
+	if i := strings.IndexByte(raw, '/'); i >= 0 {
+		host, path = raw[:i], raw[i:]
+	}
+	h, port, pe := splitHostPortPattern(host)
+	if pe != nil {
+		return raw
+	}
+	if port == "" && h == host {
+		return raw
+	}
+	return h + path
 }
 
 // afterLastBrace returns the index just past the last closing brace of s, or zero when it

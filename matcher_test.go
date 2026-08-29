@@ -23,8 +23,7 @@ func matchCtx(t *testing.T, method, target, path string, headers http.Header) Re
 		req.Header = headers
 	}
 
-	// No session: everything a matcher reads has to come off the request, or the same matcher
-	// would answer differently here and under Proxy.Match.
+	// No session: a matcher reads the request and nothing else.
 	req.RemoteAddr = "192.0.2.10:4242"
 	req.Proto, req.ProtoMajor, req.ProtoMinor = "HTTP/2.0", 2, 0
 
@@ -52,21 +51,6 @@ func TestMatcher_Scheme(t *testing.T) {
 
 	_, err = MatchScheme("ftp")
 	assert.ErrorIs(t, err, ErrInvalidMatcher)
-}
-
-func TestMatcher_Port(t *testing.T) {
-	m, err := MatchPort("8080")
-	require.NoError(t, err)
-	assert.Equal(t, "8080", m.Port())
-	assert.Equal(t, "port=8080", m.String())
-
-	assert.True(t, m.Match(matchCtx(t, http.MethodGet, "a.test:8080", "/", nil)))
-	assert.False(t, m.Match(matchCtx(t, http.MethodGet, "a.test:9090", "/", nil)))
-
-	for _, bad := range []string{"", "0", "70000", "80a", "080"} {
-		_, err := MatchPort(bad)
-		assert.ErrorIs(t, err, ErrInvalidMatcher, "port %q", bad)
-	}
 }
 
 func TestMatcher_Query(t *testing.T) {
@@ -160,11 +144,11 @@ func TestMatcher_NarrowsAnInterceptor(t *testing.T) {
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/charges", nil)
 	req.Header.Set("X-Channel", "beta")
-	got, _ := p.Match(Target{Scheme: "https", Host: "api.test", Port: "443"}, req)
+	got := matchRequest(t, p, "https", joinHostPort("api.test", "443"), req)
 	assert.Same(t, special, got, "the matched route must win over the fallback")
 
 	plain := httptest.NewRequest(http.MethodGet, "/v1/charges", nil)
-	got, _ = p.Match(Target{Scheme: "https", Host: "api.test", Port: "443"}, plain)
+	got = matchRequest(t, p, "https", joinHostPort("api.test", "443"), plain)
 	assert.Same(t, fallback, got)
 
 	// An interceptor carrying matchers is identified by them.
@@ -172,7 +156,9 @@ func TestMatcher_NarrowsAnInterceptor(t *testing.T) {
 	assert.Same(t, fallback, p.Interceptor([]string{http.MethodGet}, "api.test/v1/charges"))
 }
 
-func TestMatcher_ConnectionMatchersAreReadableUnderMatch(t *testing.T) {
+// The protocol and the client address are read off the request, so a matcher on either
+// narrows an interceptor with nothing but the request in hand.
+func TestMatcher_ProtocolAndRemoteIPComeFromTheRequest(t *testing.T) {
 	p := testProxy(t)
 
 	h3, err := MatchProtocol(HTTP3)
@@ -183,18 +169,12 @@ func TestMatcher_ConnectionMatchersAreReadableUnderMatch(t *testing.T) {
 	narrow := p.MustAddInterceptor([]string{http.MethodGet}, "api.test/v1/charges", noopHandler, WithMatchers(h3, lan))
 	fallback := p.MustAddInterceptor([]string{http.MethodGet}, "api.test/v1/charges", noopHandler)
 
-	target := Target{Scheme: "https", Host: "api.test", Port: "443"}
-
-	// Match runs without a session, so a matcher reading the connection instead of the request
-	// would never select this interceptor and Match would disagree with what serve does.
 	req := httptest.NewRequest(http.MethodGet, "/v1/charges", nil)
 	req.Proto, req.ProtoMajor, req.ProtoMinor = "HTTP/3.0", 3, 0
 	req.RemoteAddr = "192.0.2.10:4242"
-	got, _ := p.Match(target, req)
-	assert.Same(t, narrow, got)
+	assert.Same(t, narrow, matchRequest(t, p, "https", "api.test:443", req))
 
 	off := httptest.NewRequest(http.MethodGet, "/v1/charges", nil)
 	off.RemoteAddr = "198.51.100.10:4242"
-	got, _ = p.Match(target, off)
-	assert.Same(t, fallback, got)
+	assert.Same(t, fallback, matchRequest(t, p, "https", "api.test:443", off))
 }

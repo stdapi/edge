@@ -17,16 +17,16 @@ func TestInterceptor_Accessors(t *testing.T) {
 	p := testProxy(t)
 
 	type annotationKey struct{}
-	rte := p.MustAddInterceptor([]string{http.MethodGet}, "api.stripe.com/v1/{id}/refunds/*{rest}", noopHandler,
+	rte := p.MustAddInterceptor([]string{http.MethodGet}, "api.stripe.com:8443/v1/{id}/refunds/*{rest}", noopHandler,
 		WithName("refunds"),
 		WithAnnotation(annotationKey{}, "recorded"),
 		WithTrailingSlash(RelaxedSlash),
 		WithScheme("https"),
-		WithPort("8443"),
 	)
 
-	assert.Equal(t, "api.stripe.com/v1/{id}/refunds/*{rest}", rte.Pattern())
+	assert.Equal(t, "api.stripe.com:8443/v1/{id}/refunds/*{rest}", rte.Pattern())
 	assert.Equal(t, "api.stripe.com", rte.Hostname())
+	assert.Equal(t, "8443", rte.Port())
 	assert.Equal(t, "/v1/{id}/refunds/*{rest}", rte.Path())
 	assert.Equal(t, "refunds", rte.Name())
 	assert.Equal(t, "recorded", rte.Annotation(annotationKey{}))
@@ -37,13 +37,13 @@ func TestInterceptor_Accessors(t *testing.T) {
 	assert.Equal(t, 2, rte.ParamsLen())
 	assert.Equal(t, []string{"id", "rest"}, slices.Collect(rte.Params()))
 
-	assert.Equal(t, 2, rte.MatchersLen())
-	assert.Equal(t, uint(2), rte.MatchersPriority())
+	assert.Equal(t, 1, rte.MatchersLen())
+	assert.Equal(t, uint(1), rte.MatchersPriority())
 
 	assert.Contains(t, rte.String(), "method:GET")
 	assert.Contains(t, rte.String(), "name:refunds")
 	assert.Contains(t, rte.String(), "scheme=https")
-	assert.Contains(t, rte.String(), "port=8443")
+	assert.Contains(t, rte.String(), "pattern:api.stripe.com:8443/")
 }
 
 func TestInterceptor_NoMethodHasNoConstraint(t *testing.T) {

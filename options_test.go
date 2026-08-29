@@ -127,8 +127,11 @@ func TestOptions_LimitsAreEnforced(t *testing.T) {
 		p, err := New(WithCA(ca), WithMaxMatchers(1))
 		require.NoError(t, err)
 
+		header, err := MatchHeader("X-Channel", "beta")
+		require.NoError(t, err)
+
 		_, err = p.AddInterceptor([]string{http.MethodGet}, "api.test/v1", noopHandler,
-			WithScheme("https"), WithPort("8443"))
+			WithScheme("https"), WithMatcher(header))
 		require.ErrorIs(t, err, ErrTooManyMatchers)
 	})
 

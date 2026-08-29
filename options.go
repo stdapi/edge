@@ -404,29 +404,6 @@ func WithScheme(scheme string) interface {
 	})
 }
 
-// WithPort narrows an interceptor to one port. An interceptor with no port matches every port, and the
-// port compared against is always explicit: a request that carries none is given the default
-// for its scheme before the lookup, so 443 matches a plain https:// target.
-//
-// This is the usual way to tell apart services that share a host, which is what local test
-// environments are made of:
-//
-//	p.MustHandle([]string{"GET"}, "localhost/api", api, edge.WithPort("8080"))
-//	p.MustHandle([]string{"GET"}, "localhost/", ui, edge.WithPort("3000"))
-func WithPort(port string) interface {
-	InterceptorOption
-	MatcherOption
-} {
-	return optionFunc(func(s sealedOption) error {
-		m, err := MatchPort(port)
-		if err != nil {
-			return err
-		}
-		s.interceptor.matchers = append(s.interceptor.matchers, m)
-		return nil
-	})
-}
-
 // WithMatchersPriority orders routes that share a pattern. Higher runs first. It defaults to
 // the number of matchers on the interceptor, so the most constrained route is tried first.
 func WithMatchersPriority(priority uint) InterceptorOption {
