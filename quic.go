@@ -38,29 +38,29 @@ const (
 	quicPeerIdle = 2 * time.Minute
 )
 
-// PacketOriginalDestination resolves the address a redirected datagram was headed to, given
-// the local and remote addresses of the socket that received it. It is the UDP counterpart
-// of [OriginalDestination].
+// ListenAndServeQUIC listens for UDP on addr and serves the QUIC connections routed to it. It
+// is how HTTP/3 is intercepted.
 //
-// Without one the proxy places a QUIC connection by the server name in its ClientHello and
-// assumes port 443, which is where HTTP/3 is reached in practice.
-type PacketOriginalDestination func(local, remote net.Addr) (netip.AddrPort, error)
-
-// ListenAndServeQUIC listens for UDP on addr and serves the QUIC connections redirected to
-// it. It is the HTTP/3 half of transparent mode.
-//
-// HTTP/3 has no CONNECT equivalent a client can be pointed at: a proxy setting sends a
-// client back to TCP. Interception therefore only happens transparently, with the client's
-// datagrams routed here by the network.
+// A proxy setting sends an HTTP/3 client back to TCP, since CONNECT tunnels a stream and
+// HTTP/3 needs datagrams. No general purpose client implements MASQUE, which standardizes
+// tunneling them, so a client reaches this listener by being routed to it.
 func (p *Proxy) ListenAndServeQUIC(addr string) error {
 	pc, err := net.ListenPacket("udp", addr)
 	if err != nil {
 		return err
 	}
+	// A socket the platform cannot set up still serves every client that sends a server
+	// name, which is every HTTP/3 client in practice.
+	if transparent, terr := TransparentPacketConn(pc); terr == nil {
+		pc = transparent
+	} else {
+		p.cfg.logger.Debug("edge: no original destination for datagrams", slog.String("error", terr.Error()))
+	}
 	return p.ServeQUIC(pc)
 }
 
-// ServeQUIC serves the QUIC connections arriving on pc.
+// ServeQUIC serves the QUIC connections arriving on pc. Wrap pc in [TransparentPacketConn]
+// to place a client by the address it was headed to rather than by its server name alone.
 //
 // Each client is placed by reading the server name out of its first packets, which are
 // protected with keys derived from a connection ID sent in clear. A tunneled client has its
@@ -87,6 +87,8 @@ func (p *Proxy) ServeQUIC(pc net.PacketConn) error {
 // to the origin or handed to the QUIC server the proxy terminates.
 type quicDemux struct {
 	pc net.PacketConn
+	// origins is pc when it reports where its datagrams were headed, nil otherwise.
+	origins PacketOriginalDestination
 
 	p *Proxy
 
@@ -134,6 +136,7 @@ func newQUICDemux(p *Proxy, pc net.PacketConn) (*quicDemux, error) {
 		sessions: make(map[string]*Session),
 		done:     make(chan struct{}),
 	}
+	d.origins, _ = pc.(PacketOriginalDestination)
 	d.intercepted = newDemuxPacketConn(pc)
 	return d, nil
 }
@@ -338,15 +341,26 @@ func (d *quicDemux) targetFor(hello []byte, addr net.Addr) Target {
 		target.Host = stringsutil.ToLowerASCIIString(name)
 	}
 
-	if d.p.cfg.packetOriginalDst != nil {
-		if origin, err := d.p.cfg.packetOriginalDst(d.pc.LocalAddr(), addr); err == nil && origin.IsValid() {
-			target.Port = fmt.Sprint(origin.Port())
-			if target.Host == "" {
-				target.Host = origin.Addr().Unmap().String()
-			}
+	if origin := d.originalDst(addr); origin.IsValid() {
+		target.Port = fmt.Sprint(origin.Port())
+		if target.Host == "" {
+			target.Host = origin.Addr().String()
 		}
 	}
 	return target
+}
+
+// originalDst resolves where a datagram from client was headed before the redirect, or the
+// zero value when there was none.
+func (d *quicDemux) originalDst(client net.Addr) netip.AddrPort {
+	if d.origins == nil {
+		return netip.AddrPort{}
+	}
+	origin, err := d.origins.OriginalDestination(client)
+	if err != nil {
+		return netip.AddrPort{}
+	}
+	return redirectedTo(origin, d.pc.LocalAddr())
 }
 
 func (d *quicDemux) beginIntercept(key string, addr net.Addr, target Target, pending [][]byte) {
@@ -360,13 +374,9 @@ func (d *quicDemux) beginIntercept(key string, addr net.Addr, target Target, pen
 	sess.remoteAddr = addr
 	sess.localAddr = d.pc.LocalAddr()
 	sess.transparent = true
-	if d.p.cfg.packetOriginalDst != nil {
-		if origin, err := d.p.cfg.packetOriginalDst(d.pc.LocalAddr(), addr); err == nil && origin.IsValid() {
-			// Forwarding goes back to the address the client was headed to, not to a fresh
-			// resolution of the authority, which behind a redirect may not resolve at all.
-			sess.upstream = origin
-		}
-	}
+	// Forwarding goes back to the address the client was headed to, not to a fresh
+	// resolution of the authority, which behind a redirect may not resolve at all.
+	sess.upstream = d.originalDst(addr)
 
 	d.mu.Lock()
 	peer := d.peers[key]
@@ -440,10 +450,8 @@ func (d *quicDemux) beginTunnel(key string, addr net.Addr, target Target, pendin
 
 func (d *quicDemux) dialUpstreamUDP(target Target, client net.Addr) (net.Conn, error) {
 	addr := target.Authority()
-	if d.p.cfg.packetOriginalDst != nil {
-		if origin, err := d.p.cfg.packetOriginalDst(d.pc.LocalAddr(), client); err == nil && origin.IsValid() {
-			addr = origin.String()
-		}
+	if origin := d.originalDst(client); origin.IsValid() {
+		addr = origin.String()
 	}
 	return net.DialTimeout("udp", addr, 10*time.Second)
 }

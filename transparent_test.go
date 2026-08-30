@@ -14,11 +14,13 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/net/http2"
 )
 
 // startTransparent starts p on a loopback port in transparent mode.
@@ -27,6 +29,40 @@ func startTransparent(t *testing.T, p *Proxy) string {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	go func() { _ = p.ServeTransparent(ln) }()
+	t.Cleanup(func() { _ = p.Close() })
+	return ln.Addr().String()
+}
+
+// originListener makes every accepted connection report what origin answers, standing in for
+// the SO_ORIGINAL_DST or pf lookup a real redirect would answer.
+type originListener struct {
+	net.Listener
+	origin func(net.Conn) (netip.AddrPort, error)
+}
+
+func (l originListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	// A pointer, since the proxy tracks connections in a map and this one holds a func.
+	return &originConn{Conn: c, origin: l.origin}, nil
+}
+
+type originConn struct {
+	net.Conn
+	origin func(net.Conn) (netip.AddrPort, error)
+}
+
+func (c *originConn) OriginalDestination() (netip.AddrPort, error) { return c.origin(c.Conn) }
+
+// startTransparentRedirected starts p on a loopback port whose connections report where they
+// were headed.
+func startTransparentRedirected(t *testing.T, p *Proxy, origin func(net.Conn) (netip.AddrPort, error)) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	go func() { _ = p.ServeTransparent(originListener{Listener: ln, origin: origin}) }()
 	t.Cleanup(func() { _ = p.Close() })
 	return ln.Addr().String()
 }
@@ -251,16 +287,13 @@ func TestTransparent_OriginalDestinationPlacesTheConnection(t *testing.T) {
 	tr := DefaultTransport()
 	tr.RootCAs = originPool(t, origin)
 
-	p, err := New(
-		WithCA(ca),
-		WithTransport(tr),
-		// Standing in for SO_ORIGINAL_DST or a pf lookup, which need a real redirect.
-		WithOriginalDestination(func(net.Conn) (netip.AddrPort, error) { return originAddr, nil }),
-	)
+	p, err := New(WithCA(ca), WithTransport(tr))
 	require.NoError(t, err)
 	require.NoError(t, p.AddTunnel(originURL.Host))
 
-	addr := startTransparent(t, p)
+	addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) {
+		return originAddr, nil
+	})
 
 	conn, err := net.Dial("tcp", addr)
 	require.NoError(t, err)
@@ -281,4 +314,200 @@ func TestTransparent_OriginalDestinationPlacesTheConnection(t *testing.T) {
 	out, err := io.ReadAll(tlsConn)
 	require.NoError(t, err)
 	assert.Contains(t, string(out), "reached by address")
+}
+
+// A transparent listener carries many authorities, so each request is decided on its own.
+func TestTransparent_PlaintextRejectsAnUnnamedAuthority(t *testing.T) {
+	reached := new(atomic.Bool)
+	origin := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		reached.Store(true)
+	}))
+	defer origin.Close()
+
+	originURL, _ := url.Parse(origin.URL)
+	ca, _ := GenerateCA()
+
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+	require.Equal(t, Reject, p.Decide(Target{Scheme: "http", Host: "127.0.0.1", Port: originURL.Port()}))
+
+	addr := startTransparent(t, p)
+	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{DialContext: pinnedDialer(addr)}}
+
+	resp, err := client.Get("http://" + originURL.Host + "/probe")
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+	assert.False(t, reached.Load(), "a rejected authority must not be forwarded to")
+}
+
+func TestTransparent_PlaintextRelaysATunneledAuthority(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, "origin reached")
+	}))
+	defer origin.Close()
+
+	originURL, _ := url.Parse(origin.URL)
+	ca, _ := GenerateCA()
+
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+	require.NoError(t, p.AddTunnel(originURL.Host))
+
+	// A tunneled authority stays unobserved even when it arrives as a plain request the
+	// proxy had to parse to place it at all.
+	observed := new(atomic.Bool)
+	p.MustAddInterceptor(nil, "+{any}/+{rest}", func(c *Context) (*http.Response, error) {
+		observed.Store(true)
+		return c.Forward()
+	})
+
+	addr := startTransparent(t, p)
+	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{DialContext: pinnedDialer(addr)}}
+
+	resp, err := client.Get("http://" + originURL.Host + "/probe")
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	body, _ := io.ReadAll(resp.Body)
+	assert.Equal(t, "origin reached", string(body))
+	assert.False(t, observed.Load(), "no handler may observe a tunneled authority")
+}
+
+func TestTransparent_PlaintextServesH2C(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, "origin reached")
+	}))
+	defer origin.Close()
+
+	originURL, _ := url.Parse(origin.URL)
+	ca, _ := GenerateCA()
+
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+
+	var seen atomic.Value
+	p.MustAddInterceptor(nil, "+{any}/+{rest}", func(c *Context) (*http.Response, error) {
+		seen.Store(c.Protocol())
+		return c.Forward()
+	})
+
+	addr := startTransparent(t, p)
+	// A redirected client may speak HTTP/2 over plaintext, with the connection preface
+	// instead of ALPN.
+	client := &http.Client{Timeout: 10 * time.Second, Transport: &http2.Transport{
+		AllowHTTP: true,
+		DialTLSContext: func(ctx context.Context, network, _ string, _ *tls.Config) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, addr)
+		},
+	}}
+
+	resp, err := client.Get("http://" + originURL.Host + "/probe")
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	body, _ := io.ReadAll(resp.Body)
+	assert.Equal(t, "origin reached", string(body))
+	assert.Equal(t, 2, resp.ProtoMajor)
+	assert.Equal(t, HTTP2, seen.Load())
+}
+
+func TestTransparent_SessionReportsTheRedirect(t *testing.T) {
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, "origin reached")
+	}))
+	defer origin.Close()
+
+	originURL, _ := url.Parse(origin.URL)
+	ca, _ := GenerateCA()
+
+	tr := DefaultTransport()
+	tr.DialContext = pinnedDialer(originURL.Host)
+	tr.InsecureSkipVerify = true
+
+	p, err := New(WithCA(ca), WithTransport(tr))
+	require.NoError(t, err)
+
+	transparent := new(atomic.Bool)
+	p.MustAddInterceptor(nil, "api.example.test/+{rest}", func(c *Context) (*http.Response, error) {
+		transparent.Store(c.Session().Transparent())
+		return c.Forward()
+	})
+
+	addr := startTransparent(t, p)
+	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{
+		DialContext:     pinnedDialer(addr),
+		TLSClientConfig: &tls.Config{RootCAs: ca.CertPool(), MinVersion: tls.VersionTLS12},
+	}}
+
+	resp, err := client.Get("https://api.example.test/probe")
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.True(t, transparent.Load(), "a redirected TLS connection is a transparent one")
+}
+
+// A lookup on a connection that was not redirected answers with the listener's own address.
+// Taking it at face value would send the proxy back into its own socket.
+func TestTransparent_OriginalDestinationPointingAtTheListenerIsIgnored(t *testing.T) {
+	ca, _ := GenerateCA()
+
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+
+	var listenerAddr atomic.Value
+	addr := startTransparentRedirected(t, p, func(c net.Conn) (netip.AddrPort, error) {
+		listenerAddr.Store(c.LocalAddr().String())
+		return addrPort(c.LocalAddr()), nil
+	})
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+
+	// No server name and no usable original destination leaves nothing to place the
+	// connection by.
+	tlsConn := tls.Client(conn, &tls.Config{
+		ServerName:         "127.0.0.1",
+		InsecureSkipVerify: true,
+		MinVersion:         tls.VersionTLS12,
+	})
+	require.Error(t, tlsConn.Handshake())
+	assert.Equal(t, addr, listenerAddr.Load(), "the resolver must have been consulted")
+}
+
+func TestTransparent_PacketConnAnswersOnlyForTheDatagramItRead(t *testing.T) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = pc.Close() }()
+
+	wrapped, err := TransparentPacketConn(pc)
+	if err != nil {
+		t.Skipf("transparent datagrams unavailable here: %v", err)
+	}
+	defer func() { _ = wrapped.Close() }()
+	resolve := wrapped.(PacketOriginalDestination)
+
+	client, err := net.Dial("udp", wrapped.LocalAddr().String())
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+
+	_, err = client.Write([]byte("datagram"))
+	require.NoError(t, err)
+
+	buf := make([]byte, 64)
+	require.NoError(t, wrapped.SetReadDeadline(time.Now().Add(5*time.Second)))
+	n, from, err := wrapped.ReadFrom(buf)
+	require.NoError(t, err)
+	assert.Equal(t, "datagram", string(buf[:n]))
+	assert.Equal(t, client.LocalAddr().String(), from.String())
+
+	// Nothing redirected this datagram, so what the platform reports for the peer that sent
+	// it is the listener's own address at best. What has to hold is that any other peer is
+	// answered with nothing rather than with an address that was never its own.
+	other := net.UDPAddrFromAddrPort(netip.MustParseAddrPort("127.0.0.1:1"))
+	dst, err := resolve.OriginalDestination(other)
+	require.NoError(t, err)
+	assert.False(t, dst.IsValid())
 }

@@ -25,14 +25,6 @@ import (
 // this the connection is handled without a server name rather than buffered without limit.
 const clientHelloPeekSize = 16 * 1024
 
-// OriginalDestination resolves the address a transparently redirected connection was headed
-// to before the redirect. It is what makes transparent mode work for a client that sends no
-// server name, and what lets the proxy reach the same origin the client had resolved.
-//
-// The zero result with a nil error means the destination is unknown, which is not an error:
-// the proxy then falls back to the server name or the Host header.
-type OriginalDestination func(net.Conn) (netip.AddrPort, error)
-
 // ListenAndServeTransparent listens on addr and serves redirected connections. Unlike an
 // explicit proxy, the client is not configured to use it: its traffic is routed here by the
 // network, and the proxy works out where each connection was headed.
@@ -41,15 +33,15 @@ func (p *Proxy) ListenAndServeTransparent(addr string) error {
 	if err != nil {
 		return err
 	}
-	return p.ServeTransparent(ln)
+	return p.ServeTransparent(TransparentListener(ln))
 }
 
 // ServeTransparent accepts redirected connections on ln and serves them.
 //
-// The destination of a connection is resolved in this order: the original destination
-// reported by [WithOriginalDestination], the server name of a TLS ClientHello, and the Host
-// header of a plaintext request. A connection with none of the three cannot be placed and is
-// closed.
+// The destination of a connection is resolved from what an [OriginalDestination] connection
+// reports, then the server name of a TLS ClientHello, then the Host header of a plaintext
+// request. A connection with none of the three cannot be placed and is closed. Wrap ln in
+// [TransparentListener] for the first of them.
 func (p *Proxy) ServeTransparent(ln net.Listener) error {
 	if p.srv.closing.Load() {
 		return ErrProxyClosed
@@ -109,12 +101,12 @@ func (p *Proxy) ServeConn(conn net.Conn) error {
 	peeked := newPeekConnSize(conn, clientHelloPeekSize)
 
 	var origin netip.AddrPort
-	if p.cfg.originalDst != nil {
-		addr, err := p.cfg.originalDst(conn)
+	if od, ok := conn.(OriginalDestination); ok {
+		addr, err := od.OriginalDestination()
 		if err != nil {
-			return fmt.Errorf("resolve original destination: %w", err)
+			p.cfg.logger.Debug("edge: no original destination", slog.String("error", err.Error()))
 		}
-		origin = addr
+		origin = redirectedTo(addr, conn.LocalAddr())
 	}
 
 	head, err := peeked.Peek(1)
@@ -151,6 +143,7 @@ func (p *Proxy) serveTransparentTLS(ctx context.Context, conn *peekConn, origin 
 	}
 
 	sess := newSession(ctx, conn, target, p.Decide(target), HTTP11)
+	sess.transparent = true
 	sess.upstream = origin
 	if hello != nil {
 		sess.clientHello = hello
@@ -192,6 +185,20 @@ func (p *Proxy) serveTransparentPlain(ctx context.Context, conn *peekConn, origi
 		return nil
 	}
 	return err
+}
+
+// redirectedTo reports where a redirected connection was headed, or the zero value. A lookup
+// on a connection that was not redirected answers with the listener's own address, which
+// would send the proxy back into its own socket.
+func redirectedTo(origin netip.AddrPort, local net.Addr) netip.AddrPort {
+	if !origin.IsValid() {
+		return netip.AddrPort{}
+	}
+	origin = netip.AddrPortFrom(origin.Addr().Unmap(), origin.Port())
+	if origin == addrPort(local) {
+		return netip.AddrPort{}
+	}
+	return origin
 }
 
 // dialTransparentUpstream reaches the origin a redirected connection was headed to. The

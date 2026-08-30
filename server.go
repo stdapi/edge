@@ -69,17 +69,17 @@ func newServer(p *Proxy) (*server, error) {
 		MaxReadFrameSize:     1 << 20,
 	}
 
-	// A client may speak HTTP/2 to the proxy over plaintext, with the connection preface
-	// instead of ALPN. Without unencrypted HTTP/2 enabled such a client is answered as if it
-	// had sent a request whose method is "PRI".
-	frontProtocols := new(http.Protocols)
-	frontProtocols.SetHTTP1(true)
-	frontProtocols.SetHTTP2(true)
-	frontProtocols.SetUnencryptedHTTP2(true)
+	// A client may speak HTTP/2 over plaintext, with the connection preface instead of ALPN.
+	// Without unencrypted HTTP/2 enabled it is answered as if it had sent a request whose
+	// method is "PRI". Both servers can receive one.
+	protocols := new(http.Protocols)
+	protocols.SetHTTP1(true)
+	protocols.SetHTTP2(true)
+	protocols.SetUnencryptedHTTP2(true)
 
 	s.h1 = &http.Server{
 		Handler:           http.HandlerFunc(p.serveProxyRequest),
-		Protocols:         frontProtocols,
+		Protocols:         protocols,
 		ReadHeaderTimeout: p.cfg.server.readHeaderTimeout,
 		ReadTimeout:       p.cfg.server.readTimeout,
 		WriteTimeout:      p.cfg.server.writeTimeout,
@@ -93,6 +93,7 @@ func newServer(p *Proxy) (*server, error) {
 
 	s.mitm = &http.Server{
 		Handler:           http.HandlerFunc(p.serveInterceptedRequest),
+		Protocols:         protocols,
 		ReadHeaderTimeout: p.cfg.server.readHeaderTimeout,
 		ReadTimeout:       p.cfg.server.readTimeout,
 		WriteTimeout:      p.cfg.server.writeTimeout,
@@ -267,16 +268,7 @@ func (p *Proxy) serveProxyRequest(w http.ResponseWriter, r *http.Request) {
 		sess = newSession(r.Context(), nil, target, Intercept, protoOfRequest(r))
 	}
 
-	switch p.Decide(target) {
-	case Reject:
-		http.Error(w, "edge: connection rejected, no interceptor or tunnel names this authority", http.StatusForbidden)
-	case Tunnel:
-		// Nothing to tunnel at the byte level: the request is already parsed. Relay it
-		// without consulting the routing tree so no handler observes it.
-		p.relay(w, r, sess, target)
-	default:
-		p.serve(w, r, sess, target)
-	}
+	p.dispatchRequest(w, r, sess, target)
 }
 
 // proxyTarget resolves the authority an explicit proxy request names, reporting false when

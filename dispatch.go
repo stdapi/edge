@@ -15,17 +15,31 @@ import (
 	"strings"
 )
 
-// serve routes one intercepted request, runs its handler and writes the result back to the
-// client.
-func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, sess *Session, target Target) {
+// dispatchRequest serves one request under the action registered for the authority it names,
+// which is not always the authority the connection was opened for.
+func (p *Proxy) dispatchRequest(w http.ResponseWriter, r *http.Request, sess *Session, target Target) {
 	tree := p.getTree()
 	c := tree.pool.Get().(*Context)
 	defer tree.pool.Put(c)
+
+	switch tree.decide(c, target) {
+	case Reject:
+		http.Error(w, "edge: connection rejected, no interceptor or tunnel names this authority", http.StatusForbidden)
+	case Tunnel:
+		p.relay(c, w, r, sess, target)
+	default:
+		p.serve(c, w, r, sess, target)
+	}
+}
+
+// serve routes one intercepted request on c.tree, runs its handler and writes the result back
+// to the client.
+func (p *Proxy) serve(c *Context, w http.ResponseWriter, r *http.Request, sess *Session, target Target) {
 	c.reset(sess, r, target.Scheme, target.Host, target.Port)
 
 	handler := p.noInterceptor
 	if r.Method != "" {
-		if idx, n := tree.lookup(r.Method, target.Host, routingPath(r), c, false); n != nil {
+		if idx, n := c.tree.lookup(r.Method, target.Host, routingPath(r), c, false); n != nil {
 			c.interceptor = n.entries[idx]
 			handler = c.interceptor.hall
 		}
@@ -54,12 +68,9 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, sess *Session, tar
 }
 
 // relay forwards a request a tunnel asked the proxy not to look at. No interceptor is consulted
-// and no middleware runs: a tunneled authority stays unobserved even when it arrives as a
+// and no middleware runs, so a tunneled authority stays unobserved even when it arrives as a
 // plain request the proxy had to parse to route it at all.
-func (p *Proxy) relay(w http.ResponseWriter, r *http.Request, sess *Session, target Target) {
-	tree := p.getTree()
-	c := tree.pool.Get().(*Context)
-	defer tree.pool.Put(c)
+func (p *Proxy) relay(c *Context, w http.ResponseWriter, r *http.Request, sess *Session, target Target) {
 	c.reset(sess, r, target.Scheme, target.Host, target.Port)
 
 	resp, err := c.Forward()

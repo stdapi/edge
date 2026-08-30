@@ -50,7 +50,7 @@ Point the application at it with `HTTPS_PROXY=http://localhost:8080` and install
 | Tunnel end to end    | yes      | yes    | yes    |
 | Intercept and route  | yes      | yes    | yes    |
 
-HTTP/3 has no `CONNECT` a client can be pointed at: a proxy setting sends it back to TCP. It is therefore reached transparently, with the client's datagrams routed to the proxy by the network.
+A classic proxy setting sends an HTTP/3 client back to TCP, since `CONNECT` tunnels a stream and HTTP/3 needs datagrams. Tunneling those is what MASQUE standardizes, and no general purpose client implements it, so HTTP/3 is reached by routing the client to the proxy rather than by configuring it.
 
 Protocol upgrades, including WebSocket, are spliced through in both modes. Server-sent events and other streamed bodies are relayed as they are produced, not buffered. Trailers are forwarded.
 
@@ -66,7 +66,7 @@ The two combine freely. Most test setups want an explicit proxy that intercepts 
 
 ## What happens to a connection
 
-The decision is taken from the authority alone, before any request is parsed, and the most specific pattern wins: a static authority beats a parameter, which beats a wildcard.
+The decision is taken from the authority alone, before any request is parsed, and the most specific pattern wins: a static authority beats a parameter, which beats a wildcard. It is taken again for every request that names another authority, through its `Host` header or through a transparent listener carrying many, so nothing is reached on the strength of a decision taken for something else.
 
 ```go
 // Watch every Stripe subdomain, forwarding untouched unless a narrower interceptor matches.
@@ -192,18 +192,33 @@ Leaf certificates are minted on demand for the name the client asked for, cached
 ## Transparent mode
 
 ```go
-p, _ := edge.New(
-    edge.WithCA(ca),
-    edge.WithOriginalDestination(edge.OriginalDestinationSocket),
-)
+p, _ := edge.New(edge.WithCA(ca))
 
 go p.ListenAndServeTransparent(":8443") // TCP, redirected
 go p.ListenAndServeQUIC(":8443")        // UDP, redirected
 ```
 
-The destination of a connection is resolved from the original destination reported by the resolver, the server name of a TLS ClientHello, and the Host header of a plaintext request, in that order.
+Transparent means the client is not configured, not that a particular mechanism brought its traffic here. Two get it here:
 
-`OriginalDestinationSocket` reads `SO_ORIGINAL_DST` on Linux behind an iptables or nftables redirect, and asks pf on macOS, which needs read access to `/dev/pf`. Supply your own `OriginalDestination` for anything else. Without one, transparent mode still works for any client that sends a server name or a Host header.
+- **Resolve the authority to the proxy**, with a dedicated resolver, a hosts entry or a split-horizon zone, and listen on the port the client expects. Costs no privilege and works from another machine.
+- **Redirect the packets**, with an iptables or nftables `REDIRECT` on Linux or an `rdr` rule in pf on macOS. Needs the rule and the proxy on the same host, and an exclusion for the proxy's own user so its upstream connections are not redirected back into it.
+
+The destination of a connection is resolved from the address it was headed to before the redirect, then the server name of a TLS ClientHello, then the Host header of a plaintext request. The first is only needed to recover the port, to reach the exact address the client had resolved, or to place a client that sends no server name.
+
+The two `ListenAndServe` calls above set that up on the sockets they open. Bring your own and you wrap them yourself:
+
+```go
+ln, _ := net.Listen("tcp", ":8443")
+go p.ServeTransparent(edge.TransparentListener(ln))
+
+pc, _ := net.ListenPacket("udp", ":8443")
+conn, _ := edge.TransparentPacketConn(pc)
+go p.ServeQUIC(conn)
+```
+
+The connection reports where it was headed and the proxy asks it, through the `OriginalDestination` and `PacketOriginalDestination` interfaces, so a setup neither of these covers is a connection type of your own.
+
+For TCP the lookup reads `SO_ORIGINAL_DST` on Linux and asks the pf state table on macOS, which needs read access to `/dev/pf`. For UDP, netfilter reports the address with each datagram through `IP_RECVORIGDSTADDR`, while pf reports nothing with the datagram, so the socket asks for the address it arrived on and the destination comes from a `DIOCNATLOOK`.
 
 For QUIC, the proxy reads the server name out of the Initial packets by deriving their protection keys from the connection ID they carry in clear, reassembling the ClientHello across as many packets as it spans. That is what lets a connection be tunneled without being terminated first.
 

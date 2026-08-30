@@ -5,16 +5,20 @@
 package edge
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -361,4 +365,53 @@ func TestSemantics_RawPathIsPreserved(t *testing.T) {
 		assert.Equal(t, tc.wire, seen, "the request target must reach the origin byte for byte")
 		assert.Equal(t, tc.wantRouted, routed, "routing form of %q", tc.wire)
 	}
+}
+
+// A connection admitted for one authority does not admit the ones its Host header can name.
+func TestSemantics_HostHeaderCannotReachAnUnnamedAuthority(t *testing.T) {
+	reached := new(atomic.Bool)
+	other := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		reached.Store(true)
+	}))
+	defer other.Close()
+
+	otherURL, err := url.Parse(other.URL)
+	require.NoError(t, err)
+
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+	p.MustAddInterceptor(nil, "allowed.example.test/+{rest}", func(c *Context) (*http.Response, error) {
+		return c.Forward()
+	})
+	require.Equal(t, Reject, p.Decide(Target{Scheme: "http", Host: "127.0.0.1", Port: otherURL.Port()}))
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	go func() { _ = p.Serve(ln) }()
+	t.Cleanup(func() { _ = p.Close() })
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+	require.NoError(t, conn.SetDeadline(time.Now().Add(10*time.Second)))
+
+	_, err = fmt.Fprint(conn, "CONNECT allowed.example.test:80 HTTP/1.1\r\nHost: allowed.example.test:80\r\n\r\n")
+	require.NoError(t, err)
+
+	br := bufio.NewReader(conn)
+	established, err := http.ReadResponse(br, nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, established.StatusCode)
+
+	_, err = fmt.Fprintf(conn, "GET /probe HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", otherURL.Host)
+	require.NoError(t, err)
+
+	resp, err := http.ReadResponse(br, nil)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+	assert.False(t, reached.Load())
 }

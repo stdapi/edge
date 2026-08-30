@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/netip"
 	"strings"
 	"testing"
 	"time"
@@ -47,8 +46,6 @@ func TestOptions_Rejected(t *testing.T) {
 		{"nil middleware", WithMiddleware(nil)},
 		{"nil transport", WithTransport(nil)},
 		{"nil logger", WithLogger(nil)},
-		{"nil original destination", WithOriginalDestination(nil)},
-		{"nil packet original destination", WithPacketOriginalDestination(nil)},
 		{"zero max params", WithMaxPatternParams(0)},
 		{"zero max param key bytes", WithMaxPatternParamKeyBytes(0)},
 		{"negative read header timeout", WithReadHeaderTimeout(-time.Second)},
@@ -83,8 +80,6 @@ func TestOptions_Applied(t *testing.T) {
 		WithTrailingSlash(RelaxedSlash),
 		WithRegexpParam(true),
 		WithLogger(slog.New(slog.DiscardHandler)),
-		WithOriginalDestination(func(net.Conn) (netip.AddrPort, error) { return netip.AddrPort{}, nil }),
-		WithPacketOriginalDestination(func(net.Addr, net.Addr) (netip.AddrPort, error) { return netip.AddrPort{}, nil }),
 	)
 	require.NoError(t, err)
 

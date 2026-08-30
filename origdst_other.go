@@ -12,9 +12,14 @@ import (
 	"net/netip"
 )
 
-// OriginalDestinationSocket is not available on this platform. Transparent mode still works
-// for clients that send a TLS server name or a Host header; supply your own
-// [OriginalDestination] to [WithOriginalDestination] to do better.
-func OriginalDestinationSocket(net.Conn) (netip.AddrPort, error) {
+func originalDstSocket(net.Conn) (netip.AddrPort, error) {
 	return netip.AddrPort{}, errors.New("edge: original destination lookup is not implemented on this platform")
+}
+
+func setTransparentPacketOptions(*net.UDPConn) error {
+	return errors.New("edge: transparent datagrams are not implemented on this platform")
+}
+
+func originalDstFromOOB([]byte, netip.AddrPort, netip.AddrPort) netip.AddrPort {
+	return netip.AddrPort{}
 }

@@ -20,14 +20,10 @@ import (
 // x/sys/unix does not export it.
 const ip6tSoOriginalDst = 80
 
-// OriginalDestinationSocket recovers the address a connection was headed to before netfilter
-// redirected it, by asking the socket. It is the resolver to pass to
-// [WithOriginalDestination] behind an iptables REDIRECT or an nftables redirect rule.
-//
-// It does not work behind TPROXY, where the socket already carries the original address and
-// no lookup is needed, nor on a connection that was not redirected: both report the address
-// of the listener itself, which the caller can recognize and ignore.
-func OriginalDestinationSocket(c net.Conn) (netip.AddrPort, error) {
+// originalDstSocket asks netfilter, through the socket, which address the connection was
+// headed to before the redirect. A connection that was not redirected answers with the
+// address of the listener itself.
+func originalDstSocket(c net.Conn) (netip.AddrPort, error) {
 	tc, ok := c.(*net.TCPConn)
 	if !ok {
 		return netip.AddrPort{}, fmt.Errorf("edge: original destination needs a TCP connection, got %T", c)
@@ -87,4 +83,57 @@ func originalDst6(fd int) (netip.AddrPort, error) {
 
 func ntohs(v uint16) uint16 {
 	return v<<8 | v>>8
+}
+
+// setTransparentPacketOptions asks the socket to report the pre-redirect destination of every
+// datagram it delivers. A socket bound to one family refuses the option of the other, so it
+// fails only when neither is accepted.
+func setTransparentPacketOptions(c *net.UDPConn) error {
+	raw, err := c.SyscallConn()
+	if err != nil {
+		return fmt.Errorf("edge: raw connection: %w", err)
+	}
+
+	var errV4, errV6 error
+	ctrlErr := raw.Control(func(fd uintptr) {
+		errV4 = unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_RECVORIGDSTADDR, 1)
+		errV6 = unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_RECVORIGDSTADDR, 1)
+	})
+	if ctrlErr != nil {
+		return fmt.Errorf("edge: control socket: %w", ctrlErr)
+	}
+	if errV4 != nil && errV6 != nil {
+		return fmt.Errorf("edge: IP_RECVORIGDSTADDR: %w", errV4)
+	}
+	return nil
+}
+
+// originalDstFromOOB reads the address netfilter recorded for a redirected datagram. The zero
+// value means the datagram carried no such message, which is what a datagram that was not
+// redirected looks like.
+func originalDstFromOOB(oob []byte, _, _ netip.AddrPort) netip.AddrPort {
+	msgs, err := unix.ParseSocketControlMessage(oob)
+	if err != nil {
+		return netip.AddrPort{}
+	}
+
+	for _, m := range msgs {
+		switch {
+		case m.Header.Level == unix.IPPROTO_IP && m.Header.Type == unix.IP_ORIGDSTADDR:
+			// sockaddr_in, laid out as family, port, address.
+			if len(m.Data) < 8 {
+				continue
+			}
+			port := binary.BigEndian.Uint16(m.Data[2:4])
+			return netip.AddrPortFrom(netip.AddrFrom4([4]byte(m.Data[4:8])), port)
+		case m.Header.Level == unix.IPPROTO_IPV6 && m.Header.Type == unix.IPV6_ORIGDSTADDR:
+			// sockaddr_in6, laid out as family, port, flow label, address, scope.
+			if len(m.Data) < 24 {
+				continue
+			}
+			port := binary.BigEndian.Uint16(m.Data[2:4])
+			return netip.AddrPortFrom(netip.AddrFrom16([16]byte(m.Data[8:24])).Unmap(), port)
+		}
+	}
+	return netip.AddrPort{}
 }

@@ -243,38 +243,6 @@ func WithTransport(t *Transport) ProxyOption {
 	})
 }
 
-// WithOriginalDestination tells the proxy how to recover the address a transparently
-// redirected connection was headed to. Use [OriginalDestinationSocket] on Linux, where the
-// redirect is done by netfilter and the original address survives in the socket.
-//
-// Without it, transparent mode works only for clients that send a TLS server name or a Host
-// header, and the upstream is reached by resolving that name again.
-func WithOriginalDestination(fn OriginalDestination) ProxyOption {
-	return optionFunc(func(s sealedOption) error {
-		if fn == nil {
-			return fmt.Errorf("%w: original destination resolver cannot be nil", ErrInvalidConfig)
-		}
-		s.proxy.cfg.originalDst = fn
-		return nil
-	})
-}
-
-// WithPacketOriginalDestination tells the proxy how to recover the address a redirected
-// datagram was headed to. It is the UDP counterpart of [WithOriginalDestination], used to
-// place QUIC connections.
-//
-// Without it a QUIC connection is placed by the server name in its ClientHello, on port 443.
-// That covers HTTP/3 as it is deployed, and is wrong for an origin reached on another port.
-func WithPacketOriginalDestination(fn PacketOriginalDestination) ProxyOption {
-	return optionFunc(func(s sealedOption) error {
-		if fn == nil {
-			return fmt.Errorf("%w: packet original destination resolver cannot be nil", ErrInvalidConfig)
-		}
-		s.proxy.cfg.packetOriginalDst = fn
-		return nil
-	})
-}
-
 // WithLogger sets the logger used for connection level errors the proxy cannot report to a
 // handler. It defaults to [slog.Default].
 func WithLogger(l *slog.Logger) ProxyOption {

@@ -157,7 +157,7 @@ func (p *Proxy) serveInterceptedRequest(w http.ResponseWriter, r *http.Request) 
 		r.TLS = sess.tlsState
 	}
 
-	p.serve(w, r, sess, interceptedTarget(r, sess))
+	p.dispatchRequest(w, r, sess, interceptedTarget(r, sess))
 }
 
 // interceptedTarget resolves the target of a request read off an intercepted connection.

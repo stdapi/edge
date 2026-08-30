@@ -135,12 +135,15 @@ func (p *Proxy) Authorities() iter.Seq[Authority] {
 // exported so a caller can reason about a configuration without opening a connection.
 func (p *Proxy) Decide(target Target) Action {
 	tree := p.getTree()
-	if tree.authorities == 0 {
-		return Reject
-	}
-
 	c := tree.pool.Get().(*Context)
 	defer tree.pool.Put(c)
+	return tree.decide(c, target)
+}
+
+func (t *iTree) decide(c *Context, target Target) Action {
+	if t.authorities == 0 {
+		return Reject
+	}
 
 	scheme := target.Scheme
 	port := target.Port
@@ -152,7 +155,7 @@ func (p *Proxy) Decide(target Target) Action {
 	}
 	c.resetForAuthority(nil, scheme, target.Host, port)
 
-	idx, n := tree.lookupAuthority(target.Host, c)
+	idx, n := t.lookupAuthority(target.Host, c)
 	if n == nil {
 		return Reject
 	}

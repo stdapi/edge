@@ -59,15 +59,38 @@ func h3Origin(t *testing.T, ca *CA) netip.AddrPort {
 // startQUIC starts p on a loopback UDP port and returns it.
 func startQUIC(t *testing.T, p *Proxy) netip.AddrPort {
 	t.Helper()
+	return serveQUIC(t, p, func(pc net.PacketConn) net.PacketConn { return pc })
+}
+
+// startQUICRedirected starts p on a loopback UDP port whose datagrams all report origin as
+// the address they were headed to, standing in for the redirect that would have sent them.
+func startQUICRedirected(t *testing.T, p *Proxy, origin netip.AddrPort) netip.AddrPort {
+	t.Helper()
+	return serveQUIC(t, p, func(pc net.PacketConn) net.PacketConn {
+		return fixedOriginPacketConn{PacketConn: pc, origin: origin}
+	})
+}
+
+func serveQUIC(t *testing.T, p *Proxy, wrap func(net.PacketConn) net.PacketConn) netip.AddrPort {
+	t.Helper()
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	require.NoError(t, err)
 
-	go func() { _ = p.ServeQUIC(pc) }()
+	go func() { _ = p.ServeQUIC(wrap(pc)) }()
 	t.Cleanup(func() { _ = p.Close() })
 
 	addr, err := netip.ParseAddrPort(pc.LocalAddr().String())
 	require.NoError(t, err)
 	return addr
+}
+
+type fixedOriginPacketConn struct {
+	net.PacketConn
+	origin netip.AddrPort
+}
+
+func (c fixedOriginPacketConn) OriginalDestination(net.Addr) (netip.AddrPort, error) {
+	return c.origin, nil
 }
 
 func caFileOf(t *testing.T, ca *CA, name string) string {
@@ -97,14 +120,7 @@ func TestQUIC_InterceptWithCurl(t *testing.T) {
 	tr.AllowHTTP3 = true
 	tr.RootCAs = poolOf(originCA)
 
-	p, err := New(
-		WithCA(proxyCA),
-		WithTransport(tr),
-		// Standing in for the redirect that would send the client's datagrams here.
-		WithPacketOriginalDestination(func(net.Addr, net.Addr) (netip.AddrPort, error) {
-			return origin, nil
-		}),
-	)
+	p, err := New(WithCA(proxyCA), WithTransport(tr))
 	require.NoError(t, err)
 
 	seen := new(recorder)
@@ -113,7 +129,7 @@ func TestQUIC_InterceptWithCurl(t *testing.T) {
 		return c.Forward()
 	})
 
-	proxyAddr := startQUIC(t, p)
+	proxyAddr := startQUICRedirected(t, p, origin)
 	port := fmt.Sprint(proxyAddr.Port())
 
 	res := runCurl(t,
@@ -140,12 +156,7 @@ func TestQUIC_TunnelWithCurl(t *testing.T) {
 	proxyCA, err := GenerateCA()
 	require.NoError(t, err)
 
-	p, err := New(
-		WithCA(proxyCA),
-		WithPacketOriginalDestination(func(net.Addr, net.Addr) (netip.AddrPort, error) {
-			return origin, nil
-		}),
-	)
+	p, err := New(WithCA(proxyCA))
 	require.NoError(t, err)
 	require.NoError(t, p.AddTunnel(h3Authority))
 
@@ -157,7 +168,7 @@ func TestQUIC_TunnelWithCurl(t *testing.T) {
 		return c.Forward()
 	})
 
-	proxyAddr := startQUIC(t, p)
+	proxyAddr := startQUICRedirected(t, p, origin)
 	port := fmt.Sprint(proxyAddr.Port())
 
 	// Only the origin CA is trusted. A relayed handshake reaches the origin certificate, an

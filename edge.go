@@ -78,9 +78,7 @@ type config struct {
 	ca     *CA
 	logger *slog.Logger
 
-	transport         *Transport
-	originalDst       OriginalDestination
-	packetOriginalDst PacketOriginalDestination
+	transport *Transport
 
 	server serverConfig
 
