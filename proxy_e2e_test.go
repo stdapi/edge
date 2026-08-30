@@ -5,6 +5,7 @@
 package edge
 
 import (
+	"bufio"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -16,6 +17,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // originHost returns the hostname of a test server, without its port. An interceptor pattern is a
@@ -257,4 +261,77 @@ func TestProxy_PlainHTTPAbsoluteTarget(t *testing.T) {
 	if string(body) != "PLAIN /HELLO" {
 		t.Fatalf("body = %q, want PLAIN /HELLO", body)
 	}
+}
+
+// A wrapper a tunnel is handed must keep the half-close reachable.
+var (
+	_ closeWriter = (*peekConn)(nil)
+	_ closeWriter = transparentConn{}
+)
+
+// A client still uploading when the origin is done sending gets the rest of it through.
+func TestProxy_TunnelRelaysTheHalfClose(t *testing.T) {
+	const head, rest = "head", "the rest of the upload"
+
+	originLn, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = originLn.Close() }()
+
+	received := make(chan string, 1)
+	go func() {
+		conn, aerr := originLn.Accept()
+		if aerr != nil {
+			received <- "accept: " + aerr.Error()
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		first := make([]byte, len(head))
+		if _, rerr := io.ReadFull(conn, first); rerr != nil {
+			received <- "read: " + rerr.Error()
+			return
+		}
+		// Done sending while the client is still uploading.
+		_ = conn.(*net.TCPConn).CloseWrite()
+
+		tail, _ := io.ReadAll(conn)
+		received <- string(first) + string(tail)
+	}()
+
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+	require.NoError(t, p.AddTunnel(originLn.Addr().String()))
+
+	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	go func() { _ = p.Serve(proxyLn) }()
+	t.Cleanup(func() { _ = p.Close() })
+
+	client, err := net.Dial("tcp", proxyLn.Addr().String())
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+	require.NoError(t, client.SetDeadline(time.Now().Add(10*time.Second)))
+
+	_, err = fmt.Fprintf(client, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", originLn.Addr(), originLn.Addr())
+	require.NoError(t, err)
+
+	br := bufio.NewReader(client)
+	established, err := http.ReadResponse(br, nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, established.StatusCode)
+
+	_, err = client.Write([]byte(head))
+	require.NoError(t, err)
+
+	// Reading to EOF is what says the origin's half-close reached the client.
+	_, err = io.ReadAll(br)
+	require.NoError(t, err)
+
+	_, err = client.Write([]byte(rest))
+	require.NoError(t, err)
+	require.NoError(t, client.(*net.TCPConn).CloseWrite())
+
+	assert.Equal(t, head+rest, <-received)
 }

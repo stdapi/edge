@@ -63,6 +63,9 @@ func (c transparentConn) OriginalDestination() (netip.AddrPort, error) {
 	return originalDstSocket(c.Conn)
 }
 
+// CloseWrite forwards the half-close, which the embedded net.Conn does not promote.
+func (c transparentConn) CloseWrite() error { return closeWrite(c.Conn) }
+
 // TransparentPacketConn returns pc with the socket options a redirected datagram needs. The
 // connection reports where each datagram was headed and [Proxy.ServeQUIC] reads it back.
 //

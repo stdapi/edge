@@ -49,6 +49,9 @@ func newPeekConnSize(c net.Conn, size int) *peekConn {
 
 func (c *peekConn) Read(b []byte) (int, error) { return c.r.Read(b) }
 
+// CloseWrite forwards the half-close, which the embedded net.Conn does not promote.
+func (c *peekConn) CloseWrite() error { return closeWrite(c.Conn) }
+
 // Peek returns the next n bytes without consuming them.
 func (c *peekConn) Peek(n int) ([]byte, error) { return c.r.Peek(n) }
 
@@ -171,12 +174,14 @@ func copyStream(dst io.Writer, src io.Reader, idle *idleTracker) (int64, error) 
 	}
 }
 
-func halfClose(c net.Conn) {
+func halfClose(c net.Conn) { _ = closeWrite(c) }
+
+// closeWrite ends the write direction of c, or closes it when it cannot half-close.
+func closeWrite(c net.Conn) error {
 	if cw, ok := c.(closeWriter); ok {
-		_ = cw.CloseWrite()
-		return
+		return cw.CloseWrite()
 	}
-	_ = c.Close()
+	return c.Close()
 }
 
 // filterCopyErr drops the errors that are the normal end of a tunnel rather than a fault.
