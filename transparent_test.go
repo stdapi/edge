@@ -387,9 +387,10 @@ func TestTransparent_PlaintextServesH2C(t *testing.T) {
 	p, err := New(WithCA(ca))
 	require.NoError(t, err)
 
-	var seen atomic.Value
+	var seen, session atomic.Value
 	p.MustAddInterceptor(nil, "+{any}/+{rest}", func(c *Context) (*http.Response, error) {
 		seen.Store(c.Protocol())
+		session.Store(c.Session().Protocol())
 		return c.Forward()
 	})
 
@@ -411,6 +412,7 @@ func TestTransparent_PlaintextServesH2C(t *testing.T) {
 	assert.Equal(t, "origin reached", string(body))
 	assert.Equal(t, 2, resp.ProtoMajor)
 	assert.Equal(t, HTTP2, seen.Load())
+	assert.Equal(t, HTTP2, session.Load(), "the session must report the protocol the preface settled")
 }
 
 func TestTransparent_SessionReportsTheRedirect(t *testing.T) {

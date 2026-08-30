@@ -245,8 +245,7 @@ var _ http.Handler = (*Proxy)(nil)
 // anything else is a plain HTTP request carrying an absolute target.
 func (p *Proxy) serveProxyRequest(w http.ResponseWriter, r *http.Request) {
 	if sess := sessionFromRequest(r); sess != nil {
-		// The front listener builds its session from ConnContext, which runs before the
-		// protocol of the connection is known and can only assume HTTP/1.1.
+		// ConnContext builds the session before ALPN or the h2c preface has set the protocol.
 		sess.setProtocol(protoOfRequest(r))
 	}
 

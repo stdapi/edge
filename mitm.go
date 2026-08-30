@@ -150,6 +150,8 @@ func (p *Proxy) serveInterceptedRequest(w http.ResponseWriter, r *http.Request) 
 	if sess == nil {
 		sess = newSession(r.Context(), nil, Target{}, Intercept, protoOfRequest(r))
 	}
+	// serveIntercepted sets HTTP/1.1 before http.Server reads the h2c preface.
+	sess.setProtocol(protoOfRequest(r))
 
 	if r.TLS == nil && sess.tlsState != nil {
 		// http.Server only recognizes a bare *tls.Conn, and the connection it was handed
