@@ -135,9 +135,10 @@ func (t Target) IsDefaultPort() bool {
 
 var sessionSeq atomic.Uint64
 
-// Session is a client connection handled by the proxy. One session carries every request
-// multiplexed on that connection, so an HTTP/2 or HTTP/3 connection has a single session
-// and many requests.
+// Session is a client connection handled by the proxy. Every request multiplexed on that
+// connection belongs to the same session, so an HTTP/2 or HTTP/3 connection has a single
+// session and many requests. This does not apply to a protocol upgrade, which gets a session
+// of its own.
 //
 // A Session is safe for concurrent use by the goroutines serving its requests.
 type Session struct {
@@ -207,9 +208,12 @@ func addrPort(a net.Addr) netip.AddrPort {
 	return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
 }
 
-// Target returns the authority the client asked for. For an explicit proxy this is the
-// CONNECT target or the authority of the absolute request target; in transparent mode it
-// is derived from the TLS server name or the Host header.
+// Target returns the authority the client asked for. For a CONNECT it is the tunnel target,
+// and in transparent mode it comes from the TLS server name or the Host header.
+//
+// A client sending plain requests through the proxy can ask for a different authority on each
+// one, so a session shared by several of them reports none. A handler reads the authority it is
+// serving from the [Context], which always has it.
 func (s *Session) Target() Target { return s.target }
 
 // Protocol returns the protocol negotiated with the client. It describes the connection, so
@@ -252,8 +256,8 @@ func (s *Session) Upstream() netip.AddrPort { return s.upstream }
 // it, its traffic having been redirected by the network.
 func (s *Session) Transparent() bool { return s.transparent }
 
-// Action returns what the proxy did with this connection when it was established, relay it or
-// terminate its TLS. Every request multiplexed on the connection reports the same action.
+// Action returns what let this connection through, a tunnel or an interceptor. It is read
+// once, when the connection is established, and never revisited.
 func (s *Session) Action() Action { return s.action }
 
 // Close ends the connection immediately, without draining it. A tunnel is cut in both
@@ -271,7 +275,7 @@ func (s *Session) Close() error {
 	return s.closeErr
 }
 
-// CreatedAt returns when the session was accepted.
+// CreatedAt returns when the session began.
 func (s *Session) CreatedAt() time.Time { return s.createdAt }
 
 // Context returns a context canceled when the session ends.

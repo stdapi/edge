@@ -273,12 +273,8 @@ func (s *server) admitSession(sess *Session) bool {
 }
 
 // Sessions returns an iterator over a point-in-time snapshot of the connections the proxy
-// decides on, the tunnels it relays and the connections it terminated.
-//
-// Three kinds are absent. A connection a client opens to the proxy itself addresses the proxy
-// rather than an authority. A redirected plaintext connection resolves to no authority of its
-// own and is decided request by request. A protocol upgrade rides the request that established
-// it, so it is reachable only through the connection underneath.
+// decides on, the tunnels it relays and the connections it terminated. A protocol upgrade is
+// reported on its own, under the authority its request was routed on.
 //
 // Removing a tunnel or an interceptor leaves the connections already open untouched. This is
 // how a caller applies the change to them.
@@ -290,11 +286,12 @@ func (s *server) admitSession(sess *Session) bool {
 //		}
 //	}
 //
-// A connection being established while the loop runs is not missed, it reads the tree again
-// once it is registered and refuses itself. Two caveats. It may still be open when the loop
-// returns, refusing itself a moment later without having relayed anything. And a tunnel the
-// loop closes may have relayed bytes since the change. The snapshot only reflects what the
-// calling goroutine committed before it started.
+// A connection opening while the loop runs does not slip through, it refuses itself when the
+// tree no longer accepts it, though it may still be open when the loop returns.
+//
+// Two kinds are never reported. A connection a client opens to the proxy itself addresses the
+// proxy rather than an authority, and a redirected plaintext connection is decided on the Host
+// header of each request.
 func (p *Proxy) Sessions() iter.Seq[*Session] {
 	p.srv.mu.Lock()
 	out := make([]*Session, 0, len(p.srv.sessions))

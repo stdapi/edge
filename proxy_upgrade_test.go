@@ -7,11 +7,14 @@ package edge
 import (
 	"bufio"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
+	"slices"
 	"strings"
 	"testing"
 
@@ -23,7 +26,23 @@ import (
 // which is the shape every WebSocket handshake ends up in once the framing is stripped.
 func upgradeOrigin(t *testing.T) *httptest.Server {
 	t.Helper()
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewTLSServer(upgradeHandler(t))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// plainUpgradeOrigin is upgradeOrigin without TLS, which is what a redirected plaintext
+// connection and an absolute-form proxy request reach.
+func plainUpgradeOrigin(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(upgradeHandler(t))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func upgradeHandler(t *testing.T) http.HandlerFunc {
+	t.Helper()
+	return func(w http.ResponseWriter, r *http.Request) {
 		if !strings.EqualFold(r.Header.Get("Upgrade"), "echo") {
 			http.Error(w, "expected an upgrade", http.StatusBadRequest)
 			return
@@ -41,9 +60,7 @@ func upgradeOrigin(t *testing.T) *httptest.Server {
 			return
 		}
 		_, _ = io.Copy(conn, brw)
-	}))
-	t.Cleanup(srv.Close)
-	return srv
+	}
 }
 
 func TestProxy_ProtocolUpgrade(t *testing.T) {
@@ -120,4 +137,175 @@ func dialThroughProxy(t *testing.T, proxyAddr, authority string, ca *CA) (*tls.C
 		return nil, err
 	}
 	return tlsConn, nil
+}
+
+const upgradeRequest = "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\n"
+
+// A redirected plaintext connection is decided request by request and is never reported. The
+// pipe an upgrade leaves on it is, because past the 101 nothing on it is routed again.
+func TestUpgrade_TransparentPlaintextPipeIsListedAndClosed(t *testing.T) {
+	origin := plainUpgradeOrigin(t)
+	originURL, _ := url.Parse(origin.URL)
+	originAddr, err := netip.ParseAddrPort(originURL.Host)
+	require.NoError(t, err)
+
+	tr := DefaultTransport()
+	tr.DialContext = pinnedDialer(originURL.Host)
+	p := testProxy(t, WithTransport(tr))
+	p.MustAddInterceptor([]string{http.MethodGet}, "ws.example.test/ws", func(c *Context) (*http.Response, error) {
+		return c.Forward()
+	})
+
+	addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) {
+		return originAddr, nil
+	})
+
+	raw, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer func() { _ = raw.Close() }()
+
+	_, err = fmt.Fprintf(raw, upgradeRequest, "/ws", "ws.example.test")
+	require.NoError(t, err)
+
+	br := bufio.NewReader(raw)
+	resp, err := http.ReadResponse(br, nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+
+	sessions := waitForSessions(t, p, 1)
+	assert.Equal(t, Intercept, sessions[0].Action())
+	assert.Equal(t, "ws.example.test", sessions[0].Target().Host)
+	assert.True(t, sessions[0].Transparent())
+
+	require.NoError(t, sessions[0].Close())
+	_, _ = raw.Write([]byte("ping\n"))
+	_, err = br.ReadString('\n')
+	assert.Error(t, err, "the pipe is cut, nothing echoes back")
+	waitForSessions(t, p, 0)
+}
+
+// A request routes on its Host header, which on an intercepted connection can differ from the
+// CONNECT authority. Without a session of its own the pipe would hide behind a connection the
+// sweep still accepts.
+func TestUpgrade_HostDivergesFromTheConnectAuthority(t *testing.T) {
+	origin := upgradeOrigin(t)
+	originURL, _ := url.Parse(origin.URL)
+
+	ca, _ := GenerateCA()
+	tr := DefaultTransport()
+	tr.DialContext = pinnedDialer(originURL.Host)
+	tr.InsecureSkipVerify = true
+
+	p, err := New(WithCA(ca), WithTransport(tr))
+	require.NoError(t, err)
+	p.MustAddInterceptor(nil, "a.example.test/*{rest}", noopHandler)
+	p.MustAddInterceptor([]string{http.MethodGet}, "b.example.test/ws", func(c *Context) (*http.Response, error) {
+		return c.Forward()
+	})
+
+	raw, err := dialThroughProxy(t, startProxy(t, p), "a.example.test:443", ca)
+	require.NoError(t, err)
+	defer func() { _ = raw.Close() }()
+
+	_, err = fmt.Fprintf(raw, upgradeRequest, "/ws", "b.example.test")
+	require.NoError(t, err)
+
+	br := bufio.NewReader(raw)
+	resp, err := http.ReadResponse(br, nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+
+	// The connection and the pipe, each reporting the authority it talks to.
+	sessions := waitForSessions(t, p, 2)
+	hosts := make([]string, 0, 2)
+	for _, s := range sessions {
+		hosts = append(hosts, s.Target().Host)
+	}
+	slices.Sort(hosts)
+	assert.Equal(t, []string{"a.example.test", "b.example.test"}, hosts)
+
+	_, err = p.DeleteInterceptor([]string{http.MethodGet}, "b.example.test/ws")
+	require.NoError(t, err)
+
+	var closed int
+	for s := range p.Sessions() {
+		if p.ActionFor(s.Target()) == Reject {
+			require.NoError(t, s.Close())
+			closed++
+		}
+	}
+	assert.Equal(t, 1, closed, "the pipe is swept while its connection stays allowed")
+	assert.Equal(t, Intercept, p.ActionFor(target("a.example.test:443")))
+}
+
+// The tree can change while the upstream is answering. The pipe is registered before the 101
+// reaches the client, so a refusal is an ordinary status and not a granted upgrade torn down.
+func TestUpgrade_RefusedWhenTheRouteGoesAwayFirst(t *testing.T) {
+	origin := upgradeOrigin(t)
+	originURL, _ := url.Parse(origin.URL)
+	pattern := originHost(originURL) + "/ws"
+
+	ca, _ := GenerateCA()
+	tr := DefaultTransport()
+	tr.RootCAs = originPool(t, origin)
+
+	p, err := New(WithCA(ca), WithTransport(tr))
+	require.NoError(t, err)
+	p.MustAddInterceptor([]string{http.MethodGet}, pattern, func(c *Context) (*http.Response, error) {
+		resp, ferr := c.Forward()
+		if ferr != nil {
+			return nil, ferr
+		}
+		// Between the upstream 101 and the splice, which is the window the re-check covers.
+		_, derr := p.DeleteInterceptor([]string{http.MethodGet}, pattern)
+		return resp, derr
+	})
+
+	raw, err := dialThroughProxy(t, startProxy(t, p), originURL.Host, ca)
+	require.NoError(t, err)
+	defer func() { _ = raw.Close() }()
+
+	_, err = fmt.Fprintf(raw, upgradeRequest, "/ws", originURL.Host)
+	require.NoError(t, err)
+
+	resp, err := http.ReadResponse(bufio.NewReader(raw), nil)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode, "the client never sees the 101")
+	// The refusal is written on a connection the splice had already hijacked, so it unwinds
+	// with the request. What matters is that no pipe was left behind.
+	waitForSessions(t, p, 0)
+}
+
+// A hijacked connection is one http.Server neither closes nor waits for, so without the pipe
+// being tracked a shutdown would return while it is still relaying.
+func TestUpgrade_CloseEndsAPipeOnAFrontConnection(t *testing.T) {
+	origin := plainUpgradeOrigin(t)
+	originURL, _ := url.Parse(origin.URL)
+
+	p := testProxy(t)
+	p.MustAddInterceptor([]string{http.MethodGet}, originHost(originURL)+"/ws", func(c *Context) (*http.Response, error) {
+		return c.Forward()
+	})
+
+	raw, err := net.Dial("tcp", startProxy(t, p))
+	require.NoError(t, err)
+	defer func() { _ = raw.Close() }()
+
+	// An absolute-form request, so no CONNECT and no session for the connection it arrives on.
+	_, err = fmt.Fprintf(raw, upgradeRequest, origin.URL+"/ws", originURL.Host)
+	require.NoError(t, err)
+
+	br := bufio.NewReader(raw)
+	resp, err := http.ReadResponse(br, nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+
+	sessions := waitForSessions(t, p, 1)
+	assert.Equal(t, originHost(originURL), sessions[0].Target().Host)
+	assert.False(t, sessions[0].Transparent())
+
+	require.NoError(t, p.Close())
+	_, _ = raw.Write([]byte("ping\n"))
+	_, err = br.ReadString('\n')
+	assert.Error(t, err, "Close must reach a pipe http.Server no longer owns")
 }

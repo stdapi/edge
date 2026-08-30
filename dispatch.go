@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"runtime"
 	"strconv"
@@ -62,7 +63,7 @@ func (p *Proxy) serve(c *Context, w http.ResponseWriter, r *http.Request, sess *
 		resp = Status(http.StatusBadGateway)
 	}
 
-	if werr := writeResponse(w, r, resp); werr != nil {
+	if werr := writeResponse(c, w, r, resp, Intercept); werr != nil {
 		p.logf(r.Context(), slog.LevelDebug, "write response", sess, werr)
 	}
 }
@@ -79,7 +80,7 @@ func (p *Proxy) relay(c *Context, w http.ResponseWriter, r *http.Request, sess *
 		http.Error(w, "edge: "+err.Error(), http.StatusBadGateway)
 		return
 	}
-	if werr := writeResponse(w, r, resp); werr != nil {
+	if werr := writeResponse(c, w, r, resp, Tunnel); werr != nil {
 		p.logf(r.Context(), slog.LevelDebug, "write relayed response", sess, werr)
 	}
 }
@@ -137,11 +138,12 @@ func stacktrace(skip int) string {
 	return sb.String()
 }
 
-// writeResponse relays resp to the client.
-func writeResponse(w http.ResponseWriter, r *http.Request, resp *http.Response) error {
+// writeResponse relays resp to the client. action is what let the request through, which an
+// upgrade needs because past the 101 it becomes a connection of its own.
+func writeResponse(c *Context, w http.ResponseWriter, r *http.Request, resp *http.Response, action Action) error {
 	// An upgrade takes ownership of the body, which is the tunnel rather than a payload.
 	if resp.StatusCode == http.StatusSwitchingProtocols {
-		return spliceUpgrade(w, r, resp)
+		return spliceUpgrade(c, w, r, resp, action)
 	}
 
 	if resp.Body != nil {
@@ -226,9 +228,51 @@ func (f flushWriter) Write(b []byte) (int, error) {
 	return n, nil
 }
 
+// upgradedPipe is what an upgrade leaves behind, the client socket joined to the upstream one.
+// Closing it ends both directions, which is the only way to stop a splice.
+type upgradedPipe struct {
+	client  net.Conn
+	backend io.Closer
+}
+
+func (u *upgradedPipe) Close() error {
+	cerr := u.client.Close()
+	berr := u.backend.Close()
+	return errors.Join(cerr, berr)
+}
+
+// pipeSession describes the pipe an upgrade left behind.
+//
+// It gets a session of its own because a request routes on its Host header, which can differ
+// from the CONNECT authority. Reusing the connection's would report an authority the pipe does
+// not talk to, and a sweep would keep the wrong one.
+func pipeSession(c *Context, r *http.Request, action Action, pipe io.Closer) *Session {
+	target := Target{Scheme: c.scheme, Host: c.host, Port: c.port}
+	sess := newSession(r.Context(), nil, target, action, protoOfRequest(r))
+	sess.closer = pipe
+
+	front := c.sess
+	if front == nil {
+		return sess
+	}
+	sess.remoteAddr = front.remoteAddr
+	sess.localAddr = front.localAddr
+	sess.clientHello = front.clientHello
+	sess.upstream = front.upstream
+	sess.transparent = front.transparent
+	if state := front.tlsState.Load(); state != nil {
+		sess.tlsState.Store(state)
+	} else {
+		// The explicit proxy reached over TLS builds its session before the handshake, so the
+		// state only exists behind the connection.
+		sess.tlsConn = front.tlsConn
+	}
+	return sess
+}
+
 // spliceUpgrade completes a protocol upgrade, WebSocket being the common case. Past the 101
 // the connection is no longer HTTP, so both ends are joined and relayed byte for byte.
-func spliceUpgrade(w http.ResponseWriter, r *http.Request, resp *http.Response) error {
+func spliceUpgrade(c *Context, w http.ResponseWriter, r *http.Request, resp *http.Response, action Action) error {
 	backend, ok := resp.Body.(io.ReadWriteCloser)
 	if !ok {
 		if resp.Body != nil {
@@ -245,9 +289,29 @@ func spliceUpgrade(w http.ResponseWriter, r *http.Request, resp *http.Response) 
 	}
 	defer func() { _ = client.Close() }()
 
-	// Response.Write copies the body after the headers, and here the body is the tunnel:
-	// leaving it in place would block forever trying to drain a stream that only ends when
-	// the peers are done talking.
+	// After the hijack http.Server neither closes nor waits for the connection, so tracking it
+	// here is what lets a shutdown and a route change reach the pipe.
+	pipe := &upgradedPipe{client: client, backend: backend}
+	sess := pipeSession(c, r, action, pipe)
+
+	c.p.srv.track(pipe, true)
+	c.p.srv.wg.Add(1)
+	defer func() {
+		c.p.srv.track(pipe, false)
+		c.p.srv.wg.Done()
+	}()
+
+	// The 101 has not reached the client yet, so a pipe the tree no longer accepts is refused
+	// with an ordinary status rather than granted and then torn down.
+	if !c.p.srv.admitSession(sess) {
+		return writeRawStatus(brw, http.StatusForbidden,
+			"connection rejected, no interceptor or tunnel matches this authority")
+	}
+	defer c.p.srv.trackSession(sess, false)
+
+	// Response.Write copies the body after the headers, and here the body is the pipe. Leaving
+	// it in place would block forever trying to drain a stream that only ends when the peers
+	// are done talking.
 	resp.Body = nil
 	if err := resp.Write(brw); err != nil {
 		return fmt.Errorf("write upgrade response: %w", err)
