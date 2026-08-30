@@ -37,9 +37,8 @@ const (
 )
 
 // CA is the certificate authority the proxy signs intercepted authorities with. Leaf
-// certificates are minted on demand and cached, and every leaf shares one key pair: the
-// expensive half of minting is key generation, and reusing the key makes a cache miss cost
-// a single signature.
+// certificates are minted on demand and cached. Every leaf shares one key pair, so a cache
+// miss costs a signature rather than a key generation.
 //
 // A CA is safe for concurrent use.
 type CA struct {

@@ -59,17 +59,17 @@ type node struct {
 }
 
 // lookup walks the hostname, then the path under it. Every key names a hostname before its
-// path, so the walk always starts on the hostname half and lookupByHostname is the only way
-// into lookupByPath.
+// path, so the walk always starts on the hostname portion and lookupByHostname is the only
+// way into lookupByPath.
 func (n *node) lookup(method, hostPort, path string, c *Context, lazy bool) (int, *node) {
 	*c.skipStack = (*c.skipStack)[:0]
 	return lookupByHostname(n, method, netutil.StripHostPort(hostPort), path, c, lazy, false)
 }
 
-// lookupByHostname walks the hostname half of the key. With authority set it stops there
-// and answers with the entry sitting on the node the hostname ended on, instead of
-// descending into the path: an authority key carries no path at all, which is what keeps
-// the two kinds of entry from ever reaching each other.
+// lookupByHostname walks the hostname portion of the key. With authority set it stops there
+// and answers with the entry sitting on the node the hostname ended on, instead of descending
+// into the path. An authority key carries no path at all, which is what keeps the two kinds
+// of entry from ever reaching each other.
 func lookupByHostname(root *node, method, host, path string, c *Context, lazy, authority bool) (index int, n *node) {
 	var (
 		charsMatched     int

@@ -236,9 +236,8 @@ func (txn *Txn) removeInterceptor(ic *Interceptor) (*Interceptor, error) {
 	return ic, nil
 }
 
-// Truncate removes everything registered on the proxy, interceptors and authority entries alike.
-// They share one tree, so there is no half of it to keep. Truncating on a read-only
-// transaction returns ErrReadOnlyTxn.
+// Truncate empties the tree, removing the interceptors and the authority entries together.
+// Truncating on a read-only transaction returns ErrReadOnlyTxn.
 func (txn *Txn) Truncate() error {
 	if txn.rootTxn == nil {
 		panic(ErrSettledTxn)

@@ -119,9 +119,9 @@ func (p *Proxy) parsePattern(raw string) (pattern, int, error) {
 	}, paramCount, nil
 }
 
-// parseAuthorityHost parses the authority half of a pattern: a hostname or an address
-// literal, optionally followed by a port. An interceptor pattern and an authority pattern
-// name an authority the same way, so they share this and differ only in what may follow.
+// parseAuthorityHost parses the authority portion of a pattern, a hostname or an address
+// literal optionally followed by a port. An interceptor pattern and an authority pattern name
+// an authority the same way, so they share this and differ only in what may follow.
 //
 // An address literal is written the way an authority carries it, which for IPv6 means
 // bracketed. The brackets tell the colons of the address from the one before a port, and a
