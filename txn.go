@@ -274,12 +274,32 @@ func (txn *Txn) Interceptor(methods []string, pattern string, matchers ...Matche
 	}
 
 	idx := slices.IndexFunc(matched.entries, func(r *Interceptor) bool {
-		return r.pattern.str == pattern && slicesutil.EqualUnsorted(r.methods, methods) && r.matchersEqual(matchers)
+		return r.pattern.path != "" && r.pattern.str == pattern &&
+			slicesutil.EqualUnsorted(r.methods, methods) && r.matchersEqual(matchers)
 	})
 	if idx < 0 {
 		return nil
 	}
 	return matched.entries[idx]
+}
+
+// Decide reports what the proxy would do with a connection to target, resolved on the tree
+// this transaction sees rather than on the published one. A write transaction can therefore
+// check the effect of a change before it commits. See [Proxy.Decide].
+func (txn *Txn) Decide(target Target) Action {
+	if txn.rootTxn == nil {
+		panic(ErrSettledTxn)
+	}
+
+	t := txn.rootTxn
+	// The context comes from the pool of the tree the transaction forked from. Its
+	// capacities are a sizing hint that the lookup grows when it has to, and nothing on the
+	// authority path reads the tree the context was allocated for.
+	pool := &t.tree.pool
+	c := pool.Get().(*Context)
+	defer pool.Put(c)
+
+	return decideOn(t.patterns, t.authorities, c, target)
 }
 
 // Name performs a lookup for a registered interceptor matching the given name. It returns

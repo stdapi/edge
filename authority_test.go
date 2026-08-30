@@ -5,7 +5,9 @@
 package edge
 
 import (
+	"errors"
 	"net/http"
+	"slices"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -19,7 +21,7 @@ func target(authority string) Target {
 
 func collectAuthorities(p *Proxy) []Authority {
 	var out []Authority
-	for a := range p.Authorities() {
+	for a := range p.Iter().Authorities() {
 		out = append(out, a)
 	}
 	return out
@@ -251,4 +253,93 @@ func TestAuthority_TunnelOnAReadOnlyTxn(t *testing.T) {
 		assert.ErrorIs(t, err, ErrReadOnlyTxn)
 		return nil
 	}))
+}
+
+// The interceptor lookups take a raw pattern string and never parse it, so an authority
+// pattern reaches the same node. They must not answer with the authority entry sitting
+// there: it carries no handler and no method, and a caller would run it.
+func TestAuthority_InterceptorLookupsNeverReturnAnAuthority(t *testing.T) {
+	p := testProxy(t)
+	p.MustAddInterceptor(nil, "api.stripe.com/v1/charges", noopHandler)
+	require.NoError(t, p.AddTunnel("checkout.stripe.com:8443"))
+
+	for _, pattern := range []string{"api.stripe.com", "checkout.stripe.com:8443"} {
+		t.Run(pattern, func(t *testing.T) {
+			assert.False(t, p.Has(nil, pattern))
+			assert.Nil(t, p.Interceptor(nil, pattern))
+			assert.Empty(t, slices.Collect(p.Iter().Interceptors(pattern)))
+			require.NoError(t, p.View(func(txn *Txn) error {
+				assert.False(t, txn.Has(nil, pattern))
+				assert.Nil(t, txn.Interceptor(nil, pattern))
+				return nil
+			}))
+		})
+	}
+
+	assert.True(t, p.Has(nil, "api.stripe.com/v1/charges"))
+	assert.NotNil(t, p.Interceptor(nil, "api.stripe.com/v1/charges"))
+	assert.Len(t, slices.Collect(p.Iter().Interceptors("api.stripe.com/v1/charges")), 1)
+	require.NoError(t, p.View(func(txn *Txn) error {
+		assert.True(t, txn.Has(nil, "api.stripe.com/v1/charges"))
+		return nil
+	}))
+}
+
+// Proxy.Authorities is shorthand for the Iter method, and both must walk the same snapshot.
+func TestAuthority_IterAuthorities(t *testing.T) {
+	p := testProxy(t)
+	p.MustAddInterceptor(nil, "api.stripe.com/v1/charges", noopHandler)
+	require.NoError(t, p.AddTunnel("checkout.stripe.com:8443"))
+
+	fromIter := slices.Collect(p.Iter().Authorities())
+	require.Len(t, fromIter, 2)
+	assert.Equal(t, collectAuthorities(p), fromIter)
+
+	// Interceptors are never yielded as authorities, nor the reverse.
+	for _, a := range fromIter {
+		assert.Empty(t, a.entry.pattern.path)
+	}
+	assert.Len(t, slices.Collect(p.Iter().All()), 1)
+}
+
+func TestTxn_Decide(t *testing.T) {
+	p := testProxy(t)
+	p.MustAddInterceptor(nil, "api.stripe.com/v1/charges", noopHandler)
+	require.NoError(t, p.AddTunnel("checkout.stripe.com"))
+
+	// A read transaction answers what the published tree answers.
+	require.NoError(t, p.View(func(txn *Txn) error {
+		assert.Equal(t, Intercept, txn.Decide(target("api.stripe.com:443")))
+		assert.Equal(t, Tunnel, txn.Decide(target("checkout.stripe.com:443")))
+		assert.Equal(t, Reject, txn.Decide(target("elsewhere.test:443")))
+		return nil
+	}))
+
+	// A write transaction sees its own uncommitted change, the published tree does not.
+	err := p.Updates(func(txn *Txn) error {
+		if _, derr := txn.DeleteTunnel("checkout.stripe.com"); derr != nil {
+			return derr
+		}
+		assert.Equal(t, Reject, txn.Decide(target("checkout.stripe.com:443")), "the txn sees the delete")
+		assert.Equal(t, Tunnel, p.Decide(target("checkout.stripe.com:443")), "the tree is untouched until commit")
+		return errAbortDecide
+	})
+	require.ErrorIs(t, err, errAbortDecide)
+	assert.Equal(t, Tunnel, p.Decide(target("checkout.stripe.com:443")), "an aborted txn changes nothing")
+
+	require.NoError(t, p.Updates(func(txn *Txn) error {
+		_, derr := txn.DeleteTunnel("checkout.stripe.com")
+		return derr
+	}))
+	assert.Equal(t, Reject, p.Decide(target("checkout.stripe.com:443")))
+}
+
+var errAbortDecide = errors.New("abort")
+
+func TestTxn_DecideOnASettledTxn(t *testing.T) {
+	p := testProxy(t)
+	// Abort is a noop on a read transaction, so the settled one has to be a write.
+	txn := p.Txn(true)
+	txn.Abort()
+	assert.PanicsWithValue(t, ErrSettledTxn, func() { txn.Decide(target("api.stripe.com:443")) })
 }

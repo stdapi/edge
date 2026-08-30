@@ -215,7 +215,7 @@ func TestRouting_ConflictDetection(t *testing.T) {
 
 func countAuthorities(p *Proxy) int {
 	n := 0
-	for range p.Authorities() {
+	for range p.Iter().Authorities() {
 		n++
 	}
 	return n

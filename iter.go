@@ -15,7 +15,7 @@ type stack struct {
 	edges []*node
 }
 
-// Iter provide a set of range iterators for traversing registered methods and interceptors. Iter capture a point-in-time
+// Iter provide a set of range iterators for traversing registered methods, interceptors and authority entries. Iter capture a point-in-time
 // snapshot of the routing tree. Therefore, all iterators returned by Iter will not observe subsequent write on the
 // proxy or on the transaction from which the Iter is created.
 type Iter struct {
@@ -49,6 +49,9 @@ func (it Iter) Interceptors(pattern string) iter.Seq[*Interceptor] {
 		}
 
 		for _, ic := range matched.entries {
+			if ic.pattern.path == "" {
+				continue
+			}
 			if ic.pattern.str == pattern {
 				if !yield(ic) {
 					return
@@ -166,6 +169,20 @@ func (it Iter) patternPrefix(prefix string, authorities bool) iter.Seq[*Intercep
 						return
 					}
 				}
+			}
+		}
+	}
+}
+
+// Authorities returns a range iterator over the authority entries registered in the routing
+// tree, the ones implied by interceptors included. The iterator reflect a snapshot of the
+// routing tree at the time [Iter] is created. This function is safe for concurrent use by
+// multiple goroutine and while mutation on interceptors are ongoing.
+func (it Iter) Authorities() iter.Seq[Authority] {
+	return func(yield func(Authority) bool) {
+		for ic := range it.patternPrefix("", true) {
+			if !yield(Authority{entry: ic}) {
+				return
 			}
 		}
 	}

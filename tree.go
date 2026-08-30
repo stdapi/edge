@@ -46,9 +46,9 @@ func (t *iTree) lookup(method, hostPort, path string, c *Context, lazy bool) (in
 // lookupAuthority resolves the entry deciding what happens to a connection to host. It walks
 // the hostname and stops there, so it can only ever reach an authority entry, and it takes
 // no method because an authority has none to be compared against.
-func (t *iTree) lookupAuthority(host string, c *Context) (int, *node) {
+func lookupAuthority(root *node, host string, c *Context) (int, *node) {
 	*c.skipStack = (*c.skipStack)[:0]
-	return lookupByHostname(t.patterns, "", host, "", c, true, true)
+	return lookupByHostname(root, "", host, "", c, true, true)
 }
 
 func (t *iTree) allocateContext() *Context {
@@ -71,7 +71,8 @@ func (t *iTree) interceptor(methods []string, pattern string, matchers []Matcher
 	}
 
 	idx := slices.IndexFunc(matched.entries, func(r *Interceptor) bool {
-		return r.pattern.str == pattern && slicesutil.EqualUnsorted(r.methods, methods) && r.matchersEqual(matchers)
+		return r.pattern.path != "" && r.pattern.str == pattern &&
+			slicesutil.EqualUnsorted(r.methods, methods) && r.matchersEqual(matchers)
 	})
 	if idx < 0 {
 		return nil

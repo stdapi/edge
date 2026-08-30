@@ -4,10 +4,7 @@
 
 package edge
 
-import (
-	"fmt"
-	"iter"
-)
+import "fmt"
 
 // Authority is what the proxy does with connections to one authority: relay them, terminate
 // their TLS, or refuse them. Entries share the tree with the interceptors and are evaluated
@@ -15,8 +12,8 @@ import (
 //
 // An authority named by neither an interceptor nor a tunnel is refused.
 //
-//	edge.WithIntercept("+{sub}.stripe.com")   // every subdomain
-//	edge.WithTunnel("checkout.stripe.com")    // except this one, static wins
+//	p.AddInterceptor(nil, "+{sub}.stripe.com/*{rest}", h) // every subdomain, implicitly
+//	p.AddTunnel("checkout.stripe.com")                    // except this one, static wins
 type Authority struct {
 	entry *Interceptor
 }
@@ -116,20 +113,6 @@ func (txn *Txn) DeleteTunnel(pattern string) (Authority, error) {
 	return Authority{entry: deleted}, nil
 }
 
-// Authorities returns an iterator over a point-in-time snapshot of what decides the
-// connections, the entries implied by interceptors included.
-func (p *Proxy) Authorities() iter.Seq[Authority] {
-	tree := p.getTree()
-	it := Iter{patterns: tree.patterns, names: tree.names, methods: tree.methods, maxDepth: tree.maxDepth}
-	return func(yield func(Authority) bool) {
-		for ic := range it.patternPrefix("", true) {
-			if !yield(Authority{entry: ic}) {
-				return
-			}
-		}
-	}
-}
-
 // Decide reports what the proxy does with a connection to target. It is the same lookup the
 // proxy runs on CONNECT, on a transparent TLS handshake and on a plaintext request, and is
 // exported so a caller can reason about a configuration without opening a connection.
@@ -141,7 +124,14 @@ func (p *Proxy) Decide(target Target) Action {
 }
 
 func (t *iTree) decide(c *Context, target Target) Action {
-	if t.authorities == 0 {
+	return decideOn(t.patterns, t.authorities, c, target)
+}
+
+// decideOn resolves the action for target against root. The published tree and a transaction
+// see the same node structure under a different root, so the lookup is written once and given
+// the root rather than read off a receiver.
+func decideOn(root *node, authorities int, c *Context, target Target) Action {
+	if authorities == 0 {
 		return Reject
 	}
 
@@ -155,7 +145,7 @@ func (t *iTree) decide(c *Context, target Target) Action {
 	}
 	c.resetForAuthority(nil, scheme, target.Host, port)
 
-	idx, n := t.lookupAuthority(target.Host, c)
+	idx, n := lookupAuthority(root, target.Host, c)
 	if n == nil {
 		return Reject
 	}
