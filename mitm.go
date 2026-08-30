@@ -167,7 +167,9 @@ func (p *Proxy) serveInterceptedRequest(w http.ResponseWriter, r *http.Request) 
 		r.TLS = state
 	}
 
-	p.dispatchRequest(w, r, sess, interceptedTarget(r, sess))
+	// Nothing on an intercepted connection is challenged: the client believes it is talking
+	// to the origin. Whatever established the connection carries the identity, or none.
+	p.dispatchRequest(w, r, sess, interceptedTarget(r, sess), sess.identity)
 }
 
 // interceptedTarget resolves the target of a request read off an intercepted connection.

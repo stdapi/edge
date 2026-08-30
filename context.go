@@ -76,9 +76,10 @@ type Context struct {
 
 	cachedQueries url.Values
 
-	scheme string
-	host   string
-	port   string
+	scheme   string
+	host     string
+	port     string
+	identity string
 
 	scope HandlerScope
 }
@@ -91,6 +92,7 @@ func (c *Context) reset(sess *Session, r *http.Request, scheme, host, port strin
 	c.port = port
 	c.cachedQueries = nil
 	c.interceptor = nil
+	c.identity = ""
 	c.scope = InterceptorHandler
 	*c.params = (*c.params)[:0]
 }
@@ -103,6 +105,7 @@ func (c *Context) resetForAuthority(sess *Session, scheme, host, port string) {
 	c.port = port
 	c.cachedQueries = nil
 	c.interceptor = nil
+	c.identity = ""
 	// No handler runs on an authority lookup, so there is no scope to report.
 	c.scope = 0
 	*c.params = (*c.params)[:0]
@@ -215,6 +218,11 @@ func (c *Context) Protocol() Protocol {
 	}
 	return protoOfRequest(c.req)
 }
+
+// Identity returns what the configured [ProxyAuthenticator] reported for this request, or an
+// empty string when none did. A request read off an intercepted connection was never
+// challenged, so it reports the identity of the CONNECT that opened it.
+func (c *Context) Identity() string { return c.identity }
 
 // Session returns the client connection this request arrived on.
 func (c *Context) Session() *Session { return c.sess }

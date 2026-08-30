@@ -35,6 +35,7 @@ const (
 	HeaderAllow               = "Allow"
 	HeaderAuthorization       = "Authorization"
 	HeaderProxyAuthorization  = "Proxy-Authorization"
+	HeaderProxyAuthenticate   = "Proxy-Authenticate"
 	HeaderContentDisposition  = "Content-Disposition"
 	HeaderContentEncoding     = "Content-Encoding"
 	HeaderContentLength       = "Content-Length"

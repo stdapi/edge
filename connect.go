@@ -20,7 +20,7 @@ import (
 
 // serveConnect handles a CONNECT request. The authority decides whether the connection is
 // relayed byte for byte, terminated so its requests can be routed, or refused.
-func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
+func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request, identity string) {
 	target, ok := targetFromConnect(r)
 	if !ok {
 		http.Error(w, "edge: CONNECT requires an authority target", http.StatusBadRequest)
@@ -34,14 +34,14 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.ProtoMajor >= 2 {
-		p.connectStream(w, r, target, action)
+		p.connectStream(w, r, target, action, identity)
 		return
 	}
-	p.connectHijack(w, r, target, action)
+	p.connectHijack(w, r, target, action, identity)
 }
 
 // connectHijack takes over an HTTP/1.1 connection after CONNECT.
-func (p *Proxy) connectHijack(w http.ResponseWriter, r *http.Request, target Target, action Action) {
+func (p *Proxy) connectHijack(w http.ResponseWriter, r *http.Request, target Target, action Action, identity string) {
 	rc := http.NewResponseController(w)
 	client, brw, err := rc.Hijack()
 	if err != nil {
@@ -54,6 +54,7 @@ func (p *Proxy) connectHijack(w http.ResponseWriter, r *http.Request, target Tar
 	conn := newPeekConn(client, brw.Reader)
 
 	sess := newSession(r.Context(), client, target, action, HTTP11)
+	sess.identity = identity
 	if s := sessionFromRequest(r); s != nil {
 		sess.remoteAddr = s.remoteAddr
 		sess.localAddr = s.localAddr
@@ -105,7 +106,7 @@ func (p *Proxy) connectHijack(w http.ResponseWriter, r *http.Request, target Tar
 
 // connectStream handles a CONNECT carried on an HTTP/2 or HTTP/3 stream, where the stream
 // itself is the tunnel rather than the whole connection.
-func (p *Proxy) connectStream(w http.ResponseWriter, r *http.Request, target Target, action Action) {
+func (p *Proxy) connectStream(w http.ResponseWriter, r *http.Request, target Target, action Action, identity string) {
 	front := sessionFromRequest(r)
 	var local, remote net.Addr
 	if front != nil {
@@ -115,6 +116,7 @@ func (p *Proxy) connectStream(w http.ResponseWriter, r *http.Request, target Tar
 	stream := newH2Stream(w, r, local, remote)
 	sess := newSession(r.Context(), nil, target, action, protoOfRequest(r))
 	sess.localAddr, sess.remoteAddr = local, remote
+	sess.identity = identity
 
 	p.srv.track(stream, true)
 	p.srv.wg.Add(1)

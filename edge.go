@@ -75,8 +75,9 @@ type Proxy struct {
 
 // config holds the resolved configuration of a [Proxy], read-only once it is built.
 type config struct {
-	ca     *CA
-	logger *slog.Logger
+	ca        *CA
+	logger    *slog.Logger
+	proxyAuth ProxyAuthenticator
 
 	transport *Transport
 

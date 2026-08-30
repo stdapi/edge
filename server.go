@@ -339,13 +339,20 @@ var _ http.Handler = (*Proxy)(nil)
 // serveProxyRequest is the explicit forward proxy entry point: a CONNECT opens a tunnel,
 // anything else is a plain HTTP request carrying an absolute target.
 func (p *Proxy) serveProxyRequest(w http.ResponseWriter, r *http.Request) {
+	// Before anything else, including the origin-form refusal below, so that an
+	// unauthenticated client learns nothing from the answer it gets.
+	identity, ok := p.authenticate(w, r)
+	if !ok {
+		return
+	}
+
 	if sess := sessionFromRequest(r); sess != nil {
 		// ConnContext builds the session before ALPN or the h2c preface has set the protocol.
 		sess.setProtocol(protoOfRequest(r))
 	}
 
 	if r.Method == http.MethodConnect {
-		p.serveConnect(w, r)
+		p.serveConnect(w, r, identity)
 		return
 	}
 
@@ -362,7 +369,35 @@ func (p *Proxy) serveProxyRequest(w http.ResponseWriter, r *http.Request) {
 		sess = newSession(r.Context(), nil, target, Intercept, protoOfRequest(r))
 	}
 
-	p.dispatchRequest(w, r, sess, target)
+	p.dispatchRequest(w, r, sess, target, identity)
+}
+
+// authenticate runs the configured proxy authenticator and answers the client itself when it
+// refuses. It reports the identity and whether the request may go on.
+func (p *Proxy) authenticate(w http.ResponseWriter, r *http.Request) (string, bool) {
+	auth := p.cfg.proxyAuth
+	if auth == nil {
+		return "", true
+	}
+
+	if identity, ok := auth.Authenticate(r); ok {
+		return identity, true
+	}
+
+	challenges := auth.Challenges(r)
+	if len(challenges) == 0 {
+		// Nothing the client could present would change the answer, so asking it to
+		// authenticate would be a lie, and a 407 carrying no challenge is malformed.
+		http.Error(w, "edge: proxy access denied", http.StatusForbidden)
+		return "", false
+	}
+
+	header := w.Header()
+	for _, challenge := range challenges {
+		header.Add(HeaderProxyAuthenticate, challenge)
+	}
+	http.Error(w, "edge: proxy authentication required", http.StatusProxyAuthRequired)
+	return "", false
 }
 
 // proxyTarget resolves the authority of an explicit proxy request, reporting false when the

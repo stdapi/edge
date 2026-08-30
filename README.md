@@ -178,6 +178,36 @@ p.MustAddInterceptor([]string{"GET"}, "api.stripe.com/v1/charges", func(c *edge.
 })
 ```
 
+## Proxy authentication
+
+Clients of the explicit proxy can be made to authenticate. A request the authenticator refuses is answered with `407 Proxy Authentication Required` carrying the challenges it offers, or with `403 Forbidden` when it offers none.
+
+```go
+p, _ := edge.New(
+    edge.WithCA(ca),
+    edge.WithProxyAuth(edge.BasicAuth("edge", func(user, pass string) bool {
+        hash, ok := store.Lookup(user)
+        return ok && bcrypt.CompareHashAndPassword(hash, []byte(pass)) == nil
+    })),
+)
+```
+
+The check runs before the authority is resolved, so an unauthenticated client cannot tell an authority the proxy admits from one it refuses. `BasicAuth` parses the credentials and hands them to the callback, which looks them up wherever they live, so the proxy never holds one of its own. Basic sends them on every request, encoded rather than encrypted, so reach the proxy over TLS or they cross the network in the clear.
+
+The identity the authenticator reports reaches a handler as `c.Identity()`. A `CONNECT` is one authenticated request whose grant covers the tunnel it opens, so its whole session reports that identity and nothing inside the tunnel is challenged again. `Session.Identity()` is what a revocation sweeps on, and it is the only lever a tunnel offers since no handler ever runs on one:
+
+```go
+for s := range p.Sessions() {
+    if s.Identity() == revoked {
+        s.Close()
+    }
+}
+```
+
+Implementing `ProxyAuthenticator` yourself covers Bearer or anything else: `Authenticate` reads the request, `Challenges` says what a 407 should offer.
+
+A transparently redirected client does not know a proxy exists and can carry no proxy credentials, so this applies to the explicit listeners only. That is the limit of the protocol, not of the proxy. There, a client is identified by where it comes from.
+
 ## Certificate authority
 
 ```go

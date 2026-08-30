@@ -388,3 +388,79 @@ func (r *recorder) all() []string {
 	defer r.mu.Unlock()
 	return slices.Clone(r.entries)
 }
+
+// TestConformance_CurlProxyAuth drives the proxy authentication with curl rather than a Go
+// client. Go's transport sends Basic preemptively from the proxy URL and never answers a
+// challenge, so it is the one client that would never exercise the 407.
+func TestConformance_CurlProxyAuth(t *testing.T) {
+	origin := conformanceOrigin(t)
+	originURL, _ := url.Parse(origin.URL)
+
+	ca, _ := GenerateCA()
+	p, err := New(WithCA(ca), WithProxyAuth(BasicAuth("edge", func(user, pass string) bool {
+		return user == "alice" && pass == "secret"
+	})))
+	if err != nil {
+		t.Fatalf("new proxy: %v", err)
+	}
+
+	// The handler answers locally, so the origin is never reached and curl only has to trust
+	// the proxy CA.
+	p.MustAddInterceptor(nil, originHost(originURL)+"/*{any}", func(c *Context) (*http.Response, error) {
+		return Text(http.StatusOK, "identity="+c.Identity()), nil
+	})
+
+	addr := startProxy(t, p)
+	caFile := writeCAFile(t, ca)
+
+	t.Run("connect with credentials", func(t *testing.T) {
+		res := runCurl(t,
+			"--proxy", "http://"+addr,
+			"--proxy-user", "alice:secret",
+			"--cacert", caFile,
+			origin.URL+"/echo",
+		)
+		if res.status != "200" {
+			t.Fatalf("status = %s, body %q", res.status, res.body)
+		}
+		if !strings.Contains(res.body, "identity=alice") {
+			t.Fatalf("handler saw %q, want the authenticated identity", res.body)
+		}
+	})
+
+	// --proxy-anyauth makes curl wait for the challenge and pick a scheme from it, which is
+	// the exchange a preemptive client skips.
+	t.Run("connect answering the challenge", func(t *testing.T) {
+		res := runCurl(t,
+			"--proxy", "http://"+addr,
+			"--proxy-anyauth",
+			"--proxy-user", "alice:secret",
+			"--cacert", caFile,
+			origin.URL+"/echo",
+		)
+		if res.status != "200" {
+			t.Fatalf("status = %s, body %q", res.status, res.body)
+		}
+	})
+
+	// A plaintext target is not a CONNECT, so the refusal comes back as an ordinary response
+	// curl reports rather than a failed tunnel.
+	plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, "origin")
+	}))
+	t.Cleanup(plain.Close)
+
+	t.Run("refused without credentials", func(t *testing.T) {
+		res := runCurl(t, "--proxy", "http://"+addr, plain.URL+"/echo")
+		if res.status != "407" {
+			t.Fatalf("status = %s, want 407, body %q", res.status, res.body)
+		}
+	})
+
+	t.Run("refused with wrong credentials", func(t *testing.T) {
+		res := runCurl(t, "--proxy", "http://"+addr, "--proxy-user", "alice:wrong", plain.URL+"/echo")
+		if res.status != "407" {
+			t.Fatalf("status = %s, want 407, body %q", res.status, res.body)
+		}
+	})
+}

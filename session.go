@@ -162,6 +162,7 @@ type Session struct {
 	// preferred over resolving the authority again, which may not even resolve outside the
 	// client's own network.
 	upstream  netip.AddrPort
+	identity  string
 	id        uint64
 	closeOnce sync.Once
 	// proto is the protocol of the connection. The front listener builds its session from
@@ -177,6 +178,11 @@ type Session struct {
 
 // ID returns a process-unique identifier for this session.
 func (s *Session) ID() uint64 { return s.id }
+
+// Identity returns what the configured [ProxyAuthenticator] reported for the request that
+// established this connection, or an empty string when none did. It is what a revoked
+// credential sweeps on, the only lever a tunnel offers since no handler ever runs on one.
+func (s *Session) Identity() string { return s.identity }
 
 // RemoteAddr returns the address of the client, or the zero value when the connection has
 // none. Unlike [Context.RemoteAddr] it describes the connection, so it is the same for every

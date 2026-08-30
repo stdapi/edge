@@ -18,7 +18,7 @@ import (
 
 // dispatchRequest serves one request under the action registered for the authority it names,
 // which is not always the authority the connection was opened for.
-func (p *Proxy) dispatchRequest(w http.ResponseWriter, r *http.Request, sess *Session, target Target) {
+func (p *Proxy) dispatchRequest(w http.ResponseWriter, r *http.Request, sess *Session, target Target, identity string) {
 	tree := p.getTree()
 	c := tree.pool.Get().(*Context)
 	defer tree.pool.Put(c)
@@ -27,16 +27,17 @@ func (p *Proxy) dispatchRequest(w http.ResponseWriter, r *http.Request, sess *Se
 	case Reject:
 		http.Error(w, "edge: connection rejected, no interceptor or tunnel matches this authority", http.StatusForbidden)
 	case Tunnel:
-		p.relay(c, w, r, sess, target)
+		p.relay(c, w, r, sess, target, identity)
 	default:
-		p.serve(c, w, r, sess, target)
+		p.serve(c, w, r, sess, target, identity)
 	}
 }
 
 // serve routes one intercepted request on c.tree, runs its handler and writes the result back
 // to the client.
-func (p *Proxy) serve(c *Context, w http.ResponseWriter, r *http.Request, sess *Session, target Target) {
+func (p *Proxy) serve(c *Context, w http.ResponseWriter, r *http.Request, sess *Session, target Target, identity string) {
 	c.reset(sess, r, target.Scheme, target.Host, target.Port)
+	c.identity = identity
 
 	handler := p.noInterceptor
 	if r.Method != "" {
@@ -71,8 +72,9 @@ func (p *Proxy) serve(c *Context, w http.ResponseWriter, r *http.Request, sess *
 // relay forwards a request a tunnel asked the proxy not to look at. No interceptor is consulted
 // and no middleware runs, so a tunneled authority stays unobserved even when it arrives as a
 // plain request the proxy had to parse to route it at all.
-func (p *Proxy) relay(c *Context, w http.ResponseWriter, r *http.Request, sess *Session, target Target) {
+func (p *Proxy) relay(c *Context, w http.ResponseWriter, r *http.Request, sess *Session, target Target, identity string) {
 	c.reset(sess, r, target.Scheme, target.Host, target.Port)
+	c.identity = identity
 
 	resp, err := c.Forward()
 	if err != nil {
@@ -250,6 +252,9 @@ func pipeSession(c *Context, r *http.Request, action Action, pipe io.Closer) *Se
 	target := Target{Scheme: c.scheme, Host: c.host, Port: c.port}
 	sess := newSession(r.Context(), nil, target, action, protoOfRequest(r))
 	sess.closer = pipe
+	// An upgrade outlives the request that established it, so a revocation can only reach it
+	// through the identity that request carried.
+	sess.identity = c.identity
 
 	front := c.sess
 	if front == nil {

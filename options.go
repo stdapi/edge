@@ -89,6 +89,23 @@ func WithNoInterceptorHandler(handler HandlerFunc) ProxyOption {
 	})
 }
 
+// WithProxyAuth requires clients of the explicit forward proxy to authenticate. A refused
+// request is answered with 407, carrying the challenges the authenticator offers, or with 403
+// when it offers none. The check runs before the authority is resolved, so an unauthenticated
+// client learns nothing about what the proxy admits.
+//
+// A transparently redirected client does not know a proxy exists and can carry no proxy
+// credentials, so this has no effect on the transparent listeners.
+func WithProxyAuth(a ProxyAuthenticator) ProxyOption {
+	return optionFunc(func(s sealedOption) error {
+		if a == nil {
+			return fmt.Errorf("%w: proxy authenticator cannot be nil", ErrInvalidConfig)
+		}
+		s.proxy.cfg.proxyAuth = a
+		return nil
+	})
+}
+
 // WithErrorHandler sets the handler that turns a handler error into a response. It defaults
 // to [DefaultErrorHandler], which answers 502 Bad Gateway.
 func WithErrorHandler(handler ErrorHandler) ProxyOption {
