@@ -348,3 +348,44 @@ func TestQUIC_InterceptedSessionIsListedAndClosed(t *testing.T) {
 	require.NoError(t, sessions[0].Close())
 	assert.Empty(t, slices.Collect(p.Sessions()))
 }
+
+// A handler waiting on the session context has to be released when the session ends. A QUIC
+// peer owns its own, since nothing upstream of it cancels one.
+func TestQUIC_SessionContextEndsWithTheSession(t *testing.T) {
+	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
+	require.NoError(t, err)
+	origin := h3Origin(t, originCA)
+
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(proxyCA))
+	require.NoError(t, err)
+	require.NoError(t, p.AddTunnel(h3Authority))
+
+	proxyAddr := startQUICRedirected(t, p, origin)
+	tr := dialQUICTo(proxyAddr, poolOf(originCA))
+	defer func() { _ = tr.Close() }()
+
+	req, err := http.NewRequest(http.MethodGet,
+		fmt.Sprintf("https://%s:%d/echo", h3Authority, proxyAddr.Port()), nil)
+	require.NoError(t, err)
+	resp, err := tr.RoundTrip(req)
+	require.NoError(t, err)
+	_, _ = io.Copy(io.Discard, resp.Body)
+	require.NoError(t, resp.Body.Close())
+
+	sess := waitForSessions(t, p, 1)[0]
+	sessCtx := sess.Context()
+	select {
+	case <-sessCtx.Done():
+		t.Fatal("the context fired while the session was alive")
+	default:
+	}
+
+	require.NoError(t, sess.Close())
+	select {
+	case <-sessCtx.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("closing the session did not end its context")
+	}
+}

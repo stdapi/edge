@@ -32,6 +32,7 @@ func (p *Proxy) ListenAndServeTransparent(addr string) error {
 	if err != nil {
 		return err
 	}
+	defer func() { _ = ln.Close() }()
 	return p.ServeTransparent(TransparentListener(ln))
 }
 
@@ -47,6 +48,16 @@ func (p *Proxy) ServeTransparent(ln net.Listener) error {
 	}
 	p.srv.trackListener(&ln, true)
 	defer p.srv.trackListener(&ln, false)
+
+	// Held for the loop's lifetime so a connection never adds to the group from zero.
+	p.srv.wg.Add(1)
+	defer p.srv.wg.Done()
+
+	// See connectHijack. A shutdown that ran before the listener was tracked will never close
+	// it, so the loop would accept forever and hold the group open.
+	if p.srv.closing.Load() {
+		return ErrProxyClosed
+	}
 
 	var delay time.Duration
 	for {
@@ -82,6 +93,11 @@ func (p *Proxy) ServeConn(conn net.Conn) error {
 		p.srv.track(conn, false)
 		_ = conn.Close()
 	}()
+
+	// See connectHijack. The accept loop can hand one over just as the proxy stops.
+	if p.srv.closing.Load() {
+		return ErrProxyClosed
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

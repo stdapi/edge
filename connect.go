@@ -68,6 +68,12 @@ func (p *Proxy) connectHijack(w http.ResponseWriter, r *http.Request, target Tar
 		_ = conn.Close()
 	}()
 
+	// A hijacked connection is invisible to http.Server, so only the registry can end it. The
+	// check has to follow the registration, or each could miss the other.
+	if p.srv.closing.Load() {
+		return
+	}
+
 	if action == Tunnel {
 		sess.closer = conn
 		if !p.srv.admitSession(sess) {
@@ -125,6 +131,12 @@ func (p *Proxy) connectStream(w http.ResponseWriter, r *http.Request, target Tar
 		p.srv.wg.Done()
 		_ = stream.Close()
 	}()
+
+	// See connectHijack. Returning would let net/http answer 200 for a tunnel that is already
+	// gone, so the stream is reset instead.
+	if p.srv.closing.Load() {
+		panic(http.ErrAbortHandler)
+	}
 
 	if action == Tunnel {
 		// Nothing has been written to the stream yet, so a refusal here is an ordinary status

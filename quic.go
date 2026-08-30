@@ -49,6 +49,7 @@ func (p *Proxy) ListenAndServeQUIC(addr string) error {
 	if err != nil {
 		return err
 	}
+	defer func() { _ = pc.Close() }()
 	// A socket the platform cannot set up still serves every client that sends a server
 	// name, which is every HTTP/3 client in practice.
 	if transparent, terr := TransparentPacketConn(pc); terr == nil {
@@ -81,6 +82,12 @@ func (p *Proxy) ServeQUIC(pc net.PacketConn) error {
 	defer p.srv.track(d, false)
 	p.srv.trackDemux(d, true)
 	defer p.srv.trackDemux(d, false)
+
+	// See connectHijack. The socket is only closed through the demux, so a shutdown that
+	// missed it would leave run reading forever.
+	if p.srv.closing.Load() {
+		return ErrProxyClosed
+	}
 
 	return d.run()
 }
@@ -127,10 +134,20 @@ type quicPeer struct {
 	sess     *Session
 	// qc is the connection the proxy terminated for an intercepted peer. It stays nil until
 	// the handshake reaches the QUIC server, which is the only place it is handed out.
-	qc      *quic.Conn
+	qc     *quic.Conn
+	cancel context.CancelFunc
+
 	target  Target
 	pending [][]byte
 	state   peerState
+}
+
+// end ends the context of the peer's session. Whoever removes a peer from the map, or marks it
+// refused, has to call it.
+func (p *quicPeer) end() {
+	if p.cancel != nil {
+		p.cancel()
+	}
 }
 
 // h3NoError is HTTP/3's H3_NO_ERROR, what a peer sends when it closes a connection with
@@ -157,6 +174,7 @@ func (c *quicPeerCloser) Close() error {
 	if peer.upstream != nil {
 		_ = peer.upstream.Close()
 	}
+	peer.end()
 	delete(c.d.peers, c.key)
 	c.d.mu.Unlock()
 
@@ -434,7 +452,8 @@ func (d *quicDemux) beginIntercept(key string, addr net.Addr, target Target, pen
 		return
 	}
 
-	sess := newSession(context.Background(), nil, target, Intercept, HTTP3)
+	ctx, cancel := context.WithCancel(context.Background())
+	sess := newSession(ctx, nil, target, Intercept, HTTP3)
 	sess.remoteAddr = addr
 	sess.localAddr = d.pc.LocalAddr()
 	sess.transparent = true
@@ -447,12 +466,14 @@ func (d *quicDemux) beginIntercept(key string, addr net.Addr, target Target, pen
 	peer := d.peers[key]
 	if peer == nil {
 		d.mu.Unlock()
+		cancel()
 		return
 	}
 	peer.state = peerIntercepted
 	peer.target = target
 	peer.pending = nil
 	peer.sess = sess
+	peer.cancel = cancel
 	d.mu.Unlock()
 
 	// The session is published, so a sweep started after the tree changed either found it or
@@ -479,7 +500,8 @@ func (d *quicDemux) beginTunnel(key string, addr net.Addr, target Target, pendin
 
 	// A tunneled peer needs a session of its own. Its action is read once, here, so without
 	// one nothing would report that it is still relaying after the tree changed.
-	sess := newSession(context.Background(), nil, target, Tunnel, HTTP3)
+	ctx, cancel := context.WithCancel(context.Background())
+	sess := newSession(ctx, nil, target, Tunnel, HTTP3)
 	sess.remoteAddr = addr
 	sess.localAddr = d.pc.LocalAddr()
 	sess.transparent = true
@@ -491,6 +513,7 @@ func (d *quicDemux) beginTunnel(key string, addr net.Addr, target Target, pendin
 	if peer == nil {
 		d.mu.Unlock()
 		_ = upstream.Close()
+		cancel()
 		return
 	}
 	peer.state = peerTunneling
@@ -498,6 +521,7 @@ func (d *quicDemux) beginTunnel(key string, addr net.Addr, target Target, pendin
 	peer.target = target
 	peer.pending = nil
 	peer.sess = sess
+	peer.cancel = cancel
 	d.mu.Unlock()
 
 	// See beginIntercept. Refusing here happens before the first datagram reaches the origin,
@@ -556,6 +580,7 @@ func (d *quicDemux) reject(key string, addr net.Addr, reason string) {
 		peer.pending = nil
 		peer.sniffer = nil
 		peer.sess = nil
+		peer.end()
 	}
 	d.mu.Unlock()
 	d.p.cfg.logger.Debug("edge: QUIC connection dropped",
@@ -564,8 +589,11 @@ func (d *quicDemux) reject(key string, addr net.Addr, reason string) {
 
 func (d *quicDemux) drop(key string) {
 	d.mu.Lock()
-	if peer, ok := d.peers[key]; ok && peer.upstream != nil {
-		_ = peer.upstream.Close()
+	if peer, ok := d.peers[key]; ok {
+		if peer.upstream != nil {
+			_ = peer.upstream.Close()
+		}
+		peer.end()
 	}
 	delete(d.peers, key)
 	d.mu.Unlock()
@@ -582,6 +610,7 @@ func (d *quicDemux) sweepIdle() {
 		if peer.upstream != nil {
 			_ = peer.upstream.Close()
 		}
+		peer.end()
 		delete(d.peers, key)
 	}
 }
@@ -598,6 +627,7 @@ func (d *quicDemux) close() {
 			if peer.upstream != nil {
 				_ = peer.upstream.Close()
 			}
+			peer.end()
 		}
 		clear(d.peers)
 		d.mu.Unlock()

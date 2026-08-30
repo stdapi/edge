@@ -210,3 +210,38 @@ func TestLifecycle_TunnelOnlyProxyNeedsNoCA(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	assert.Equal(t, "tunneled", string(body))
 }
+
+// A listener the proxy accepts on itself is only ever closed by Shutdown or Close, so without
+// that the accept loop outlives the proxy and keeps taking connections nothing will serve.
+func TestLifecycle_ShutdownClosesTheTransparentListener(t *testing.T) {
+	p := testProxy(t)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr := ln.Addr().String()
+
+	served := make(chan error, 1)
+	go func() { served <- p.ServeTransparent(ln) }()
+
+	// Wait on the registration itself. A successful dial would only prove the listen backlog
+	// exists, which it does before ServeTransparent runs at all.
+	require.Eventually(t, func() bool {
+		p.srv.mu.Lock()
+		defer p.srv.mu.Unlock()
+		return len(p.srv.listeners) == 1
+	}, 3*time.Second, 10*time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, p.Shutdown(ctx))
+
+	select {
+	case err := <-served:
+		assert.ErrorIs(t, err, ErrProxyClosed)
+	case <-time.After(5 * time.Second):
+		t.Fatal("ServeTransparent did not return after Shutdown")
+	}
+
+	_, err = net.DialTimeout("tcp", addr, time.Second)
+	assert.Error(t, err, "the listener must be closed")
+}

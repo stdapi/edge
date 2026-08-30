@@ -135,6 +135,8 @@ func (p *Proxy) ListenAndServe(addr string) error {
 	if err != nil {
 		return err
 	}
+	// This call built the listener, and a refused Serve never takes it over.
+	defer func() { _ = ln.Close() }()
 	return p.Serve(ln)
 }
 
@@ -143,9 +145,8 @@ func (p *Proxy) Serve(ln net.Listener) error {
 	if p.srv.closing.Load() {
 		return ErrProxyClosed
 	}
-	p.srv.trackListener(&ln, true)
-	defer p.srv.trackListener(&ln, false)
-
+	// The listener is not tracked. http.Server closes the one it serves on every return path,
+	// and closing it here as well would make its own Shutdown report the second close.
 	err := p.srv.h1.Serve(ln)
 	if errors.Is(err, http.ErrServerClosed) {
 		return ErrProxyClosed
@@ -161,6 +162,7 @@ func (p *Proxy) ListenAndServeTLS(addr string, cert tls.Certificate) error {
 	if err != nil {
 		return err
 	}
+	defer func() { _ = ln.Close() }()
 	return p.ServeTLS(ln, cert)
 }
 
@@ -181,7 +183,8 @@ func (p *Proxy) Shutdown(ctx context.Context) error {
 	p.srv.closing.Store(true)
 	p.srv.closeOne.Do(func() { close(p.srv.closed) })
 
-	err := errors.Join(p.srv.h1.Shutdown(ctx), p.srv.mitm.Shutdown(ctx))
+	// Before the wait, so the accept loops drain rather than keep feeding it.
+	err := errors.Join(p.srv.closeListeners(), p.srv.h1.Shutdown(ctx), p.srv.mitm.Shutdown(ctx))
 
 	done := make(chan struct{})
 	go func() {
@@ -204,7 +207,7 @@ func (p *Proxy) Shutdown(ctx context.Context) error {
 func (p *Proxy) Close() error {
 	p.srv.closing.Store(true)
 	p.srv.closeOne.Do(func() { close(p.srv.closed) })
-	err := errors.Join(p.srv.h1.Close(), p.srv.mitm.Close())
+	err := errors.Join(p.srv.closeListeners(), p.srv.h1.Close(), p.srv.mitm.Close())
 	p.srv.closeActive()
 	p.srv.fwd.close()
 	return err
@@ -310,6 +313,25 @@ func (p *Proxy) Sessions() iter.Seq[*Session] {
 		out = d.appendSessions(out)
 	}
 	return slices.Values(out)
+}
+
+// closeListeners closes the listeners the proxy accepts on itself. A listener http.Server
+// serves is not among them, it closes that one itself.
+func (s *server) closeListeners() error {
+	s.mu.Lock()
+	lns := make([]*net.Listener, 0, len(s.listeners))
+	for ln := range s.listeners {
+		lns = append(lns, ln)
+	}
+	s.mu.Unlock()
+
+	var err error
+	for _, ln := range lns {
+		if cerr := (*ln).Close(); cerr != nil && !errors.Is(cerr, net.ErrClosed) {
+			err = errors.Join(err, cerr)
+		}
+	}
+	return err
 }
 
 func (s *server) closeActive() {

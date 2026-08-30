@@ -306,6 +306,11 @@ func spliceUpgrade(c *Context, w http.ResponseWriter, r *http.Request, resp *htt
 		c.p.srv.wg.Done()
 	}()
 
+	// See connectHijack. The 101 has not been written, so the client sees the upgrade fail.
+	if c.p.srv.closing.Load() {
+		return nil
+	}
+
 	// The 101 has not reached the client yet, so a pipe the tree no longer accepts is refused
 	// with an ordinary status rather than granted and then torn down.
 	if !c.p.srv.admitSession(sess) {
