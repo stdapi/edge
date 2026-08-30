@@ -21,6 +21,8 @@ const transparentOOBSize = 512
 //
 // The zero result with a nil error means the destination is unknown, which is not an error.
 // The proxy then falls back to the server name or the Host header.
+//
+// Implementation must be comparable.
 type OriginalDestination interface {
 	net.Conn
 	OriginalDestination() (netip.AddrPort, error)
