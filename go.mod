@@ -1,6 +1,6 @@
 module github.com/fox-toolkit/edge
 
-go 1.26.0
+go 1.27.0
 
 require (
 	github.com/quic-go/quic-go v0.62.0
