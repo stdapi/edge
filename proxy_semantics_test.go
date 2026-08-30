@@ -22,7 +22,7 @@ import (
 
 // interceptingProxy wires an origin behind a proxy that intercepts it, and returns the
 // proxy, the origin hostname and a client pointed at the proxy.
-func interceptingProxy(t *testing.T, origin *httptest.Server, opts ...Option) (*Proxy, string, *http.Client) {
+func interceptingProxy(t *testing.T, origin *httptest.Server, opts ...ProxyOption) (*Proxy, string, *http.Client) {
 	t.Helper()
 	originURL, err := url.Parse(origin.URL)
 	require.NoError(t, err)
@@ -34,7 +34,7 @@ func interceptingProxy(t *testing.T, origin *httptest.Server, opts ...Option) (*
 	tr.RootCAs = originPool(t, origin)
 
 	host := originHost(originURL)
-	all := append([]Option{WithCA(ca), WithTransport(tr)}, opts...)
+	all := append([]ProxyOption{WithCA(ca), WithTransport(tr)}, opts...)
 	p, err := New(all...)
 	require.NoError(t, err)
 
@@ -252,13 +252,13 @@ func TestSemantics_MiddlewareOrder(t *testing.T) {
 	p.MustAddInterceptor([]string{http.MethodGet}, authority+"/x", func(c *Context) (*http.Response, error) {
 		order = append(order, "handler")
 		return Status(http.StatusOK), nil
-	}, WithMiddleware(record("route")))
+	}, WithMiddleware(record("interceptor")))
 
 	resp, err := client.Get(origin.URL + "/x")
 	require.NoError(t, err)
 	_ = resp.Body.Close()
 
-	assert.Equal(t, []string{"→outer", "→inner", "→route", "handler", "←route", "←inner", "←outer"}, order)
+	assert.Equal(t, []string{"→outer", "→inner", "→interceptor", "handler", "←interceptor", "←inner", "←outer"}, order)
 }
 
 func TestSemantics_NoInterceptorForwardsUnchanged(t *testing.T) {
@@ -280,6 +280,9 @@ func TestSemantics_NoInterceptorForwardsUnchanged(t *testing.T) {
 	assert.Equal(t, "origin got /unknown", string(body))
 }
 
+// The proxy matches on the canonical form of the path and forwards the one the client sent.
+// The two differ only by the normalizations RFC 3986 declares equivalent, and the target that
+// reaches the origin is the wire target byte for byte.
 func TestSemantics_RawPathIsPreserved(t *testing.T) {
 	var seen string
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -288,19 +291,44 @@ func TestSemantics_RawPathIsPreserved(t *testing.T) {
 	}))
 	defer origin.Close()
 
-	p, authority, client := interceptingProxy(t, origin)
+	originURL, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	tr := DefaultTransport()
+	tr.RootCAs = originPool(t, origin)
+
+	p, err := New(WithCA(ca), WithTransport(tr))
+	require.NoError(t, err)
 
 	var routed string
-	p.MustAddInterceptor([]string{http.MethodGet}, authority+"/files/+{path}", func(c *Context) (*http.Response, error) {
+	p.MustAddInterceptor([]string{http.MethodGet}, originHost(originURL)+"/*{any}", func(c *Context) (*http.Response, error) {
 		routed = c.RoutingPath()
 		return c.Forward()
 	})
+	client := proxyClient(startProxy(t, p), ca.CertPool())
 
-	// %2F must stay encoded on the wire and must not be matched as a path separator.
-	resp, err := client.Get(origin.URL + "/files/a%2Fb?q=1%2B2")
-	require.NoError(t, err)
-	_ = resp.Body.Close()
+	cases := []struct{ wire, wantRouted string }{
+		{"/v1/charges", "/v1/charges"},
+		// %2F stays encoded on the wire and is never matched as a path separator.
+		{"/files/a%2Fb?q=1%2B2", "/files/a%2Fb"},
+		{"/v1%2fcharges", "/v1%2Fcharges"},
+		// An escaped unreserved character is decoded for matching, not on the wire.
+		{"/v1/%63harges", "/v1/charges"},
+		{"/v1/%2e%2e/charges", "/v1/../charges"},
+		// Nothing collapses a dot segment or a double slash, in either direction.
+		{"//v1/./sub/../charges", "//v1/./sub/../charges"},
+		{"/v1/charges;x=1", "/v1/charges;x=1"},
+	}
 
-	assert.Equal(t, "/files/a%2Fb?q=1%2B2", seen, "the request target must reach the origin byte for byte")
-	assert.Equal(t, "/files/a%2Fb", routed)
+	for _, tc := range cases {
+		seen, routed = "", ""
+		resp, err := client.Get(origin.URL + tc.wire)
+		require.NoError(t, err, tc.wire)
+		_ = resp.Body.Close()
+
+		assert.Equal(t, tc.wire, seen, "the request target must reach the origin byte for byte")
+		assert.Equal(t, tc.wantRouted, routed, "routing form of %q", tc.wire)
+	}
 }

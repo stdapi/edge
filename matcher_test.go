@@ -145,7 +145,7 @@ func TestMatcher_NarrowsAnInterceptor(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/v1/charges", nil)
 	req.Header.Set("X-Channel", "beta")
 	got := matchRequest(t, p, "https", joinHostPort("api.test", "443"), req)
-	assert.Same(t, special, got, "the matched route must win over the fallback")
+	assert.Same(t, special, got, "the matched interceptor must win over the fallback")
 
 	plain := httptest.NewRequest(http.MethodGet, "/v1/charges", nil)
 	got = matchRequest(t, p, "https", joinHostPort("api.test", "443"), plain)

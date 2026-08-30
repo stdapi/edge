@@ -5,10 +5,15 @@
 package edge
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"iter"
 	"net/http"
 	"net/netip"
 	"net/url"
+
+	"github.com/fox-toolkit/edge/internal/stringsutil"
 )
 
 // Param is a matched pattern parameter.
@@ -36,15 +41,10 @@ type RequestContext interface {
 	Port() string
 	// Authority returns the request target as host:port.
 	Authority() string
-	// RoutingPath returns the canonical form of the path the client sent. Percent-encoded
-	// RFC 3986 unreserved characters are decoded, bytes that must be escaped in a path are
-	// encoded in place, and every other escape keeps uppercase hex and stays distinct from
-	// its decoded form, so %2F never matches /.
-	//
-	// With [WithMergeSlashes] or [WithCollapseDotSegments] the tree matches on a further
-	// normalized form, which this deliberately does not report: what a handler needs to see
-	// is what the client asked for. The request itself is never rewritten: what goes upstream
-	// is the target the client sent, byte for byte.
+	// RoutingPath returns the canonical form of the path the client sent, which is the form
+	// the tree matched on. Percent-encoded RFC 3986 unreserved characters are decoded, bytes
+	// that must be escaped in a path are encoded in place, and every other escape keeps
+	// uppercase hex and stays distinct from its decoded form, so %2F never matches /.
 	RoutingPath() string
 	// QueryParams parses the raw query and caches the result.
 	QueryParams() url.Values
@@ -75,13 +75,10 @@ type Context struct {
 	p    *Proxy // no reset
 
 	cachedQueries url.Values
-	cachedPath    string
 
 	scheme string
 	host   string
 	port   string
-
-	hasPath bool
 
 	scope HandlerScope
 }
@@ -93,8 +90,6 @@ func (c *Context) reset(sess *Session, r *http.Request, scheme, host, port strin
 	c.host = host
 	c.port = port
 	c.cachedQueries = nil
-	c.cachedPath = ""
-	c.hasPath = false
 	c.interceptor = nil
 	c.scope = InterceptorHandler
 	*c.params = (*c.params)[:0]
@@ -107,8 +102,6 @@ func (c *Context) resetForAuthority(sess *Session, scheme, host, port string) {
 	c.host = host
 	c.port = port
 	c.cachedQueries = nil
-	c.cachedPath = ""
-	c.hasPath = false
 	c.interceptor = nil
 	// No handler runs on an authority lookup, so the scope names none.
 	c.scope = 0
@@ -119,10 +112,11 @@ func (c *Context) resetForAuthority(sess *Session, scheme, host, port string) {
 // sent upstream.
 func (c *Context) Request() *http.Request { return c.req }
 
-// SetRequest replaces the request sent upstream.
+// SetRequest replaces the request the rest of the chain sees, and with it the one sent
+// upstream. It is how a middleware hands a substituted request down: the middleware signature
+// carries no request of its own.
 func (c *Context) SetRequest(r *http.Request) {
 	c.cachedQueries = nil
-	c.hasPath = false
 	c.req = r
 }
 
@@ -147,15 +141,30 @@ func (c *Context) Port() string { return c.port }
 // Authority returns the request target as host:port.
 func (c *Context) Authority() string { return joinHostPort(c.host, c.port) }
 
-// RoutingPath returns the canonical form of the path the client sent, not the further
-// normalized form the tree may have matched on. See [RequestContext] for both. The request
-// is never rewritten to either.
-func (c *Context) RoutingPath() string {
-	if !c.hasPath {
-		c.cachedPath = routingPath(c.req)
-		c.hasPath = true
+// RoutingPath returns the canonical form of the path the client sent, which is the form the
+// tree matched on. See [RequestContext] for what canonical covers. It is recomputed on every
+// call, so a handler that rewrites the request reads back what it wrote.
+func (c *Context) RoutingPath() string { return routingPath(c.req) }
+
+// routingPath returns the canonical form of the request path used for matching. The request
+// is never rewritten to it: a proxy must put back on the wire exactly what the client sent,
+// so the canonical form only ever exists inside the lookup.
+func routingPath(r *http.Request) string {
+	if r == nil || r.URL == nil {
+		return ""
 	}
-	return c.cachedPath
+	u := r.URL
+	if u.RawPath == "" {
+		// The wire path was the default encoding of Path, which is always canonical.
+		return stringsutil.EscapePath(u.Path)
+	}
+	norm, _ := stringsutil.NormalizeRawPath(u.RawPath, u.Path)
+	if norm == "" {
+		// RawPath holds a malformed escape or is not an encoding of Path. Like net/url,
+		// Path is then the source of truth.
+		return stringsutil.EscapePath(u.Path)
+	}
+	return norm
 }
 
 // QueryParams parses the raw query and caches the result.
@@ -210,7 +219,7 @@ func (c *Context) Protocol() Protocol {
 // Session returns the client connection this request arrived on.
 func (c *Context) Session() *Session { return c.sess }
 
-// Params returns an iterator over the parameters matched by the current route.
+// Params returns an iterator over the parameters matched by the current interceptor.
 func (c *Context) Params() iter.Seq[Param] {
 	return func(yield func(Param) bool) {
 		if c.interceptor == nil {
@@ -240,7 +249,7 @@ func (c *Context) Param(name string) string {
 	return ""
 }
 
-// Pattern returns the pattern of the matched route, or an empty string outside of
+// Pattern returns the pattern of the matched interceptor, or an empty string outside of
 // [InterceptorHandler] scope.
 func (c *Context) Pattern() string {
 	if c.interceptor == nil {
@@ -257,6 +266,97 @@ func (c *Context) Scope() HandlerScope { return c.scope }
 
 // Proxy returns the [Proxy] serving this request.
 func (c *Context) Proxy() *Proxy { return c.p }
+
+// Forward sends the request upstream and returns the response. The response body streams
+// from the upstream connection: returning the response from a handler relays it to the
+// client without buffering, and reading it consumes it.
+//
+// The request is sent as the client wrote it, minus the hop-by-hop headers a proxy must not
+// relay. Nothing is added: no Via, no X-Forwarded-For, no Accept-Encoding of the proxy's
+// own. Anything a handler mutates on [Context.Request] before calling Forward is what the
+// upstream sees.
+func (c *Context) Forward() (*http.Response, error) {
+	return c.ForwardRequest(c.req)
+}
+
+// ForwardRequest sends r upstream instead of the request the handler was given. Use it to
+// retry, to fan out, or to rewrite the target entirely.
+func (c *Context) ForwardRequest(r *http.Request) (*http.Response, error) {
+	if r == nil {
+		return nil, errors.New("edge: forward a nil request")
+	}
+	if c.p == nil || c.p.srv == nil || c.p.srv.fwd == nil {
+		return nil, errors.New("edge: proxy has no forwarder")
+	}
+
+	out, err := c.outboundRequest(r)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := c.p.srv.fwd.roundTrip(out, c.upstreamProtocol())
+	if err != nil {
+		return nil, fmt.Errorf("forward %s %s: %w", out.Method, out.URL.Redacted(), err)
+	}
+
+	stripResponseHopByHop(resp)
+	return resp, nil
+}
+
+// outboundRequest turns the request the proxy received into one the upstream transport can
+// send. The target of the original request is preserved byte for byte; only the headers a
+// proxy must not relay are removed.
+func (c *Context) outboundRequest(r *http.Request) (*http.Request, error) {
+	if r.URL == nil {
+		return nil, errors.New("edge: forward a request with no URL")
+	}
+
+	ctx := r.Context()
+	if c.sess != nil && c.sess.upstream.IsValid() {
+		// A transparently redirected connection is sent back to the address the client had
+		// already resolved, rather than to a fresh resolution of the authority.
+		ctx = context.WithValue(ctx, upstreamAddrKey{}, c.sess.upstream)
+	}
+
+	out := r.Clone(ctx)
+	// A client request carries no RequestURI; net/http panics otherwise.
+	out.RequestURI = ""
+	out.Close = false
+
+	if out.URL.Scheme == "" {
+		out.URL.Scheme = c.scheme
+	}
+	if out.URL.Host == "" {
+		out.URL.Host = c.Authority()
+	}
+	if out.Host == "" {
+		out.Host = r.Host
+	}
+	if out.Host == "" {
+		out.Host = out.URL.Host
+	}
+
+	upgrade := upgradeType(r.Header)
+	stripHopByHop(out.Header)
+	if upgrade != "" {
+		// An upgrade is the one case where the connection-scoped headers are the payload:
+		// dropping them turns a WebSocket handshake into a plain request.
+		out.Header.Set("Connection", "Upgrade")
+		out.Header.Set("Upgrade", upgrade)
+	}
+
+	return out, nil
+}
+
+// upstreamProtocol reports which protocol the proxy should try upstream. It mirrors the
+// client, so an app that chose HTTP/3 keeps talking to an origin over HTTP/3 and the
+// interception stays invisible in the one place an app can most easily notice it.
+func (c *Context) upstreamProtocol() Protocol {
+	if c.sess == nil {
+		return HTTP11
+	}
+	return c.sess.Protocol()
+}
 
 // onlyRequestContext seals a Context down to [RequestContext] so a [Matcher] cannot reach
 // the mutating half of the API.

@@ -15,7 +15,7 @@ import (
 type TrailingSlashOption uint8
 
 const (
-	// ExactSlash matches the path exactly as registered. /foo and /foo/ are distinct routes.
+	// ExactSlash matches the path exactly as registered. /foo and /foo/ are distinct interceptors.
 	ExactSlash TrailingSlashOption = iota
 	// RelaxedSlash matches the path with or without its trailing slash. An exactly registered
 	// variant always wins over a relaxed match.
@@ -36,8 +36,8 @@ const (
 	AllHandlers = InterceptorHandler | NoInterceptorHandler
 )
 
-// Option configures a [Proxy].
-type Option interface {
+// ProxyOption configures a [Proxy].
+type ProxyOption interface {
 	applyProxy(sealedOption) error
 }
 
@@ -67,7 +67,7 @@ func (o optionFunc) applyMatcher(s sealedOption) error     { return o(s) }
 
 // WithCA sets the certificate authority used to mint leaf certificates for intercepted
 // authorities. Without it the proxy can only tunnel.
-func WithCA(ca *CA) Option {
+func WithCA(ca *CA) ProxyOption {
 	return optionFunc(func(s sealedOption) error {
 		if ca == nil {
 			return fmt.Errorf("%w: certificate authority cannot be nil", ErrInvalidConfig)
@@ -78,8 +78,8 @@ func WithCA(ca *CA) Option {
 }
 
 // WithNoInterceptorHandler sets the handler called for an intercepted request that matches no
-// route. It defaults to [DefaultNoInterceptorHandler], which forwards the request unchanged.
-func WithNoInterceptorHandler(handler HandlerFunc) Option {
+// interceptor. It defaults to [DefaultNoInterceptorHandler], which forwards the request unchanged.
+func WithNoInterceptorHandler(handler HandlerFunc) ProxyOption {
 	return optionFunc(func(s sealedOption) error {
 		if handler == nil {
 			return fmt.Errorf("%w: no interceptor handler cannot be nil", ErrInvalidConfig)
@@ -91,7 +91,7 @@ func WithNoInterceptorHandler(handler HandlerFunc) Option {
 
 // WithErrorHandler sets the handler that turns a handler error into a response. It defaults
 // to [DefaultErrorHandler], which answers 502 Bad Gateway.
-func WithErrorHandler(handler ErrorHandler) Option {
+func WithErrorHandler(handler ErrorHandler) ProxyOption {
 	return optionFunc(func(s sealedOption) error {
 		if handler == nil {
 			return fmt.Errorf("%w: error handler cannot be nil", ErrInvalidConfig)
@@ -108,7 +108,7 @@ func WithErrorHandler(handler ErrorHandler) Option {
 //	edge.New(edge.WithCA(ca), edge.WithMiddleware(log))                  // every handler
 //	p.AddInterceptor(nil, "api.test/v1", h, edge.WithMiddleware(retry))  // this one only
 func WithMiddleware(m ...MiddlewareFunc) interface {
-	Option
+	ProxyOption
 	InterceptorOption
 } {
 	return optionFunc(func(s sealedOption) error {
@@ -133,7 +133,7 @@ func WithMiddleware(m ...MiddlewareFunc) interface {
 }
 
 // WithMiddlewareFor registers proxy-wide middleware for the given scopes only.
-func WithMiddlewareFor(scope HandlerScope, m ...MiddlewareFunc) Option {
+func WithMiddlewareFor(scope HandlerScope, m ...MiddlewareFunc) ProxyOption {
 	return optionFunc(func(s sealedOption) error {
 		// A scope naming nothing, or naming something no handler runs in, would register
 		// middleware that silently never fires.
@@ -154,7 +154,7 @@ func WithMiddlewareFor(scope HandlerScope, m ...MiddlewareFunc) Option {
 func WithName(name string) InterceptorOption {
 	return optionFunc(func(s sealedOption) error {
 		if name == "" {
-			return fmt.Errorf("%w: route name cannot be empty", ErrInvalidConfig)
+			return fmt.Errorf("%w: interceptor name cannot be empty", ErrInvalidConfig)
 		}
 		s.interceptor.name = name
 		return nil
@@ -172,10 +172,10 @@ func WithAnnotation(key, value any) InterceptorOption {
 	})
 }
 
-// WithTrailingSlash configures trailing slash handling, proxy-wide or for a single route.
+// WithTrailingSlash configures trailing slash handling, proxy-wide or for a single interceptor.
 // An interceptor setting overrides the proxy default.
 func WithTrailingSlash(opt TrailingSlashOption) interface {
-	Option
+	ProxyOption
 	InterceptorOption
 } {
 	return optionFunc(func(s sealedOption) error {
@@ -191,29 +191,10 @@ func WithTrailingSlash(opt TrailingSlashOption) interface {
 	})
 }
 
-// WithMergeSlashes collapses consecutive slashes before matching. The request itself is
-// never rewritten: what goes upstream is the target the client sent, byte for byte.
-func WithMergeSlashes(enable bool) Option {
-	return optionFunc(func(s sealedOption) error {
-		s.proxy.cfg.mergeSlash = enable
-		return nil
-	})
-}
-
-// WithCollapseDotSegments resolves "." and ".." segments before matching. As with
-// [WithMergeSlashes] the forwarded request is left untouched. A ".." escaping above the root
-// makes the request match no interceptor.
-func WithCollapseDotSegments(enable bool) Option {
-	return optionFunc(func(s sealedOption) error {
-		s.proxy.cfg.collapseDots = enable
-		return nil
-	})
-}
-
 // WithRegexpParam enables regular expression constraints on pattern parameters. It is off by
 // default: a regexp runs on every candidate segment during a lookup, and an expression with
 // pathological backtracking turns a request into a denial of service.
-func WithRegexpParam(enable bool) Option {
+func WithRegexpParam(enable bool) ProxyOption {
 	return optionFunc(func(s sealedOption) error {
 		s.proxy.cfg.allowRegexp = enable
 		return nil
@@ -221,10 +202,10 @@ func WithRegexpParam(enable bool) Option {
 }
 
 // WithMaxPatternParams bounds how many parameters a pattern may declare. It defaults to 255.
-func WithMaxPatternParams(n uint8) Option {
+func WithMaxPatternParams(n uint8) ProxyOption {
 	return optionFunc(func(s sealedOption) error {
 		if n == 0 {
-			return fmt.Errorf("%w: max route params must be greater than zero", ErrInvalidConfig)
+			return fmt.Errorf("%w: max pattern params must be greater than zero", ErrInvalidConfig)
 		}
 		s.proxy.cfg.maxParams = int(n)
 		return nil
@@ -232,10 +213,10 @@ func WithMaxPatternParams(n uint8) Option {
 }
 
 // WithMaxPatternParamKeyBytes bounds the length of a parameter name. It defaults to 255.
-func WithMaxPatternParamKeyBytes(n uint8) Option {
+func WithMaxPatternParamKeyBytes(n uint8) ProxyOption {
 	return optionFunc(func(s sealedOption) error {
 		if n == 0 {
-			return fmt.Errorf("%w: max route param key bytes must be greater than zero", ErrInvalidConfig)
+			return fmt.Errorf("%w: max pattern param key bytes must be greater than zero", ErrInvalidConfig)
 		}
 		s.proxy.cfg.maxParamKeyBytes = int(n)
 		return nil
@@ -244,7 +225,7 @@ func WithMaxPatternParamKeyBytes(n uint8) Option {
 
 // WithMaxMatchers bounds how many matchers an interceptor may carry, implicit scheme and port
 // matchers included. It defaults to 255.
-func WithMaxMatchers(n uint8) Option {
+func WithMaxMatchers(n uint8) ProxyOption {
 	return optionFunc(func(s sealedOption) error {
 		s.proxy.cfg.maxMatchers = int(n)
 		return nil
@@ -252,7 +233,7 @@ func WithMaxMatchers(n uint8) Option {
 }
 
 // WithTransport configures how the proxy reaches upstream servers.
-func WithTransport(t *Transport) Option {
+func WithTransport(t *Transport) ProxyOption {
 	return optionFunc(func(s sealedOption) error {
 		if t == nil {
 			return fmt.Errorf("%w: transport cannot be nil", ErrInvalidConfig)
@@ -268,7 +249,7 @@ func WithTransport(t *Transport) Option {
 //
 // Without it, transparent mode works only for clients that send a TLS server name or a Host
 // header, and the upstream is reached by resolving that name again.
-func WithOriginalDestination(fn OriginalDestination) Option {
+func WithOriginalDestination(fn OriginalDestination) ProxyOption {
 	return optionFunc(func(s sealedOption) error {
 		if fn == nil {
 			return fmt.Errorf("%w: original destination resolver cannot be nil", ErrInvalidConfig)
@@ -284,7 +265,7 @@ func WithOriginalDestination(fn OriginalDestination) Option {
 //
 // Without it a QUIC connection is placed by the server name in its ClientHello, on port 443.
 // That covers HTTP/3 as it is deployed, and is wrong for an origin reached on another port.
-func WithPacketOriginalDestination(fn PacketOriginalDestination) Option {
+func WithPacketOriginalDestination(fn PacketOriginalDestination) ProxyOption {
 	return optionFunc(func(s sealedOption) error {
 		if fn == nil {
 			return fmt.Errorf("%w: packet original destination resolver cannot be nil", ErrInvalidConfig)
@@ -296,7 +277,7 @@ func WithPacketOriginalDestination(fn PacketOriginalDestination) Option {
 
 // WithLogger sets the logger used for connection level errors the proxy cannot report to a
 // handler. It defaults to [slog.Default].
-func WithLogger(l *slog.Logger) Option {
+func WithLogger(l *slog.Logger) ProxyOption {
 	return optionFunc(func(s sealedOption) error {
 		if l == nil {
 			return fmt.Errorf("%w: logger cannot be nil", ErrInvalidConfig)
@@ -308,7 +289,7 @@ func WithLogger(l *slog.Logger) Option {
 
 // WithReadHeaderTimeout bounds how long the proxy waits for a client to send its request
 // headers. Zero disables the timeout. It defaults to 10s.
-func WithReadHeaderTimeout(d time.Duration) Option {
+func WithReadHeaderTimeout(d time.Duration) ProxyOption {
 	return optionFunc(func(s sealedOption) error {
 		if d < 0 {
 			return fmt.Errorf("%w: read header timeout cannot be negative", ErrInvalidConfig)
@@ -320,7 +301,7 @@ func WithReadHeaderTimeout(d time.Duration) Option {
 
 // WithIdleTimeout bounds how long an idle keep-alive connection is kept open. Zero disables
 // the timeout. It defaults to 90s.
-func WithIdleTimeout(d time.Duration) Option {
+func WithIdleTimeout(d time.Duration) ProxyOption {
 	return optionFunc(func(s sealedOption) error {
 		if d < 0 {
 			return fmt.Errorf("%w: idle timeout cannot be negative", ErrInvalidConfig)
@@ -333,7 +314,7 @@ func WithIdleTimeout(d time.Duration) Option {
 // WithTunnelIdleTimeout bounds how long a tunneled connection may stay silent in both
 // directions before it is closed. Zero disables the timeout, which is the default: a tunnel
 // can legitimately carry a long-lived stream the proxy knows nothing about.
-func WithTunnelIdleTimeout(d time.Duration) Option {
+func WithTunnelIdleTimeout(d time.Duration) ProxyOption {
 	return optionFunc(func(s sealedOption) error {
 		if d < 0 {
 			return fmt.Errorf("%w: tunnel idle timeout cannot be negative", ErrInvalidConfig)
@@ -344,7 +325,7 @@ func WithTunnelIdleTimeout(d time.Duration) Option {
 }
 
 // WithMaxHeaderBytes bounds the size of a request header block. It defaults to 1 MiB.
-func WithMaxHeaderBytes(n int) Option {
+func WithMaxHeaderBytes(n int) ProxyOption {
 	return optionFunc(func(s sealedOption) error {
 		if n <= 0 {
 			return fmt.Errorf("%w: max header bytes must be greater than zero", ErrInvalidConfig)
@@ -404,8 +385,8 @@ func WithScheme(scheme string) interface {
 	})
 }
 
-// WithMatchersPriority orders routes that share a pattern. Higher runs first. It defaults to
-// the number of matchers on the interceptor, so the most constrained route is tried first.
+// WithMatchersPriority orders interceptors that share a pattern. Higher runs first. It defaults
+// to the number of matchers on it, so the most constrained one is tried first.
 func WithMatchersPriority(priority uint) InterceptorOption {
 	return optionFunc(func(s sealedOption) error {
 		s.interceptor.priority = priority

@@ -81,16 +81,16 @@ func FuzzRoundTripRegistration(f *testing.F) {
 	f.Fuzz(func(t *testing.T, raw string) {
 		p := mustFuzzProxy(t)
 
-		rte, err := p.AddInterceptor([]string{http.MethodGet}, raw, noopHandler)
+		ic, err := p.AddInterceptor([]string{http.MethodGet}, raw, noopHandler)
 		if err != nil {
 			return
 		}
 
 		found := p.Interceptor([]string{http.MethodGet}, raw)
 		if found == nil {
-			t.Fatalf("route registered as %q cannot be found again", raw)
+			t.Fatalf("interceptor registered as %q cannot be found again", raw)
 		}
-		if found != rte {
+		if found != ic {
 			t.Fatalf("Interceptor returned a different entry for %q", raw)
 		}
 
@@ -98,11 +98,11 @@ func FuzzRoundTripRegistration(f *testing.F) {
 		if err != nil {
 			t.Fatalf("delete %q: %v", raw, err)
 		}
-		if deleted != rte {
-			t.Fatalf("Delete returned a different route for %q", raw)
+		if deleted != ic {
+			t.Fatalf("Delete returned a different interceptor for %q", raw)
 		}
 		if p.InterceptorsLen() != 0 {
-			t.Fatalf("tree still holds %d routes after deleting %q", p.InterceptorsLen(), raw)
+			t.Fatalf("tree still holds %d interceptors after deleting %q", p.InterceptorsLen(), raw)
 		}
 	})
 }

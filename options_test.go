@@ -39,10 +39,10 @@ func TestOptions_Rejected(t *testing.T) {
 
 	cases := []struct {
 		name string
-		opt  Option
+		opt  ProxyOption
 	}{
 		{"nil CA", WithCA(nil)},
-		{"nil no route handler", WithNoInterceptorHandler(nil)},
+		{"nil no interceptor handler", WithNoInterceptorHandler(nil)},
 		{"nil error handler", WithErrorHandler(nil)},
 		{"nil middleware", WithMiddleware(nil)},
 		{"nil transport", WithTransport(nil)},
@@ -254,13 +254,13 @@ func TestOptions_MiddlewareIsComposable(t *testing.T) {
 	}
 
 	p := testProxy(t, WithMiddleware(tag("proxy")))
-	rte := p.MustAddInterceptor(nil, "api.test/v1", func(c *Context) (*http.Response, error) {
+	ic := p.MustAddInterceptor(nil, "api.test/v1", func(c *Context) (*http.Response, error) {
 		seen = append(seen, "handler")
 		return Status(http.StatusOK), nil
 	}, WithMiddleware(tag("interceptor")))
 
 	c := &Context{}
-	_, err := rte.hall(c)
+	_, err := ic.hall(c)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"proxy", "interceptor", "handler"}, seen,
 		"the proxy-wide middleware wraps the interceptor's")

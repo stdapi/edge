@@ -15,8 +15,8 @@ import (
 
 func patternsOf(seq func(func(*Interceptor) bool)) []string {
 	var out []string
-	for rte := range seq {
-		out = append(out, rte.Pattern())
+	for ic := range seq {
+		out = append(out, ic.Pattern())
 	}
 	slices.Sort(out)
 	return out
@@ -43,7 +43,7 @@ func TestIter_Methods(t *testing.T) {
 
 	methods := slices.Sorted(p.Iter().Methods())
 	assert.Equal(t, []string{http.MethodGet, http.MethodPost}, methods,
-		"a route with no method constraint contributes none")
+		"an interceptor with no method constraint contributes none")
 }
 
 func TestIter_Interceptors(t *testing.T) {
@@ -84,8 +84,8 @@ func TestIter_NamePrefix(t *testing.T) {
 	p.MustAddInterceptor([]string{http.MethodGet}, "files.test/v1/files", noopHandler, WithName("files.list"))
 
 	var names []string
-	for rte := range p.Iter().NamePrefix("stripe.") {
-		names = append(names, rte.Name())
+	for ic := range p.Iter().NamePrefix("stripe.") {
+		names = append(names, ic.Name())
 	}
 	slices.Sort(names)
 	assert.Equal(t, []string{"stripe.charges", "stripe.refunds"}, names)
@@ -108,8 +108,8 @@ func TestIter_Names(t *testing.T) {
 	p.MustAddInterceptor([]string{http.MethodGet}, "api.test/v1/refunds", noopHandler)
 
 	var named []string
-	for rte := range p.Iter().Names() {
-		named = append(named, rte.Name())
+	for ic := range p.Iter().Names() {
+		named = append(named, ic.Name())
 	}
 	require.Equal(t, []string{"charges"}, named)
 }

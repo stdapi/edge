@@ -105,18 +105,18 @@ func TestContext_NoInterceptorScope(t *testing.T) {
 
 	var scope HandlerScope
 	var pattern string
-	var route *Interceptor
+	var ic *Interceptor
 
 	originURL := origin.URL
 	p, host, client := interceptingProxy(t, origin, WithNoInterceptorHandler(func(c *Context) (*http.Response, error) {
 		scope = c.Scope()
 		pattern = c.Pattern()
-		route = c.Interceptor()
-		return Text(http.StatusOK, "no route"), nil
+		ic = c.Interceptor()
+		return Text(http.StatusOK, "no interceptor"), nil
 	}))
 
 	// The helper arms the authority with a catch-all, which would match here and leave the
-	// no-interceptor handler unreachable. A narrow route keeps the authority armed while
+	// no-interceptor handler unreachable. A narrow interceptor keeps the authority armed while
 	// letting an unregistered path fall through, which is what this test is about.
 	_, err := p.DeleteInterceptor(nil, host+"/*{any}")
 	require.NoError(t, err)
@@ -127,10 +127,10 @@ func TestContext_NoInterceptorScope(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 
-	assert.Equal(t, "no route", string(body))
+	assert.Equal(t, "no interceptor", string(body))
 	assert.Equal(t, NoInterceptorHandler, scope)
-	assert.Empty(t, pattern, "there is no pattern outside of a route")
-	assert.Nil(t, route)
+	assert.Empty(t, pattern, "there is no pattern outside of an interceptor")
+	assert.Nil(t, ic)
 }
 
 func TestContext_SetRequest(t *testing.T) {
@@ -166,4 +166,22 @@ func TestContext_RemoteAddrOfAnAddresslessRequest(t *testing.T) {
 
 	sess := &Session{remoteAddr: &net.UnixAddr{Name: "/tmp/sock", Net: "unix"}}
 	assert.False(t, sess.RemoteAddr().IsValid(), "neither does the connection it arrived on")
+}
+
+func TestContext_RoutingPathCanonicalization(t *testing.T) {
+	cases := []struct{ target, want string }{
+		{"/v1/charges", "/v1/charges"},
+		// An escaped unreserved character is decoded, an escaped delimiter is not.
+		{"/v1/%41", "/v1/A"},
+		{"/v1/a%2Fb", "/v1/a%2Fb"},
+		// Lowercase hex is normalized so a pattern and a request agree on one form.
+		{"/v1/a%2fb", "/v1/a%2Fb"},
+	}
+
+	for _, tc := range cases {
+		req := httptest.NewRequest(http.MethodGet, tc.target, nil)
+		assert.Equal(t, tc.want, routingPath(req), "routingPath(%q)", tc.target)
+	}
+
+	assert.Empty(t, routingPath(nil))
 }

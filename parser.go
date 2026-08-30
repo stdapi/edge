@@ -40,7 +40,7 @@ type pattern struct {
 }
 
 // parsePattern parses an interceptor pattern of the form host[:port]/path. The hostname is
-// required: a route arms the interception of the authority it names, and one that names none
+// required: an interceptor arms the interception of the authority it names, and one that names none
 // would arm nothing, leaving a handler registered that no connection can ever reach. Matching
 // every authority is spelled with a wildcard, which says so.
 func (p *Proxy) parsePattern(raw string) (pattern, int, error) {
@@ -606,9 +606,6 @@ func (p *Proxy) parsePath(path string, paramCount int) ([]token, bool, int, *Pat
 				}
 				_, size := utf8.DecodeRuneInString(path[i:])
 				return nil, false, 0, newPatternError("syntax", i, i+size, "character requires percent-encoding")
-			}
-			if c == '/' && i > 0 && path[i-1] == '/' && p.cfg.mergeSlash {
-				return nil, false, 0, newPatternError("syntax", i-1, i+1, "consecutive '/' unreachable, slashes are merged before matching")
 			}
 			if c == '.' && i > 0 && path[i-1] == '/' {
 				next := i + 1

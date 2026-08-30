@@ -17,53 +17,53 @@ func TestInterceptor_Accessors(t *testing.T) {
 	p := testProxy(t)
 
 	type annotationKey struct{}
-	rte := p.MustAddInterceptor([]string{http.MethodGet}, "api.stripe.com:8443/v1/{id}/refunds/*{rest}", noopHandler,
+	ic := p.MustAddInterceptor([]string{http.MethodGet}, "api.stripe.com:8443/v1/{id}/refunds/*{rest}", noopHandler,
 		WithName("refunds"),
 		WithAnnotation(annotationKey{}, "recorded"),
 		WithTrailingSlash(RelaxedSlash),
 		WithScheme("https"),
 	)
 
-	assert.Equal(t, "api.stripe.com:8443/v1/{id}/refunds/*{rest}", rte.Pattern())
-	assert.Equal(t, "api.stripe.com", rte.Hostname())
-	assert.Equal(t, "8443", rte.Port())
-	assert.Equal(t, "/v1/{id}/refunds/*{rest}", rte.Path())
-	assert.Equal(t, "refunds", rte.Name())
-	assert.Equal(t, "recorded", rte.Annotation(annotationKey{}))
-	assert.Nil(t, rte.Annotation("missing"))
-	assert.Equal(t, RelaxedSlash, rte.TrailingSlashOption())
+	assert.Equal(t, "api.stripe.com:8443/v1/{id}/refunds/*{rest}", ic.Pattern())
+	assert.Equal(t, "api.stripe.com", ic.Hostname())
+	assert.Equal(t, "8443", ic.Port())
+	assert.Equal(t, "/v1/{id}/refunds/*{rest}", ic.Path())
+	assert.Equal(t, "refunds", ic.Name())
+	assert.Equal(t, "recorded", ic.Annotation(annotationKey{}))
+	assert.Nil(t, ic.Annotation("missing"))
+	assert.Equal(t, RelaxedSlash, ic.TrailingSlashOption())
 
-	assert.Equal(t, []string{http.MethodGet}, slices.Collect(rte.Methods()))
-	assert.Equal(t, 2, rte.ParamsLen())
-	assert.Equal(t, []string{"id", "rest"}, slices.Collect(rte.Params()))
+	assert.Equal(t, []string{http.MethodGet}, slices.Collect(ic.Methods()))
+	assert.Equal(t, 2, ic.ParamsLen())
+	assert.Equal(t, []string{"id", "rest"}, slices.Collect(ic.Params()))
 
-	assert.Equal(t, 1, rte.MatchersLen())
-	assert.Equal(t, uint(1), rte.MatchersPriority())
+	assert.Equal(t, 1, ic.MatchersLen())
+	assert.Equal(t, uint(1), ic.MatchersPriority())
 
-	assert.Contains(t, rte.String(), "method:GET")
-	assert.Contains(t, rte.String(), "name:refunds")
-	assert.Contains(t, rte.String(), "scheme=https")
-	assert.Contains(t, rte.String(), "pattern:api.stripe.com:8443/")
+	assert.Contains(t, ic.String(), "method:GET")
+	assert.Contains(t, ic.String(), "name:refunds")
+	assert.Contains(t, ic.String(), "scheme=https")
+	assert.Contains(t, ic.String(), "pattern:api.stripe.com:8443/")
 }
 
 func TestInterceptor_NoMethodHasNoConstraint(t *testing.T) {
 	p := testProxy(t)
-	rte := p.MustAddInterceptor(nil, "api.test/v1", noopHandler)
+	ic := p.MustAddInterceptor(nil, "api.test/v1", noopHandler)
 
-	assert.Empty(t, slices.Collect(rte.Methods()))
-	assert.Contains(t, rte.String(), "method:*")
+	assert.Empty(t, slices.Collect(ic.Methods()))
+	assert.Contains(t, ic.String(), "method:*")
 }
 
 func TestInterceptor_NameLookup(t *testing.T) {
 	p := testProxy(t)
-	rte := p.MustAddInterceptor([]string{http.MethodGet}, "api.test/v1/charges", noopHandler, WithName("charges"))
+	ic := p.MustAddInterceptor([]string{http.MethodGet}, "api.test/v1/charges", noopHandler, WithName("charges"))
 
-	assert.Same(t, rte, p.Name("charges"))
+	assert.Same(t, ic, p.Name("charges"))
 	assert.Nil(t, p.Name("nothing"))
 
 	_, err := p.AddInterceptor([]string{http.MethodPost}, "api.test/v1/refunds", noopHandler, WithName("charges"))
 	var conflict *InterceptorNameConflictError
-	require.ErrorAs(t, err, &conflict, "a name identifies one route")
+	require.ErrorAs(t, err, &conflict, "a name identifies one interceptor")
 }
 
 func TestInterceptor_HandleRunsWithoutMiddleware(t *testing.T) {
@@ -79,20 +79,20 @@ func TestInterceptor_HandleRunsWithoutMiddleware(t *testing.T) {
 		}
 	}
 
-	rte, err := p.newInterceptor([]string{http.MethodGet}, "api.test/v1", func(c *Context) (*http.Response, error) {
+	ic, err := p.newInterceptor([]string{http.MethodGet}, "api.test/v1", func(c *Context) (*http.Response, error) {
 		seen = append(seen, "handler")
 		return Status(http.StatusOK), nil
-	}, WithMiddleware(mw("route")))
+	}, WithMiddleware(mw("interceptor")))
 	require.NoError(t, err)
 
-	_, err = rte.Handle(nil)
+	_, err = ic.Handle(nil)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"handler"}, seen, "Handle must skip the middleware")
 
 	seen = nil
-	_, err = rte.HandleMiddleware(nil)
+	_, err = ic.HandleMiddleware(nil)
 	require.NoError(t, err)
-	assert.Equal(t, []string{"route", "handler"}, seen)
+	assert.Equal(t, []string{"interceptor", "handler"}, seen)
 }
 
 func TestInterceptor_UpdateReplacesTheHandler(t *testing.T) {
@@ -105,7 +105,7 @@ func TestInterceptor_UpdateReplacesTheHandler(t *testing.T) {
 		return Text(http.StatusOK, "second"), nil
 	})
 	require.NoError(t, err)
-	assert.Equal(t, 1, p.InterceptorsLen(), "an update must not add a route")
+	assert.Equal(t, 1, p.InterceptorsLen(), "an update must not add an interceptor")
 
 	resp, err := updated.Handle(nil)
 	require.NoError(t, err)
@@ -151,19 +151,19 @@ func TestMethodFastNeverMatchesAnEmptyMethod(t *testing.T) {
 	require.NoError(t, err)
 
 	cases := []struct {
-		name  string
-		route *Interceptor
+		name string
+		ic   *Interceptor
 	}{
-		{name: "many methods", route: p.MustAddInterceptor([]string{http.MethodGet, http.MethodPost}, "a.test/many", noopHandler)},
-		{name: "with matchers", route: p.MustAddInterceptor([]string{http.MethodGet}, "a.test/matched", noopHandler, WithMatcher(beta))},
-		{name: "no method", route: p.MustAddInterceptor(nil, "a.test/any", noopHandler)},
+		{name: "many methods", ic: p.MustAddInterceptor([]string{http.MethodGet, http.MethodPost}, "a.test/many", noopHandler)},
+		{name: "with matchers", ic: p.MustAddInterceptor([]string{http.MethodGet}, "a.test/matched", noopHandler, WithMatcher(beta))},
+		{name: "no method", ic: p.MustAddInterceptor(nil, "a.test/any", noopHandler)},
 	}
 
 	c := &Context{params: new([]string)}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.NotEmpty(t, tc.route.methodFast, "methodFast must never be left at its zero value")
-			assert.False(t, tc.route.match("", c) && len(tc.route.matchers) > 0,
+			assert.NotEmpty(t, tc.ic.methodFast, "methodFast must never be left at its zero value")
+			assert.False(t, tc.ic.match("", c) && len(tc.ic.matchers) > 0,
 				"an empty method must not short circuit the matchers")
 		})
 	}

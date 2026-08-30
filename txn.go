@@ -14,7 +14,7 @@ import (
 // A Txn must not be used concurrently by multiple goroutines. It is however
 // safe to run multiple transactions from different goroutines, each on its
 // own Txn. Read transactions operate on a point-in-time snapshot and never
-// block, while write transactions are serialized by the router. A write Txn
+// block, while write transactions are serialized by the proxy. A write Txn
 // must be finalized with [Txn.Commit] or [Txn.Abort]. Routing requests never
 // block, even while a write transaction is in progress.
 type Txn struct {
@@ -86,7 +86,7 @@ func replaceAuthorityRefs(t *tXn, existing *Interceptor, refs uint32) error {
 	return t.insert(&next, modeInsert)
 }
 
-// AddInterceptor registers a new route for the given methods, pattern and matchers. On success, it returns the newly registered [Interceptor].
+// AddInterceptor registers a new interceptor for the given methods, pattern and matchers. On success, it returns the newly registered [Interceptor].
 // If an error occurs, it returns one of the following:
 //   - [*PatternError]: If the pattern syntax is invalid.
 //   - [*InterceptorConflictError]: If the interceptor conflict with others.
@@ -105,21 +105,21 @@ func (txn *Txn) AddInterceptor(methods []string, pattern string, handler Handler
 		return nil, ErrReadOnlyTxn
 	}
 
-	rte, err := txn.p.newInterceptor(methods, pattern, handler, opts...)
+	ic, err := txn.p.newInterceptor(methods, pattern, handler, opts...)
 	if err != nil {
 		return nil, err
 	}
 
-	if err = txn.addImpliedAuthority(rte); err != nil {
+	if err = txn.addImpliedAuthority(ic); err != nil {
 		return nil, err
 	}
-	if err = txn.rootTxn.insert(rte, modeInsert); err != nil {
+	if err = txn.rootTxn.insert(ic, modeInsert); err != nil {
 		return nil, err
 	}
-	return rte, nil
+	return ic, nil
 }
 
-// UpdateInterceptor override an existing route for the given methods, pattern and matchers. On success, it returns the newly registered [Interceptor].
+// UpdateInterceptor override an existing interceptor for the given methods, pattern and matchers. On success, it returns the newly registered [Interceptor].
 // If an error occurs, it returns one of the following:
 //   - [*PatternError]: If the pattern syntax is invalid.
 //   - [ErrInterceptorNotFound]: If the interceptor does not exist.
@@ -141,19 +141,19 @@ func (txn *Txn) UpdateInterceptor(methods []string, pattern string, handler Hand
 		return nil, ErrReadOnlyTxn
 	}
 
-	rte, err := txn.p.newInterceptor(methods, pattern, handler, opts...)
+	ic, err := txn.p.newInterceptor(methods, pattern, handler, opts...)
 	if err != nil {
 		return nil, err
 	}
 
-	if err = txn.rootTxn.insert(rte, modeUpdate); err != nil {
+	if err = txn.rootTxn.insert(ic, modeUpdate); err != nil {
 		return nil, err
 	}
 
-	return rte, nil
+	return ic, nil
 }
 
-// DeleteInterceptor deletes an existing route for the given methods, pattern and matchers. On success, it returns the deleted [Interceptor].
+// DeleteInterceptor deletes an existing interceptor for the given methods, pattern and matchers. On success, it returns the deleted [Interceptor].
 // If an error occurs, it returns one of the following:
 //   - [*PatternError]: If the pattern syntax is invalid.
 //   - [ErrInterceptorNotFound]: If the interceptor does not exist.
@@ -180,42 +180,42 @@ func (txn *Txn) DeleteInterceptor(methods []string, pattern string, opts ...Matc
 		return nil, err
 	}
 
-	rte := &Interceptor{pattern: pat}
+	ic := &Interceptor{pattern: pat}
 
 	for _, opt := range opts {
-		if err = opt.applyMatcher(sealedOption{proxy: txn.p, interceptor: rte}); err != nil {
+		if err = opt.applyMatcher(sealedOption{proxy: txn.p, interceptor: ic}); err != nil {
 			return nil, err
 		}
 	}
 
-	if len(rte.matchers) > txn.p.cfg.maxMatchers {
+	if len(ic.matchers) > txn.p.cfg.maxMatchers {
 		return nil, fmt.Errorf("%w: %w", ErrInvalidInterceptor, ErrTooManyMatchers)
 	}
 
 	// If this interceptor is registered with methods, push the internal matcher at first position.
 	if len(methods) > 0 {
 		// As a defensive mesure, keep our own copy of the provided slice.
-		rte.methods = make([]string, len(methods))
-		copy(rte.methods, methods)
-		slices.Sort(rte.methods)
-		rte.methods = slices.Compact(rte.methods)
+		ic.methods = make([]string, len(methods))
+		copy(ic.methods, methods)
+		slices.Sort(ic.methods)
+		ic.methods = slices.Compact(ic.methods)
 	}
 
-	route, deleted := txn.rootTxn.delete(rte)
+	ic, deleted := txn.rootTxn.delete(ic)
 	if !deleted {
-		return nil, newInterceptorNotFoundError(rte)
+		return nil, newInterceptorNotFoundError(ic)
 	}
-	txn.dropImpliedAuthority(route)
+	txn.dropImpliedAuthority(ic)
 
-	return route, nil
+	return ic, nil
 }
 
-// removeInterceptor deletes an existing route that match the provided [Interceptor] pattern and matchers. On success, it returns
+// removeInterceptor deletes an existing interceptor that match the provided [Interceptor] pattern and matchers. On success, it returns
 // the deleted [Interceptor]. If an error occurs, it returns one of the following:
 //   - [ErrInterceptorNotFound]: If the interceptor does not exist.
 //   - [ErrInvalidInterceptor]: If the interceptor is missing.
 //   - [ErrReadOnlyTxn]: On write in a read-only transaction.
-func (txn *Txn) removeInterceptor(route *Interceptor) (*Interceptor, error) {
+func (txn *Txn) removeInterceptor(ic *Interceptor) (*Interceptor, error) {
 	if txn.rootTxn == nil {
 		panic(ErrSettledTxn)
 	}
@@ -223,20 +223,20 @@ func (txn *Txn) removeInterceptor(route *Interceptor) (*Interceptor, error) {
 		return nil, ErrReadOnlyTxn
 	}
 
-	if route == nil || route.hbase == nil {
+	if ic == nil || ic.hbase == nil {
 		return nil, ErrInvalidInterceptor
 	}
 
-	rte, deleted := txn.rootTxn.delete(route)
+	ic, deleted := txn.rootTxn.delete(ic)
 	if !deleted {
-		return nil, newInterceptorNotFoundError(route)
+		return nil, newInterceptorNotFoundError(ic)
 	}
-	txn.dropImpliedAuthority(rte)
+	txn.dropImpliedAuthority(ic)
 
-	return rte, nil
+	return ic, nil
 }
 
-// Truncate removes everything registered on the proxy, routes and authority entries alike.
+// Truncate removes everything registered on the proxy, interceptors and authority entries alike.
 // They share one tree, so there is no half of it to keep. Truncating on a read-only
 // transaction returns ErrReadOnlyTxn.
 func (txn *Txn) Truncate() error {
@@ -331,7 +331,7 @@ func (txn *Txn) Commit() {
 
 	newRoot := txn.rootTxn.commit()
 	// Authorities are published first. An interceptor visible before the authority entry that intercepts its
-	// authority would never fire; an authority entry visible before its route only means the authority
+	// authority would never fire; an authority entry visible before its interceptor only means the authority
 	// is intercepted and forwarded unchanged for an instant.
 	txn.p.tree.Store(newRoot)
 

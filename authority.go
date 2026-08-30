@@ -72,11 +72,11 @@ func (txn *Txn) AddTunnel(patterns ...string) error {
 	}
 
 	for _, pattern := range patterns {
-		rte, err := txn.p.newAuthority(pattern, Tunnel, false)
+		ic, err := txn.p.newAuthority(pattern, Tunnel, false)
 		if err != nil {
 			return err
 		}
-		if err := insertAuthority(txn.rootTxn, rte); err != nil {
+		if err := insertAuthority(txn.rootTxn, ic); err != nil {
 			return err
 		}
 	}
@@ -93,12 +93,12 @@ func (txn *Txn) DeleteTunnel(pattern string) (Authority, error) {
 		return Authority{}, ErrReadOnlyTxn
 	}
 
-	rte, err := txn.p.newAuthority(pattern, Tunnel, false)
+	ic, err := txn.p.newAuthority(pattern, Tunnel, false)
 	if err != nil {
 		return Authority{}, err
 	}
 
-	deleted, ok := txn.rootTxn.delete(rte)
+	deleted, ok := txn.rootTxn.delete(ic)
 	if !ok {
 		return Authority{}, fmt.Errorf("%w: no tunnel registered for %q", ErrTunnelNotFound, pattern)
 	}
@@ -122,8 +122,8 @@ func (p *Proxy) Authorities() iter.Seq[Authority] {
 	tree := p.getTree()
 	it := Iter{patterns: tree.patterns, names: tree.names, methods: tree.methods, maxDepth: tree.maxDepth}
 	return func(yield func(Authority) bool) {
-		for rte := range it.patternPrefix("", true) {
-			if !yield(Authority{entry: rte}) {
+		for ic := range it.patternPrefix("", true) {
+			if !yield(Authority{entry: ic}) {
 				return
 			}
 		}
@@ -170,19 +170,19 @@ func (p *Proxy) addAuthorities(action Action, patterns []string, implicit bool) 
 
 	rules := make([]*Interceptor, 0, len(patterns))
 	for _, pattern := range patterns {
-		rte, err := p.newAuthority(pattern, action, implicit)
+		ic, err := p.newAuthority(pattern, action, implicit)
 		if err != nil {
 			return err
 		}
-		rules = append(rules, rte)
+		rules = append(rules, ic)
 	}
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
 	txn := p.getTree().txn()
-	for _, rte := range rules {
-		if err := insertAuthority(txn, rte); err != nil {
+	for _, ic := range rules {
+		if err := insertAuthority(txn, ic); err != nil {
 			return err
 		}
 	}
@@ -193,31 +193,31 @@ func (p *Proxy) addAuthorities(action Action, patterns []string, implicit bool) 
 // insertAuthority adds an authority entry, replacing an implied one registered for the same
 // authority. The same authority declared twice is a configuration error, so the
 // conflict is reported rather than silently resolved.
-func insertAuthority(txn *tXn, rte *Interceptor) error {
-	existing := txn.searchAuthority(rte)
+func insertAuthority(txn *tXn, ic *Interceptor) error {
+	existing := txn.searchAuthority(ic)
 	switch {
 	case existing == nil:
-		return txn.insert(rte, modeInsert)
-	case existing.implicit && !rte.implicit:
-		// The entry sitting there was derived from routes. Taking it over is only sound if
+		return txn.insert(ic, modeInsert)
+	case existing.implicit && !ic.implicit:
+		// The entry sitting there was derived from interceptors. Taking it over is only sound if
 		// the explicit declaration keeps intercepting them; anything else would leave those
-		// routes registered and unreachable, which is the failure this rejects.
-		if rte.action != Intercept && existing.refs > 0 {
+		// interceptors registered and unreachable, which is the failure this rejects.
+		if ic.action != Intercept && existing.refs > 0 {
 			return fmt.Errorf("%w: %d interceptor(s) intercept %s, so it cannot be set to %s",
-				ErrAuthorityConflict, existing.refs, existing.pattern.str, rte.action)
+				ErrAuthorityConflict, existing.refs, existing.pattern.str, ic.action)
 		}
 		if _, ok := txn.delete(existing); !ok {
 			return fmt.Errorf("internal error: authority %q vanished during replace", existing.pattern.str)
 		}
 		// The count travels with the decision, so deleting the explicit rule later can hand
-		// the authority back to the routes that still need it.
-		rte.refs = existing.refs
-		return txn.insert(rte, modeInsert)
-	case rte.implicit:
+		// the authority back to the interceptors that still need it.
+		ic.refs = existing.refs
+		return txn.insert(ic, modeInsert)
+	case ic.implicit:
 		// An interceptor never overrides an authority entry that is already there.
 		return nil
 	default:
-		return &InterceptorConflictError{New: rte, Conflicts: []*Interceptor{existing}}
+		return &InterceptorConflictError{New: ic, Conflicts: []*Interceptor{existing}}
 	}
 }
 
@@ -227,21 +227,21 @@ func (p *Proxy) newAuthority(pattern string, action Action, implicit bool) (*Int
 		return nil, err
 	}
 
-	rte := &Interceptor{
+	ic := &Interceptor{
 		pattern:    pat,
 		action:     action,
 		implicit:   implicit,
 		methodFast: noFastMethod,
 	}
 
-	rte.params = make([]string, 0, paramsCnt)
+	ic.params = make([]string, 0, paramsCnt)
 	for _, tk := range pat.tokens {
 		if tk.typ != nodeStatic {
-			rte.params = append(rte.params, tk.value)
+			ic.params = append(ic.params, tk.value)
 		}
 	}
 
-	return rte, nil
+	return ic, nil
 }
 
 // impliedAuthorityFor returns the authority entry an interceptor implies. The hostname is

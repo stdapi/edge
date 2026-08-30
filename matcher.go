@@ -244,7 +244,7 @@ func (m RemoteIPMatcher) Equal(matcher Matcher) bool {
 func (m RemoteIPMatcher) String() string { return "remoteip=" + m.prefix.String() }
 
 // ProtocolMatcher matches the protocol the client is speaking to the proxy. It is how a
-// route targets, say, only the HTTP/3 traffic of an authority.
+// interceptor targets, say, only the HTTP/3 traffic of an authority.
 type ProtocolMatcher struct {
 	proto Protocol
 }

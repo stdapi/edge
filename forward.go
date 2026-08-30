@@ -5,9 +5,6 @@
 package edge
 
 import (
-	"context"
-	"errors"
-	"fmt"
 	"net/http"
 	"net/textproto"
 	"strings"
@@ -30,8 +27,6 @@ var hopByHopHeaders = [...]string{
 	"Upgrade",
 }
 
-// forwarder sends requests upstream. One forwarder is shared by every session so upstream
-// connections are pooled across clients.
 // forwarder sends requests upstream. It keeps one transport per protocol so the version the
 // client chose can be mirrored upstream, and every session shares it so upstream connections
 // are pooled across clients.
@@ -89,42 +84,6 @@ func (f *forwarder) roundTrip(req *http.Request, proto Protocol) (*http.Response
 	}
 }
 
-// Forward sends the request upstream and returns the response. The response body streams
-// from the upstream connection: returning the response from a handler relays it to the
-// client without buffering, and reading it consumes it.
-//
-// The request is sent as the client wrote it, minus the hop-by-hop headers a proxy must not
-// relay. Nothing is added: no Via, no X-Forwarded-For, no Accept-Encoding of the proxy's
-// own. Anything a handler mutates on [Context.Request] before calling Forward is what the
-// upstream sees.
-func (c *Context) Forward() (*http.Response, error) {
-	return c.ForwardRequest(c.req)
-}
-
-// ForwardRequest sends r upstream instead of the request the handler was given. Use it to
-// retry, to fan out, or to rewrite the target entirely.
-func (c *Context) ForwardRequest(r *http.Request) (*http.Response, error) {
-	if r == nil {
-		return nil, errors.New("edge: forward a nil request")
-	}
-	if c.p == nil || c.p.srv == nil || c.p.srv.fwd == nil {
-		return nil, errors.New("edge: proxy has no forwarder")
-	}
-
-	out, err := c.outboundRequest(r)
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := c.p.srv.fwd.roundTrip(out, c.upstreamProtocol())
-	if err != nil {
-		return nil, fmt.Errorf("forward %s %s: %w", out.Method, out.URL.Redacted(), err)
-	}
-
-	stripResponseHopByHop(resp)
-	return resp, nil
-}
-
 // stripResponseHopByHop removes the connection-scoped headers from a response, except on a
 // 101 where Connection and Upgrade are the whole point of the answer.
 func stripResponseHopByHop(resp *http.Response) {
@@ -139,61 +98,6 @@ func stripResponseHopByHop(resp *http.Response) {
 		resp.Header.Set("Connection", "Upgrade")
 		resp.Header.Set("Upgrade", upgrade)
 	}
-}
-
-// upstreamProtocol reports which protocol the proxy should try upstream. It mirrors the
-// client, so an app that chose HTTP/3 keeps talking to an origin over HTTP/3 and the
-// interception stays invisible in the one place an app can most easily notice it.
-func (c *Context) upstreamProtocol() Protocol {
-	if c.sess == nil {
-		return HTTP11
-	}
-	return c.sess.Protocol()
-}
-
-// outboundRequest turns the request the proxy received into one the upstream transport can
-// send. The target of the original request is preserved byte for byte; only the headers a
-// proxy must not relay are removed.
-func (c *Context) outboundRequest(r *http.Request) (*http.Request, error) {
-	if r.URL == nil {
-		return nil, errors.New("edge: forward a request with no URL")
-	}
-
-	ctx := r.Context()
-	if c.sess != nil && c.sess.upstream.IsValid() {
-		// A transparently redirected connection is sent back to the address the client had
-		// already resolved, rather than to a fresh resolution of the authority.
-		ctx = context.WithValue(ctx, upstreamAddrKey{}, c.sess.upstream)
-	}
-
-	out := r.Clone(ctx)
-	// A client request carries no RequestURI; net/http panics otherwise.
-	out.RequestURI = ""
-	out.Close = false
-
-	if out.URL.Scheme == "" {
-		out.URL.Scheme = c.scheme
-	}
-	if out.URL.Host == "" {
-		out.URL.Host = c.Authority()
-	}
-	if out.Host == "" {
-		out.Host = r.Host
-	}
-	if out.Host == "" {
-		out.Host = out.URL.Host
-	}
-
-	upgrade := upgradeType(r.Header)
-	stripHopByHop(out.Header)
-	if upgrade != "" {
-		// An upgrade is the one case where the connection-scoped headers are the payload:
-		// dropping them turns a WebSocket handshake into a plain request.
-		out.Header.Set("Connection", "Upgrade")
-		out.Header.Set("Upgrade", upgrade)
-	}
-
-	return out, nil
 }
 
 // stripHopByHop removes the connection-scoped headers, including the ones the peer listed in

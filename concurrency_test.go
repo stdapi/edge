@@ -38,7 +38,7 @@ func TestConcurrency_InterceptorMutationDuringTraffic(t *testing.T) {
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
 
-	// A writer churning the tree: routes come and go for the whole run.
+	// A writer churning the tree: interceptors come and go for the whole run.
 	wg.Go(func() {
 		for i := 0; ; i++ {
 			select {
@@ -48,13 +48,13 @@ func TestConcurrency_InterceptorMutationDuringTraffic(t *testing.T) {
 			}
 
 			pattern := fmt.Sprintf("%s/churn/%d", authority, i%16)
-			rte, err := p.AddInterceptor([]string{http.MethodGet}, pattern, func(c *Context) (*http.Response, error) {
+			ic, err := p.AddInterceptor([]string{http.MethodGet}, pattern, func(c *Context) (*http.Response, error) {
 				return Text(http.StatusOK, "churn"), nil
 			})
 			if err != nil {
 				continue
 			}
-			if _, err := p.removeInterceptor(rte); err != nil {
+			if _, err := p.removeInterceptor(ic); err != nil {
 				t.Errorf("delete %s: %v", pattern, err)
 				return
 			}

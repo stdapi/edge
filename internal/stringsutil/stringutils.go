@@ -53,7 +53,7 @@ func init() {
 
 // EqualStringsASCIIIgnoreCase performs case-insensitive comparison of two strings
 // containing ASCII characters. Only supports ASCII letters (A-Z, a-z), digits (0-9), hyphen (-) and underscore (_).
-// Used for hostname matching where registered routes follow LDH standard.
+// Used for hostname matching where registered patterns follow LDH standard.
 func EqualStringsASCIIIgnoreCase(s1, s2 string) bool {
 	// Easy case.
 	if len(s1) != len(s2) {
@@ -69,7 +69,7 @@ func EqualStringsASCIIIgnoreCase(s1, s2 string) bool {
 
 // EqualASCIIIgnoreCase performs case-insensitive comparison of two ASCII bytes.
 // Only supports ASCII letters (A-Z, a-z), digits (0-9), hyphen (-) and underscore (_).
-// Used for hostname matching where registered routes follow LDH standard.
+// Used for hostname matching where registered patterns follow LDH standard.
 func EqualASCIIIgnoreCase(s, t uint8) bool {
 	// Easy case.
 	if t == s {

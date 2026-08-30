@@ -12,7 +12,7 @@ import (
 	"strings"
 )
 
-// Interceptor is an immutable route: a request target pattern, the methods and matchers that
+// Interceptor is an immutable rule: a request target pattern, the methods and matchers that
 // narrow it, and the handler that serves it. A Interceptor is safe for concurrent use and is
 // never mutated after registration.
 type Interceptor struct {
@@ -40,7 +40,7 @@ func (r *Interceptor) Handle(c *Context) (*http.Response, error) {
 }
 
 // HandleMiddleware calls the interceptor handler with the interceptor-specific middleware applied.
-// It is not meant to be registered as another route's handler: the middleware chain would
+// It is not meant to be registered as another interceptor's handler: the middleware chain would
 // be applied twice. Use [Interceptor.Handle] to reuse a handler.
 func (r *Interceptor) HandleMiddleware(c *Context, _ ...struct{}) (*http.Response, error) {
 	// The variadic parameter keeps this method from having the HandlerFunc signature,
@@ -107,7 +107,7 @@ func (r *Interceptor) String() string {
 // would then match the interceptor outright, skipping the port and the matchers that narrow it.
 //
 // A NUL byte is not a valid HTTP token character, so validMethod rejects this value and no
-// route can be registered with it. TestMethodSentinels holds both properties.
+// interceptor can be registered with it. TestMethodSentinels holds both properties.
 const noFastMethod = "\x00none"
 
 // match reports whether the request satisfies this interceptor's method constraint, the port
@@ -191,33 +191,33 @@ outer:
 	return true
 }
 
-func entryf(sb *strings.Builder, route *Interceptor, pad int, showName bool) {
+func entryf(sb *strings.Builder, ic *Interceptor, pad int, showName bool) {
 	sb.WriteString(strings.Repeat(" ", pad))
-	if route.action != 0 {
+	if ic.action != 0 {
 		sb.WriteString("authority:")
-		sb.WriteString(route.pattern.str)
+		sb.WriteString(ic.pattern.str)
 		sb.WriteString(" action:")
-		sb.WriteString(route.action.String())
+		sb.WriteString(ic.action.String())
 		return
 	}
 
 	sb.WriteString("method:")
-	if len(route.methods) > 0 {
-		sb.WriteString(strings.Join(route.methods, ","))
+	if len(ic.methods) > 0 {
+		sb.WriteString(strings.Join(ic.methods, ","))
 	} else {
 		sb.WriteString("*")
 	}
 
 	sb.WriteString(" pattern:")
-	sb.WriteString(route.pattern.str)
+	sb.WriteString(ic.pattern.str)
 
-	if route.name != "" && showName {
+	if ic.name != "" && showName {
 		sb.WriteString(" name:")
-		sb.WriteString(route.name)
+		sb.WriteString(ic.name)
 	}
 
 	size := sb.Len()
-	for _, matcher := range route.matchers {
+	for _, matcher := range ic.matchers {
 		m, ok := matcher.(fmt.Stringer)
 		if !ok {
 			continue

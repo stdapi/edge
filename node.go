@@ -26,8 +26,8 @@ type node struct {
 	// Static nodes: Contains the literal path segment (e.g., "/users", "foo")
 	//
 	// Param nodes without regex: Contains "?" as a canonical placeholder.
-	// This allows routes with different param names (/foo/{bar} and /foo/{fizz})
-	// to share the same tree node while preventing duplicate route registration.
+	// This allows interceptors with different param names (/foo/{bar} and /foo/{fizz})
+	// to share the same tree node while preventing duplicate registration.
 	// The actual placeholder names are stored in the interceptor definition.
 	//
 	// Wildcard nodes without regex: Contains "*" as a canonical placeholder,
@@ -349,7 +349,7 @@ Walk:
 				child := matched.statics[idx]
 				keyLen := len(child.key)
 				// While this is less performant than byte-by-byte comparaison for reasonable search size,
-				// direct == comparaison on string scale way better on long route. The keyLen == 1 case
+				// direct == comparaison on string scale way better on long keys. The keyLen == 1 case
 				// short-circuits the memequal call: we already verified search[0] == child.key[0] via the
 				// label match above.
 				if keyLen == 1 || (keyLen <= len(search) && search[:keyLen] == child.key) {
@@ -459,8 +459,8 @@ Walk:
 								if wildcardNode.regexp != nil && !wildcardNode.regexp.MatchString(path[offset:]) {
 									break
 								}
-								for j, route := range child.entries {
-									if route.handleSlash != ExactSlash && route.match(method, c) {
+								for j, ic := range child.entries {
+									if ic.handleSlash != ExactSlash && ic.match(method, c) {
 										// This is the only case where we don't return a slash match immediately. Interceptors
 										// like /+{args}/ (with RelaxedSlash) and /+{args} can coexist. For a request like
 										// /a/b/c, the infix /+{args}/ would match with a trailing slash added, but we must
@@ -543,8 +543,8 @@ Walk:
 					continue
 				}
 
-				for i, route := range wildcardNode.entries {
-					if route.match(method, c) {
+				for i, ic := range wildcardNode.entries {
+					if ic.match(method, c) {
 						if !lazy {
 							*c.params = append(*c.params, search)
 						}
@@ -566,8 +566,8 @@ Walk:
 	}
 
 	if matched.isLeaf() {
-		for i, route := range matched.entries {
-			if route.match(method, c) {
+		for i, ic := range matched.entries {
+			if ic.match(method, c) {
 				return i, matched
 			}
 		}
@@ -575,8 +575,8 @@ Walk:
 
 	// Try to catch empty for wildcard supporting it.
 	for _, wildcardNode := range matched.wildcards {
-		for i, route := range wildcardNode.entries {
-			if route.pattern.optionalCatchAll && route.match(method, c) {
+		for i, ic := range wildcardNode.entries {
+			if ic.pattern.optionalCatchAll && ic.match(method, c) {
 				if !lazy {
 					*c.params = append(*c.params, "")
 				}
@@ -590,8 +590,8 @@ Walk:
 			return i, slashNode
 		}
 	} else if matched.key == "/" && parent != nil && parent.isLeaf() && !strings.HasSuffix(path, "//") {
-		for i, route := range parent.entries {
-			if route.handleSlash != ExactSlash && !route.pattern.catchAll && route.match(method, c) {
+		for i, ic := range parent.entries {
+			if ic.handleSlash != ExactSlash && !ic.pattern.catchAll && ic.match(method, c) {
 				return i, parent
 			}
 		}
@@ -599,8 +599,8 @@ Walk:
 
 Backtrack:
 	if search == "/" && matched.isLeaf() && !strings.HasSuffix(path, "//") {
-		for i, route := range matched.entries {
-			if route.handleSlash != ExactSlash && !route.pattern.catchAll && route.match(method, c) {
+		for i, ic := range matched.entries {
+			if ic.handleSlash != ExactSlash && !ic.pattern.catchAll && ic.match(method, c) {
 				return i, matched
 			}
 		}
@@ -628,12 +628,12 @@ Backtrack:
 }
 
 // matchTrailingSlash returns a trailing slash candidate on child, a static node whose
-// key appends a "/" to the matched path: either a non-strict route on child itself or
+// key appends a "/" to the matched path: either a non-strict interceptor on child itself or
 // an empty match on one of its optional catch-all. Returns (-1, nil) when none match.
 func matchTrailingSlash(child *node, method string, c *Context, lazy bool) (int, *node) {
 	if child.isLeaf() {
-		for i, route := range child.entries {
-			if route.handleSlash != ExactSlash && route.match(method, c) {
+		for i, ic := range child.entries {
+			if ic.handleSlash != ExactSlash && ic.match(method, c) {
 				return i, child
 			}
 		}
@@ -641,8 +641,8 @@ func matchTrailingSlash(child *node, method string, c *Context, lazy bool) (int,
 	// Since /foo/ and /foo/*{any} are permitted with different set of matchers and methods,
 	// we still need to search for a matching empty catch-all.
 	for _, wildcardNode := range child.wildcards {
-		for i, route := range wildcardNode.entries {
-			if route.handleSlash != ExactSlash && route.pattern.optionalCatchAll && route.match(method, c) {
+		for i, ic := range wildcardNode.entries {
+			if ic.handleSlash != ExactSlash && ic.pattern.optionalCatchAll && ic.match(method, c) {
 				if !lazy {
 					// record empty match
 					*c.params = append(*c.params, "")
@@ -654,30 +654,30 @@ func matchTrailingSlash(child *node, method string, c *Context, lazy bool) (int,
 	return -1, nil
 }
 
-func (n *node) addEntry(route *Interceptor) {
+func (n *node) addEntry(ic *Interceptor) {
 	// Method-less and no matchers is always evaluated last.
-	if len(route.methods) == 0 && len(route.matchers) == 0 && route.pattern.port == "" {
+	if len(ic.methods) == 0 && len(ic.matchers) == 0 && ic.pattern.port == "" {
 		// Nothing narrows it, so it is the fallback and belongs last.
-		n.entries = append(n.entries, route)
+		n.entries = append(n.entries, ic)
 		return
 	}
 
-	pos := n.findInsertPosition(route)
-	n.entries = slices.Insert(n.entries, pos, route)
+	pos := n.findInsertPosition(ic)
+	n.entries = slices.Insert(n.entries, pos, ic)
 }
 
-func (n *node) replaceEntry(idx int, route *Interceptor) {
+func (n *node) replaceEntry(idx int, ic *Interceptor) {
 	// Priority unchanged or nothing to order on, replace in place. A port is part of the
 	// pattern, so an update never changes it: the two would be different entries.
-	if n.entries[idx].priority == route.priority || (len(route.matchers) == 0 && route.pattern.port == "") {
-		n.entries[idx] = route
+	if n.entries[idx].priority == ic.priority || (len(ic.matchers) == 0 && ic.pattern.port == "") {
+		n.entries[idx] = ic
 		return
 	}
 
 	// Priority changed with matchers, we need to reposition the interceptor.
 	n.entries = slices.Delete(n.entries, idx, idx+1)
-	pos := n.findInsertPosition(route)
-	n.entries = slices.Insert(n.entries, pos, route)
+	pos := n.findInsertPosition(ic)
+	n.entries = slices.Insert(n.entries, pos, ic)
 }
 
 // findInsertPosition orders the entries of a node from the most narrowly targeted to the
@@ -686,17 +686,17 @@ func (n *node) replaceEntry(idx int, route *Interceptor) {
 // The tiers run from what a request is addressed to toward how it is shaped: the port, which
 // is the last piece of the target that stays out of the key, then the method, then the
 // matchers, which are arbitrary predicates. Within the matcher tier, priority decides.
-func (n *node) findInsertPosition(route *Interceptor) int {
-	hasPort := route.pattern.port != ""
-	hasMethods := len(route.methods) > 0
-	hasMatchers := len(route.matchers) > 0
+func (n *node) findInsertPosition(ic *Interceptor) int {
+	hasPort := ic.pattern.port != ""
+	hasMethods := len(ic.methods) > 0
+	hasMatchers := len(ic.matchers) > 0
 
 	for i, existing := range n.entries {
 		existingHasPort := existing.pattern.port != ""
 		existingHasMethods := len(existing.methods) > 0
 		existingHasMatchers := len(existing.matchers) > 0
 
-		// Routes naming a port before routes accepting every one
+		// Interceptors naming a port before those accepting every one
 		if hasPort && !existingHasPort {
 			return i
 		}
@@ -704,20 +704,20 @@ func (n *node) findInsertPosition(route *Interceptor) int {
 			continue
 		}
 
-		// Routes with methods before routes without
+		// Interceptors with methods before those without
 		if hasMethods && !existingHasMethods {
 			return i
 		}
 
 		// Within same method tier...
 		if hasMethods == existingHasMethods {
-			// Routes with matchers before routes without
+			// Interceptors with matchers before those without
 			if hasMatchers && !existingHasMatchers {
 				return i
 			}
 
 			// Within same matchers tier, higher priority first
-			if hasMatchers && existingHasMatchers && route.priority > existing.priority {
+			if hasMatchers && existingHasMatchers && ic.priority > existing.priority {
 				return i
 			}
 		}
@@ -726,7 +726,7 @@ func (n *node) findInsertPosition(route *Interceptor) int {
 	return len(n.entries)
 }
 
-func (n *node) delRoute(idx int) {
+func (n *node) delIC(idx int) {
 	if idx >= 0 {
 		copy(n.entries[idx:], n.entries[idx+1:])
 		last := len(n.entries) - 1
@@ -960,7 +960,7 @@ func (n *node) searchName(key string) (matched *node) {
 //     returns (0, "") to signal static handling
 //
 // This is a lightweight parser that does not fully validate the segment. It assumes the caller
-// will verify that the retrieved route's pattern matches the search pattern after tree lookup.
+// will verify that the retrieved interceptor's pattern matches the search pattern after tree lookup.
 func parseBraceSegment(pattern string) (int, string) {
 	length := len(pattern)
 	if length == 0 {
@@ -985,7 +985,7 @@ func parseBraceSegment(pattern string) (int, string) {
 	if idx == -1 {
 		return end, key
 	}
-	// Handle missing param name such as {:[A-z]} here since it would be an invalid route anyway.
+	// Handle missing param name such as {:[A-z]} here since it would be an invalid pattern anyway.
 	if idx == 0 {
 		return 0, ""
 	}
@@ -1042,15 +1042,15 @@ func (n *node) string(space int) string {
 		sb.WriteByte(']')
 	}
 
-	for _, route := range n.entries {
+	for _, ic := range n.entries {
 		sb.WriteByte('\n')
 		sb.WriteString(strings.Repeat(" ", space+8))
 		sb.WriteString("=> ")
-		sb.WriteString(route.pattern.str)
+		sb.WriteString(ic.pattern.str)
 
-		if len(route.methods) > 0 {
+		if len(ic.methods) > 0 {
 			sb.WriteString(" [methods: ")
-			for i, method := range route.methods {
+			for i, method := range ic.methods {
 				if i > 0 {
 					sb.WriteString(", ")
 				}
@@ -1059,9 +1059,9 @@ func (n *node) string(space int) string {
 			sb.WriteByte(']')
 		}
 
-		if len(route.matchers) > 0 {
+		if len(ic.matchers) > 0 {
 			sb.WriteString(" [matchers: ")
-			for i, matcher := range route.matchers {
+			for i, matcher := range ic.matchers {
 				if i > 0 {
 					sb.WriteString(", ")
 				}
@@ -1074,7 +1074,7 @@ func (n *node) string(space int) string {
 			sb.WriteByte(']')
 		}
 		sb.WriteString(" [priority: ")
-		sb.WriteString(strconv.FormatUint(uint64(route.priority), 10))
+		sb.WriteString(strconv.FormatUint(uint64(ic.priority), 10))
 		sb.WriteByte(']')
 	}
 

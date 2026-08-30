@@ -87,10 +87,8 @@ type config struct {
 	maxParamKeyBytes int
 	maxMatchers      int
 
-	handleSlash  TrailingSlashOption
-	mergeSlash   bool
-	collapseDots bool
-	allowRegexp  bool
+	handleSlash TrailingSlashOption
+	allowRegexp bool
 }
 
 func newConfig() *config {
@@ -107,7 +105,7 @@ func newConfig() *config {
 
 // Must returns a ready to use [Proxy] and panics on error. It is a convenience wrapper
 // for [New].
-func Must(opts ...Option) *Proxy {
+func Must(opts ...ProxyOption) *Proxy {
 	p, err := New(opts...)
 	if err != nil {
 		panic(err)
@@ -121,7 +119,7 @@ func Must(opts ...Option) *Proxy {
 // cannot intercept: anything that would require minting a leaf certificate, an intercept
 // an interceptor, is reported as [ErrNoCertificateAuthority]. Use [NewCA], [LoadCA] or
 // [GenerateCA] with [WithCA] to provide one.
-func New(opts ...Option) (*Proxy, error) {
+func New(opts ...ProxyOption) (*Proxy, error) {
 	cfg := newConfig()
 	p := &Proxy{cfg: cfg}
 	p.noInterceptor = DefaultNoInterceptorHandler
@@ -133,7 +131,7 @@ func New(opts ...Option) (*Proxy, error) {
 		}
 	}
 
-	// Clip so NewRoute's append(p.mws, rte.mws...) can never write into the shared backing array.
+	// Clip so newInterceptor's append(p.mws, ic.mws...) can never write into the shared backing array.
 	p.mws = slices.Clip(p.mws)
 	p.noInterceptor = applyMiddleware(NoInterceptorHandler, p.mws, p.noInterceptor)
 
@@ -167,11 +165,11 @@ func (p *Proxy) getTree() *iTree { return p.tree.Load() }
 // MustAddInterceptor registers handler for the given methods and pattern and panics on error. It is
 // a convenience wrapper for [Proxy.AddInterceptor].
 func (p *Proxy) MustAddInterceptor(methods []string, pattern string, handler HandlerFunc, opts ...InterceptorOption) *Interceptor {
-	rte, err := p.AddInterceptor(methods, pattern, handler, opts...)
+	ic, err := p.AddInterceptor(methods, pattern, handler, opts...)
 	if err != nil {
 		panic(err)
 	}
-	return rte
+	return ic
 }
 
 // AddInterceptor registers handler for the given methods and pattern. An empty or nil set of
@@ -203,12 +201,12 @@ func (p *Proxy) MustAddInterceptor(methods []string, pattern string, handler Han
 func (p *Proxy) AddInterceptor(methods []string, pattern string, handler HandlerFunc, opts ...InterceptorOption) (*Interceptor, error) {
 	txn := p.Txn(true)
 	defer txn.Abort()
-	rte, err := txn.AddInterceptor(methods, pattern, handler, opts...)
+	ic, err := txn.AddInterceptor(methods, pattern, handler, opts...)
 	if err != nil {
 		return nil, err
 	}
 	txn.Commit()
-	return rte, nil
+	return ic, nil
 }
 
 // UpdateInterceptor overrides the handler and options of an existing interceptor. Options and middleware
@@ -216,12 +214,12 @@ func (p *Proxy) AddInterceptor(methods []string, pattern string, handler Handler
 func (p *Proxy) UpdateInterceptor(methods []string, pattern string, handler HandlerFunc, opts ...InterceptorOption) (*Interceptor, error) {
 	txn := p.Txn(true)
 	defer txn.Abort()
-	rte, err := txn.UpdateInterceptor(methods, pattern, handler, opts...)
+	ic, err := txn.UpdateInterceptor(methods, pattern, handler, opts...)
 	if err != nil {
 		return nil, err
 	}
 	txn.Commit()
-	return rte, nil
+	return ic, nil
 }
 
 // DeleteInterceptor removes the interceptor registered for the given methods, pattern and matchers, and
@@ -229,24 +227,24 @@ func (p *Proxy) UpdateInterceptor(methods []string, pattern string, handler Hand
 func (p *Proxy) DeleteInterceptor(methods []string, pattern string, opts ...MatcherOption) (*Interceptor, error) {
 	txn := p.Txn(true)
 	defer txn.Abort()
-	rte, err := txn.DeleteInterceptor(methods, pattern, opts...)
+	ic, err := txn.DeleteInterceptor(methods, pattern, opts...)
 	if err != nil {
 		return nil, err
 	}
 	txn.Commit()
-	return rte, nil
+	return ic, nil
 }
 
-// removeInterceptor removes the provided [Interceptor] and returns the deleted route.
-func (p *Proxy) removeInterceptor(route *Interceptor) (*Interceptor, error) {
+// removeInterceptor removes the provided [Interceptor] and returns the deleted interceptor.
+func (p *Proxy) removeInterceptor(ic *Interceptor) (*Interceptor, error) {
 	txn := p.Txn(true)
 	defer txn.Abort()
-	rte, err := txn.removeInterceptor(route)
+	ic, err := txn.removeInterceptor(ic)
 	if err != nil {
 		return nil, err
 	}
 	txn.Commit()
-	return rte, nil
+	return ic, nil
 }
 
 // Has reports whether an interceptor is registered for the given methods, pattern and matchers.
@@ -332,54 +330,54 @@ func (p *Proxy) newInterceptor(methods []string, pattern string, handler Handler
 		return nil, err
 	}
 
-	rte := &Interceptor{
+	ic := &Interceptor{
 		hbase:       handler,
 		pattern:     pat,
 		handleSlash: p.cfg.handleSlash,
 		methodFast:  noFastMethod,
 	}
 
-	rte.params = make([]string, 0, paramsCnt)
+	ic.params = make([]string, 0, paramsCnt)
 	for _, tk := range pat.tokens {
 		if tk.typ != nodeStatic {
-			rte.params = append(rte.params, tk.value)
+			ic.params = append(ic.params, tk.value)
 		}
 	}
 
 	for _, opt := range opts {
-		if err = opt.applyInterceptor(sealedOption{proxy: p, interceptor: rte}); err != nil {
+		if err = opt.applyInterceptor(sealedOption{proxy: p, interceptor: ic}); err != nil {
 			return nil, err
 		}
 	}
 
-	if len(rte.matchers) > p.cfg.maxMatchers {
+	if len(ic.matchers) > p.cfg.maxMatchers {
 		return nil, fmt.Errorf("%w: %w", ErrInvalidInterceptor, ErrTooManyMatchers)
 	}
-	if len(rte.matchers) == 0 && rte.priority > 0 {
+	if len(ic.matchers) == 0 && ic.priority > 0 {
 		return nil, fmt.Errorf("%w: priority requires matchers", ErrInvalidInterceptor)
 	}
 
-	rte.priority = cmp.Or(rte.priority, uint(len(rte.matchers)))
-	rte.hself, rte.hall = applyInterceptorMiddleware(append(p.mws, rte.mws...), handler)
+	ic.priority = cmp.Or(ic.priority, uint(len(ic.matchers)))
+	ic.hself, ic.hall = applyInterceptorMiddleware(append(p.mws, ic.mws...), handler)
 
 	if len(methods) > 0 {
 		// Defensive copy: the caller keeps ownership of the slice it passed.
-		rte.methods = slices.Clone(methods)
-		slices.Sort(rte.methods)
-		rte.methods = slices.Compact(rte.methods)
+		ic.methods = slices.Clone(methods)
+		slices.Sort(ic.methods)
+		ic.methods = slices.Compact(ic.methods)
 	}
 
-	if len(rte.methods) == 1 && len(rte.matchers) == 0 && rte.pattern.port == "" {
+	if len(ic.methods) == 1 && len(ic.matchers) == 0 && ic.pattern.port == "" {
 		// A port is compared in matchSlow, so an interceptor naming one cannot take the fast
 		// path any more than one carrying a matcher can.
-		rte.methodFast = rte.methods[0]
+		ic.methodFast = ic.methods[0]
 	}
 
-	return rte, nil
+	return ic, nil
 }
 
 // DefaultNoInterceptorHandler forwards the request upstream unchanged. It is the handler used for
-// intercepted requests that match no interceptor, which makes interception without a matching route
+// intercepted requests that match no interceptor, which makes interception without a matching interceptor
 // observable but not disruptive.
 func DefaultNoInterceptorHandler(c *Context) (*http.Response, error) {
 	return c.Forward()

@@ -13,11 +13,11 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func testProxy(t *testing.T, opts ...Option) *Proxy {
+func testProxy(t *testing.T, opts ...ProxyOption) *Proxy {
 	t.Helper()
 	ca, err := GenerateCA()
 	require.NoError(t, err)
-	p, err := New(append([]Option{WithCA(ca)}, opts...)...)
+	p, err := New(append([]ProxyOption{WithCA(ca)}, opts...)...)
 	require.NoError(t, err)
 	return p
 }
@@ -42,11 +42,7 @@ func matchRequest(t *testing.T, p *Proxy, scheme, authority string, req *http.Re
 	defer tree.pool.Put(c)
 	c.reset(nil, req, target.Scheme, target.Host, target.Port)
 
-	path, ok := p.normalizeForMatch(routingPath(req))
-	if !ok {
-		return nil
-	}
-	idx, n := tree.lookup(req.Method, target.Host, path, c, false)
+	idx, n := tree.lookup(req.Method, target.Host, routingPath(req), c, false)
 	if n == nil {
 		return nil
 	}
@@ -58,9 +54,9 @@ func TestRouting_SchemeIsOptional(t *testing.T) {
 	p.MustAddInterceptor([]string{http.MethodGet}, "api.stripe.com/v1/charges", noopHandler)
 
 	for _, scheme := range []string{"http", "https"} {
-		rte := match(t, p, http.MethodGet, scheme, "api.stripe.com:443", "/v1/charges")
-		require.NotNil(t, rte, "scheme %s", scheme)
-		assert.Equal(t, "api.stripe.com/v1/charges", rte.Pattern())
+		ic := match(t, p, http.MethodGet, scheme, "api.stripe.com:443", "/v1/charges")
+		require.NotNil(t, ic, "scheme %s", scheme)
+		assert.Equal(t, "api.stripe.com/v1/charges", ic.Pattern())
 	}
 }
 
@@ -212,7 +208,7 @@ func TestRouting_ConflictDetection(t *testing.T) {
 	var conflict *InterceptorConflictError
 	require.ErrorAs(t, err, &conflict)
 
-	// Differing by a matcher is not a conflict: the matchers tell the two routes apart.
+	// Differing by a matcher is not a conflict: the matchers tell the two interceptors apart.
 	_, err = p.AddInterceptor([]string{http.MethodGet}, "api.stripe.com/v1/charges", noopHandler, WithScheme("https"))
 	require.NoError(t, err)
 }

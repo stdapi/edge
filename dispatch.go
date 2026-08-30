@@ -23,9 +23,8 @@ func (p *Proxy) serve(w http.ResponseWriter, r *http.Request, sess *Session, tar
 	c.reset(sess, r, target.Scheme, target.Host, target.Port)
 
 	handler := p.noInterceptor
-	path, ok := p.normalizeForMatch(routingPath(r))
-	if ok && r.Method != "" {
-		if idx, n := tree.lookup(r.Method, target.Host, path, c, false); n != nil {
+	if r.Method != "" {
+		if idx, n := tree.lookup(r.Method, target.Host, routingPath(r), c, false); n != nil {
 			c.interceptor = n.entries[idx]
 			handler = c.interceptor.hall
 		}

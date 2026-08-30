@@ -130,7 +130,7 @@ func ExampleWithMiddleware() {
 	_, _ = p.AddInterceptor(nil, "api.example.test/*{any}", edge.DefaultNoInterceptorHandler)
 }
 
-// Change routes while traffic is flowing. Lookups never block on a write.
+// Change interceptors while traffic is flowing. Lookups never block on a write.
 func ExampleProxy_Updates() {
 	ca, _ := edge.GenerateCA()
 	p, _ := edge.New(edge.WithCA(ca))

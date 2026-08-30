@@ -15,9 +15,9 @@ type stack struct {
 	edges []*node
 }
 
-// Iter provide a set of range iterators for traversing registered methods and routes. Iter capture a point-in-time
+// Iter provide a set of range iterators for traversing registered methods and interceptors. Iter capture a point-in-time
 // snapshot of the routing tree. Therefore, all iterators returned by Iter will not observe subsequent write on the
-// router or on the transaction from which the Iter is created.
+// proxy or on the transaction from which the Iter is created.
 type Iter struct {
 	patterns *node
 	names    *node
@@ -38,7 +38,7 @@ func (it Iter) Methods() iter.Seq[string] {
 	}
 }
 
-// Interceptors returns a range iterator over all registered interceptors in the routing tree that exactly match the provided route
+// Interceptors returns a range iterator over all registered interceptors in the routing tree that exactly match the provided
 // pattern. The iterator reflect a snapshot of the routing tree at the time [Iter] is created. This function is safe for
 // concurrent use by multiple goroutine and while mutation on interceptors are ongoing.
 func (it Iter) Interceptors(pattern string) iter.Seq[*Interceptor] {
@@ -48,9 +48,9 @@ func (it Iter) Interceptors(pattern string) iter.Seq[*Interceptor] {
 			return
 		}
 
-		for _, route := range matched.entries {
-			if route.pattern.str == pattern {
-				if !yield(route) {
+		for _, ic := range matched.entries {
+			if ic.pattern.str == pattern {
+				if !yield(ic) {
 					return
 				}
 			}
@@ -106,14 +106,14 @@ func (it Iter) NamePrefix(prefix string) iter.Seq[*Interceptor] {
 // PatternPrefix returns a range iterator over all interceptors in the routing tree that match a given pattern prefix.
 // The iterator reflect a snapshot of the routing tree at the time [Iter] is created. This function is safe for
 // concurrent use by multiple goroutine and while mutation on interceptors are ongoing.
-// Note: Partial parameter syntax (e.g., /users/{name:) is not supported and will not match any routes.
+// Note: Partial parameter syntax (e.g., /users/{name:) is not supported and will not match any interceptor.
 func (it Iter) PatternPrefix(prefix string) iter.Seq[*Interceptor] {
 	return it.patternPrefix(prefix, false)
 }
 
-// patternPrefix walks the tree yielding either the routes or the authority entries, never
+// patternPrefix walks the tree yielding either the interceptors or the authority entries, never
 // both. They share the tree but nothing else: an authority has no handler to call and no
-// method to report, so handing one to a caller asking for routes would be a trap.
+// method to report, so handing one to a caller asking for interceptors would be a trap.
 func (it Iter) patternPrefix(prefix string, authorities bool) iter.Seq[*Interceptor] {
 	return func(yield func(*Interceptor) bool) {
 		var stacks []stack
@@ -154,15 +154,15 @@ func (it Iter) patternPrefix(prefix string, authorities bool) iter.Seq[*Intercep
 			}
 
 			if elem.isLeaf() {
-				for _, route := range elem.entries {
-					if (route.pattern.path == "") != authorities {
+				for _, ic := range elem.entries {
+					if (ic.pattern.path == "") != authorities {
 						continue
 					}
-					if len(route.params) > 0 && !strings.HasPrefix(route.pattern.str, prefix) {
+					if len(ic.params) > 0 && !strings.HasPrefix(ic.pattern.str, prefix) {
 						continue
 					}
 
-					if !yield(route) {
+					if !yield(ic) {
 						return
 					}
 				}
@@ -176,8 +176,8 @@ func (it Iter) patternPrefix(prefix string, authorities bool) iter.Seq[*Intercep
 // and while mutation on interceptors are ongoing. See also [Iter.PatternPrefix] as an alternative.
 func (it Iter) All() iter.Seq[*Interceptor] {
 	return func(yield func(*Interceptor) bool) {
-		for route := range it.PatternPrefix("") {
-			if !yield(route) {
+		for ic := range it.PatternPrefix("") {
+			if !yield(ic) {
 				return
 			}
 		}
@@ -189,8 +189,8 @@ func (it Iter) All() iter.Seq[*Interceptor] {
 // and while mutation on interceptors are ongoing. See also [Iter.NamePrefix] as an alternative.
 func (it Iter) Names() iter.Seq[*Interceptor] {
 	return func(yield func(*Interceptor) bool) {
-		for route := range it.NamePrefix("") {
-			if !yield(route) {
+		for ic := range it.NamePrefix("") {
+			if !yield(ic) {
 				return
 			}
 		}
