@@ -168,7 +168,7 @@ This is also where anything protocol-specific goes. A gRPC decoder is middleware
 
 ## Sessions
 
-A `Session` is the client connection a request arrived on, shared by every request multiplexed onto it. It carries the peer address, the negotiated protocol, the TLS state, what the client offered in its ClientHello, and a key-value store for middleware that needs to correlate requests across one connection.
+A `Session` is the client connection a request arrived on, shared by every request multiplexed onto it. It carries the peer address, the negotiated protocol, the TLS state, what the client offered in its ClientHello, and a context canceled when the connection ends.
 
 ```go
 p.MustAddInterceptor([]string{"GET"}, "api.stripe.com/v1/charges", func(c *edge.Context) (*http.Response, error) {
