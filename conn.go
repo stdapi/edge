@@ -17,6 +17,9 @@ import (
 
 const (
 	copyBufSize = 32 * 1024
+	// halfClosedIdleTimeout bounds how long the remaining direction of a tunnel may sit
+	// silent once the other one is done.
+	halfClosedIdleTimeout = 30 * time.Second
 	// defaultPeekSize covers a protocol discriminator and the buffering http.Server would
 	// have done anyway on the connection it is handed.
 	defaultPeekSize = 4096
@@ -137,10 +140,12 @@ func tunnel(client, upstream net.Conn, idleTimeout time.Duration) (sent, receive
 	wg.Go(func() {
 		toUp, upErr = copyStream(upstream, client, idle)
 		halfClose(upstream)
+		idle.arm(halfClosedIdleTimeout)
 	})
 	wg.Go(func() {
 		toDown, downErr = copyStream(client, upstream, idle)
 		halfClose(client)
+		idle.arm(halfClosedIdleTimeout)
 	})
 	wg.Wait()
 
@@ -197,30 +202,48 @@ func filterCopyErr(err error) error {
 }
 
 // idleTracker closes both ends of a tunnel once neither direction has moved a byte for the
-// configured duration. A zero duration disables it, which is the default: a tunnel can
-// legitimately carry a long-lived stream the proxy knows nothing about.
+// configured duration. A zero duration leaves it disarmed until a half-close arms it, since a
+// tunnel open in both directions can legitimately carry a long-lived silent stream.
 type idleTracker struct {
 	timer   *time.Timer
+	conns   []net.Conn
 	timeout time.Duration
+	armed   atomic.Bool
 	mu      sync.Mutex
 	stopped bool
 }
 
 func newIdleTracker(timeout time.Duration, conns ...net.Conn) *idleTracker {
-	t := &idleTracker{timeout: timeout}
-	if timeout <= 0 {
-		return t
+	t := &idleTracker{timeout: timeout, conns: conns}
+	if timeout > 0 {
+		t.start(timeout)
 	}
-	t.timer = time.AfterFunc(timeout, func() {
-		for _, c := range conns {
-			_ = c.Close()
-		}
-	})
 	return t
 }
 
+// arm starts the timer when none is running, which is what a half-close does.
+func (t *idleTracker) arm(d time.Duration) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.stopped || t.timer != nil {
+		return
+	}
+	t.start(d)
+}
+
+// start must be called with the lock held, or before the tracker is shared.
+func (t *idleTracker) start(d time.Duration) {
+	t.timeout = d
+	t.timer = time.AfterFunc(d, func() {
+		for _, c := range t.conns {
+			_ = c.Close()
+		}
+	})
+	t.armed.Store(true)
+}
+
 func (t *idleTracker) touch() {
-	if t.timer == nil {
+	if !t.armed.Load() {
 		return
 	}
 	t.mu.Lock()
@@ -231,13 +254,12 @@ func (t *idleTracker) touch() {
 }
 
 func (t *idleTracker) stop() {
-	if t.timer == nil {
-		return
-	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.stopped = true
-	t.timer.Stop()
+	if t.timer != nil {
+		t.timer.Stop()
+	}
 }
 
 // h2Stream adapts an HTTP/2 or HTTP/3 CONNECT stream to a net.Conn, so the same tunneling
