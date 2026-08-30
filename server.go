@@ -102,6 +102,13 @@ func newServer(p *Proxy) (*server, error) {
 		MaxHeaderBytes:    p.cfg.server.maxHeaderBytes,
 		ErrorLog:          log.New(slogWriter{p.cfg.logger}, "", 0),
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
+			// A connection without a wrapper keeps the server context, since a cancel
+			// nothing ever calls would leak.
+			if cc := cancelConnOf(c); cc != nil {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cc.arm(cancel)
+			}
 			return context.WithValue(ctx, sessionKey{}, newSession(ctx, c, Target{}, Intercept, HTTP11))
 		},
 	}
@@ -144,7 +151,14 @@ func (p *Proxy) ListenAndServe(addr string) error {
 }
 
 // Serve accepts connections on ln and serves them as an explicit forward proxy.
+//
+// Prefer [Proxy.ServeTLS] over a TLS listener built by the caller. Such a listener still
+// works, but the [Session.Context] of its connections never ends.
 func (p *Proxy) Serve(ln net.Listener) error {
+	return p.serveFront(cancelListener{ln})
+}
+
+func (p *Proxy) serveFront(ln net.Listener) error {
 	if p.srv.closing.Load() {
 		return ErrProxyClosed
 	}
@@ -176,7 +190,9 @@ func (p *Proxy) ServeTLS(ln net.Listener, cert tls.Certificate) error {
 		MinVersion:   tls.VersionTLS12,
 		NextProtos:   []string{"h2", "http/1.1"},
 	}
-	return p.Serve(tls.NewListener(ln, cfg))
+	// The cancel wrapper sits under the TLS listener, where it cannot hide the handshake
+	// from net/http.
+	return p.serveFront(tls.NewListener(cancelListener{ln}, cfg))
 }
 
 // Shutdown stops accepting new connections, then waits for the requests in flight to finish.

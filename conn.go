@@ -6,6 +6,8 @@ package edge
 
 import (
 	"bufio"
+	"context"
+	"crypto/tls"
 	"errors"
 	"io"
 	"net"
@@ -148,6 +150,81 @@ func (c *servedConn) Close() error {
 		_ = c.l.Close()
 	})
 	return err
+}
+
+// cancelConn fires the cancel of the session context from Close. Every close path in
+// net/http and in this package funnels through Close, so one hook covers them all.
+type cancelConn struct {
+	net.Conn
+	cancel context.CancelFunc
+	mu     sync.Mutex
+	closed bool
+}
+
+func (c *cancelConn) arm(cancel context.CancelFunc) {
+	c.mu.Lock()
+	closed := c.closed
+	if !closed {
+		c.cancel = cancel
+	}
+	c.mu.Unlock()
+	if closed {
+		cancel()
+	}
+}
+
+func (c *cancelConn) Close() error {
+	err := c.Conn.Close()
+	c.mu.Lock()
+	cancel := c.cancel
+	c.cancel = nil
+	c.closed = true
+	c.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	return err
+}
+
+// CloseWrite forwards the half-close, which the embedded net.Conn does not promote.
+func (c *cancelConn) CloseWrite() error {
+	if cw, ok := c.Conn.(closeWriter); ok {
+		return cw.CloseWrite()
+	}
+	return c.Close()
+}
+
+// cancelListener wraps the front listeners so each accepted connection can carry the
+// cancel of its session context.
+type cancelListener struct {
+	net.Listener
+}
+
+func (l cancelListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	// Wrapping a connection that already carries TLS would hide the handshake from
+	// net/http, so it is served untouched and its session context never ends.
+	if _, ok := c.(interface{ ConnectionState() tls.ConnectionState }); ok {
+		return c, nil
+	}
+	return &cancelConn{Conn: c}, nil
+}
+
+// cancelConnOf finds the wrapper under a connection, reaching through the TLS layer
+// [Proxy.ServeTLS] adds.
+func cancelConnOf(c net.Conn) *cancelConn {
+	if cc, ok := c.(*cancelConn); ok {
+		return cc
+	}
+	if tc, ok := c.(*tls.Conn); ok {
+		if cc, ok := tc.NetConn().(*cancelConn); ok {
+			return cc
+		}
+	}
+	return nil
 }
 
 // tunnel relays bytes between client and upstream until both directions are done. It

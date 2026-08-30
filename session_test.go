@@ -6,6 +6,7 @@ package edge
 
 import (
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"fmt"
 	"io"
@@ -224,4 +225,64 @@ func TestSession_AdmitAfterDelete(t *testing.T) {
 	refused := newSession(context.Background(), nil, target, Tunnel, HTTP11)
 	assert.False(t, p.srv.admitSession(refused))
 	assert.Empty(t, slices.Collect(p.Sessions()), "a refused connection is not reported")
+}
+
+// frontSessionContext runs one plain proxied request through client, captures the session
+// context the handler saw, and asserts it ends when the client's connection does.
+func frontSessionContext(t *testing.T, p *Proxy, client *http.Client) {
+	t.Helper()
+
+	ctxCh := make(chan context.Context, 1)
+	p.MustAddInterceptor(nil, "example.test/", func(c *Context) (*http.Response, error) {
+		select {
+		case ctxCh <- c.Session().Context():
+		default:
+		}
+		return Text(http.StatusOK, "ok"), nil
+	})
+
+	resp, err := client.Get("http://example.test/")
+	require.NoError(t, err)
+	_, _ = io.Copy(io.Discard, resp.Body)
+	require.NoError(t, resp.Body.Close())
+
+	sessCtx := <-ctxCh
+	select {
+	case <-sessCtx.Done():
+		t.Fatal("the context fired while the connection was alive")
+	default:
+	}
+
+	client.CloseIdleConnections()
+	select {
+	case <-sessCtx.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("closing the connection did not end the session context")
+	}
+}
+
+// The proxy-facing session of an explicit connection ends with the connection. A plain
+// proxied request is served under it, so a handler waiting on Session.Context is released
+// when the client goes away.
+func TestSession_FrontContextEndsWithTheConnection(t *testing.T) {
+	p := testProxy(t)
+	frontSessionContext(t, p, proxyClient(startProxy(t, p), nil))
+}
+
+// The same contract when the proxy itself is reached over TLS.
+func TestSession_FrontContextEndsWithTheConnectionOverTLS(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+
+	addr, pool := startProxyTLS(t, p, ca)
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			Proxy:           http.ProxyURL(&url.URL{Scheme: "https", Host: addr}),
+			TLSClientConfig: &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12},
+		},
+	}
+	frontSessionContext(t, p, client)
 }

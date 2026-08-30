@@ -389,3 +389,41 @@ func TestQUIC_SessionContextEndsWithTheSession(t *testing.T) {
 		t.Fatal("closing the session did not end its context")
 	}
 }
+
+// The session context of an intercepted QUIC peer follows the connection. A client that
+// closes it and leaves ends the context right away, not two minutes later when the idle
+// sweep gets to the peer.
+func TestQUIC_SessionContextEndsWhenTheClientLeaves(t *testing.T) {
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(proxyCA))
+	require.NoError(t, err)
+	p.MustAddInterceptor(nil, h3Authority+"/", func(c *Context) (*http.Response, error) {
+		return Text(http.StatusOK, "ok"), nil
+	})
+
+	proxyAddr := startQUIC(t, p)
+	tr := dialQUICTo(proxyAddr, poolOf(proxyCA))
+
+	req, err := http.NewRequest(http.MethodGet,
+		fmt.Sprintf("https://%s:%d/", h3Authority, proxyAddr.Port()), nil)
+	require.NoError(t, err)
+	resp, err := tr.RoundTrip(req)
+	require.NoError(t, err)
+	_, _ = io.Copy(io.Discard, resp.Body)
+	require.NoError(t, resp.Body.Close())
+
+	sessCtx := waitForSessions(t, p, 1)[0].Context()
+	select {
+	case <-sessCtx.Done():
+		t.Fatal("the context fired while the connection was alive")
+	default:
+	}
+
+	require.NoError(t, tr.Close())
+	select {
+	case <-sessCtx.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("the client leaving did not end the session context")
+	}
+}

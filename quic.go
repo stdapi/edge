@@ -210,6 +210,8 @@ func (d *quicDemux) attach(c *quic.Conn) *Session {
 		return nil
 	}
 	peer.qc = c
+	// Ends the session context with the connection instead of waiting for the idle sweep.
+	context.AfterFunc(c.Context(), peer.end)
 	return peer.sess
 }
 
