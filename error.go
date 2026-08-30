@@ -150,3 +150,16 @@ func newPatternError(reason string, start, end int, msg string) *PatternError {
 		Hint:   msg,
 	}
 }
+
+// PanicError reports that a handler panicked.
+type PanicError struct {
+	Value any
+	Stack string
+}
+
+func (e *PanicError) Error() string { return fmt.Sprintf("handler panic: %v", e.Value) }
+
+func (e *PanicError) Unwrap() error {
+	err, _ := e.Value.(error)
+	return err
+}

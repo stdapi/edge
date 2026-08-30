@@ -10,7 +10,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"runtime/debug"
+	"runtime"
+	"strconv"
 	"strings"
 )
 
@@ -72,30 +73,57 @@ func (p *Proxy) relay(w http.ResponseWriter, r *http.Request, sess *Session, tar
 	}
 }
 
-// runHandler calls the handler and turns a panic into an error. A handler that panics must
-// not take down the connection: the application being proxied would see a transport failure
-// it has no way to explain.
+// runHandler calls the handler and turns a panic into a [PanicError]. Nothing is logged here,
+// the error takes the normal path and the [ErrorHandler] decides what a panic answers.
 func (p *Proxy) runHandler(c *Context, handler HandlerFunc) (resp *http.Response, err error) {
 	defer func() {
 		rec := recover()
 		if rec == nil {
 			return
 		}
-		if rec == http.ErrAbortHandler {
+		if e, ok := rec.(error); ok && errors.Is(e, http.ErrAbortHandler) {
 			// The caller deliberately aborted; let net/http see it.
 			panic(rec)
 		}
-		stack := debug.Stack()
-		p.cfg.logger.Error("edge: handler panic",
-			slog.String("pattern", c.Pattern()),
-			slog.Any("panic", rec),
-			slog.String("stack", string(stack)),
-		)
 		resp = nil
-		err = fmt.Errorf("handler panic: %v", rec)
+		err = &PanicError{Value: rec, Stack: stacktrace(panicStackSkip)}
 	}()
 
 	return handler(c)
+}
+
+const (
+	// panicStackFrames bounds what a capture costs.
+	panicStackFrames = 16
+	// panicStackSkip drops runtime.Callers, stacktrace, the deferred closure and
+	// runtime.gopanic, so the first frame reported is the one that panicked.
+	panicStackSkip = 3
+)
+
+// stacktrace formats the call stack of its caller, dropping the first skip frames and keeping
+// at most panicStackFrames of what is left.
+func stacktrace(skip int) string {
+	pcs := make([]uintptr, panicStackFrames)
+	n := runtime.Callers(skip+1, pcs)
+	if n == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	frames := runtime.CallersFrames(pcs[:n])
+	for {
+		frame, more := frames.Next()
+		sb.WriteString(frame.Function)
+		sb.WriteString("\n\t")
+		sb.WriteString(frame.File)
+		sb.WriteByte(':')
+		sb.WriteString(strconv.Itoa(frame.Line))
+		if !more {
+			break
+		}
+		sb.WriteByte('\n')
+	}
+	return sb.String()
 }
 
 // writeResponse relays resp to the client.

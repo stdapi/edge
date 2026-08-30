@@ -195,7 +195,8 @@ func TestSemantics_HandlerPanicBecomesAnError(t *testing.T) {
 	require.NoError(t, err)
 	body, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
-	assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
+	assert.Equal(t, http.StatusInternalServerError, resp.StatusCode,
+		"a panic is a failure of the proxy, not an answer from the upstream")
 	assert.Contains(t, string(body), "handler panic")
 
 	// The connection must survive: an application under test should not see a transport
@@ -205,6 +206,35 @@ func TestSemantics_HandlerPanicBecomesAnError(t *testing.T) {
 	body, _ = io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 	assert.Equal(t, "still alive", string(body))
+}
+
+// A panic reaches the error handler as a [PanicError] carrying what recover returned and the
+// stack, so a replacement decides both the status and what is logged.
+func TestSemantics_PanicReachesTheErrorHandler(t *testing.T) {
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer origin.Close()
+
+	sentinel := errors.New("boom")
+
+	var got *PanicError
+	p, authority, client := interceptingProxy(t, origin, WithErrorHandler(func(c *Context, err error) *http.Response {
+		got, _ = errors.AsType[*PanicError](err)
+		return Status(http.StatusTeapot)
+	}))
+	p.MustAddInterceptor([]string{http.MethodGet}, authority+"/boom", func(c *Context) (*http.Response, error) {
+		panic(sentinel)
+	})
+
+	resp, err := client.Get(origin.URL + "/boom")
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+
+	assert.Equal(t, http.StatusTeapot, resp.StatusCode)
+	require.NotNil(t, got)
+	assert.Equal(t, sentinel, got.Value)
+	assert.ErrorIs(t, got, sentinel, "a panic carrying an error stays reachable through Unwrap")
+	assert.Contains(t, got.Stack, "TestSemantics_PanicReachesTheErrorHandler",
+		"the first frame captured must be the one that panicked")
 }
 
 func TestSemantics_ErrorHandler(t *testing.T) {

@@ -6,6 +6,7 @@ package edge
 
 import (
 	"cmp"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -383,8 +384,19 @@ func DefaultNoInterceptorHandler(c *Context) (*http.Response, error) {
 	return c.Forward()
 }
 
-// DefaultErrorHandler answers 502 Bad Gateway with the error text.
+// DefaultErrorHandler answers 502 Bad Gateway with the error text, and 500 for a
+// [PanicError], which it logs with its stack. A replacement takes over that logging.
 func DefaultErrorHandler(c *Context, err error) *http.Response {
+	if pe, ok := errors.AsType[*PanicError](err); ok {
+		if c != nil && c.p != nil {
+			c.p.cfg.logger.Error("edge: handler panic",
+				slog.String("pattern", c.Pattern()),
+				slog.Any("panic", pe.Value),
+				slog.String("stack", pe.Stack),
+			)
+		}
+		return Text(http.StatusInternalServerError, pe.Error())
+	}
 	return Text(http.StatusBadGateway, err.Error())
 }
 

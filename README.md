@@ -148,7 +148,7 @@ type HandlerFunc func(c *edge.Context) (*http.Response, error)
 
 An interceptor is registered for a set of methods. An empty or nil set matches every method, which is the only way to say it: there is no separate constant for it and no single-method form of the call.
 
-Returning a response from `c.Forward()` relays the upstream answer without buffering it. Returning one built locally short-circuits the upstream entirely and the request never leaves the proxy. Returning an error hands it to the configured `ErrorHandler`, which answers 502 by default.
+Returning a response from `c.Forward()` relays the upstream answer without buffering it. Returning one built locally short-circuits the upstream entirely and the request never leaves the proxy. Returning an error hands it to the configured `ErrorHandler`, which answers 502 by default. A panicking handler is recovered and reaches the same `ErrorHandler` as a `PanicError` carrying the value and the stack; the default logs it and answers 500.
 
 A request matching no interceptor is forwarded unchanged, so watching an authority without rewriting anything stays non-disruptive. `WithNoInterceptorHandler` changes that.
 
