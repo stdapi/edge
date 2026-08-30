@@ -51,7 +51,7 @@ func (p *Proxy) intercept(ctx context.Context, conn *peekConn, sess *Session) er
 	}
 
 	state := tlsConn.ConnectionState()
-	sess.tlsState = &state
+	sess.tlsState.Store(&state)
 	sess.target.Scheme = "https"
 	// The server name the client asked for is what it believes it is talking to. It is a
 	// better identity than the CONNECT authority, which an explicit proxy client may write
@@ -125,6 +125,14 @@ func (p *Proxy) serveIntercepted(ctx context.Context, conn net.Conn, sess *Sessi
 		sess.localAddr = conn.LocalAddr()
 	}
 
+	// Every intercepted connection settles here, however it arrived, so this is the single
+	// point where its session is registered with a target a reader can rely on.
+	sess.closer = conn
+	if !p.srv.admitSession(sess) {
+		return ErrConnectionRejected
+	}
+	defer p.srv.trackSession(sess, false)
+
 	if proto == HTTP2 {
 		sess.setProtocol(HTTP2)
 		p.srv.h2.ServeConn(conn, &http2.ServeConnOpts{
@@ -153,10 +161,10 @@ func (p *Proxy) serveInterceptedRequest(w http.ResponseWriter, r *http.Request) 
 	// serveIntercepted sets HTTP/1.1 before http.Server reads the h2c preface.
 	sess.setProtocol(protoOfRequest(r))
 
-	if r.TLS == nil && sess.tlsState != nil {
+	if state := sess.tlsState.Load(); r.TLS == nil && state != nil {
 		// http.Server only recognizes a bare *tls.Conn, and the connection it was handed
 		// is wrapped. Handlers still expect Request.TLS to describe the handshake.
-		r.TLS = sess.tlsState
+		r.TLS = state
 	}
 
 	p.dispatchRequest(w, r, sess, interceptedTarget(r, sess))

@@ -7,9 +7,12 @@ package edge
 import (
 	"context"
 	"crypto/tls"
+	"errors"
+	"io"
 	"net"
 	"net/netip"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -142,7 +145,13 @@ type Session struct {
 	remoteAddr net.Addr
 	localAddr  net.Addr
 	ctx        context.Context
-	tlsState   *tls.ConnectionState
+	// closer ends the connection. Each listener sets its own, a connection, a CONNECT stream,
+	// or the bookkeeping a QUIC peer needs, before the session is registered and never after.
+	closer   io.Closer
+	closeErr error
+	// tlsState is atomic because the QUIC path fills it in once the handshake reaches the
+	// server, by which point [Proxy.Sessions] already reports the session.
+	tlsState atomic.Pointer[tls.ConnectionState]
 	// tlsConn is set instead of tlsState when the session is created before the handshake,
 	// so TLS() can read the state once it exists.
 	tlsConn     *tls.Conn
@@ -151,13 +160,17 @@ type Session struct {
 	// upstream is the address a transparently redirected connection was headed to. It is
 	// preferred over resolving the authority again, which may not even resolve outside the
 	// client's own network.
-	upstream netip.AddrPort
-	id       uint64
+	upstream  netip.AddrPort
+	id        uint64
+	closeOnce sync.Once
 	// proto is the protocol of the connection. The front listener builds its session from
 	// ConnContext, before the protocol is known, so unlike every other field it is written
 	// once a request has been read, from a goroutine serving one of them.
-	proto       atomic.Uint32
-	action      Action
+	proto  atomic.Uint32
+	action Action
+	// perRequest marks a redirected plaintext connection, decided on the Host header of each
+	// request rather than once at the connection. It is not reported by [Proxy.Sessions].
+	perRequest  bool
 	transparent bool
 }
 
@@ -213,8 +226,8 @@ func (s *Session) setProtocol(p Protocol) { s.proto.Store(uint32(p)) }
 // TLS returns the state of the TLS connection with the client, or nil when the client is not
 // speaking TLS to the proxy.
 func (s *Session) TLS() *tls.ConnectionState {
-	if s.tlsState != nil {
-		return s.tlsState
+	if state := s.tlsState.Load(); state != nil {
+		return state
 	}
 	if s.tlsConn != nil {
 		// The handshake had not run when the session was created. tls.Conn guards its own
@@ -238,6 +251,25 @@ func (s *Session) Upstream() netip.AddrPort { return s.upstream }
 // Transparent reports whether the client reached the proxy without being configured to use
 // it, its traffic having been redirected by the network.
 func (s *Session) Transparent() bool { return s.transparent }
+
+// Action returns what the proxy did with this connection when it was established, relay it or
+// terminate its TLS. Every request multiplexed on the connection reports the same action.
+func (s *Session) Action() Action { return s.action }
+
+// Close ends the connection immediately, without draining it. A tunnel is cut in both
+// directions, an intercepted connection is dropped along with the requests in flight on it.
+// Closing a connection that already ended is a no-op.
+func (s *Session) Close() error {
+	if s.closer == nil {
+		return nil
+	}
+	s.closeOnce.Do(func() {
+		if err := s.closer.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			s.closeErr = err
+		}
+	})
+	return s.closeErr
+}
 
 // CreatedAt returns when the session was accepted.
 func (s *Session) CreatedAt() time.Time { return s.createdAt }

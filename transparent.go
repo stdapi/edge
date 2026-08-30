@@ -13,7 +13,6 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"net/http"
 	"net/netip"
 	"time"
 
@@ -150,6 +149,12 @@ func (p *Proxy) serveTransparentTLS(ctx context.Context, conn *peekConn, origin 
 	case Reject:
 		return ErrConnectionRejected
 	case Tunnel:
+		sess.closer = conn
+		if !p.srv.admitSession(sess) {
+			return ErrConnectionRejected
+		}
+		defer p.srv.trackSession(sess, false)
+
 		upstream, err := p.dialTransparentUpstream(ctx, target, origin)
 		if err != nil {
 			return err
@@ -175,13 +180,11 @@ func (p *Proxy) serveTransparentPlain(ctx context.Context, conn *peekConn, origi
 	sess := newSession(ctx, conn, target, Intercept, HTTP11)
 	sess.upstream = origin
 	sess.transparent = true
+	sess.perRequest = true
 
-	ln := newSingleConnListener(conn, sess)
-	err := p.srv.mitm.Serve(ln)
-	if errors.Is(err, net.ErrClosed) || errors.Is(err, http.ErrServerClosed) {
-		return nil
-	}
-	return err
+	// The same work an intercepted connection does, and going through it keeps a single point
+	// where a session is registered.
+	return p.serveIntercepted(ctx, conn, sess, HTTP11)
 }
 
 // redirectedTo reports where a redirected connection was headed, or the zero value. A lookup

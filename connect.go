@@ -29,7 +29,7 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 
 	action := p.Decide(target)
 	if action == Reject {
-		http.Error(w, "edge: connection rejected, no interceptor or tunnel names this authority", http.StatusForbidden)
+		http.Error(w, "edge: connection rejected, no interceptor or tunnel matches this authority", http.StatusForbidden)
 		return
 	}
 
@@ -68,6 +68,14 @@ func (p *Proxy) connectHijack(w http.ResponseWriter, r *http.Request, target Tar
 	}()
 
 	if action == Tunnel {
+		sess.closer = conn
+		if !p.srv.admitSession(sess) {
+			_ = writeRawStatus(brw, http.StatusForbidden,
+				"connection rejected, no interceptor or tunnel matches this authority")
+			return
+		}
+		defer p.srv.trackSession(sess, false)
+
 		upstream, derr := p.dialUpstream(r.Context(), target)
 		if derr != nil {
 			_ = writeRawStatus(brw, http.StatusBadGateway, derr.Error())
@@ -104,20 +112,6 @@ func (p *Proxy) connectStream(w http.ResponseWriter, r *http.Request, target Tar
 		local, remote = front.localAddr, front.remoteAddr
 	}
 
-	var upstream net.Conn
-	if action == Tunnel {
-		var err error
-		upstream, err = p.dialUpstream(r.Context(), target)
-		if err != nil {
-			http.Error(w, "edge: "+err.Error(), http.StatusBadGateway)
-			return
-		}
-		defer func() { _ = upstream.Close() }()
-	}
-
-	w.WriteHeader(http.StatusOK)
-	_ = http.NewResponseController(w).Flush()
-
 	stream := newH2Stream(w, r, local, remote)
 	sess := newSession(r.Context(), nil, target, action, protoOfRequest(r))
 	sess.localAddr, sess.remoteAddr = local, remote
@@ -131,11 +125,34 @@ func (p *Proxy) connectStream(w http.ResponseWriter, r *http.Request, target Tar
 	}()
 
 	if action == Tunnel {
-		if _, _, err := tunnel(stream, upstream, p.cfg.server.tunnelIdleTimeout); err != nil {
-			p.logf(r.Context(), slog.LevelDebug, "tunnel closed", sess, err)
+		// Nothing has been written to the stream yet, so a refusal here is an ordinary status
+		// rather than a tunnel granted and then torn down.
+		sess.closer = stream
+		if !p.srv.admitSession(sess) {
+			http.Error(w, "edge: connection rejected, no interceptor or tunnel matches this authority",
+				http.StatusForbidden)
+			return
+		}
+		defer p.srv.trackSession(sess, false)
+
+		upstream, err := p.dialUpstream(r.Context(), target)
+		if err != nil {
+			http.Error(w, "edge: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer func() { _ = upstream.Close() }()
+
+		w.WriteHeader(http.StatusOK)
+		_ = http.NewResponseController(w).Flush()
+
+		if _, _, terr := tunnel(stream, upstream, p.cfg.server.tunnelIdleTimeout); terr != nil {
+			p.logf(r.Context(), slog.LevelDebug, "tunnel closed", sess, terr)
 		}
 		return
 	}
+
+	w.WriteHeader(http.StatusOK)
+	_ = http.NewResponseController(w).Flush()
 
 	if err := p.intercept(r.Context(), newPeekConn(stream, nil), sess); err != nil {
 		p.logf(r.Context(), slog.LevelDebug, "intercepted stream closed", sess, err)

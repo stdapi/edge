@@ -47,6 +47,9 @@ func (p *Proxy) AddTunnel(patterns ...string) error {
 
 // DeleteTunnel removes the tunnel registered for the given authority pattern and returns it.
 // It fails with [ErrTunnelNotFound] when none is registered.
+//
+// The connections already relaying under it are left untouched. See [Proxy.Sessions] to close
+// them.
 func (p *Proxy) DeleteTunnel(pattern string) (Authority, error) {
 	txn := p.Txn(true)
 	defer txn.Abort()

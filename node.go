@@ -58,8 +58,8 @@ type node struct {
 	host bool
 }
 
-// lookup walks the hostname, then the path under it. Every key names a hostname before its
-// path, so the walk always starts on the hostname portion and lookupByHostname is the only
+// lookup walks the hostname, then the path under it. Every key starts with a hostname and
+// ends with a path, so the walk always starts on the hostname portion and lookupByHostname is the only
 // way into lookupByPath.
 func (n *node) lookup(method, hostPort, path string, c *Context, lazy bool) (int, *node) {
 	*c.skipStack = (*c.skipStack)[:0]

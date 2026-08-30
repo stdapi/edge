@@ -103,7 +103,7 @@ func (c *Context) resetForAuthority(sess *Session, scheme, host, port string) {
 	c.port = port
 	c.cachedQueries = nil
 	c.interceptor = nil
-	// No handler runs on an authority lookup, so the scope names none.
+	// No handler runs on an authority lookup, so there is no scope to report.
 	c.scope = 0
 	*c.params = (*c.params)[:0]
 }

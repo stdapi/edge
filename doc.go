@@ -9,7 +9,7 @@
 // The proxy routes on the full request target, authority and path, using an immutable radix
 // tree with lock-free reads and single-writer semantics. Interceptors and tunnels can be
 // added and removed while traffic is flowing without blocking any lookup. Nothing is
-// configured at construction: the whole traffic policy is set and changed at runtime.
+// configured at construction, the whole traffic policy is set and changed at runtime.
 //
 // # Interception
 //
@@ -23,15 +23,16 @@
 // globally:
 //
 //   - [Proxy.AddInterceptor] registers a handler for an authority and a path. The authority
-//     it names is the one it intercepts, so a handler always sees the traffic it was written
-//     for.
-//   - [Proxy.AddTunnel] names an authority to relay untouched, which is how a host that
+//     in its pattern is the one it intercepts, so a handler always sees the traffic it was
+//     written for.
+//   - [Proxy.AddTunnel] marks an authority to relay untouched, which is how a host that
 //     pins its certificate is carved out of a broader interception.
 //
-// Anything else is refused. A proxy meant to capture the traffic of an application under
-// test should say what it expects that application to reach, and hear about it when the
-// application reaches somewhere else. [Proxy.AddTunnel] with a wildcard authority is the
-// one line that restores a permissive proxy, and it says so in the code.
+// Anything else is refused. A proxy is told what the application in front of it may reach,
+// and reports it when the application reaches anywhere else. That serves observing what a
+// test subject does as much as confining what a network may talk to. [Proxy.AddTunnel] with
+// a wildcard authority is the one line that restores a permissive proxy, and it says so in
+// the code.
 //
 // # Message framing
 //

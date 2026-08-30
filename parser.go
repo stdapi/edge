@@ -30,8 +30,8 @@ type pattern struct {
 	str  string
 	key  string
 	host string
-	// port is the port the pattern names, empty when it names none and therefore matches
-	// every port. It is never part of key.
+	// port is the port the pattern restricts to, empty when it matches every port. It is
+	// never part of key.
 	port             string
 	path             string
 	tokens           []token
@@ -40,9 +40,9 @@ type pattern struct {
 }
 
 // parsePattern parses an interceptor pattern of the form host[:port]/path. The hostname is
-// required: an interceptor arms the interception of the authority it names, and one that names none
-// would arm nothing, leaving a handler registered that no connection can ever reach. Matching
-// every authority is spelled with a wildcard, which says so.
+// required. An interceptor arms the interception of the authority it matches, so one without a
+// hostname would arm nothing and leave a handler registered that no connection can reach.
+// Matching every authority is spelled with a wildcard, which says so.
 func (p *Proxy) parsePattern(raw string) (pattern, int, error) {
 	if len(raw) == 0 {
 		return pattern{}, 0, fmt.Errorf("%w: empty pattern", ErrInvalidInterceptor)
@@ -79,7 +79,7 @@ func (p *Proxy) parsePattern(raw string) (pattern, int, error) {
 			Pattern: raw,
 			Type:    "hostname",
 			Reason:  "syntax",
-			Hint:    "an interceptor pattern names the authority it intercepts, write +{any} to match every one",
+			Hint:    "an interceptor pattern starts with the authority it intercepts, write +{any} to match every one",
 			Start:   0,
 			End:     1,
 		}

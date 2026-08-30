@@ -14,6 +14,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -512,4 +513,46 @@ func TestTransparent_PacketConnAnswersOnlyForTheDatagramItRead(t *testing.T) {
 	dst, err := resolve.OriginalDestination(other)
 	require.NoError(t, err)
 	assert.False(t, dst.IsValid())
+}
+
+// A redirected plaintext connection resolves to the address it was headed to, never to an
+// authority. Deciding it at connection level would refuse it, since no entry matches the
+// origin by its address, so each request is decided on its own Host header instead.
+func TestTransparent_PlaintextWithOriginalDestination(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "origin got host=%s", r.Host)
+	}))
+	defer origin.Close()
+
+	originURL, _ := url.Parse(origin.URL)
+	originAddr, err := netip.ParseAddrPort(originURL.Host)
+	require.NoError(t, err)
+
+	tr := DefaultTransport()
+	tr.DialContext = pinnedDialer(originURL.Host)
+
+	p := testProxy(t, WithTransport(tr))
+	p.MustAddInterceptor([]string{http.MethodGet}, "api.example.test/ping", func(c *Context) (*http.Response, error) {
+		return c.Forward()
+	})
+
+	addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) {
+		return originAddr, nil
+	})
+
+	client := &http.Client{
+		Timeout:   10 * time.Second,
+		Transport: &http.Transport{DialContext: pinnedDialer(addr)},
+	}
+
+	resp, err := client.Get("http://api.example.test/ping")
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, "origin got host=api.example.test", string(body))
+
+	assert.Empty(t, slices.Collect(p.Sessions()), "a connection decided per request is not reported")
 }

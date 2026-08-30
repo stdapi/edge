@@ -79,6 +79,8 @@ func (p *Proxy) ServeQUIC(pc net.PacketConn) error {
 
 	p.srv.track(d, true)
 	defer p.srv.track(d, false)
+	p.srv.trackDemux(d, true)
+	defer p.srv.trackDemux(d, false)
 
 	return d.run()
 }
@@ -99,8 +101,7 @@ type quicDemux struct {
 	listener    *quic.EarlyListener
 	transport   *quic.Transport
 
-	peers    map[string]*quicPeer
-	sessions map[string]*Session
+	peers map[string]*quicPeer
 
 	done chan struct{}
 	wg   sync.WaitGroup
@@ -123,18 +124,83 @@ type quicPeer struct {
 	lastSeen time.Time
 	upstream net.Conn
 	sniffer  *quicsniff.Reassembler
-	target   Target
-	pending  [][]byte
-	state    peerState
+	sess     *Session
+	// qc is the connection the proxy terminated for an intercepted peer. It stays nil until
+	// the handshake reaches the QUIC server, which is the only place it is handed out.
+	qc      *quic.Conn
+	target  Target
+	pending [][]byte
+	state   peerState
+}
+
+// h3NoError is HTTP/3's H3_NO_ERROR, what a peer sends when it closes a connection with
+// nothing to report.
+const h3NoError quic.ApplicationErrorCode = 0x100
+
+// quicPeerCloser ends one QUIC peer. An intercepted peer is told about it, with a
+// CONNECTION_CLOSE the proxy can write because it terminated the handshake. A tunneled one is
+// not, its handshake stayed end to end, so the client simply stops hearing back until its own
+// idle timeout fires.
+type quicPeerCloser struct {
+	d   *quicDemux
+	key string
+}
+
+func (c *quicPeerCloser) Close() error {
+	c.d.mu.Lock()
+	peer := c.d.peers[c.key]
+	if peer == nil {
+		c.d.mu.Unlock()
+		return nil
+	}
+	qc := peer.qc
+	if peer.upstream != nil {
+		_ = peer.upstream.Close()
+	}
+	delete(c.d.peers, c.key)
+	c.d.mu.Unlock()
+
+	if qc == nil {
+		// A tunnel, ended by closing the upstream socket, or an intercepted peer still
+		// handshaking. Dropping the peer starves both.
+		return nil
+	}
+	// Outside the lock, quic-go writes a CONNECTION_CLOSE from here.
+	return qc.CloseWithError(h3NoError, "")
+}
+
+// appendSessions adds the sessions of the peers this demux serves to out.
+func (d *quicDemux) appendSessions(out []*Session) []*Session {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, peer := range d.peers {
+		if peer.sess != nil {
+			out = append(out, peer.sess)
+		}
+	}
+	return out
+}
+
+// attach records the connection the QUIC server terminated for an intercepted peer, and
+// returns the session it belongs to. It is the only point where that connection is handed
+// out, so it is the only place the session can learn how to close it.
+func (d *quicDemux) attach(c *quic.Conn) *Session {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	peer := d.peers[c.RemoteAddr().String()]
+	if peer == nil {
+		return nil
+	}
+	peer.qc = c
+	return peer.sess
 }
 
 func newQUICDemux(p *Proxy, pc net.PacketConn) (*quicDemux, error) {
 	d := &quicDemux{
-		p:        p,
-		pc:       pc,
-		peers:    make(map[string]*quicPeer),
-		sessions: make(map[string]*Session),
-		done:     make(chan struct{}),
+		p:     p,
+		pc:    pc,
+		peers: make(map[string]*quicPeer),
+		done:  make(chan struct{}),
 	}
 	d.origins, _ = pc.(PacketOriginalDestination)
 	d.intercepted = newDemuxPacketConn(pc)
@@ -171,12 +237,11 @@ func (d *quicDemux) startInterception() error {
 		IdleTimeout:    d.p.cfg.server.idleTimeout,
 		Logger:         d.p.cfg.logger,
 		ConnContext: func(ctx context.Context, c *quic.Conn) context.Context {
-			if sess := d.sessionFor(c.RemoteAddr()); sess != nil {
+			if sess := d.attach(c); sess != nil {
 				// The session is created before the handshake, so this is the first point
-				// where the TLS state exists. It runs before any request is read off the
-				// connection, which is what lets it be written without synchronization.
+				// where the TLS state exists, and it is already registered by then.
 				state := c.ConnectionState().TLS
-				sess.tlsState = &state
+				sess.tlsState.Store(&state)
 				return context.WithValue(ctx, sessionKey{}, sess)
 			}
 			return ctx
@@ -323,7 +388,7 @@ func (d *quicDemux) sniff(addr net.Addr, key string, peer *quicPeer, datagram []
 
 	switch d.p.Decide(target) {
 	case Reject:
-		d.reject(key, addr, "no interceptor or tunnel names this authority")
+		d.reject(key, addr, "no interceptor or tunnel matches this authority")
 	case Intercept:
 		d.beginIntercept(key, addr, target, pending)
 	default:
@@ -376,6 +441,7 @@ func (d *quicDemux) beginIntercept(key string, addr net.Addr, target Target, pen
 	// Forwarding goes back to the address the client was headed to, not to a fresh
 	// resolution of the authority, which behind a redirect may not resolve at all.
 	sess.upstream = d.originalDst(addr)
+	sess.closer = &quicPeerCloser{d: d, key: key}
 
 	d.mu.Lock()
 	peer := d.peers[key]
@@ -386,8 +452,16 @@ func (d *quicDemux) beginIntercept(key string, addr net.Addr, target Target, pen
 	peer.state = peerIntercepted
 	peer.target = target
 	peer.pending = nil
-	d.sessions[key] = sess
+	peer.sess = sess
 	d.mu.Unlock()
+
+	// The session is published, so a sweep started after the tree changed either found it or
+	// ran before this read, which then observes the change. Nothing has been handed to the
+	// QUIC server yet, so a peer refused here never completes a handshake.
+	if d.p.Decide(target) == Reject {
+		d.reject(key, addr, "the authority was withdrawn while the connection was starting")
+		return
+	}
 
 	for _, dg := range pending {
 		d.intercepted.deliver(addr, dg)
@@ -403,6 +477,15 @@ func (d *quicDemux) beginTunnel(key string, addr net.Addr, target Target, pendin
 		return
 	}
 
+	// A tunneled peer needs a session of its own. Its action is read once, here, so without
+	// one nothing would report that it is still relaying after the tree changed.
+	sess := newSession(context.Background(), nil, target, Tunnel, HTTP3)
+	sess.remoteAddr = addr
+	sess.localAddr = d.pc.LocalAddr()
+	sess.transparent = true
+	sess.upstream = d.originalDst(addr)
+	sess.closer = &quicPeerCloser{d: d, key: key}
+
 	d.mu.Lock()
 	peer := d.peers[key]
 	if peer == nil {
@@ -414,7 +497,18 @@ func (d *quicDemux) beginTunnel(key string, addr net.Addr, target Target, pendin
 	peer.upstream = upstream
 	peer.target = target
 	peer.pending = nil
+	peer.sess = sess
 	d.mu.Unlock()
+
+	// See beginIntercept. Refusing here happens before the first datagram reaches the origin,
+	// so a tunnel the tree no longer accepts never relays a byte.
+	if d.p.Decide(target) == Reject {
+		d.drop(key)
+		d.p.cfg.logger.Debug("edge: QUIC connection dropped",
+			slog.String("client", addr.String()),
+			slog.String("reason", "the authority was withdrawn while the connection was starting"))
+		return
+	}
 
 	for _, dg := range pending {
 		if _, err := upstream.Write(dg); err != nil {
@@ -461,6 +555,7 @@ func (d *quicDemux) reject(key string, addr net.Addr, reason string) {
 		peer.state = peerRejected
 		peer.pending = nil
 		peer.sniffer = nil
+		peer.sess = nil
 	}
 	d.mu.Unlock()
 	d.p.cfg.logger.Debug("edge: QUIC connection dropped",
@@ -473,14 +568,7 @@ func (d *quicDemux) drop(key string) {
 		_ = peer.upstream.Close()
 	}
 	delete(d.peers, key)
-	delete(d.sessions, key)
 	d.mu.Unlock()
-}
-
-func (d *quicDemux) sessionFor(addr net.Addr) *Session {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	return d.sessions[addr.String()]
 }
 
 func (d *quicDemux) sweepIdle() {
@@ -495,7 +583,6 @@ func (d *quicDemux) sweepIdle() {
 			_ = peer.upstream.Close()
 		}
 		delete(d.peers, key)
-		delete(d.sessions, key)
 	}
 }
 
@@ -513,7 +600,6 @@ func (d *quicDemux) close() {
 			}
 		}
 		clear(d.peers)
-		clear(d.sessions)
 		d.mu.Unlock()
 
 		if h3 != nil {

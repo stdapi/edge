@@ -24,7 +24,7 @@ func (p *Proxy) dispatchRequest(w http.ResponseWriter, r *http.Request, sess *Se
 
 	switch tree.decide(c, target) {
 	case Reject:
-		http.Error(w, "edge: connection rejected, no interceptor or tunnel names this authority", http.StatusForbidden)
+		http.Error(w, "edge: connection rejected, no interceptor or tunnel matches this authority", http.StatusForbidden)
 	case Tunnel:
 		p.relay(c, w, r, sess, target)
 	default:

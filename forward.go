@@ -106,7 +106,7 @@ func stripHopByHop(h http.Header) {
 	if h == nil {
 		return
 	}
-	// Read the Connection header before deleting it: it names the other headers to drop.
+	// Read the Connection header before deleting it, it lists the other headers to drop.
 	for _, value := range h.Values("Connection") {
 		for field := range strings.SplitSeq(value, ",") {
 			if field = textproto.TrimString(field); field != "" {

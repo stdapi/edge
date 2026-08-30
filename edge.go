@@ -223,6 +223,9 @@ func (p *Proxy) UpdateInterceptor(methods []string, pattern string, handler Hand
 
 // DeleteInterceptor removes the interceptor registered for the given methods, pattern and matchers, and
 // returns it.
+//
+// The connections already open are left untouched, though the requests on them are routed
+// again. See [Proxy.Sessions] to close them.
 func (p *Proxy) DeleteInterceptor(methods []string, pattern string, opts ...MatcherOption) (*Interceptor, error) {
 	txn := p.Txn(true)
 	defer txn.Abort()

@@ -10,11 +10,13 @@ import (
 	"crypto/tls"
 	"errors"
 	"io"
+	"iter"
 	"log"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -40,8 +42,16 @@ type server struct {
 
 	listeners map[*net.Listener]struct{}
 	// active tracks connections the proxy owns outside of http.Server, which is every
-	// tunnel and every intercepted connection.
-	active   map[io.Closer]struct{}
+	// tunnel and every intercepted connection. It answers what a shutdown must close, so a
+	// connection enters it as soon as it is accepted, before anything has decided it.
+	active map[io.Closer]struct{}
+	// sessions is what [Proxy.Sessions] reports. A session enters it only once its target is
+	// resolved, so a caller never sees one it cannot pass to [Proxy.Decide].
+	sessions map[*Session]struct{}
+	// quics tracks the QUIC demultiplexers. Their peers own their sessions under a separate
+	// lock, merged when the sessions are read rather than mirrored here, so no invariant
+	// spans the two locks.
+	quics    map[*quicDemux]struct{}
 	closed   chan struct{}
 	wg       sync.WaitGroup
 	closeOne sync.Once
@@ -61,6 +71,8 @@ func newServer(p *Proxy) (*server, error) {
 		fwd:       fwd,
 		listeners: make(map[*net.Listener]struct{}),
 		active:    make(map[io.Closer]struct{}),
+		sessions:  make(map[*Session]struct{}),
+		quics:     make(map[*quicDemux]struct{}),
 		closed:    make(chan struct{}),
 	}
 
@@ -218,6 +230,91 @@ func (s *server) track(c io.Closer, add bool) {
 	delete(s.active, c)
 }
 
+// trackSession adds or removes a session. The goroutine serving the connection makes both
+// calls, so membership stays single-writer.
+func (s *server) trackSession(sess *Session, add bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if add {
+		s.sessions[sess] = struct{}{}
+		return
+	}
+	delete(s.sessions, sess)
+}
+
+func (s *server) trackDemux(d *quicDemux, add bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if add {
+		s.quics[d] = struct{}{}
+		return
+	}
+	delete(s.quics, d)
+}
+
+// admitSession registers a session and reports whether the tree still accepts it.
+//
+// The decision that let the connection in was read from the tree as it stood then, and a
+// delete may have committed since. Reading it again, after the session is registered, leaves
+// no window. A sweep that missed this session missed it because the registration came after
+// the snapshot, so it also came after the delete, and this read sees that delete. Registering
+// after the read would reopen the window.
+func (s *server) admitSession(sess *Session) bool {
+	if sess.perRequest {
+		return true
+	}
+
+	s.trackSession(sess, true)
+	if s.p.Decide(sess.target) != Reject {
+		return true
+	}
+	s.trackSession(sess, false)
+	return false
+}
+
+// Sessions returns an iterator over a point-in-time snapshot of the connections the proxy
+// decides on, the tunnels it relays and the connections it terminated.
+//
+// Three kinds are absent. A connection a client opens to the proxy itself addresses the proxy
+// rather than an authority. A redirected plaintext connection resolves to no authority of its
+// own and is decided request by request. A protocol upgrade rides the request that established
+// it, so it is reachable only through the connection underneath.
+//
+// Removing a tunnel or an interceptor leaves the connections already open untouched. This is
+// how a caller applies the change to them.
+//
+//	p.DeleteTunnel("example.com")
+//	for s := range p.Sessions() {
+//		if p.Decide(s.Target()) == Reject {
+//			s.Close()
+//		}
+//	}
+//
+// A connection being established while the loop runs is not missed, it reads the tree again
+// once it is registered and refuses itself. Two caveats. It may still be open when the loop
+// returns, refusing itself a moment later without having relayed anything. And a tunnel the
+// loop closes may have relayed bytes since the change. The snapshot only reflects what the
+// calling goroutine committed before it started.
+func (p *Proxy) Sessions() iter.Seq[*Session] {
+	p.srv.mu.Lock()
+	out := make([]*Session, 0, len(p.srv.sessions))
+	for sess := range p.srv.sessions {
+		out = append(out, sess)
+	}
+	demuxes := make([]*quicDemux, 0, len(p.srv.quics))
+	for d := range p.srv.quics {
+		demuxes = append(demuxes, d)
+	}
+	p.srv.mu.Unlock()
+
+	// A demux owns its peers under a lock of its own, taken here only once the server lock
+	// is released, so the two are never held at once.
+	for _, d := range demuxes {
+		out = d.appendSessions(out)
+	}
+	return slices.Values(out)
+}
+
 func (s *server) closeActive() {
 	s.mu.Lock()
 	conns := make([]io.Closer, 0, len(s.active))
@@ -271,10 +368,10 @@ func (p *Proxy) serveProxyRequest(w http.ResponseWriter, r *http.Request) {
 	p.dispatchRequest(w, r, sess, target)
 }
 
-// proxyTarget resolves the authority an explicit proxy request names, reporting false when
-// the request names none.
+// proxyTarget resolves the authority of an explicit proxy request, reporting false when the
+// request gives none.
 //
-// HTTP/1.1 carries it in an absolute-form request target. HTTP/2 has no absolute form: RFC
+// HTTP/1.1 puts it in an absolute-form request target. HTTP/2 has no absolute form. RFC
 // 9113 splits the target across :scheme, :authority and :path, which reach a handler as a
 // relative URL, Host, and a TLS state net/http fills in only when :scheme is https. So an
 // HTTP/2 request is indistinguishable from an origin-form one, and since a proxy connection
@@ -333,7 +430,7 @@ func newSession(ctx context.Context, c net.Conn, target Target, action Action, p
 		s.localAddr = c.LocalAddr()
 		if tc, ok := c.(*tls.Conn); ok {
 			if state := tc.ConnectionState(); state.HandshakeComplete {
-				s.tlsState = &state
+				s.tlsState.Store(&state)
 			} else {
 				// http.Server calls ConnContext before it performs the handshake, so the
 				// state read here would be the zero one. Keeping the connection lets it be

@@ -5,14 +5,17 @@
 package edge
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -235,4 +238,113 @@ func TestQUIC_RejectDropsTheConnection(t *testing.T) {
 		&quic.Config{HandshakeIdleTimeout: 2 * time.Second},
 	)
 	require.Error(t, err, "a rejected authority must never complete a handshake")
+}
+
+// dialQUICTo returns an HTTP/3 transport reaching addr whatever the URL says, so a test can
+// use the authority the proxy sniffs without it having to resolve.
+func dialQUICTo(addr netip.AddrPort, roots *x509.CertPool) *http3.Transport {
+	return &http3.Transport{
+		TLSClientConfig: &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS13},
+		// A short idle timeout so a connection the proxy cut does not hold the test open.
+		QUICConfig: &quic.Config{MaxIdleTimeout: time.Second},
+		Dial: func(ctx context.Context, _ string, cfg *tls.Config, qcfg *quic.Config) (*quic.Conn, error) {
+			pc, err := net.ListenUDP("udp", nil)
+			if err != nil {
+				return nil, err
+			}
+			conn, err := quic.Dial(ctx, pc, net.UDPAddrFromAddrPort(addr), cfg, qcfg)
+			if err != nil {
+				_ = pc.Close()
+				return nil, err
+			}
+			return conn, nil
+		},
+	}
+}
+
+// A tunneled QUIC peer is decided once, when its ClientHello is read, and never again, so it
+// needs a session of its own for a sweep to reach it.
+func TestQUIC_TunnelSessionIsListedAndClosed(t *testing.T) {
+	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
+	require.NoError(t, err)
+	origin := h3Origin(t, originCA)
+
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(proxyCA))
+	require.NoError(t, err)
+	require.NoError(t, p.AddTunnel(h3Authority))
+
+	proxyAddr := startQUICRedirected(t, p, origin)
+
+	tr := dialQUICTo(proxyAddr, poolOf(originCA))
+	defer func() { _ = tr.Close() }()
+
+	req, err := http.NewRequest(http.MethodGet,
+		fmt.Sprintf("https://%s:%d/echo", h3Authority, proxyAddr.Port()), nil)
+	require.NoError(t, err)
+
+	resp, err := tr.RoundTrip(req)
+	require.NoError(t, err)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	// End to end, the origin answered its own certificate and the proxy only moved datagrams.
+	assert.Contains(t, string(body), "path=/echo")
+
+	sessions := waitForSessions(t, p, 1)
+	assert.Equal(t, Tunnel, sessions[0].Action())
+	assert.Equal(t, h3Authority, sessions[0].Target().Host)
+	assert.Equal(t, HTTP3, sessions[0].Protocol())
+
+	require.NoError(t, sessions[0].Close())
+	assert.Empty(t, slices.Collect(p.Sessions()), "closing removes the peer under the demux lock")
+}
+
+// The proxy terminated the connection of an intercepted QUIC peer, so closing its session goes
+// through CloseWithError rather than leaving the client to time out. What the client
+// then observes is not asserted, an http3.Transport is free to redial on its own.
+func TestQUIC_InterceptedSessionIsListedAndClosed(t *testing.T) {
+	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
+	require.NoError(t, err)
+	origin := h3Origin(t, originCA)
+
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+
+	upstream := DefaultTransport()
+	upstream.AllowHTTP3 = true
+	upstream.RootCAs = poolOf(originCA)
+
+	p, err := New(WithCA(proxyCA), WithTransport(upstream))
+	require.NoError(t, err)
+	p.MustAddInterceptor(nil, h3Authority+"/+{any}", func(c *Context) (*http.Response, error) {
+		return c.Forward()
+	})
+
+	proxyAddr := startQUICRedirected(t, p, origin)
+
+	tr := dialQUICTo(proxyAddr, poolOf(proxyCA))
+	defer func() { _ = tr.Close() }()
+
+	req, err := http.NewRequest(http.MethodGet,
+		fmt.Sprintf("https://%s:%d/echo", h3Authority, proxyAddr.Port()), nil)
+	require.NoError(t, err)
+
+	resp, err := tr.RoundTrip(req)
+	require.NoError(t, err)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Contains(t, string(body), "path=/echo")
+
+	sessions := waitForSessions(t, p, 1)
+	assert.Equal(t, Intercept, sessions[0].Action())
+	assert.Equal(t, h3Authority, sessions[0].Target().Host)
+	assert.NotNil(t, sessions[0].TLS(), "the handshake the proxy terminated is recorded")
+
+	require.NoError(t, sessions[0].Close())
+	assert.Empty(t, slices.Collect(p.Sessions()))
 }
