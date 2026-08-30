@@ -43,21 +43,12 @@ func (p *Proxy) ListenAndServeTransparent(addr string) error {
 // request. A connection with none of the three cannot be placed and is closed. Wrap ln in
 // [TransparentListener] for the first of them.
 func (p *Proxy) ServeTransparent(ln net.Listener) error {
-	if p.srv.closing.Load() {
+	// A refused registration means a shutdown started; accepting would run a loop nothing
+	// ever closes.
+	if !p.srv.tryTrackListener(&ln) {
 		return ErrProxyClosed
 	}
-	p.srv.trackListener(&ln, true)
-	defer p.srv.trackListener(&ln, false)
-
-	// Held for the loop's lifetime so a connection never adds to the group from zero.
-	p.srv.wg.Add(1)
-	defer p.srv.wg.Done()
-
-	// See connectHijack. A shutdown that ran before the listener was tracked will never close
-	// it, so the loop would accept forever and hold the group open.
-	if p.srv.closing.Load() {
-		return ErrProxyClosed
-	}
+	defer p.srv.untrackListener(&ln)
 
 	var delay time.Duration
 	for {
@@ -88,20 +79,19 @@ func (p *Proxy) ServeTransparent(ln net.Listener) error {
 // ServeConn serves one already accepted connection as if it had been transparently
 // redirected. It takes ownership of conn and closes it when done.
 func (p *Proxy) ServeConn(conn net.Conn) error {
-	p.srv.track(conn, true)
-	defer func() {
-		p.srv.track(conn, false)
+	if !p.srv.tryTrack(conn) {
 		_ = conn.Close()
-	}()
-
-	// See connectHijack. The accept loop can hand one over just as the proxy stops.
-	if p.srv.closing.Load() {
 		return ErrProxyClosed
 	}
+	defer func() {
+		_ = conn.Close()
+		p.srv.untrack(conn)
+	}()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	// A shutdown cancels the work in flight on this connection.
+	// A shutdown aborts the handshake and the dials still in flight on this connection.
+	// Requests being served are not on this context; they drain through the server.
 	go func() {
 		select {
 		case <-p.srv.closed:
@@ -175,7 +165,18 @@ func (p *Proxy) serveTransparentTLS(ctx context.Context, conn *peekConn, origin 
 		if err != nil {
 			return err
 		}
-		defer func() { _ = upstream.Close() }()
+
+		// See connectHijack: without this, closing the client side at the deadline can leave
+		// the upstream read parked until the idle timeout.
+		if !p.srv.tryTrack(upstream) {
+			_ = upstream.Close()
+			return ErrProxyClosed
+		}
+		defer func() {
+			_ = upstream.Close()
+			p.srv.untrack(upstream)
+		}()
+
 		_, _, err = tunnel(conn, upstream, p.cfg.server.tunnelIdleTimeout)
 		return err
 	default:
@@ -200,7 +201,7 @@ func (p *Proxy) serveTransparentPlain(ctx context.Context, conn *peekConn, origi
 
 	// The same work an intercepted connection does, and going through it keeps a single point
 	// where a session is registered.
-	return p.serveIntercepted(ctx, conn, sess, HTTP11)
+	return p.serveIntercepted(conn, sess, HTTP11)
 }
 
 // redirectedTo reports where a redirected connection was headed, or the zero value. A lookup

@@ -185,6 +185,50 @@ func TestConformance_CurlThroughInterceptingProxy(t *testing.T) {
 	}
 }
 
+// An h2c client inside a CONNECT tunnel: curl opens the tunnel to a plaintext port and
+// starts HTTP/2 with prior knowledge, no upgrade and no TLS, so the proxy has nothing but
+// the connection preface to detect it by. The origin answers over HTTP/1.1: h2 upstream is
+// only reachable through ALPN, so the mirrored version stops at what the origin can do.
+func TestConformance_CurlH2CThroughInterceptingProxy(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "method=%s path=%s proto=%s", r.Method, r.URL.RequestURI(), r.Proto)
+	}))
+	defer origin.Close()
+	originURL, _ := url.Parse(origin.URL)
+
+	p := testProxy(t)
+
+	seen := new(recorder)
+	p.MustAddInterceptor(nil, originHost(originURL)+"/+{any}", func(c *Context) (*http.Response, error) {
+		seen.add(c.Protocol().String() + " " + c.Request().URL.RequestURI())
+		return c.Forward()
+	})
+
+	addr := startProxy(t, p)
+
+	res := runCurl(t,
+		"--proxytunnel",
+		"--http2-prior-knowledge",
+		"--proxy", "http://"+addr,
+		origin.URL+"/echo",
+	)
+	if res.status != "200" {
+		t.Fatalf("status = %s, body %q", res.status, res.body)
+	}
+	if res.version != "2" {
+		t.Fatalf("negotiated version = %s, want 2", res.version)
+	}
+	if !strings.Contains(res.body, "proto=HTTP/1.1") {
+		t.Fatalf("origin proto not HTTP/1.1 in %q", res.body)
+	}
+	if !strings.Contains(res.body, "path=/echo") {
+		t.Fatalf("path not preserved in %q", res.body)
+	}
+	if got := seen.all(); !slices.Contains(got, "HTTP/2.0 /echo") {
+		t.Fatalf("interceptor saw %v, want HTTP/2.0 /echo", got)
+	}
+}
+
 func TestConformance_CurlTunnel(t *testing.T) {
 	origin := conformanceOrigin(t)
 	originURL, _ := url.Parse(origin.URL)

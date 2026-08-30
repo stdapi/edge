@@ -60,19 +60,15 @@ func (p *Proxy) connectHijack(w http.ResponseWriter, r *http.Request, target Tar
 		sess.localAddr = s.localAddr
 	}
 
-	p.srv.track(conn, true)
-	p.srv.wg.Add(1)
-	defer func() {
-		p.srv.track(conn, false)
-		p.srv.wg.Done()
+	// A hijacked connection is invisible to http.Server, so only the registry can end it.
+	if !p.srv.tryTrack(conn) {
 		_ = conn.Close()
-	}()
-
-	// A hijacked connection is invisible to http.Server, so only the registry can end it. The
-	// check has to follow the registration, or each could miss the other.
-	if p.srv.closing.Load() {
 		return
 	}
+	defer func() {
+		_ = conn.Close()
+		p.srv.untrack(conn)
+	}()
 
 	if action == Tunnel {
 		sess.closer = conn
@@ -89,7 +85,17 @@ func (p *Proxy) connectHijack(w http.ResponseWriter, r *http.Request, target Tar
 			p.logf(r.Context(), slog.LevelWarn, "tunnel dial failed", sess, derr)
 			return
 		}
-		defer func() { _ = upstream.Close() }()
+
+		// The far side is tracked too: past the deadline a shutdown ends the upstream read
+		// that closing the client side alone would leave parked until the idle timeout.
+		if !p.srv.tryTrack(upstream) {
+			_ = upstream.Close()
+			return
+		}
+		defer func() {
+			_ = upstream.Close()
+			p.srv.untrack(upstream)
+		}()
 
 		if werr := writeRawStatus(brw, http.StatusOK, ""); werr != nil {
 			return
@@ -124,19 +130,15 @@ func (p *Proxy) connectStream(w http.ResponseWriter, r *http.Request, target Tar
 	sess.localAddr, sess.remoteAddr = local, remote
 	sess.identity = identity
 
-	p.srv.track(stream, true)
-	p.srv.wg.Add(1)
-	defer func() {
-		p.srv.track(stream, false)
-		p.srv.wg.Done()
-		_ = stream.Close()
-	}()
-
-	// See connectHijack. Returning would let net/http answer 200 for a tunnel that is already
-	// gone, so the stream is reset instead.
-	if p.srv.closing.Load() {
+	// A refused registration means the proxy is stopping. Returning would let net/http
+	// answer 200 for a tunnel that is already gone, so the stream is reset instead.
+	if !p.srv.tryTrack(stream) {
 		panic(http.ErrAbortHandler)
 	}
+	defer func() {
+		_ = stream.Close()
+		p.srv.untrack(stream)
+	}()
 
 	if action == Tunnel {
 		// Nothing has been written to the stream yet, so a refusal here is an ordinary status
@@ -154,7 +156,17 @@ func (p *Proxy) connectStream(w http.ResponseWriter, r *http.Request, target Tar
 			http.Error(w, "edge: "+err.Error(), http.StatusBadGateway)
 			return
 		}
-		defer func() { _ = upstream.Close() }()
+
+		// See connectHijack: without this, closing the client side at the deadline can leave
+		// the upstream read parked until the idle timeout.
+		if !p.srv.tryTrack(upstream) {
+			_ = upstream.Close()
+			panic(http.ErrAbortHandler)
+		}
+		defer func() {
+			_ = upstream.Close()
+			p.srv.untrack(upstream)
+		}()
 
 		w.WriteHeader(http.StatusOK)
 		_ = http.NewResponseController(w).Flush()

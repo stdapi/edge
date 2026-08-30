@@ -14,8 +14,6 @@ import (
 	"slices"
 
 	"github.com/fox-toolkit/edge/internal/stringsutil"
-
-	"golang.org/x/net/http2"
 )
 
 // tlsHandshakeRecord is the TLS record type of a handshake message. A connection whose first
@@ -38,7 +36,7 @@ func (p *Proxy) intercept(ctx context.Context, conn *peekConn, sess *Session) er
 	if head[0] != tlsHandshakeRecord {
 		// A CONNECT to a plaintext port, or a transparent connection carrying clear HTTP.
 		sess.target.Scheme = "http"
-		return p.serveIntercepted(ctx, conn, sess, HTTP11)
+		return p.serveIntercepted(conn, sess, HTTP11)
 	}
 
 	if p.cfg.ca == nil {
@@ -61,7 +59,7 @@ func (p *Proxy) intercept(ctx context.Context, conn *peekConn, sess *Session) er
 	}
 	sess.setProtocol(protocolFromALPN(state.NegotiatedProtocol))
 
-	return p.serveIntercepted(ctx, tlsConn, sess, sess.Protocol())
+	return p.serveIntercepted(tlsConn, sess, sess.Protocol())
 }
 
 // serverTLSConfig builds the configuration the proxy presents to an intercepted client. The
@@ -117,7 +115,11 @@ func negotiateALPN(offered, supported []string) []string {
 
 // serveIntercepted runs the HTTP server side of an intercepted connection. The requests it
 // reads are ordinary origin-form requests, which is exactly what the routing tree expects.
-func (p *Proxy) serveIntercepted(ctx context.Context, conn net.Conn, sess *Session, proto Protocol) error {
+//
+// One server serves both protocols: an HTTP/2 client, ALPN or not, opens with the connection
+// preface, which the server detects on the plaintext it is handed and answers natively. That
+// single path is what ties every intercepted connection to the server's graceful shutdown.
+func (p *Proxy) serveIntercepted(conn net.Conn, sess *Session, proto Protocol) error {
 	if sess.remoteAddr == nil {
 		sess.remoteAddr = conn.RemoteAddr()
 	}
@@ -133,19 +135,10 @@ func (p *Proxy) serveIntercepted(ctx context.Context, conn net.Conn, sess *Sessi
 	}
 	defer p.srv.trackSession(sess, false)
 
-	if proto == HTTP2 {
-		sess.setProtocol(HTTP2)
-		p.srv.h2.ServeConn(conn, &http2.ServeConnOpts{
-			Context:    context.WithValue(ctx, sessionKey{}, sess),
-			BaseConfig: p.srv.mitm,
-			Handler:    http.HandlerFunc(p.serveInterceptedRequest),
-		})
-		return nil
-	}
-
-	sess.setProtocol(HTTP11)
+	sess.setProtocol(proto)
 	ln := newSingleConnListener(conn, sess)
 	err := p.srv.mitm.Serve(ln)
+	ln.wait()
 	if errors.Is(err, net.ErrClosed) || errors.Is(err, http.ErrServerClosed) {
 		return nil
 	}
@@ -158,7 +151,8 @@ func (p *Proxy) serveInterceptedRequest(w http.ResponseWriter, r *http.Request) 
 	if sess == nil {
 		sess = newSession(r.Context(), nil, Target{}, Intercept, protoOfRequest(r))
 	}
-	// serveIntercepted sets HTTP/1.1 before http.Server reads the h2c preface.
+	// A plaintext connection is announced as HTTP/1.1 before http.Server has had a chance
+	// to read a connection preface; the request knows what was actually negotiated.
 	sess.setProtocol(protoOfRequest(r))
 
 	if state := sess.tlsState.Load(); r.TLS == nil && state != nil {

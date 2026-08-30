@@ -295,21 +295,15 @@ func spliceUpgrade(c *Context, w http.ResponseWriter, r *http.Request, resp *htt
 	defer func() { _ = client.Close() }()
 
 	// After the hijack http.Server neither closes nor waits for the connection, so tracking it
-	// here is what lets a shutdown and a route change reach the pipe.
+	// here is what lets a shutdown and a route change reach the pipe. A refusal means the
+	// proxy is stopping; the 101 has not been written, so the client sees the upgrade fail.
 	pipe := &upgradedPipe{client: client, backend: backend}
 	sess := pipeSession(c, r, action, pipe)
 
-	c.p.srv.track(pipe, true)
-	c.p.srv.wg.Add(1)
-	defer func() {
-		c.p.srv.track(pipe, false)
-		c.p.srv.wg.Done()
-	}()
-
-	// See connectHijack. The 101 has not been written, so the client sees the upgrade fail.
-	if c.p.srv.closing.Load() {
+	if !c.p.srv.tryTrack(pipe) {
 		return nil
 	}
+	defer c.p.srv.untrack(pipe)
 
 	// The 101 has not reached the client yet, so a pipe the tree no longer accepts is refused
 	// with an ordinary status rather than granted and then torn down.

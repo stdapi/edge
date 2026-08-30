@@ -13,6 +13,7 @@ import (
 	"iter"
 	"log"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"net/url"
@@ -23,7 +24,6 @@ import (
 	"time"
 
 	"github.com/fox-toolkit/edge/internal/stringsutil"
-	"golang.org/x/net/http2"
 )
 
 type sessionKey struct{}
@@ -38,7 +38,6 @@ type server struct {
 	// itself, which speak origin semantics rather than proxy semantics.
 	h1   *http.Server
 	mitm *http.Server
-	h2   *http2.Server
 
 	listeners map[*net.Listener]struct{}
 	// active tracks connections the proxy owns outside of http.Server, which is every
@@ -76,23 +75,26 @@ func newServer(p *Proxy) (*server, error) {
 		closed:    make(chan struct{}),
 	}
 
-	s.h2 = &http2.Server{
-		MaxConcurrentStreams: p.cfg.server.maxConcurrentStreams,
-		IdleTimeout:          p.cfg.server.idleTimeout,
-		MaxReadFrameSize:     1 << 20,
-	}
-
 	// A client may speak HTTP/2 over plaintext, with the connection preface instead of ALPN.
 	// Without unencrypted HTTP/2 enabled it is answered as if it had sent a request whose
-	// method is "PRI". Both servers can receive one.
+	// method is "PRI". Both servers can receive one, and for mitm it is the only HTTP/2
+	// path: an intercepted connection arrives with its TLS already terminated, so even a
+	// client that negotiated h2 through ALPN reaches the server as plaintext carrying the
+	// preface every HTTP/2 connection must start with.
 	protocols := new(http.Protocols)
 	protocols.SetHTTP1(true)
 	protocols.SetHTTP2(true)
 	protocols.SetUnencryptedHTTP2(true)
 
+	http2Cfg := &http.HTTP2Config{
+		MaxConcurrentStreams: p.cfg.server.maxConcurrentStreams,
+		MaxReadFrameSize:     1 << 20,
+	}
+
 	s.h1 = &http.Server{
 		Handler:           http.HandlerFunc(p.serveProxyRequest),
 		Protocols:         protocols,
+		HTTP2:             http2Cfg,
 		ReadHeaderTimeout: p.cfg.server.readHeaderTimeout,
 		ReadTimeout:       p.cfg.server.readTimeout,
 		WriteTimeout:      p.cfg.server.writeTimeout,
@@ -107,6 +109,7 @@ func newServer(p *Proxy) (*server, error) {
 	s.mitm = &http.Server{
 		Handler:           http.HandlerFunc(p.serveInterceptedRequest),
 		Protocols:         protocols,
+		HTTP2:             http2Cfg,
 		ReadHeaderTimeout: p.cfg.server.readHeaderTimeout,
 		ReadTimeout:       p.cfg.server.readTimeout,
 		WriteTimeout:      p.cfg.server.writeTimeout,
@@ -177,25 +180,65 @@ func (p *Proxy) ServeTLS(ln net.Listener, cert tls.Certificate) error {
 }
 
 // Shutdown stops accepting new connections, then waits for the requests in flight to finish.
-// Tunneled connections carry traffic the proxy cannot see the end of, so they are closed
-// once ctx is done rather than waited on.
+// The servers drain together: idle HTTP/1.1 connections are closed, HTTP/2 and HTTP/3
+// connections are told with a GOAWAY, and every request already started runs to completion.
+// Tunneled connections carry traffic the proxy cannot see the end of, so they are relayed
+// until they end on their own and cut when ctx is done, along with anything else still open.
+// Without a deadline on ctx, Shutdown waits indefinitely, on tunnels and on handlers alike.
 func (p *Proxy) Shutdown(ctx context.Context) error {
-	p.srv.closing.Store(true)
-	p.srv.closeOne.Do(func() { close(p.srv.closed) })
+	p.srv.beginClose()
 
-	// Before the wait, so the accept loops drain rather than keep feeding it.
-	err := errors.Join(p.srv.closeListeners(), p.srv.h1.Shutdown(ctx), p.srv.mitm.Shutdown(ctx))
+	err := p.srv.closeListeners()
+
+	// Past the deadline, whatever draining could not end is cut: tunnels, upgraded pipes,
+	// and connections still handshaking. Cutting them is what unblocks the waits below.
+	stop := context.AfterFunc(ctx, p.srv.closeActive)
+	defer stop()
+
+	p.srv.mu.Lock()
+	demuxes := slices.Collect(maps.Keys(p.srv.quics))
+	p.srv.mu.Unlock()
+
+	// The planes drain together. An intercepted connection carried on a CONNECT stream of
+	// the front server only ends once the mitm server drains it, so draining one server
+	// after the other would hold the first open until the deadline.
+	errs := make([]error, 2+len(demuxes))
+	var drains sync.WaitGroup
+	drains.Go(func() { errs[0] = p.srv.h1.Shutdown(ctx) })
+	drains.Go(func() { errs[1] = p.srv.mitm.Shutdown(ctx) })
+	for i, d := range demuxes {
+		drains.Go(func() { errs[2+i] = d.shutdown(ctx) })
+	}
+
+	// Each drain bounds itself by ctx, but the cut only closes sockets and no close can
+	// force a handler to return. The deadline has to bound Shutdown itself, so the waits
+	// are raced against it rather than trusted; past it, Shutdown returns and whatever a
+	// handler still holds unwinds behind it once the handler does.
+	drained := make(chan struct{})
+	go func() { drains.Wait(); close(drained) }()
+	select {
+	case <-drained:
+	case <-ctx.Done():
+		// The drains may still be writing errs, so it is not read; the deadline is the
+		// whole report.
+		p.srv.fwd.close()
+		return errors.Join(err, ctx.Err())
+	}
+
+	// Every drain that ran into the deadline reports it; the deadline is one fact and it is
+	// reported once, on the paths that know it cut something.
+	for i, e := range errs {
+		if errors.Is(e, context.Canceled) || errors.Is(e, context.DeadlineExceeded) {
+			errs[i] = nil
+		}
+	}
+	err = errors.Join(err, errors.Join(errs...))
 
 	done := make(chan struct{})
-	go func() {
-		p.srv.wg.Wait()
-		close(done)
-	}()
-
+	go func() { p.srv.wg.Wait(); close(done) }()
 	select {
 	case <-done:
 	case <-ctx.Done():
-		p.srv.closeActive()
 		err = errors.Join(err, ctx.Err())
 	}
 
@@ -205,32 +248,87 @@ func (p *Proxy) Shutdown(ctx context.Context) error {
 
 // Close stops the proxy at once, dropping every connection including tunnels in flight.
 func (p *Proxy) Close() error {
-	p.srv.closing.Store(true)
-	p.srv.closeOne.Do(func() { close(p.srv.closed) })
+	p.srv.beginClose()
 	err := errors.Join(p.srv.closeListeners(), p.srv.h1.Close(), p.srv.mitm.Close())
 	p.srv.closeActive()
 	p.srv.fwd.close()
 	return err
 }
 
-func (s *server) trackListener(ln *net.Listener, add bool) {
+// beginClose marks the proxy as stopping. Writing closing under the lock orders it against
+// every registration: one that saw it unset committed inside a critical section that ran
+// first, so the snapshots a shutdown takes under the same lock cannot miss it.
+func (s *server) beginClose() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if add {
-		s.listeners[ln] = struct{}{}
-		return
-	}
-	delete(s.listeners, ln)
+	s.closing.Store(true)
+	s.mu.Unlock()
+	s.closeOne.Do(func() { close(s.closed) })
 }
 
-func (s *server) track(c io.Closer, add bool) {
+// tryTrack registers a connection the proxy owns outside of http.Server and reports whether
+// it may be served. A refusal means the proxy is stopping and the caller still owns the
+// connection. The WaitGroup shares the critical section with [server.beginClose], so a
+// successful Add always happens before a shutdown starts waiting; without that ordering an
+// Add racing the Wait from a counter of zero is a runtime panic.
+func (s *server) tryTrack(c io.Closer) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if add {
-		s.active[c] = struct{}{}
-		return
+	if s.closing.Load() {
+		return false
 	}
+	s.wg.Add(1)
+	s.active[c] = struct{}{}
+	return true
+}
+
+func (s *server) untrack(c io.Closer) {
+	s.mu.Lock()
 	delete(s.active, c)
+	s.mu.Unlock()
+	s.wg.Done()
+}
+
+// tryTrackListener is [server.tryTrack] for the listeners the proxy accepts on itself, which
+// live in a registry of their own because a shutdown closes them first, before any draining.
+func (s *server) tryTrackListener(ln *net.Listener) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closing.Load() {
+		return false
+	}
+	s.wg.Add(1)
+	s.listeners[ln] = struct{}{}
+	return true
+}
+
+func (s *server) untrackListener(ln *net.Listener) {
+	s.mu.Lock()
+	delete(s.listeners, ln)
+	s.mu.Unlock()
+	s.wg.Done()
+}
+
+// tryTrackDemux is [server.tryTrack] for a QUIC demultiplexer, which enters both registries
+// in one critical section so a shutdown cannot see one without the other: missing quics
+// would skip the drain, missing active would skip the cut at the deadline.
+func (s *server) tryTrackDemux(d *quicDemux) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closing.Load() {
+		return false
+	}
+	s.wg.Add(1)
+	s.active[d] = struct{}{}
+	s.quics[d] = struct{}{}
+	return true
+}
+
+func (s *server) untrackDemux(d *quicDemux) {
+	s.mu.Lock()
+	delete(s.active, d)
+	delete(s.quics, d)
+	s.mu.Unlock()
+	s.wg.Done()
 }
 
 // trackSession adds or removes a session. The goroutine serving the connection makes both
@@ -243,16 +341,6 @@ func (s *server) trackSession(sess *Session, add bool) {
 		return
 	}
 	delete(s.sessions, sess)
-}
-
-func (s *server) trackDemux(d *quicDemux, add bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if add {
-		s.quics[d] = struct{}{}
-		return
-	}
-	delete(s.quics, d)
 }
 
 // admitSession registers a session and reports whether the tree still accepts it.
@@ -341,9 +429,14 @@ func (s *server) closeActive() {
 		conns = append(conns, c)
 	}
 	s.mu.Unlock()
+
+	// Concurrently: a closer that blocks, a QUIC demux waiting out a handler that will not
+	// return for instance, must not starve the cut of everything after it.
+	var wg sync.WaitGroup
 	for _, c := range conns {
-		_ = c.Close()
+		wg.Go(func() { _ = c.Close() })
 	}
+	wg.Wait()
 }
 
 // ServeHTTP serves one request with explicit forward proxy semantics: a CONNECT opens a

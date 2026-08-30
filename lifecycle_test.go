@@ -7,16 +7,20 @@ package edge
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -244,4 +248,382 @@ func TestLifecycle_ShutdownClosesTheTransparentListener(t *testing.T) {
 
 	_, err = net.DialTimeout("tcp", addr, time.Second)
 	assert.Error(t, err, "the listener must be closed")
+}
+
+// blockingHandler signals that a request reached it, then holds it until release closes.
+func blockingHandler(started chan<- struct{}, release <-chan struct{}) HandlerFunc {
+	return func(c *Context) (*http.Response, error) {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-release
+		return Text(http.StatusOK, "drained over "+c.Protocol().String()), nil
+	}
+}
+
+type drainResult struct {
+	body string
+	err  error
+}
+
+// assertShutdownDrains runs get in the background, waits until its request is blocked inside
+// the handler, begins a graceful Shutdown, checks that it neither returns early nor cuts the
+// request, then releases the handler and returns the body the client got.
+func assertShutdownDrains(t *testing.T, p *Proxy, started <-chan struct{}, release chan<- struct{}, get func() (string, error)) string {
+	t.Helper()
+
+	got := make(chan drainResult, 1)
+	go func() {
+		body, err := get()
+		got <- drainResult{body: body, err: err}
+	}()
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the request never reached the handler")
+	}
+
+	shutdownErr := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+		shutdownErr <- p.Shutdown(ctx)
+	}()
+
+	select {
+	case err := <-shutdownErr:
+		t.Fatalf("Shutdown returned while a request was in flight: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(release)
+
+	var r drainResult
+	select {
+	case r = <-got:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the in-flight request never completed")
+	}
+	require.NoError(t, r.err, "a graceful shutdown must not cut a request in flight")
+
+	select {
+	case err := <-shutdownErr:
+		require.NoError(t, err, "a drain finished before the deadline reports no error")
+	case <-time.After(5 * time.Second):
+		t.Fatal("Shutdown did not return after the drain")
+	}
+	return r.body
+}
+
+func getBody(client *http.Client, url string) (string, error) {
+	resp, err := client.Get(url)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	b, err := io.ReadAll(resp.Body)
+	return string(b), err
+}
+
+func TestLifecycle_ShutdownDrainsInterceptedHTTP1(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	p.MustAddInterceptor(nil, "example.test/", blockingHandler(started, release))
+
+	addr := startProxy(t, p)
+	client := proxyClient(addr, ca.CertPool())
+
+	body := assertShutdownDrains(t, p, started, release, func() (string, error) {
+		return getBody(client, "https://example.test/")
+	})
+	assert.Equal(t, "drained over HTTP/1.1", body)
+}
+
+// An HTTP/2 client keeps its connection open until it is told to go away, so this drain only
+// converges if the shutdown reaches the connection with a GOAWAY.
+func TestLifecycle_ShutdownDrainsInterceptedHTTP2(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	p.MustAddInterceptor(nil, "example.test/", blockingHandler(started, release))
+
+	addr := startProxy(t, p)
+	client := h2Client(addr, ca.CertPool())
+
+	body := assertShutdownDrains(t, p, started, release, func() (string, error) {
+		return getBody(client, "https://example.test/")
+	})
+	assert.Equal(t, "drained over HTTP/2.0", body)
+}
+
+func TestLifecycle_ShutdownDrainsInterceptedHTTP3(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	p.MustAddInterceptor(nil, h3Authority+"/", blockingHandler(started, release))
+
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	served := make(chan error, 1)
+	go func() { served <- p.ServeQUIC(pc) }()
+	t.Cleanup(func() { _ = p.Close() })
+
+	proxyAddr, err := netip.ParseAddrPort(pc.LocalAddr().String())
+	require.NoError(t, err)
+
+	// dialQUICTo carries a deliberately short idle timeout; a request parked in the handler
+	// needs one that outlives the drain.
+	tr := &http3.Transport{
+		TLSClientConfig: &tls.Config{RootCAs: poolOf(ca), MinVersion: tls.VersionTLS13},
+		QUICConfig:      &quic.Config{MaxIdleTimeout: 10 * time.Second},
+		Dial: func(ctx context.Context, _ string, cfg *tls.Config, qcfg *quic.Config) (*quic.Conn, error) {
+			udp, err := net.ListenUDP("udp", nil)
+			if err != nil {
+				return nil, err
+			}
+			conn, err := quic.Dial(ctx, udp, net.UDPAddrFromAddrPort(proxyAddr), cfg, qcfg)
+			if err != nil {
+				_ = udp.Close()
+				return nil, err
+			}
+			return conn, nil
+		},
+	}
+	defer func() { _ = tr.Close() }()
+
+	body := assertShutdownDrains(t, p, started, release, func() (string, error) {
+		req, err := http.NewRequest(http.MethodGet,
+			fmt.Sprintf("https://%s:%d/", h3Authority, proxyAddr.Port()), nil)
+		if err != nil {
+			return "", err
+		}
+		resp, err := tr.RoundTrip(req)
+		if err != nil {
+			return "", err
+		}
+		defer func() { _ = resp.Body.Close() }()
+		b, err := io.ReadAll(resp.Body)
+		return string(b), err
+	})
+	assert.Equal(t, "drained over HTTP/3.0", body)
+
+	select {
+	case err := <-served:
+		assert.ErrorIs(t, err, ErrProxyClosed)
+	case <-time.After(5 * time.Second):
+		t.Fatal("ServeQUIC did not return after Shutdown")
+	}
+}
+
+// A graceful shutdown that has nothing to drain still has to stop the QUIC side: the read
+// loop, the HTTP/3 server and the relays are not tied to a listener http.Server closes.
+func TestLifecycle_ShutdownStopsQUIC(t *testing.T) {
+	p := testProxy(t)
+
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	served := make(chan error, 1)
+	go func() { served <- p.ServeQUIC(pc) }()
+
+	require.Eventually(t, func() bool {
+		p.srv.mu.Lock()
+		defer p.srv.mu.Unlock()
+		return len(p.srv.quics) == 1
+	}, 3*time.Second, 10*time.Millisecond)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	require.NoError(t, p.Shutdown(ctx))
+
+	select {
+	case err := <-served:
+		assert.ErrorIs(t, err, ErrProxyClosed)
+	case <-time.After(5 * time.Second):
+		t.Fatal("ServeQUIC did not return after Shutdown")
+	}
+
+	pc2, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = pc2.Close() }()
+	assert.ErrorIs(t, p.ServeQUIC(pc2), ErrProxyClosed)
+}
+
+// A handler that ignores its cancellation cannot hold Shutdown past its deadline. The cut
+// only closes sockets and no close can force a handler to return, so the deadline has to
+// bound Shutdown itself; what the handler still holds unwinds behind it.
+func TestLifecycle_ShutdownDeadlineBoundsAStuckHandler(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	p.MustAddInterceptor(nil, "example.test/", blockingHandler(started, release))
+
+	addr := startProxy(t, p)
+	client := proxyClient(addr, ca.CertPool())
+
+	got := make(chan error, 1)
+	go func() {
+		_, gerr := getBody(client, "https://example.test/")
+		got <- gerr
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the request never reached the handler")
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err = p.Shutdown(ctx)
+	elapsed := time.Since(start)
+
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, elapsed, 3*time.Second, "the deadline must bound Shutdown, not the handler")
+
+	select {
+	case cerr := <-got:
+		assert.Error(t, cerr, "the request must have been cut at the deadline")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the client request never returned after the cut")
+	}
+	close(release)
+}
+
+// The HTTP/3 shape of the same guarantee: quic-go's own graceful close waits on its
+// handlers, so a stuck one wedges the drain goroutine, and only Shutdown racing its
+// deadline keeps the caller out of that wait.
+func TestLifecycle_ShutdownDeadlineBoundsAStuckHTTP3Handler(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	p.MustAddInterceptor(nil, h3Authority+"/", blockingHandler(started, release))
+
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	served := make(chan error, 1)
+	go func() { served <- p.ServeQUIC(pc) }()
+	t.Cleanup(func() { _ = p.Close() })
+
+	proxyAddr, err := netip.ParseAddrPort(pc.LocalAddr().String())
+	require.NoError(t, err)
+
+	tr := &http3.Transport{
+		TLSClientConfig: &tls.Config{RootCAs: poolOf(ca), MinVersion: tls.VersionTLS13},
+		QUICConfig:      &quic.Config{MaxIdleTimeout: 10 * time.Second},
+		Dial: func(ctx context.Context, _ string, cfg *tls.Config, qcfg *quic.Config) (*quic.Conn, error) {
+			udp, err := net.ListenUDP("udp", nil)
+			if err != nil {
+				return nil, err
+			}
+			conn, err := quic.Dial(ctx, udp, net.UDPAddrFromAddrPort(proxyAddr), cfg, qcfg)
+			if err != nil {
+				_ = udp.Close()
+				return nil, err
+			}
+			return conn, nil
+		},
+	}
+	defer func() { _ = tr.Close() }()
+
+	got := make(chan error, 1)
+	go func() {
+		req, rerr := http.NewRequest(http.MethodGet,
+			fmt.Sprintf("https://%s:%d/", h3Authority, proxyAddr.Port()), nil)
+		if rerr != nil {
+			got <- rerr
+			return
+		}
+		resp, rerr := tr.RoundTrip(req)
+		if rerr == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+		}
+		got <- rerr
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the request never reached the handler")
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err = p.Shutdown(ctx)
+	elapsed := time.Since(start)
+
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, elapsed, 3*time.Second, "the deadline must bound Shutdown, not the handler")
+
+	// Releasing the handler lets everything the deadline left behind unwind.
+	close(release)
+	select {
+	case <-got:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the client request never returned after the release")
+	}
+	select {
+	case err := <-served:
+		assert.ErrorIs(t, err, ErrProxyClosed)
+	case <-time.After(10 * time.Second):
+		t.Fatal("ServeQUIC did not return after the release")
+	}
+}
+
+// A tunnel never drains on its own: the proxy cannot see the end of what it relays. The
+// deadline is what cuts it, and the cut has to release Shutdown promptly, upstream included.
+func TestLifecycle_ShutdownCutsTunnelsAtTheDeadline(t *testing.T) {
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	defer origin.Close()
+	originURL, _ := url.Parse(origin.URL)
+
+	p, err := New()
+	require.NoError(t, err)
+	require.NoError(t, p.AddTunnel(originHost(originURL)))
+
+	addr := startProxy(t, p)
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+	_, err = fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", originURL.Host, originURL.Host)
+	require.NoError(t, err)
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err = p.Shutdown(ctx)
+	elapsed := time.Since(start)
+
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, elapsed, 3*time.Second, "cutting the tunnel must release the wait promptly")
+
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(2*time.Second)))
+	_, err = conn.Read(make([]byte, 1))
+	assert.Error(t, err, "the tunnel must be cut")
 }

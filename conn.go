@@ -70,13 +70,22 @@ type closeWriter interface {
 type singleConnListener struct {
 	conn net.Conn
 	addr net.Addr
-	done chan struct{}
-	once sync.Once
-	mu   sync.Mutex
+	// done releases the accept loop; connDone only closes with the connection itself. They
+	// are separate because a shutdown closes the listener while the connection may still be
+	// serving a request, and the two events must not be mistaken for one another.
+	done     chan struct{}
+	connDone chan struct{}
+	once     sync.Once
+	mu       sync.Mutex
+	taken    bool
 }
 
 func newSingleConnListener(c net.Conn, sess *Session) *singleConnListener {
-	l := &singleConnListener{addr: c.LocalAddr(), done: make(chan struct{})}
+	l := &singleConnListener{
+		addr:     c.LocalAddr(),
+		done:     make(chan struct{}),
+		connDone: make(chan struct{}),
+	}
 	// Closing the connection closes the listener, so the accept loop set up for it returns
 	// instead of blocking forever on a second Accept that will never be served.
 	l.conn = &servedConn{Conn: c, sess: sess, l: l}
@@ -87,6 +96,9 @@ func (l *singleConnListener) Accept() (net.Conn, error) {
 	l.mu.Lock()
 	c := l.conn
 	l.conn = nil
+	if c != nil {
+		l.taken = true
+	}
 	l.mu.Unlock()
 
 	if c != nil {
@@ -103,6 +115,22 @@ func (l *singleConnListener) Close() error {
 
 func (l *singleConnListener) Addr() net.Addr { return l.addr }
 
+// wait blocks until the served connection is closed. The transport under it belongs to the
+// caller of Serve and dies the moment that caller returns, while Serve itself returns as
+// soon as the listener closes, which a shutdown does with the connection still serving a
+// request. Waiting on the connection rather than on Serve is what lets that request finish.
+//
+// A connection Serve never accepted is not waited on: Serve refused it before taking it
+// over, so it never closes, and the caller still owns it.
+func (l *singleConnListener) wait() {
+	l.mu.Lock()
+	taken := l.taken
+	l.mu.Unlock()
+	if taken {
+		<-l.connDone
+	}
+}
+
 // servedConn is the connection handed to http.Server for an intercepted connection. It
 // carries the session so ConnContext can attach it to every request read off the
 // connection, and it closes its listener so the accept loop ends with it.
@@ -115,7 +143,10 @@ type servedConn struct {
 
 func (c *servedConn) Close() error {
 	err := c.Conn.Close()
-	c.once.Do(func() { _ = c.l.Close() })
+	c.once.Do(func() {
+		close(c.l.connDone)
+		_ = c.l.Close()
+	})
 	return err
 }
 

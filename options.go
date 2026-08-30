@@ -386,7 +386,7 @@ type serverConfig struct {
 	idleTimeout          time.Duration
 	tunnelIdleTimeout    time.Duration
 	maxHeaderBytes       int
-	maxConcurrentStreams uint32
+	maxConcurrentStreams int
 }
 
 func defaultServerConfig() serverConfig {

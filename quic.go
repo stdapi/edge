@@ -78,16 +78,12 @@ func (p *Proxy) ServeQUIC(pc net.PacketConn) error {
 	}
 	defer d.close()
 
-	p.srv.track(d, true)
-	defer p.srv.track(d, false)
-	p.srv.trackDemux(d, true)
-	defer p.srv.trackDemux(d, false)
-
-	// See connectHijack. The socket is only closed through the demux, so a shutdown that
-	// missed it would leave run reading forever.
-	if p.srv.closing.Load() {
+	// A refused registration means a shutdown started; the socket is only closed through
+	// the demux, so serving would leave run reading forever.
+	if !p.srv.tryTrackDemux(d) {
 		return ErrProxyClosed
 	}
+	defer p.srv.untrackDemux(d)
 
 	return d.run()
 }
@@ -116,6 +112,10 @@ type quicDemux struct {
 	closeOnce sync.Once
 
 	mu sync.Mutex
+	// draining refuses new peers while the ones already placed finish. It is written and,
+	// on the paths that publish a peer, read under mu, so a publication is either refused
+	// or visible to the first snapshot the shutdown takes.
+	draining atomic.Bool
 }
 
 type peerState uint8
@@ -234,6 +234,12 @@ func (d *quicDemux) startInterception() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
+	// Before the listener check: a shutdown already told the server it has to send GOAWAY
+	// on, and one brought up now would be missed. It also spares a proxy that never
+	// intercepted from minting one on its way out.
+	if d.draining.Load() {
+		return ErrProxyClosed
+	}
 	if d.listener != nil {
 		return nil
 	}
@@ -268,7 +274,10 @@ func (d *quicDemux) startInterception() error {
 
 	srv := d.h3
 	d.wg.Go(func() {
-		if err := srv.ServeListener(ln); err != nil && !errors.Is(err, quic.ErrServerClosed) {
+		// ServeListener answers a shutdown with http.ErrServerClosed, and a listener closed
+		// under it with an error unwrapping to net.ErrClosed. Neither is worth a line.
+		err := srv.ServeListener(ln)
+		if err != nil && !errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
 			d.p.cfg.logger.Debug("edge: HTTP/3 server stopped", slog.String("error", err.Error()))
 		}
 	})
@@ -447,7 +456,9 @@ func (d *quicDemux) originalDst(client net.Addr) netip.AddrPort {
 
 func (d *quicDemux) beginIntercept(key string, addr net.Addr, target Target, pending [][]byte) {
 	if err := d.startInterception(); err != nil {
-		d.p.cfg.logger.Error("edge: cannot intercept QUIC", slog.String("error", err.Error()))
+		if !errors.Is(err, ErrProxyClosed) {
+			d.p.cfg.logger.Error("edge: cannot intercept QUIC", slog.String("error", err.Error()))
+		}
 		d.reject(key, addr, err.Error())
 		return
 	}
@@ -467,6 +478,15 @@ func (d *quicDemux) beginIntercept(key string, addr net.Addr, target Target, pen
 	if peer == nil {
 		d.mu.Unlock()
 		cancel()
+		return
+	}
+	// Inside the publish critical section, so a shutdown either refuses this peer or finds
+	// it in the snapshot it takes under the same lock; startInterception alone cannot
+	// guarantee that once the server is already up.
+	if d.draining.Load() {
+		d.mu.Unlock()
+		cancel()
+		d.reject(key, addr, "the proxy is shutting down")
 		return
 	}
 	peer.state = peerIntercepted
@@ -516,30 +536,22 @@ func (d *quicDemux) beginTunnel(key string, addr net.Addr, target Target, pendin
 		cancel()
 		return
 	}
+	// See beginIntercept for why the check sits in the publish critical section. The relay
+	// starts here too: its Add shares the critical section with the close that waits on the
+	// group, so it either precedes the wait or does not happen.
+	if d.draining.Load() {
+		d.mu.Unlock()
+		_ = upstream.Close()
+		cancel()
+		d.reject(key, addr, "the proxy is shutting down")
+		return
+	}
 	peer.state = peerTunneling
 	peer.upstream = upstream
 	peer.target = target
 	peer.pending = nil
 	peer.sess = sess
 	peer.cancel = cancel
-	d.mu.Unlock()
-
-	// See beginIntercept. Refusing here happens before the first datagram reaches the origin,
-	// so a tunnel the tree no longer accepts never relays a byte.
-	if d.p.ActionFor(target) == Reject {
-		d.drop(key)
-		d.p.cfg.logger.Debug("edge: QUIC connection dropped",
-			slog.String("client", addr.String()),
-			slog.String("reason", "the authority was withdrawn while the connection was starting"))
-		return
-	}
-
-	for _, dg := range pending {
-		if _, err := upstream.Write(dg); err != nil {
-			break
-		}
-	}
-
 	// Relay what the origin sends back to the client it belongs to.
 	d.wg.Go(func() {
 		defer func() { _ = upstream.Close() }()
@@ -563,6 +575,23 @@ func (d *quicDemux) beginTunnel(key string, addr net.Addr, target Target, pendin
 			}
 		}
 	})
+	d.mu.Unlock()
+
+	// See beginIntercept. Refusing here happens before the first datagram reaches the origin,
+	// so a tunnel the tree no longer accepts never relays a byte.
+	if d.p.ActionFor(target) == Reject {
+		d.drop(key)
+		d.p.cfg.logger.Debug("edge: QUIC connection dropped",
+			slog.String("client", addr.String()),
+			slog.String("reason", "the authority was withdrawn while the connection was starting"))
+		return
+	}
+
+	for _, dg := range pending {
+		if _, err := upstream.Write(dg); err != nil {
+			break
+		}
+	}
 }
 
 func (d *quicDemux) dialUpstreamUDP(target Target, client net.Addr) (net.Conn, error) {
@@ -613,6 +642,52 @@ func (d *quicDemux) sweepIdle() {
 		peer.end()
 		delete(d.peers, key)
 	}
+}
+
+// shutdown drains the demux: no peer is placed any more, the terminating server tells its
+// clients with a GOAWAY and waits for their requests, and the tunnels are relayed until they
+// go quiet or ctx is done. The read loop keeps running through all of it, because the
+// connections being drained only finish if their datagrams still arrive.
+func (d *quicDemux) shutdown(ctx context.Context) error {
+	d.mu.Lock()
+	d.draining.Store(true)
+	h3 := d.h3
+	d.mu.Unlock()
+
+	var err error
+	if h3 != nil {
+		err = h3.Shutdown(ctx)
+	}
+
+	// A tunnel ends invisibly: the far side stops answering and the peer ages out through
+	// its read deadline or the sweep. Polling for that is all there is to wait on. The done
+	// case covers a teardown that started elsewhere; joining the close waits for it.
+	tick := time.Tick(500 * time.Millisecond)
+poll:
+	for d.tunneling() {
+		select {
+		case <-tick:
+		case <-ctx.Done():
+			break poll
+		case <-d.done:
+			break poll
+		}
+	}
+
+	d.close()
+	return err
+}
+
+// tunneling reports whether any peer is still being relayed.
+func (d *quicDemux) tunneling() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, peer := range d.peers {
+		if peer.state == peerTunneling {
+			return true
+		}
+	}
+	return false
 }
 
 func (d *quicDemux) Close() error { d.close(); return nil }
