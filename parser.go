@@ -328,7 +328,7 @@ func parsePort(s string, offset int) (string, *PatternError) {
 	// Characters come before length and range, so a port that is not a number at all is
 	// reported as such. "{port}" is a plausible mistake, and answering "port out of range"
 	// to it sends the reader looking in the wrong place.
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		if c := s[i]; c < '0' || c > '9' {
 			return "", newPatternError("syntax", offset+i, offset+i+1, "illegal character in port")
 		}
@@ -342,7 +342,7 @@ func parsePort(s string, offset int) (string, *PatternError) {
 	}
 
 	n := 0
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		n = n*10 + int(s[i]-'0')
 	}
 	if n > 65535 || n == 0 {
@@ -761,7 +761,7 @@ func isASCIIControl(c byte) bool {
 func braceIndex(s string, startLevel int) int {
 	level := startLevel
 
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		switch s[i] {
 		case '{':
 			level++

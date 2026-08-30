@@ -32,7 +32,7 @@ func captureInitials(t testing.TB, serverName string, tlsCfg *tls.Config) [][]by
 	cfg.ServerName = serverName
 	cfg.InsecureSkipVerify = true
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
 
 	go func() {
@@ -49,8 +49,7 @@ func captureInitials(t testing.TB, serverName string, tlsCfg *tls.Config) [][]by
 		buf := make([]byte, 2048)
 		n, _, err := pc.ReadFrom(buf)
 		if err != nil {
-			var ne net.Error
-			if errors.As(err, &ne) && ne.Timeout() {
+			if ne, ok := errors.AsType[net.Error](err); ok && ne.Timeout() {
 				break
 			}
 			break

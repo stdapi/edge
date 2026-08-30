@@ -6,6 +6,7 @@ package edge
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"fmt"
 	"log/slog"
@@ -169,9 +170,7 @@ func targetFromConnect(r *http.Request) (Target, bool) {
 	if host == "" {
 		return Target{}, false
 	}
-	if port == "" {
-		port = "443"
-	}
+	port = cmp.Or(port, "443")
 
 	return Target{
 		Scheme: schemeForPort(port),

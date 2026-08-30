@@ -237,8 +237,7 @@ func (d *quicDemux) run() error {
 			if d.p.srv.closing.Load() {
 				return ErrProxyClosed
 			}
-			var ne net.Error
-			if errors.As(err, &ne) && ne.Timeout() {
+			if ne, ok := errors.AsType[net.Error](err); ok && ne.Timeout() {
 				continue
 			}
 			return err

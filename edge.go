@@ -400,9 +400,9 @@ func DefaultErrorHandler(c *Context, err error) *http.Response {
 
 func applyMiddleware(scope HandlerScope, mws []middleware, h HandlerFunc) HandlerFunc {
 	m := h
-	for i := len(mws) - 1; i >= 0; i-- {
-		if mws[i].scope&scope != 0 {
-			m = mws[i].m(m)
+	for _, mw := range slices.Backward(mws) {
+		if mw.scope&scope != 0 {
+			m = mw.m(m)
 		}
 	}
 	return m
@@ -410,11 +410,11 @@ func applyMiddleware(scope HandlerScope, mws []middleware, h HandlerFunc) Handle
 
 func applyInterceptorMiddleware(mws []middleware, base HandlerFunc) (self, all HandlerFunc) {
 	self, all = base, base
-	for i := len(mws) - 1; i >= 0; i-- {
-		if mws[i].scope&InterceptorHandler != 0 {
-			all = mws[i].m(all)
-			if !mws[i].g {
-				self = mws[i].m(self)
+	for _, mw := range slices.Backward(mws) {
+		if mw.scope&InterceptorHandler != 0 {
+			all = mw.m(all)
+			if !mw.g {
+				self = mw.m(self)
 			}
 		}
 	}

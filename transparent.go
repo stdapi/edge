@@ -56,8 +56,7 @@ func (p *Proxy) ServeTransparent(ln net.Listener) error {
 			if p.srv.closing.Load() {
 				return ErrProxyClosed
 			}
-			var ne net.Error
-			if errors.As(err, &ne) && ne.Timeout() {
+			if ne, ok := errors.AsType[net.Error](err); ok && ne.Timeout() {
 				// A temporary accept failure, typically the file descriptor limit. Back
 				// off instead of spinning on it.
 				delay = min(max(2*delay, 5*time.Millisecond), time.Second)
@@ -68,13 +67,11 @@ func (p *Proxy) ServeTransparent(ln net.Listener) error {
 		}
 		delay = 0
 
-		p.srv.wg.Add(1)
-		go func() {
-			defer p.srv.wg.Done()
+		p.srv.wg.Go(func() {
 			if err := p.ServeConn(conn); err != nil {
 				p.cfg.logger.Debug("edge: transparent connection closed", slog.String("error", err.Error()))
 			}
-		}()
+		})
 	}
 }
 

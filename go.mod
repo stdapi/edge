@@ -3,7 +3,7 @@ module github.com/fox-toolkit/edge
 go 1.26.0
 
 require (
-	github.com/quic-go/quic-go v0.61.0
+	github.com/quic-go/quic-go v0.62.0
 	github.com/stretchr/testify v1.12.1
 	golang.org/x/net v0.58.0
 	golang.org/x/sys v0.47.0

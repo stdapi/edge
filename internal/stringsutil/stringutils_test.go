@@ -314,7 +314,7 @@ func BenchmarkEscapePath(b *testing.B) {
 	for _, bc := range cases {
 		b.Run(bc.name, func(b *testing.B) {
 			b.ReportAllocs()
-			for range b.N {
+			for b.Loop() {
 				EscapePath(bc.path)
 			}
 		})

@@ -86,7 +86,7 @@ func runCurl(t *testing.T, args ...string) curlResult {
 	}
 	tail := text[idx+1:]
 	res := curlResult{body: text[:idx]}
-	for _, field := range strings.Fields(tail) {
+	for field := range strings.FieldsSeq(tail) {
 		k, v, ok := strings.Cut(field, "=")
 		if !ok {
 			continue

@@ -5,6 +5,7 @@
 package edge
 
 import (
+	"cmp"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -291,21 +292,14 @@ func proxyTarget(r *http.Request) (Target, bool) {
 		scheme = "https"
 	}
 	host, port := splitHostPort(r.Host)
-	if port == "" {
-		port = defaultPort(scheme)
-	}
+	port = cmp.Or(port, defaultPort(scheme))
 	return Target{Scheme: scheme, Host: stringsutil.ToLowerASCIIString(host), Port: port}, true
 }
 
 func targetFromURL(u *url.URL) Target {
-	scheme := u.Scheme
-	if scheme == "" {
-		scheme = "http"
-	}
+	scheme := cmp.Or(u.Scheme, "http")
 	host, port := splitHostPort(u.Host)
-	if port == "" {
-		port = defaultPort(scheme)
-	}
+	port = cmp.Or(port, defaultPort(scheme))
 	return Target{Scheme: scheme, Host: stringsutil.ToLowerASCIIString(host), Port: port}
 }
 
