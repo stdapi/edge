@@ -92,7 +92,7 @@ func TestConcurrency_InterceptorMutationDuringTraffic(t *testing.T) {
 	wg.Wait()
 
 	assert.Positive(t, served.Load(), "no request was served")
-	assert.Equal(t, Intercept, p.Decide(target(authority)), "the authority the stable interceptor implies must have survived the churn")
+	assert.Equal(t, Intercept, p.ActionFor(target(authority)), "the authority the stable interceptor implies must have survived the churn")
 }
 
 // TestConcurrency_AuthorityMutationDuringTraffic does the same for the authority entry set, which decides
@@ -131,12 +131,12 @@ func TestConcurrency_AuthorityMutationDuringTraffic(t *testing.T) {
 					return
 				default:
 				}
-				if got := p.Decide(target("stable.example.test:443")); got != Intercept {
+				if got := p.ActionFor(target("stable.example.test:443")); got != Intercept {
 					t.Errorf("decide = %v, want intercept", got)
 					return
 				}
 				// Named by nothing, so it stays refused however the authority entry set churns.
-				if got := p.Decide(target("other.example.test:443")); got != Reject {
+				if got := p.ActionFor(target("other.example.test:443")); got != Reject {
 					t.Errorf("decide = %v, want reject", got)
 					return
 				}

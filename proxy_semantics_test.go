@@ -385,7 +385,7 @@ func TestSemantics_HostHeaderCannotReachAnUnnamedAuthority(t *testing.T) {
 	p.MustAddInterceptor(nil, "allowed.example.test/+{rest}", func(c *Context) (*http.Response, error) {
 		return c.Forward()
 	})
-	require.Equal(t, Reject, p.Decide(Target{Scheme: "http", Host: "127.0.0.1", Port: otherURL.Port()}))
+	require.Equal(t, Reject, p.ActionFor(Target{Scheme: "http", Host: "127.0.0.1", Port: otherURL.Port()}))
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)

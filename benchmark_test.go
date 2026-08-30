@@ -102,7 +102,7 @@ func BenchmarkLookupDeepTree(b *testing.B) {
 	}
 }
 
-func BenchmarkDecide(b *testing.B) {
+func BenchmarkActionFor(b *testing.B) {
 	cases := []struct {
 		name        string
 		authorities []string
@@ -132,7 +132,7 @@ func BenchmarkDecide(b *testing.B) {
 
 			b.ReportAllocs()
 			for b.Loop() {
-				p.Decide(t)
+				p.ActionFor(t)
 			}
 		})
 	}

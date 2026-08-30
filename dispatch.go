@@ -22,7 +22,7 @@ func (p *Proxy) dispatchRequest(w http.ResponseWriter, r *http.Request, sess *Se
 	c := tree.pool.Get().(*Context)
 	defer tree.pool.Put(c)
 
-	switch tree.decide(c, target) {
+	switch tree.actionFor(c, target) {
 	case Reject:
 		http.Error(w, "edge: connection rejected, no interceptor or tunnel matches this authority", http.StatusForbidden)
 	case Tunnel:

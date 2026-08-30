@@ -94,7 +94,7 @@ func TestSession_SweepAfterDeleteTunnel(t *testing.T) {
 
 	var closed int
 	for s := range p.Sessions() {
-		if p.Decide(s.Target()) == Reject {
+		if p.ActionFor(s.Target()) == Reject {
 			require.NoError(t, s.Close())
 			closed++
 		}

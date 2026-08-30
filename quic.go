@@ -386,7 +386,7 @@ func (d *quicDemux) sniff(addr net.Addr, key string, peer *quicPeer, datagram []
 		return
 	}
 
-	switch d.p.Decide(target) {
+	switch d.p.ActionFor(target) {
 	case Reject:
 		d.reject(key, addr, "no interceptor or tunnel matches this authority")
 	case Intercept:
@@ -458,7 +458,7 @@ func (d *quicDemux) beginIntercept(key string, addr net.Addr, target Target, pen
 	// The session is published, so a sweep started after the tree changed either found it or
 	// ran before this read, which then observes the change. Nothing has been handed to the
 	// QUIC server yet, so a peer refused here never completes a handshake.
-	if d.p.Decide(target) == Reject {
+	if d.p.ActionFor(target) == Reject {
 		d.reject(key, addr, "the authority was withdrawn while the connection was starting")
 		return
 	}
@@ -502,7 +502,7 @@ func (d *quicDemux) beginTunnel(key string, addr net.Addr, target Target, pendin
 
 	// See beginIntercept. Refusing here happens before the first datagram reaches the origin,
 	// so a tunnel the tree no longer accepts never relays a byte.
-	if d.p.Decide(target) == Reject {
+	if d.p.ActionFor(target) == Reject {
 		d.drop(key)
 		d.p.cfg.logger.Debug("edge: QUIC connection dropped",
 			slog.String("client", addr.String()),

@@ -116,24 +116,24 @@ func (txn *Txn) DeleteTunnel(pattern string) (Authority, error) {
 	return Authority{entry: deleted}, nil
 }
 
-// Decide reports what the proxy does with a connection to target. It is the same lookup the
+// ActionFor reports what the proxy does with a connection to target. It is the same lookup the
 // proxy runs on CONNECT, on a transparent TLS handshake and on a plaintext request, and is
 // exported so a caller can reason about a configuration without opening a connection.
-func (p *Proxy) Decide(target Target) Action {
+func (p *Proxy) ActionFor(target Target) Action {
 	tree := p.getTree()
 	c := tree.pool.Get().(*Context)
 	defer tree.pool.Put(c)
-	return tree.decide(c, target)
+	return tree.actionFor(c, target)
 }
 
-func (t *iTree) decide(c *Context, target Target) Action {
-	return decideOn(t.patterns, t.authorities, c, target)
+func (t *iTree) actionFor(c *Context, target Target) Action {
+	return resolveAction(t.patterns, t.authorities, c, target)
 }
 
-// decideOn resolves the action for target against root. The published tree and a transaction
-// see the same node structure under a different root, so the lookup is written once and given
-// the root rather than read off a receiver.
-func decideOn(root *node, authorities int, c *Context, target Target) Action {
+// resolveAction walks the authority entries under root and returns what the matching one says
+// to do. A transaction and the published tree share the node structure under a different root,
+// so the root is passed in rather than read off a receiver.
+func resolveAction(root *node, authorities int, c *Context, target Target) Action {
 	if authorities == 0 {
 		return Reject
 	}

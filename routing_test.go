@@ -146,7 +146,7 @@ func TestRouting_WildcardAuthorityMatchesEveryHost(t *testing.T) {
 	// It names every authority, so that is what it arms: the wildcard says out loud what
 	// an omitted hostname used to leave to guesswork.
 	assert.Equal(t, 1, countAuthorities(p))
-	assert.Equal(t, Intercept, p.Decide(target("anything.test:443")))
+	assert.Equal(t, Intercept, p.ActionFor(target("anything.test:443")))
 }
 
 // An interceptor must name the authority it intercepts. An omitted one used to be accepted and arm
@@ -235,9 +235,9 @@ func TestRouting_PortDiscriminatesTwoInterceptors(t *testing.T) {
 	assert.Nil(t, match(t, p, http.MethodGet, "http", "localhost:9090", "/api"))
 
 	// Each one arms only its own authority.
-	assert.Equal(t, Intercept, p.Decide(target("localhost:8080")))
-	assert.Equal(t, Intercept, p.Decide(target("localhost:3000")))
-	assert.Equal(t, Reject, p.Decide(target("localhost:9090")))
+	assert.Equal(t, Intercept, p.ActionFor(target("localhost:8080")))
+	assert.Equal(t, Intercept, p.ActionFor(target("localhost:3000")))
+	assert.Equal(t, Reject, p.ActionFor(target("localhost:9090")))
 
 	// The pattern identifies them, so no matcher has to be passed back to find one.
 	assert.Same(t, api, p.Interceptor([]string{http.MethodGet}, "localhost:8080/api"))
@@ -248,7 +248,7 @@ func TestRouting_PortDiscriminatesTwoInterceptors(t *testing.T) {
 	require.NoError(t, err)
 	assert.Same(t, api, deleted)
 	assert.Same(t, ui, match(t, p, http.MethodGet, "http", "localhost:3000", "/api"))
-	assert.Equal(t, Reject, p.Decide(target("localhost:8080")))
+	assert.Equal(t, Reject, p.ActionFor(target("localhost:8080")))
 }
 
 // An interceptor naming a port is more narrowly targeted than one accepting every port, so it

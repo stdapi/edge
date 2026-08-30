@@ -46,7 +46,7 @@ type server struct {
 	// connection enters it as soon as it is accepted, before anything has decided it.
 	active map[io.Closer]struct{}
 	// sessions is what [Proxy.Sessions] reports. A session enters it only once its target is
-	// resolved, so a caller never sees one it cannot pass to [Proxy.Decide].
+	// resolved, so a caller never sees one it cannot pass to [Proxy.ActionFor].
 	sessions map[*Session]struct{}
 	// quics tracks the QUIC demultiplexers. Their peers own their sessions under a separate
 	// lock, merged when the sessions are read rather than mirrored here, so no invariant
@@ -265,7 +265,7 @@ func (s *server) admitSession(sess *Session) bool {
 	}
 
 	s.trackSession(sess, true)
-	if s.p.Decide(sess.target) != Reject {
+	if s.p.ActionFor(sess.target) != Reject {
 		return true
 	}
 	s.trackSession(sess, false)
@@ -285,7 +285,7 @@ func (s *server) admitSession(sess *Session) bool {
 //
 //	p.DeleteTunnel("example.com")
 //	for s := range p.Sessions() {
-//		if p.Decide(s.Target()) == Reject {
+//		if p.ActionFor(s.Target()) == Reject {
 //			s.Close()
 //		}
 //	}

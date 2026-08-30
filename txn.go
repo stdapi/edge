@@ -283,10 +283,10 @@ func (txn *Txn) Interceptor(methods []string, pattern string, matchers ...Matche
 	return matched.entries[idx]
 }
 
-// Decide reports what the proxy would do with a connection to target, resolved on the tree
+// ActionFor reports what the proxy would do with a connection to target, resolved on the tree
 // this transaction sees rather than on the published one. A write transaction can therefore
-// check the effect of a change before it commits. See [Proxy.Decide].
-func (txn *Txn) Decide(target Target) Action {
+// check the effect of a change before it commits. See [Proxy.ActionFor].
+func (txn *Txn) ActionFor(target Target) Action {
 	if txn.rootTxn == nil {
 		panic(ErrSettledTxn)
 	}
@@ -299,7 +299,7 @@ func (txn *Txn) Decide(target Target) Action {
 	c := pool.Get().(*Context)
 	defer pool.Put(c)
 
-	return decideOn(t.patterns, t.authorities, c, target)
+	return resolveAction(t.patterns, t.authorities, c, target)
 }
 
 // Name performs a lookup for a registered interceptor matching the given name. It returns

@@ -32,7 +32,7 @@ func collectAuthorities(p *Proxy) []Authority {
 // the traffic relayed unobserved.
 func TestAuthority_DefaultIsReject(t *testing.T) {
 	p := testProxy(t)
-	assert.Equal(t, Reject, p.Decide(target("anything.test:443")))
+	assert.Equal(t, Reject, p.ActionFor(target("anything.test:443")))
 	assert.Empty(t, collectAuthorities(p))
 }
 
@@ -40,12 +40,12 @@ func TestAuthority_DefaultIsReject(t *testing.T) {
 // separate verb for that: naming the authority is what admitting it means.
 func TestAuthority_InterceptorArmsItsAuthority(t *testing.T) {
 	p := testProxy(t)
-	require.Equal(t, Reject, p.Decide(target("api.stripe.com:443")))
+	require.Equal(t, Reject, p.ActionFor(target("api.stripe.com:443")))
 
 	p.MustAddInterceptor([]string{http.MethodPost}, "api.stripe.com/v1/charges", noopHandler)
 
-	assert.Equal(t, Intercept, p.Decide(target("api.stripe.com:443")))
-	assert.Equal(t, Reject, p.Decide(target("files.stripe.com:443")), "only the one named")
+	assert.Equal(t, Intercept, p.ActionFor(target("api.stripe.com:443")))
+	assert.Equal(t, Reject, p.ActionFor(target("files.stripe.com:443")), "only the one named")
 
 	authorities := collectAuthorities(p)
 	require.Len(t, authorities, 1)
@@ -58,8 +58,8 @@ func TestAuthority_AddTunnel(t *testing.T) {
 	p := testProxy(t)
 	require.NoError(t, p.AddTunnel("checkout.stripe.com"))
 
-	assert.Equal(t, Tunnel, p.Decide(target("checkout.stripe.com:443")))
-	assert.Equal(t, Reject, p.Decide(target("api.stripe.com:443")))
+	assert.Equal(t, Tunnel, p.ActionFor(target("checkout.stripe.com:443")))
+	assert.Equal(t, Reject, p.ActionFor(target("api.stripe.com:443")))
 
 	authorities := collectAuthorities(p)
 	require.Len(t, authorities, 1)
@@ -76,10 +76,10 @@ func TestAuthority_StaticBeatsWildcard(t *testing.T) {
 	p.MustAddInterceptor(nil, "+{sub}.stripe.com/*{any}", DefaultNoInterceptorHandler)
 	require.NoError(t, p.AddTunnel("checkout.stripe.com"))
 
-	assert.Equal(t, Intercept, p.Decide(target("api.stripe.com:443")))
-	assert.Equal(t, Intercept, p.Decide(target("a.b.stripe.com:443")))
-	assert.Equal(t, Tunnel, p.Decide(target("checkout.stripe.com:443")))
-	assert.Equal(t, Reject, p.Decide(target("example.test:443")))
+	assert.Equal(t, Intercept, p.ActionFor(target("api.stripe.com:443")))
+	assert.Equal(t, Intercept, p.ActionFor(target("a.b.stripe.com:443")))
+	assert.Equal(t, Tunnel, p.ActionFor(target("checkout.stripe.com:443")))
+	assert.Equal(t, Reject, p.ActionFor(target("example.test:443")))
 }
 
 // Terminating TLS on a port no interceptor can serve would be visible to the client for
@@ -88,12 +88,12 @@ func TestAuthority_PortScoped(t *testing.T) {
 	p := testProxy(t)
 	p.MustAddInterceptor([]string{http.MethodGet}, "localhost:8080/api", noopHandler)
 
-	assert.Equal(t, Intercept, p.Decide(target("localhost:8080")))
-	assert.Equal(t, Reject, p.Decide(target("localhost:9090")))
+	assert.Equal(t, Intercept, p.ActionFor(target("localhost:8080")))
+	assert.Equal(t, Reject, p.ActionFor(target("localhost:9090")))
 
 	require.NoError(t, p.AddTunnel("localhost:9090"))
-	assert.Equal(t, Tunnel, p.Decide(target("localhost:9090")))
-	assert.Equal(t, Intercept, p.Decide(target("localhost:8080")), "the interceptor keeps its port")
+	assert.Equal(t, Tunnel, p.ActionFor(target("localhost:9090")))
+	assert.Equal(t, Intercept, p.ActionFor(target("localhost:8080")), "the interceptor keeps its port")
 }
 
 func TestAuthority_RejectsSchemeAndPath(t *testing.T) {
@@ -121,7 +121,7 @@ func TestAuthority_InterceptorUnderATunnelIsRefused(t *testing.T) {
 	require.ErrorIs(t, err, ErrAuthorityConflict)
 	assert.Contains(t, err.Error(), "would never run")
 
-	assert.Equal(t, Tunnel, p.Decide(target("api.stripe.com:443")))
+	assert.Equal(t, Tunnel, p.ActionFor(target("api.stripe.com:443")))
 	assert.Zero(t, p.InterceptorsLen(), "the refused interceptor must not be registered")
 }
 
@@ -130,13 +130,13 @@ func TestAuthority_InterceptorUnderATunnelIsRefused(t *testing.T) {
 func TestAuthority_TunnelingAnInterceptedAuthorityIsRefused(t *testing.T) {
 	p := testProxy(t)
 	p.MustAddInterceptor([]string{http.MethodPost}, "api.stripe.com/v1/charges", noopHandler)
-	require.Equal(t, Intercept, p.Decide(target("api.stripe.com:443")))
+	require.Equal(t, Intercept, p.ActionFor(target("api.stripe.com:443")))
 
 	err := p.AddTunnel("api.stripe.com")
 	require.ErrorIs(t, err, ErrAuthorityConflict)
 	assert.Contains(t, err.Error(), "1 interceptor(s) intercept")
 
-	assert.Equal(t, Intercept, p.Decide(target("api.stripe.com:443")), "the interceptors keep it")
+	assert.Equal(t, Intercept, p.ActionFor(target("api.stripe.com:443")), "the interceptors keep it")
 }
 
 // Nothing but precision arbitrates between a tunnel and an interception. On the very same
@@ -160,11 +160,11 @@ func TestAuthority_ImpliedEntryIsReferenceCounted(t *testing.T) {
 
 	_, err := p.removeInterceptor(one)
 	require.NoError(t, err)
-	assert.Equal(t, Intercept, p.Decide(target("api.stripe.com:443")), "one still needs it")
+	assert.Equal(t, Intercept, p.ActionFor(target("api.stripe.com:443")), "one still needs it")
 
 	_, err = p.removeInterceptor(two)
 	require.NoError(t, err)
-	assert.Equal(t, Reject, p.Decide(target("api.stripe.com:443")), "none needs it any more")
+	assert.Equal(t, Reject, p.ActionFor(target("api.stripe.com:443")), "none needs it any more")
 	assert.Empty(t, collectAuthorities(p))
 }
 
@@ -175,7 +175,7 @@ func TestAuthority_DeleteTunnel(t *testing.T) {
 	tn, err := p.DeleteTunnel("checkout.stripe.com")
 	require.NoError(t, err)
 	assert.Equal(t, "checkout.stripe.com", tn.Pattern())
-	assert.Equal(t, Reject, p.Decide(target("checkout.stripe.com:443")))
+	assert.Equal(t, Reject, p.ActionFor(target("checkout.stripe.com:443")))
 
 	_, err = p.DeleteTunnel("checkout.stripe.com")
 	require.ErrorIs(t, err, ErrTunnelNotFound)
@@ -213,7 +213,7 @@ func TestAuthority_TruncateDropsEverything(t *testing.T) {
 func TestAuthority_SwapInterceptionForATunnelAtomically(t *testing.T) {
 	p := testProxy(t)
 	p.MustAddInterceptor([]string{http.MethodPost}, "api.stripe.com/v1/charges", noopHandler)
-	require.Equal(t, Intercept, p.Decide(target("api.stripe.com:443")))
+	require.Equal(t, Intercept, p.ActionFor(target("api.stripe.com:443")))
 
 	err := p.Updates(func(txn *Txn) error {
 		if _, err := txn.DeleteInterceptor([]string{http.MethodPost}, "api.stripe.com/v1/charges"); err != nil {
@@ -223,7 +223,7 @@ func TestAuthority_SwapInterceptionForATunnelAtomically(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	assert.Equal(t, Tunnel, p.Decide(target("api.stripe.com:443")))
+	assert.Equal(t, Tunnel, p.ActionFor(target("api.stripe.com:443")))
 	assert.Zero(t, p.InterceptorsLen())
 }
 
@@ -241,7 +241,7 @@ func TestAuthority_SwapInTheWrongOrderAbortsCleanly(t *testing.T) {
 	})
 	require.ErrorIs(t, err, ErrAuthorityConflict)
 
-	assert.Equal(t, Intercept, p.Decide(target("api.stripe.com:443")), "nothing was applied")
+	assert.Equal(t, Intercept, p.ActionFor(target("api.stripe.com:443")), "nothing was applied")
 	assert.Equal(t, 1, p.InterceptorsLen())
 }
 
@@ -302,16 +302,16 @@ func TestAuthority_IterAuthorities(t *testing.T) {
 	assert.Len(t, slices.Collect(p.Iter().All()), 1)
 }
 
-func TestTxn_Decide(t *testing.T) {
+func TestTxn_ActionFor(t *testing.T) {
 	p := testProxy(t)
 	p.MustAddInterceptor(nil, "api.stripe.com/v1/charges", noopHandler)
 	require.NoError(t, p.AddTunnel("checkout.stripe.com"))
 
 	// A read transaction answers what the published tree answers.
 	require.NoError(t, p.View(func(txn *Txn) error {
-		assert.Equal(t, Intercept, txn.Decide(target("api.stripe.com:443")))
-		assert.Equal(t, Tunnel, txn.Decide(target("checkout.stripe.com:443")))
-		assert.Equal(t, Reject, txn.Decide(target("elsewhere.test:443")))
+		assert.Equal(t, Intercept, txn.ActionFor(target("api.stripe.com:443")))
+		assert.Equal(t, Tunnel, txn.ActionFor(target("checkout.stripe.com:443")))
+		assert.Equal(t, Reject, txn.ActionFor(target("elsewhere.test:443")))
 		return nil
 	}))
 
@@ -320,26 +320,26 @@ func TestTxn_Decide(t *testing.T) {
 		if _, derr := txn.DeleteTunnel("checkout.stripe.com"); derr != nil {
 			return derr
 		}
-		assert.Equal(t, Reject, txn.Decide(target("checkout.stripe.com:443")), "the txn sees the delete")
-		assert.Equal(t, Tunnel, p.Decide(target("checkout.stripe.com:443")), "the tree is untouched until commit")
-		return errAbortDecide
+		assert.Equal(t, Reject, txn.ActionFor(target("checkout.stripe.com:443")), "the txn sees the delete")
+		assert.Equal(t, Tunnel, p.ActionFor(target("checkout.stripe.com:443")), "the tree is untouched until commit")
+		return errAbortActionFor
 	})
-	require.ErrorIs(t, err, errAbortDecide)
-	assert.Equal(t, Tunnel, p.Decide(target("checkout.stripe.com:443")), "an aborted txn changes nothing")
+	require.ErrorIs(t, err, errAbortActionFor)
+	assert.Equal(t, Tunnel, p.ActionFor(target("checkout.stripe.com:443")), "an aborted txn changes nothing")
 
 	require.NoError(t, p.Updates(func(txn *Txn) error {
 		_, derr := txn.DeleteTunnel("checkout.stripe.com")
 		return derr
 	}))
-	assert.Equal(t, Reject, p.Decide(target("checkout.stripe.com:443")))
+	assert.Equal(t, Reject, p.ActionFor(target("checkout.stripe.com:443")))
 }
 
-var errAbortDecide = errors.New("abort")
+var errAbortActionFor = errors.New("abort")
 
-func TestTxn_DecideOnASettledTxn(t *testing.T) {
+func TestTxn_ActionForOnASettledTxn(t *testing.T) {
 	p := testProxy(t)
 	// Abort is a noop on a read transaction, so the settled one has to be a write.
 	txn := p.Txn(true)
 	txn.Abort()
-	assert.PanicsWithValue(t, ErrSettledTxn, func() { txn.Decide(target("api.stripe.com:443")) })
+	assert.PanicsWithValue(t, ErrSettledTxn, func() { txn.ActionFor(target("api.stripe.com:443")) })
 }

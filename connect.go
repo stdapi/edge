@@ -27,7 +27,7 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	action := p.Decide(target)
+	action := p.ActionFor(target)
 	if action == Reject {
 		http.Error(w, "edge: connection rejected, no interceptor or tunnel matches this authority", http.StatusForbidden)
 		return

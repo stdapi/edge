@@ -330,7 +330,7 @@ func TestTransparent_PlaintextRejectsAnUnnamedAuthority(t *testing.T) {
 
 	p, err := New(WithCA(ca))
 	require.NoError(t, err)
-	require.Equal(t, Reject, p.Decide(Target{Scheme: "http", Host: "127.0.0.1", Port: originURL.Port()}))
+	require.Equal(t, Reject, p.ActionFor(Target{Scheme: "http", Host: "127.0.0.1", Port: originURL.Port()}))
 
 	addr := startTransparent(t, p)
 	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{DialContext: pinnedDialer(addr)}}

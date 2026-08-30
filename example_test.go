@@ -100,9 +100,9 @@ func ExampleProxy_AddTunnel() {
 		log.Fatal(err)
 	}
 
-	fmt.Println(p.Decide(edge.Target{Scheme: "https", Host: "api.stripe.com", Port: "443"}))
-	fmt.Println(p.Decide(edge.Target{Scheme: "https", Host: "checkout.stripe.com", Port: "443"}))
-	fmt.Println(p.Decide(edge.Target{Scheme: "https", Host: "example.test", Port: "443"}))
+	fmt.Println(p.ActionFor(edge.Target{Scheme: "https", Host: "api.stripe.com", Port: "443"}))
+	fmt.Println(p.ActionFor(edge.Target{Scheme: "https", Host: "checkout.stripe.com", Port: "443"}))
+	fmt.Println(p.ActionFor(edge.Target{Scheme: "https", Host: "example.test", Port: "443"}))
 	// Output:
 	// intercept
 	// tunnel
