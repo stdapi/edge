@@ -153,6 +153,10 @@ type quicDemux struct {
 	// connection state. It is set once, when interception starts.
 	tag atomic.Pointer[quicCIDTag]
 
+	// ctx ends when the demux closes, bounding the resolver lookups the sniff path waits on.
+	ctx    context.Context
+	cancel context.CancelFunc
+
 	done               chan struct{}
 	flows              map[netip.AddrPort]*quicFlow
 	replySockets       map[netip.AddrPort]net.PacketConn
@@ -343,6 +347,7 @@ func newQUICDemux(p *Proxy, pc net.PacketConn) (*quicDemux, error) {
 		flows: make(map[netip.AddrPort]*quicFlow),
 		done:  make(chan struct{}),
 	}
+	d.ctx, d.cancel = context.WithCancel(context.Background())
 	d.origins, _ = pc.(PacketOriginalDestination)
 	if e, ok := pc.(interface{ exactOriginalDestination() bool }); ok && d.origins != nil {
 		d.exactOrigins = e.exactOriginalDestination()
@@ -1002,7 +1007,18 @@ func (d *quicDemux) sniff(from netip.AddrPort, conn *quicConn, datagram []byte) 
 		return
 	}
 
-	switch d.p.ActionFor(target) {
+	named := ch != nil && ch.ServerName != ""
+	action, target, verdict := d.p.actionForTransparent(d.ctx, target, conn.origin, named)
+	switch verdict {
+	case nameMismatch:
+		d.rejectConn(from, conn, "the server name does not resolve to the destination")
+		return
+	case nameUnresolved:
+		d.rejectConn(from, conn, "the server name cannot be resolved")
+		return
+	}
+
+	switch action {
 	case Reject:
 		d.rejectConn(from, conn, "no interceptor or tunnel matches this authority")
 	case Intercept:
@@ -1454,6 +1470,7 @@ func (d *quicDemux) Close() error { d.close(); return nil }
 func (d *quicDemux) close() {
 	d.closeOnce.Do(func() {
 		close(d.done)
+		d.cancel()
 
 		d.mu.Lock()
 		// The read loop publishes with no lock held across its dials, so close must refuse

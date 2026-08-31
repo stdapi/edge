@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"net"
 	"net/http"
 	"regexp"
 	"slices"
@@ -80,6 +81,7 @@ type config struct {
 	proxyAuth ProxyAuthenticator
 
 	transport *Transport
+	resolver  NameResolver
 
 	server serverConfig
 
@@ -90,6 +92,7 @@ type config struct {
 	handleSlash TrailingSlashOption
 	allowRegexp bool
 	rejectECH   bool
+	verifyNames NameVerification
 }
 
 func newConfig() *config {
@@ -100,6 +103,7 @@ func newConfig() *config {
 		maxMatchers:      math.MaxUint8,
 		handleSlash:      ExactSlash,
 		transport:        DefaultTransport(),
+		resolver:         net.DefaultResolver,
 		server:           defaultServerConfig(),
 	}
 }

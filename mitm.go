@@ -51,10 +51,11 @@ func (p *Proxy) intercept(ctx context.Context, conn *peekConn, sess *Session) er
 	state := tlsConn.ConnectionState()
 	sess.tlsState.Store(&state)
 	sess.target.Scheme = "https"
-	// The server name the client asked for is what it believes it is talking to. It is a
-	// better identity than the CONNECT authority, which an explicit proxy client may write
-	// as an address.
-	if state.ServerName != "" {
+	// The server name the client asked for is a better identity than the CONNECT authority,
+	// which an explicit proxy client may write as an address. A transparent target already
+	// comes from the sniffed ClientHello or the destination, and name verification may
+	// have ruled the name out.
+	if state.ServerName != "" && !sess.transparent {
 		sess.target.Host = state.ServerName
 	}
 	sess.setProtocol(protocolFromALPN(state.NegotiatedProtocol))
