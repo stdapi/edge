@@ -75,7 +75,7 @@ func (f *forwarder) roundTrip(req *http.Request, proto Protocol) (*http.Response
 	switch {
 	case proto == HTTP3 && f.h3 != nil && req.URL.Scheme == "https":
 		return f.h3.RoundTrip(req)
-	case proto >= HTTP2 && f.h2 != nil:
+	case (proto == HTTP2 || proto == HTTP3) && f.h2 != nil:
 		// h2 is only reachable through ALPN, so an origin that does not offer it is served
 		// over HTTP/1.1 by the same transport.
 		return f.h2.RoundTrip(req)

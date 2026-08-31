@@ -19,7 +19,10 @@ import (
 	"github.com/fox-toolkit/edge/internal/stringsutil"
 )
 
-// Protocol is the protocol spoken on a connection.
+// Protocol is the deepest framing the proxy itself established or parsed on a connection.
+// An HTTP version is spoken by the proxy, [TLS] and [QUIC] mean the handshake was
+// recognized on a connection the proxy does not terminate, and [TCP] and [UDP] mean the
+// bytes are relayed without inspection.
 type Protocol uint8
 
 const (
@@ -33,6 +36,10 @@ const (
 	UDP
 	// TCP is a raw byte stream relayed without inspection.
 	TCP
+	// TLS is TLS relayed with its payload opaque.
+	TLS
+	// QUIC is QUIC relayed with its payload opaque.
+	QUIC
 )
 
 func (p Protocol) String() string {
@@ -47,6 +54,10 @@ func (p Protocol) String() string {
 		return "UDP"
 	case TCP:
 		return "TCP"
+	case TLS:
+		return "TLS"
+	case QUIC:
+		return "QUIC"
 	default:
 		return "unknown"
 	}
@@ -231,8 +242,10 @@ func addrPort(a net.Addr) netip.AddrPort {
 // serving from the [Context], which always has it.
 func (s *Session) Target() Target { return s.target }
 
-// Protocol returns the protocol negotiated with the client. It describes the connection, so
-// it is the same for every request multiplexed on it.
+// Protocol returns the deepest framing the proxy established or parsed on the connection.
+// It describes the connection, so it is the same for every request multiplexed on it. A
+// tunneled connection reports [TLS] or [QUIC] since what those frame stays opaque, and a
+// raw relay reports [TCP] or [UDP].
 func (s *Session) Protocol() Protocol {
 	//nolint:gosec // the field is only ever written by setProtocol, from a Protocol.
 	return Protocol(s.proto.Load())

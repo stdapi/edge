@@ -193,7 +193,7 @@ func (p *Proxy) serveTransparentTLS(ctx context.Context, conn *peekConn, origin 
 		return errors.New("edge: transparent TLS connection with no server name and no original destination")
 	}
 
-	sess := newSession(ctx, conn, target, p.ActionFor(target), HTTP11)
+	sess := newSession(ctx, conn, target, p.ActionFor(target), TLS)
 	sess.transparent = true
 	sess.upstream = origin
 	if hello != nil {

@@ -122,6 +122,13 @@ func TestMatcher_Protocol(t *testing.T) {
 
 	_, err = MatchProtocol(Protocol(99))
 	assert.ErrorIs(t, err, ErrInvalidMatcher)
+
+	// A matcher runs on requests the proxy parsed, which the opaque and raw protocols
+	// never produce.
+	for _, proto := range []Protocol{TLS, QUIC, TCP, UDP} {
+		_, err = MatchProtocol(proto)
+		assert.ErrorIs(t, err, ErrInvalidMatcher, proto.String())
+	}
 }
 
 func TestMatcher_Func(t *testing.T) {

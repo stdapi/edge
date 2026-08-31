@@ -163,6 +163,10 @@ func TestTransparent_TLSTunnelLeavesTheHandshakeAlone(t *testing.T) {
 
 	body, _ := io.ReadAll(resp.Body)
 	assert.Equal(t, "tunneled", string(body))
+
+	sessions := waitForSessions(t, p, 1)
+	assert.Equal(t, Tunnel, sessions[0].Action())
+	assert.Equal(t, TLS, sessions[0].Protocol(), "a tunneled handshake stays opaque, no HTTP version is established")
 }
 
 func TestTransparent_PlaintextRoutesOnHostHeader(t *testing.T) {

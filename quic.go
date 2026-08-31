@@ -434,9 +434,11 @@ func (d *quicDemux) startInterception() error {
 				return ctx
 			}
 			// The session is registered before the handshake, so this is the first point
-			// where its TLS state exists.
+			// where its TLS state exists and where HTTP/3 is established rather than
+			// pending, the server offering h3 alone.
 			state := c.ConnectionState().TLS
 			sess.tlsState.Store(&state)
+			sess.setProtocol(HTTP3)
 			return context.WithValue(ctx, sessionKey{}, sess)
 		},
 	}
@@ -1033,7 +1035,7 @@ func (d *quicDemux) originalDst(client net.Addr) netip.AddrPort {
 // may not resolve at all.
 func (d *quicDemux) newQUICSession(from netip.AddrPort, client net.Addr, conn *quicConn, target Target, hello *ClientHello, action Action) (*Session, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background())
-	sess := newSession(ctx, nil, target, action, HTTP3)
+	sess := newSession(ctx, nil, target, action, QUIC)
 	sess.remoteAddr = client
 	sess.localAddr = d.pc.LocalAddr()
 	sess.transparent = true
