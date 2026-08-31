@@ -345,7 +345,13 @@ func (c *Context) outboundRequest(r *http.Request) (*http.Request, error) {
 	}
 
 	upgrade := upgradeType(r.Header)
+	trailers := headerListContains(r.Header, "Te", "trailers")
 	stripHopByHop(out.Header)
+	if trailers {
+		// Tell an upstream that cares about trailer support that the proxy relays them,
+		// and only when the client thought it worth mentioning.
+		out.Header.Set("Te", "trailers")
+	}
 	if upgrade != "" {
 		// An upgrade is the one case where the connection-scoped headers are the payload:
 		// dropping them turns a WebSocket handshake into a plain request.

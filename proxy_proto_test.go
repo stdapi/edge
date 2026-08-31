@@ -240,6 +240,49 @@ func TestProxy_ForwardsTrailers(t *testing.T) {
 	}
 }
 
+// A gRPC client announces trailer support and speaks HTTP/2, where "trailers" is the only
+// value TE may carry. The announcement must survive the hop the proxy adds, or an origin that
+// enforces it refuses the call.
+func TestProxy_AnnouncesTETrailersOverHTTP2(t *testing.T) {
+	origin := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "te=%s proto=%s", r.Header.Get("Te"), r.Proto)
+	}))
+	origin.EnableHTTP2 = true
+	origin.StartTLS()
+	defer origin.Close()
+
+	originURL, _ := url.Parse(origin.URL)
+	ca, _ := GenerateCA()
+	tr := DefaultTransport()
+	tr.RootCAs = originPool(t, origin)
+
+	p, err := New(WithCA(ca), WithTransport(tr))
+	if err != nil {
+		t.Fatalf("new proxy: %v", err)
+	}
+	p.MustAddInterceptor(nil, originHost(originURL)+"/*{any}", DefaultNoInterceptorHandler)
+
+	addr := startProxy(t, p)
+	client := h2Client(addr, ca.CertPool())
+
+	req, err := http.NewRequest(http.MethodGet, origin.URL+"/", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("TE", "trailers")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("get through proxy: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "te=trailers proto=HTTP/2.0" {
+		t.Fatalf("origin saw %q, want te=trailers proto=HTTP/2.0", body)
+	}
+}
+
 // startProxyTLS serves p as an explicit proxy reached over TLS, offering h2 in ALPN, and
 // returns its address with a pool that trusts it.
 func startProxyTLS(t *testing.T, p *Proxy, ca *CA) (string, *x509.CertPool) {

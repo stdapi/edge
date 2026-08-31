@@ -181,6 +181,51 @@ func TestSemantics_HopByHopHeadersAreStripped(t *testing.T) {
 	assert.Equal(t, "leaked=", string(body))
 }
 
+func TestSemantics_TETrailersIsAnnouncedForTheProxy(t *testing.T) {
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "te=%s", strings.Join(r.Header.Values("Te"), "|"))
+	}))
+	defer origin.Close()
+
+	_, _, client := interceptingProxy(t, origin)
+
+	cases := []struct {
+		name string
+		conn string
+		want string
+		sent []string
+	}{
+		{name: "nothing announced", want: "te="},
+		{name: "trailers", sent: []string{"trailers"}, want: "te=trailers"},
+		{name: "transfer coding only", sent: []string{"gzip"}, want: "te="},
+		{name: "trailers among codings", sent: []string{"gzip", "trailers"}, want: "te=trailers"},
+		{name: "listed in connection", sent: []string{"trailers"}, conn: "TE", want: "te=trailers"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := http.NewRequest(http.MethodGet, origin.URL+"/", nil)
+			require.NoError(t, err)
+			for _, v := range tc.sent {
+				req.Header.Add("TE", v)
+			}
+			if tc.conn != "" {
+				req.Header.Set("Connection", tc.conn)
+			}
+
+			resp, err := client.Do(req)
+			require.NoError(t, err)
+			defer func() { _ = resp.Body.Close() }()
+
+			body, _ := io.ReadAll(resp.Body)
+			// TE stops at the first hop, so the proxy makes the announcement for itself
+			// rather than relaying the client's. A transfer coding it does not implement is
+			// not announced at all.
+			assert.Equal(t, tc.want, string(body))
+		})
+	}
+}
+
 func TestSemantics_HandlerPanicBecomesAnError(t *testing.T) {
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "origin")
