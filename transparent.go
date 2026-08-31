@@ -42,7 +42,7 @@ func (p *Proxy) ListenAndServeTransparent(addr string) error {
 // reports, then the server name of a TLS ClientHello, then the Host header of a plaintext
 // request. A connection with none of the three cannot be placed and is closed. Wrap ln in
 // [TransparentListener] for the first of them. When a tunnel matches the destination of a
-// connection that is not TLS, the bytes are relayed untouched rather than read as a
+// connection that is not TLS, the connection is relayed untouched rather than parsed as a
 // plaintext request.
 func (p *Proxy) ServeTransparent(ln net.Listener) error {
 	// A refused registration means a shutdown started; accepting would run a loop nothing

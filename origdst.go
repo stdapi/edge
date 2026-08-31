@@ -81,9 +81,9 @@ func (c transparentConn) CloseWrite() error { return closeWrite(c.Conn) }
 // redirect does not preserve that address, so there connections are placed by their server
 // name and [Session.Upstream] reports nothing.
 //
-// On a Linux socket carrying IP_TRANSPARENT, behind a TPROXY rule, every datagram keeps the
-// address it was headed to and replies are sent from that address, which needs the
-// CAP_NET_ADMIN or CAP_NET_RAW capability.
+// On Linux, when the socket has IP_TRANSPARENT set behind a TPROXY rule, every datagram
+// reports the address it was headed to and replies are sent from that address. This needs
+// CAP_NET_ADMIN or CAP_NET_RAW.
 //
 // It needs a *net.UDPConn, and on Linux an nftables or an iptables redirect or TPROXY rule,
 // on macOS an rdr rule in pf with read access to /dev/pf. No other platform is supported.

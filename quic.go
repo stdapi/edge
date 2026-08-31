@@ -97,15 +97,15 @@ func (p *Proxy) ListenAndServeQUIC(addr string) error {
 // Under Encrypted Client Hello the decision sees the outer server name only. QUIC versions
 // other than v1 and v2 are rejected. A tunneled client that changes address in flight has
 // to re-handshake. Behind a Linux redirect a client may tunnel several origins from one
-// socket. Behind a Linux TPROXY rule every datagram reports its destination exactly and
-// replies leave from the address the client targeted, though one client socket then holds
-// one intercepted origin at a time. On macOS, and when pc is not wrapped in
+// socket. Behind a Linux TPROXY rule every datagram reports its exact destination, replies
+// are sent from the address the client targeted, and a client socket supports one
+// intercepted origin at a time. On macOS, and when pc is not wrapped in
 // [TransparentPacketConn], a client socket supports one tunneled origin, and connections to
 // further origins drop shortly after their handshake.
 //
-// A datagram that is not QUIC is decided by the address it was headed to, when the platform
-// reports one. A tunnel matching that authority relays the bytes untouched, in both
-// directions, and anything else drops them.
+// A datagram that is not QUIC is placed by the address it was headed to, when the platform
+// reports one. A tunnel registered for that authority relays the traffic in both
+// directions, and without one the datagram is dropped.
 func (p *Proxy) ServeQUIC(pc net.PacketConn) error {
 	if p.srv.closing.Load() {
 		return ErrProxyClosed

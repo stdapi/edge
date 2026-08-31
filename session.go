@@ -29,9 +29,9 @@ const (
 	HTTP2
 	// HTTP3 is HTTP/3 over QUIC.
 	HTTP3
-	// UDP is datagrams relayed untouched, with no protocol read into them.
+	// UDP is raw datagrams relayed without inspection.
 	UDP
-	// TCP is a byte stream relayed untouched, with no protocol read into it.
+	// TCP is a raw byte stream relayed without inspection.
 	TCP
 )
 
