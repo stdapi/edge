@@ -115,10 +115,12 @@ func setTransparentPacketOptions(c *net.UDPConn) error {
 	return nil
 }
 
-// udpTransparentMode reports whether the socket carries IP_TRANSPARENT, the mark of a
+// transparentSocket reports whether the socket has IP_TRANSPARENT set, the mark of a
 // TPROXY deployment.
-func udpTransparentMode(c *net.UDPConn) bool {
-	raw, err := c.SyscallConn()
+func transparentSocket(sc interface {
+	SyscallConn() (syscall.RawConn, error)
+}) bool {
+	raw, err := sc.SyscallConn()
 	if err != nil {
 		return false
 	}
@@ -133,6 +135,16 @@ func udpTransparentMode(c *net.UDPConn) bool {
 		}
 	})
 	return on
+}
+
+func udpTransparentMode(c *net.UDPConn) bool { return transparentSocket(c) }
+
+func tcpTransparentMode(c net.Conn) bool {
+	tc, ok := c.(*net.TCPConn)
+	if !ok {
+		return false
+	}
+	return transparentSocket(tc)
 }
 
 // listenTransparentReply opens the socket replies to one origin leave from: bound to the

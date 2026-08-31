@@ -681,3 +681,88 @@ func TestTransparent_RawTCPTunnelWinsOverHTTPParsing(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, request, string(buf), "the origin must receive the request byte for byte")
 }
+
+func TestDivertedOrigin(t *testing.T) {
+	ap := netip.MustParseAddrPort
+	tests := []struct {
+		name     string
+		local    netip.AddrPort
+		listener netip.AddrPort
+		want     netip.AddrPort
+		diverted bool
+	}{
+		{"another port settles it", ap("203.0.113.9:5301"), ap("0.0.0.0:7778"), ap("203.0.113.9:5301"), true},
+		{"listener port on a wildcard bind reads as direct", ap("127.0.0.1:7778"), ap("0.0.0.0:7778"), netip.AddrPort{}, false},
+		{"the listener address itself is direct", ap("10.0.0.1:7778"), ap("10.0.0.1:7778"), netip.AddrPort{}, false},
+		{"listener port on a specific bind still discriminates", ap("203.0.113.9:7778"), ap("10.0.0.1:7778"), ap("203.0.113.9:7778"), true},
+		{"a mapped local address is unmapped", ap("[::ffff:203.0.113.9]:5301"), ap("0.0.0.0:7778"), ap("203.0.113.9:5301"), true},
+		{"invalid local", netip.AddrPort{}, ap("0.0.0.0:7778"), netip.AddrPort{}, false},
+		{"invalid listener", ap("203.0.113.9:5301"), netip.AddrPort{}, netip.AddrPort{}, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, diverted := divertedOrigin(tc.local, tc.listener)
+			assert.Equal(t, tc.diverted, diverted)
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
+
+// divertedListener stands in for a TPROXY diverted TCP listener: the conntrack lookup has
+// nothing to answer and the accepted socket reports the destination itself.
+type divertedListener struct {
+	net.Listener
+	origin netip.AddrPort
+}
+
+func (l divertedListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return &divertedConn{Conn: c, origin: l.origin}, nil
+}
+
+type divertedConn struct {
+	net.Conn
+	origin netip.AddrPort
+}
+
+func (c *divertedConn) OriginalDestination() (netip.AddrPort, error) {
+	return netip.AddrPort{}, fmt.Errorf("no conntrack entry")
+}
+
+func (c *divertedConn) divertedTo() (netip.AddrPort, bool) { return c.origin, true }
+
+func TestTransparent_TProxyTCPPlacesByTheSocketAddress(t *testing.T) {
+	origin := tcpEchoOrigin(t)
+
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+	require.NoError(t, p.AddTunnel(origin.String()))
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	go func() { _ = p.ServeTransparent(divertedListener{Listener: ln, origin: origin}) }()
+	t.Cleanup(func() { _ = p.Close() })
+
+	client, err := net.Dial("tcp", ln.Addr().String())
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+
+	payload := []byte{0x00, 0x2a, 'v', 'i', 'a', '-', 't', 'p', 'r', 'o', 'x', 'y'}
+	_, err = client.Write(payload)
+	require.NoError(t, err)
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
+	buf := make([]byte, 64)
+	n, err := client.Read(buf)
+	require.NoError(t, err)
+	assert.Equal(t, payload, buf[:n])
+
+	sessions := waitForSessions(t, p, 1)
+	assert.Equal(t, Tunnel, sessions[0].Action())
+	assert.Equal(t, TCP, sessions[0].Protocol())
+	assert.Equal(t, origin, sessions[0].Upstream())
+}

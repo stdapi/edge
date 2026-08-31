@@ -28,6 +28,8 @@ func originalDstFromOOB([]byte, netip.AddrPort, netip.AddrPort) netip.AddrPort {
 
 func udpTransparentMode(*net.UDPConn) bool { return false }
 
+func tcpTransparentMode(net.Conn) bool { return false }
+
 func listenTransparentReply(netip.AddrPort) (net.PacketConn, error) {
 	return nil, errors.New("edge: transparent replies are not implemented on this platform")
 }

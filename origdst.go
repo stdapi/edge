@@ -51,26 +51,62 @@ type transparentReplier interface {
 // The lookup reads SO_ORIGINAL_DST on Linux and asks the pf state table on macOS, which needs
 // read access to /dev/pf. Anywhere else, and on a connection that was not redirected, it
 // answers with nothing and the proxy places the connection by its server name or its Host
-// header. Behind TPROXY the socket already carries the original address and no lookup is
-// needed.
+// header. Behind a Linux TPROXY rule, on a listener with IP_TRANSPARENT set, no lookup is
+// needed and the accepted socket itself reports the destination. A wildcard bound listener
+// cannot tell a diverted connection from a direct one on its own port, so bind the listener
+// to a specific address there.
 func TransparentListener(ln net.Listener) net.Listener {
-	return transparentListener{Listener: ln}
+	return transparentListener{Listener: ln, addr: addrPort(ln.Addr())}
 }
 
-type transparentListener struct{ net.Listener }
+type transparentListener struct {
+	net.Listener
+	addr netip.AddrPort
+}
 
 func (l transparentListener) Accept() (net.Conn, error) {
 	c, err := l.Listener.Accept()
 	if err != nil {
 		return nil, err
 	}
-	return transparentConn{Conn: c}, nil
+	return transparentConn{Conn: c, listener: l.addr}, nil
 }
 
-type transparentConn struct{ net.Conn }
+type transparentConn struct {
+	net.Conn
+	listener netip.AddrPort
+}
 
 func (c transparentConn) OriginalDestination() (netip.AddrPort, error) {
 	return originalDstSocket(c.Conn)
+}
+
+// divertedTo reports the destination of a connection a TPROXY rule diverted. The accepted
+// socket owns the client's chosen destination as its own address, so the answer is read off
+// the socket once it provably differs from the listener.
+func (c transparentConn) divertedTo() (netip.AddrPort, bool) {
+	if !tcpTransparentMode(c.Conn) {
+		return netip.AddrPort{}, false
+	}
+	return divertedOrigin(addrPort(c.LocalAddr()), c.listener)
+}
+
+// divertedOrigin tells a diverted connection from a direct one. TPROXY keeps the original
+// port, so a port other than the listener's settles it, and on the listener's own port only
+// a specific bind can still discriminate. The ambiguous case reads as direct, which places
+// the connection by its server name or its Host header rather than dialing the proxy itself.
+func divertedOrigin(local, listener netip.AddrPort) (netip.AddrPort, bool) {
+	if !local.IsValid() || !listener.IsValid() {
+		return netip.AddrPort{}, false
+	}
+	origin := netip.AddrPortFrom(local.Addr().Unmap(), local.Port())
+	if local.Port() != listener.Port() {
+		return origin, true
+	}
+	if listener.Addr().IsUnspecified() || origin.Addr() == listener.Addr().Unmap() {
+		return netip.AddrPort{}, false
+	}
+	return origin, true
 }
 
 // CloseWrite forwards the half-close, which the embedded net.Conn does not promote.

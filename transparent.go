@@ -112,6 +112,15 @@ func (p *Proxy) ServeConn(conn net.Conn) error {
 		}
 		origin = redirectedTo(addr, conn.LocalAddr())
 	}
+	if !origin.IsValid() {
+		// Behind TPROXY the lookup has nothing to answer and the guard above would refuse
+		// the socket's own address, the one place the destination actually is.
+		if tc, ok := conn.(interface{ divertedTo() (netip.AddrPort, bool) }); ok {
+			if diverted, ok := tc.divertedTo(); ok {
+				origin = diverted
+			}
+		}
+	}
 
 	head, err := peeked.Peek(1)
 	if err != nil {
