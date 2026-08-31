@@ -1028,6 +1028,85 @@ func TestQUIC_RawUDPSessionClosePerOrigin(t *testing.T) {
 	require.NoError(t, err, "the other origin's relay must keep going")
 	assert.Equal(t, payload, buf[:n])
 	assert.Len(t, slices.Collect(p.Sessions()), 1)
+
+	// A revocation scoped to the flow instead of the pair would refuse this too.
+	originC := udpEchoOrigin(t)
+	payload = rawPayloadFor(originC)
+	_, err = client.Write(payload)
+	require.NoError(t, err)
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
+	n, err = client.Read(buf)
+	require.NoError(t, err, "a fresh origin must still be admitted")
+	assert.Equal(t, payload, buf[:n])
+	assert.Len(t, slices.Collect(p.Sessions()), 2)
+}
+
+// A close of a session already ended by a transport failure stays a no-op. The relay
+// re-admitted since then keeps going and no revocation is posted.
+func TestQUIC_RawUDPStaleSessionCloseIsNoOp(t *testing.T) {
+	origin := udpEchoOrigin(t)
+
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(proxyCA))
+	require.NoError(t, err)
+	p.MustAddTunnel("+{any}")
+
+	proxyAddr := startQUICRedirected(t, p, origin)
+
+	client, err := net.Dial("udp", proxyAddr.String())
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+
+	buf := make([]byte, 64)
+	_, err = client.Write([]byte("ping"))
+	require.NoError(t, err)
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
+	_, err = client.Read(buf)
+	require.NoError(t, err)
+
+	stale := waitForSessions(t, p, 1)[0]
+
+	var d *quicDemux
+	p.srv.mu.Lock()
+	for dd := range p.srv.quics {
+		d = dd
+	}
+	p.srv.mu.Unlock()
+	require.NotNil(t, d)
+
+	from := netip.MustParseAddrPort(client.LocalAddr().String())
+	d.mu.Lock()
+	flow := d.flows[from]
+	var relay *quicRelay
+	if flow != nil {
+		relay = flow.relays[origin]
+	}
+	d.mu.Unlock()
+	require.NotNil(t, relay)
+
+	// The transport failure path, then the client is re-admitted onto a fresh relay.
+	d.closeRelay(from, relay)
+	_, err = client.Write([]byte("again"))
+	require.NoError(t, err)
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
+	_, err = client.Read(buf)
+	require.NoError(t, err, "a transport failure must allow the redial")
+	waitForSessions(t, p, 1)
+
+	require.NoError(t, stale.Close())
+
+	_, err = client.Write([]byte("still"))
+	require.NoError(t, err)
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
+	_, err = client.Read(buf)
+	require.NoError(t, err, "the stale close must not touch the fresh relay")
+	assert.Len(t, slices.Collect(p.Sessions()), 1)
+
+	d.mu.Lock()
+	revoked := len(flow.revoked)
+	d.mu.Unlock()
+	assert.Zero(t, revoked, "a stale close must not post a revocation")
 }
 
 // Closing a tunneled QUIC session leaves the client's connection sending datagrams no

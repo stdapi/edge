@@ -1482,23 +1482,25 @@ func (d *quicDemux) teardownRelay(from netip.AddrPort, relay *quicRelay, revoke 
 		d.mu.Unlock()
 		return
 	}
-	// Revoked even when a transport failure closed the relay first, the revocation being
-	// about the destination, not this relay.
+	// Revoked even when a transport failure closed this relay first, but not when a newer
+	// relay holds the key, where the close is stale and stays the documented no-op.
 	if revoke {
-		if flow.revoked == nil {
-			flow.revoked = make(map[netip.AddrPort]time.Time)
-		}
-		if len(flow.revoked) >= maxRevokedPerFlow {
-			var victim netip.AddrPort
-			var soonest time.Time
-			for origin, deadline := range flow.revoked {
-				if soonest.IsZero() || deadline.Before(soonest) {
-					victim, soonest = origin, deadline
-				}
+		if r := flow.relays[relay.key]; r == nil || r == relay {
+			if flow.revoked == nil {
+				flow.revoked = make(map[netip.AddrPort]time.Time)
 			}
-			delete(flow.revoked, victim)
+			if _, dup := flow.revoked[relay.key]; !dup && len(flow.revoked) >= maxRevokedPerFlow {
+				var victim netip.AddrPort
+				var soonest time.Time
+				for origin, deadline := range flow.revoked {
+					if !victim.IsValid() || deadline.Before(soonest) {
+						victim, soonest = origin, deadline
+					}
+				}
+				delete(flow.revoked, victim)
+			}
+			flow.revoked[relay.key] = time.Now().Add(quicRevokeTTL)
 		}
-		flow.revoked[relay.key] = time.Now().Add(quicRevokeTTL)
 	}
 	if relay.closed {
 		d.mu.Unlock()
