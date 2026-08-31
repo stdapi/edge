@@ -41,7 +41,9 @@ func (p *Proxy) ListenAndServeTransparent(addr string) error {
 // The destination of a connection is resolved from what an [OriginalDestination] connection
 // reports, then the server name of a TLS ClientHello, then the Host header of a plaintext
 // request. A connection with none of the three cannot be placed and is closed. Wrap ln in
-// [TransparentListener] for the first of them.
+// [TransparentListener] for the first of them. When a tunnel matches the destination of a
+// connection that is not TLS, the bytes are relayed untouched rather than read as a
+// plaintext request.
 func (p *Proxy) ServeTransparent(ln net.Listener) error {
 	// A refused registration means a shutdown started; accepting would run a loop nothing
 	// ever closes.
@@ -119,7 +121,45 @@ func (p *Proxy) ServeConn(conn net.Conn) error {
 	if head[0] == tlsHandshakeRecord {
 		return p.serveTransparentTLS(ctx, peeked, origin)
 	}
+	if origin.IsValid() {
+		target := Target{Host: origin.Addr().Unmap().String(), Port: fmt.Sprint(origin.Port())}
+		if p.ActionFor(target) == Tunnel {
+			return p.serveTransparentRaw(ctx, peeked, origin, target)
+		}
+	}
 	return p.serveTransparentPlain(ctx, peeked, origin)
+}
+
+// serveTransparentRaw relays a redirected connection that is not TLS and whose destination a
+// tunnel names, before any protocol is assumed of the bytes.
+func (p *Proxy) serveTransparentRaw(ctx context.Context, conn *peekConn, origin netip.AddrPort, target Target) error {
+	sess := newSession(ctx, conn, target, Tunnel, TCP)
+	sess.transparent = true
+	sess.upstream = origin
+	sess.closer = conn
+	if !p.srv.admitSession(sess) {
+		return ErrConnectionRejected
+	}
+	defer p.srv.trackSession(sess, false)
+
+	upstream, err := p.dialTransparentUpstream(ctx, target, origin)
+	if err != nil {
+		return err
+	}
+
+	// See connectHijack: without this, closing the client side at the deadline can leave
+	// the upstream read parked until the idle timeout.
+	if !p.srv.tryTrack(upstream) {
+		_ = upstream.Close()
+		return ErrProxyClosed
+	}
+	defer func() {
+		_ = upstream.Close()
+		p.srv.untrack(upstream)
+	}()
+
+	_, _, err = tunnel(conn, upstream, p.cfg.server.tunnelIdleTimeout)
+	return err
 }
 
 // serveTransparentTLS reads the server name out of the ClientHello without consuming it,

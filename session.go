@@ -31,6 +31,8 @@ const (
 	HTTP3
 	// UDP is datagrams relayed untouched, with no protocol read into them.
 	UDP
+	// TCP is a byte stream relayed untouched, with no protocol read into it.
+	TCP
 )
 
 func (p Protocol) String() string {
@@ -43,6 +45,8 @@ func (p Protocol) String() string {
 		return "HTTP/3.0"
 	case UDP:
 		return "UDP"
+	case TCP:
+		return "TCP"
 	default:
 		return "unknown"
 	}

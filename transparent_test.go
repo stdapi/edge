@@ -556,3 +556,128 @@ func TestTransparent_PlaintextWithOriginalDestination(t *testing.T) {
 
 	assert.Empty(t, slices.Collect(p.Sessions()), "a connection decided per request is not reported")
 }
+
+// tcpEchoOrigin starts a TCP echo server and returns its address.
+func tcpEchoOrigin(t *testing.T) netip.AddrPort {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	go func() {
+		for {
+			c, aerr := ln.Accept()
+			if aerr != nil {
+				return
+			}
+			go func() {
+				_, _ = io.Copy(c, c)
+				_ = c.Close()
+			}()
+		}
+	}()
+	t.Cleanup(func() { _ = ln.Close() })
+	addr, err := netip.ParseAddrPort(ln.Addr().String())
+	require.NoError(t, err)
+	return addr
+}
+
+func TestTransparent_RawTCPTunnelByDestination(t *testing.T) {
+	origin := tcpEchoOrigin(t)
+
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+	require.NoError(t, p.AddTunnel(origin.String()))
+
+	addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) {
+		return origin, nil
+	})
+
+	client, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+
+	payload := []byte{0x00, 0x2a, 'r', 'a', 'w', '-', 'd', 'n', 's'}
+	_, err = client.Write(payload)
+	require.NoError(t, err)
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
+	buf := make([]byte, 64)
+	n, err := client.Read(buf)
+	require.NoError(t, err)
+	assert.Equal(t, payload, buf[:n])
+
+	sessions := waitForSessions(t, p, 1)
+	sess := sessions[0]
+	assert.Equal(t, Tunnel, sess.Action())
+	assert.Equal(t, TCP, sess.Protocol())
+	assert.Equal(t, origin.Addr().String(), sess.Target().Host)
+	assert.Equal(t, fmt.Sprint(origin.Port()), sess.Target().Port)
+	assert.Equal(t, origin, sess.Upstream())
+	assert.True(t, sess.Transparent())
+	assert.Nil(t, sess.ClientHello())
+
+	require.NoError(t, sess.Close())
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
+	_, err = client.Read(buf)
+	require.Error(t, err, "closing the session cuts the connection")
+}
+
+// A connection that is neither TLS nor claimed by a tunnel keeps today's path: parsed as a
+// plaintext request, which these bytes are not, so it is closed.
+func TestTransparent_RawTCPRejectedWithoutTunnel(t *testing.T) {
+	origin := tcpEchoOrigin(t)
+
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+
+	addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) {
+		return origin, nil
+	})
+
+	client, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+
+	_, err = client.Write([]byte{0x00, 0x2a, 'n', 'o', 'p', 'e'})
+	require.NoError(t, err)
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(500*time.Millisecond)))
+	buf := make([]byte, 512)
+	for {
+		if _, err = client.Read(buf); err != nil {
+			break
+		}
+	}
+	require.Error(t, err)
+	assert.Empty(t, slices.Collect(p.Sessions()))
+}
+
+// A tunnel entry says to leave the connection alone, so bytes that would parse as HTTP go
+// through untouched rather than being intercepted on their Host header.
+func TestTransparent_RawTCPTunnelWinsOverHTTPParsing(t *testing.T) {
+	origin := tcpEchoOrigin(t)
+
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+	require.NoError(t, p.AddTunnel(origin.String()))
+
+	addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) {
+		return origin, nil
+	})
+
+	client, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+
+	request := "GET /secret HTTP/1.1\r\nHost: never-consulted.test\r\n\r\n"
+	_, err = client.Write([]byte(request))
+	require.NoError(t, err)
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
+	buf := make([]byte, len(request))
+	_, err = io.ReadFull(client, buf)
+	require.NoError(t, err)
+	assert.Equal(t, request, string(buf), "the origin must receive the request byte for byte")
+}
