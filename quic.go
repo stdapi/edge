@@ -213,7 +213,7 @@ type quicFlow struct {
 	// where its connection ID ends.
 	learned map[string]*quicRelay
 	// revoked refuses an origin in raw admission until its deadline. Only a policy close
-	// grows it, never the peer.
+	// adds an entry, never the peer, and an origin with a live relay never has one.
 	revoked map[netip.AddrPort]time.Time
 	lens    uint32
 }
