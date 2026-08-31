@@ -1025,8 +1025,11 @@ func (d *quicDemux) publishRawLocked(from netip.AddrPort, client net.Addr, relay
 		return false
 	}
 	// Re-checked under the lock, a revocation may have landed since raw admission looked.
-	if deadline, ok := flow.revoked[relay.key]; ok && time.Now().Before(deadline) {
-		return false
+	if deadline, ok := flow.revoked[relay.key]; ok {
+		if time.Now().Before(deadline) {
+			return false
+		}
+		delete(flow.revoked, relay.key)
 	}
 	if d.replier != nil {
 		reply, err := d.replySocketLocked(relay.key)
@@ -1482,25 +1485,8 @@ func (d *quicDemux) teardownRelay(from netip.AddrPort, relay *quicRelay, revoke 
 		d.mu.Unlock()
 		return
 	}
-	// Revoked even when a transport failure closed this relay first, but not when a newer
-	// relay holds the key, where the close is stale and stays the documented no-op.
 	if revoke {
-		if r := flow.relays[relay.key]; r == nil || r == relay {
-			if flow.revoked == nil {
-				flow.revoked = make(map[netip.AddrPort]time.Time)
-			}
-			if _, dup := flow.revoked[relay.key]; !dup && len(flow.revoked) >= maxRevokedPerFlow {
-				var victim netip.AddrPort
-				var soonest time.Time
-				for origin, deadline := range flow.revoked {
-					if !victim.IsValid() || deadline.Before(soonest) {
-						victim, soonest = origin, deadline
-					}
-				}
-				delete(flow.revoked, victim)
-			}
-			flow.revoked[relay.key] = time.Now().Add(quicRevokeTTL)
-		}
+		d.revokeLocked(flow, relay)
 	}
 	if relay.closed {
 		d.mu.Unlock()
@@ -1526,6 +1512,29 @@ func (d *quicDemux) teardownRelay(from netip.AddrPort, relay *quicRelay, revoke 
 	}
 	d.mu.Unlock()
 	_ = relay.upstream.Close()
+}
+
+// revokeLocked refuses the relay's origin in raw admission. It lands even when a transport
+// failure closed the relay first, but not when a newer relay holds the key, where the close
+// is stale and stays the documented no-op.
+func (d *quicDemux) revokeLocked(flow *quicFlow, relay *quicRelay) {
+	if r := flow.relays[relay.key]; r != nil && r != relay {
+		return
+	}
+	if flow.revoked == nil {
+		flow.revoked = make(map[netip.AddrPort]time.Time)
+	}
+	if _, dup := flow.revoked[relay.key]; !dup && len(flow.revoked) >= maxRevokedPerFlow {
+		var victim netip.AddrPort
+		var soonest time.Time
+		for origin, deadline := range flow.revoked {
+			if !victim.IsValid() || deadline.Before(soonest) {
+				victim, soonest = origin, deadline
+			}
+		}
+		delete(flow.revoked, victim)
+	}
+	flow.revoked[relay.key] = time.Now().Add(quicRevokeTTL)
 }
 
 func (d *quicDemux) dialUpstreamUDP(target Target, origin netip.AddrPort) (net.Conn, error) {
