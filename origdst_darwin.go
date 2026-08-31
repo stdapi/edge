@@ -8,6 +8,7 @@ package edge
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -51,6 +52,14 @@ const (
 // origDstExact stays false because DIOCNATLOOK keys on the client and proxy addresses
 // alone, ambiguous when one client port reaches two origins.
 const origDstExact = false
+
+// A pf rdr rule rewrites the destination and translates replies back itself, so there is no
+// transparent reply mode on this platform.
+func udpTransparentMode(*net.UDPConn) bool { return false }
+
+func listenTransparentReply(netip.AddrPort) (net.PacketConn, error) {
+	return nil, errors.New("edge: transparent replies are not implemented on this platform")
+}
 
 var (
 	pfOnce sync.Once

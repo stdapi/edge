@@ -901,3 +901,170 @@ func TestQUIC_RawUDPSessionEndsOnProxyClose(t *testing.T) {
 		t.Fatal("closing the proxy must end the raw session")
 	}
 }
+
+// tproxyOriginPacketConn stands in for a TPROXY socket: exact per datagram origins, reply
+// sockets that are plain loopback ones, and a shared socket that black-holes every direct
+// client write so a reply sneaking around the reply sockets fails the test.
+type tproxyOriginPacketConn struct {
+	net.PacketConn
+	origin  atomic.Value
+	replies chan net.Addr
+	direct  atomic.Int64
+}
+
+func newTProxyOriginPacketConn(pc net.PacketConn, origin netip.AddrPort) *tproxyOriginPacketConn {
+	c := &tproxyOriginPacketConn{PacketConn: pc, replies: make(chan net.Addr, 8)}
+	c.origin.Store(origin)
+	return c
+}
+
+func (c *tproxyOriginPacketConn) OriginalDestination(net.Addr) (netip.AddrPort, error) {
+	return c.origin.Load().(netip.AddrPort), nil
+}
+
+func (c *tproxyOriginPacketConn) exactOriginalDestination() bool { return true }
+
+func (c *tproxyOriginPacketConn) transparentReplies() bool { return true }
+
+func (c *tproxyOriginPacketConn) replySocket(netip.AddrPort) (net.PacketConn, error) {
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err == nil {
+		select {
+		case c.replies <- pc.LocalAddr():
+		default:
+		}
+	}
+	return pc, err
+}
+
+func (c *tproxyOriginPacketConn) WriteTo(b []byte, _ net.Addr) (int, error) {
+	c.direct.Add(1)
+	return len(b), nil
+}
+
+// startTProxyQUIC starts p on a loopback UDP port wrapped as a TPROXY socket, built before
+// the serving goroutine so the test may touch the wrapper freely.
+func startTProxyQUIC(t *testing.T, p *Proxy, origin netip.AddrPort) (*tproxyOriginPacketConn, netip.AddrPort) {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	wrapper := newTProxyOriginPacketConn(pc, origin)
+
+	go func() { _ = p.ServeQUIC(wrapper) }()
+	t.Cleanup(func() { _ = p.Close() })
+
+	addr, err := netip.ParseAddrPort(pc.LocalAddr().String())
+	require.NoError(t, err)
+	return wrapper, addr
+}
+
+func TestQUIC_TProxyRawRelayRepliesFromTheOrigin(t *testing.T) {
+	origin := udpEchoOrigin(t)
+
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(proxyCA))
+	require.NoError(t, err)
+	require.NoError(t, p.AddTunnel(origin.String()))
+
+	wrapper, proxyAddr := startTProxyQUIC(t, p, origin)
+
+	client, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+
+	payload := []byte("spoofed-return-path")
+	_, err = client.WriteTo(payload, net.UDPAddrFromAddrPort(proxyAddr))
+	require.NoError(t, err)
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
+	buf := make([]byte, 64)
+	n, from, err := client.ReadFrom(buf)
+	require.NoError(t, err)
+	assert.Equal(t, payload, buf[:n])
+
+	replyAddr := <-wrapper.replies
+	assert.Equal(t, replyAddr.String(), from.String(), "the reply must leave from the origin's socket")
+	assert.NotEqual(t, proxyAddr.String(), from.String())
+	assert.Zero(t, wrapper.direct.Load(), "nothing may write to a client through the shared socket")
+}
+
+func TestQUIC_TProxyInterceptRepliesFromTheOrigin(t *testing.T) {
+	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
+	require.NoError(t, err)
+	origin := h3Origin(t, originCA)
+
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+
+	upstream := DefaultTransport()
+	upstream.AllowHTTP3 = true
+	upstream.RootCAs = poolOf(originCA)
+
+	p, err := New(WithCA(proxyCA), WithTransport(upstream))
+	require.NoError(t, err)
+	p.MustAddInterceptor(nil, h3Authority+"/+{any}", func(c *Context) (*http.Response, error) {
+		return c.Forward()
+	})
+
+	wrapper, proxyAddr := startTProxyQUIC(t, p, origin)
+
+	tr := dialQUICTo(proxyAddr, poolOf(proxyCA))
+	defer func() { _ = tr.Close() }()
+
+	req, err := http.NewRequest(http.MethodGet,
+		fmt.Sprintf("https://%s:%d/echo", h3Authority, proxyAddr.Port()), nil)
+	require.NoError(t, err)
+
+	resp, err := tr.RoundTrip(req)
+	require.NoError(t, err)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Contains(t, string(body), "path=/echo")
+	assert.Zero(t, wrapper.direct.Load(), "every handshake byte must leave from the origin's socket")
+}
+
+// The terminating server's writes are addressed by client alone, so under TPROXY one client
+// socket holds one intercepted origin and a connection towards a second is dropped.
+func TestQUIC_TProxySecondInterceptedOriginIsRefused(t *testing.T) {
+	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
+	require.NoError(t, err)
+	first := h3Origin(t, originCA)
+	second := h3Origin(t, originCA, "second.test")
+
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+
+	upstream := DefaultTransport()
+	upstream.AllowHTTP3 = true
+	upstream.RootCAs = poolOf(originCA)
+
+	p, err := New(WithCA(proxyCA), WithTransport(upstream))
+	require.NoError(t, err)
+	p.MustAddInterceptor(nil, h3Authority+"/+{any}", func(c *Context) (*http.Response, error) {
+		return c.Forward()
+	})
+	p.MustAddInterceptor(nil, "second.test/+{any}", func(c *Context) (*http.Response, error) {
+		return c.Forward()
+	})
+
+	wrapper, proxyAddr := startTProxyQUIC(t, p, first)
+
+	clientPC, err := net.ListenUDP("udp", nil)
+	require.NoError(t, err)
+	tr := &quic.Transport{Conn: clientPC}
+	defer func() { _ = tr.Close(); _ = clientPC.Close() }()
+
+	connA := dialSharedQUIC(t, tr, proxyAddr, h3Authority, poolOf(proxyCA))
+	defer func() { _ = connA.CloseWithError(0, "") }()
+
+	wrapper.origin.Store(second)
+	_, err = tr.Dial(t.Context(), net.UDPAddrFromAddrPort(proxyAddr), &tls.Config{
+		ServerName: "second.test",
+		RootCAs:    poolOf(proxyCA),
+		NextProtos: []string{"h3"},
+		MinVersion: tls.VersionTLS13,
+	}, &quic.Config{HandshakeIdleTimeout: time.Second})
+	require.Error(t, err, "a second intercepted origin on one client socket must be refused")
+}

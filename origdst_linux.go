@@ -7,10 +7,12 @@
 package edge
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"net"
 	"net/netip"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -111,6 +113,51 @@ func setTransparentPacketOptions(c *net.UDPConn) error {
 		return fmt.Errorf("edge: IP_RECVORIGDSTADDR: %w", errV4)
 	}
 	return nil
+}
+
+// udpTransparentMode reports whether the socket carries IP_TRANSPARENT, the mark of a
+// TPROXY deployment.
+func udpTransparentMode(c *net.UDPConn) bool {
+	raw, err := c.SyscallConn()
+	if err != nil {
+		return false
+	}
+	var on bool
+	_ = raw.Control(func(fd uintptr) {
+		if v, verr := unix.GetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_TRANSPARENT); verr == nil && v == 1 {
+			on = true
+			return
+		}
+		if v, verr := unix.GetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_TRANSPARENT); verr == nil && v == 1 {
+			on = true
+		}
+	})
+	return on
+}
+
+// listenTransparentReply opens the socket replies to one origin leave from: bound to the
+// foreign address itself, which IP_TRANSPARENT permits, so the client sees them come from
+// where it sent. SO_REUSEADDR lets several demuxes answer for one origin.
+func listenTransparentReply(origin netip.AddrPort) (net.PacketConn, error) {
+	lc := net.ListenConfig{Control: func(_, _ string, c syscall.RawConn) error {
+		var optErr error
+		ctrlErr := c.Control(func(fd uintptr) {
+			optErr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_REUSEADDR, 1)
+			if optErr != nil {
+				return
+			}
+			if origin.Addr().Unmap().Is4() {
+				optErr = unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_TRANSPARENT, 1)
+			} else {
+				optErr = unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_TRANSPARENT, 1)
+			}
+		})
+		if ctrlErr != nil {
+			return ctrlErr
+		}
+		return optErr
+	}}
+	return lc.ListenPacket(context.Background(), "udp", origin.String())
 }
 
 // originalDstFromOOB reads the address netfilter recorded for a redirected datagram. The zero

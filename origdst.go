@@ -36,6 +36,14 @@ type PacketOriginalDestination interface {
 	OriginalDestination(remote net.Addr) (netip.AddrPort, error)
 }
 
+// transparentReplier is a packet conn whose deployment delivers datagrams with their
+// destination intact, TPROXY, so a reply must leave from that destination or the client's
+// connected socket drops it.
+type transparentReplier interface {
+	transparentReplies() bool
+	replySocket(origin netip.AddrPort) (net.PacketConn, error)
+}
+
 // TransparentListener returns ln with every accepted connection able to report where it was
 // headed before the redirect. [Proxy.ListenAndServeTransparent] wraps the listener it opens,
 // so this is for a listener of your own.
@@ -73,8 +81,12 @@ func (c transparentConn) CloseWrite() error { return closeWrite(c.Conn) }
 // redirect does not preserve that address, so there connections are placed by their server
 // name and [Session.Upstream] reports nothing.
 //
-// It needs a *net.UDPConn, and on Linux an nftables or an iptables redirect, on macOS an rdr
-// rule in pf with read access to /dev/pf. No other platform is supported.
+// On a Linux socket carrying IP_TRANSPARENT, behind a TPROXY rule, every datagram keeps the
+// address it was headed to and replies are sent from that address, which needs the
+// CAP_NET_ADMIN or CAP_NET_RAW capability.
+//
+// It needs a *net.UDPConn, and on Linux an nftables or an iptables redirect or TPROXY rule,
+// on macOS an rdr rule in pf with read access to /dev/pf. No other platform is supported.
 func TransparentPacketConn(pc net.PacketConn) (net.PacketConn, error) {
 	udp, ok := pc.(*net.UDPConn)
 	if !ok {
@@ -88,6 +100,7 @@ func TransparentPacketConn(pc net.PacketConn) (net.PacketConn, error) {
 		UDPConn: udp,
 		oob:     make([]byte, transparentOOBSize),
 		local:   addrPort(udp.LocalAddr()),
+		tproxy:  udpTransparentMode(udp),
 	}, nil
 }
 
@@ -102,6 +115,9 @@ type transparentPacketConn struct {
 	dst  netip.AddrPort
 	oob  []byte
 	mu   sync.Mutex
+	// tproxy is set when the socket carries IP_TRANSPARENT, so nothing rewrites replies on
+	// their way back and they must leave from the origin's own address.
+	tproxy bool
 }
 
 func (c *transparentPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
@@ -134,4 +150,11 @@ func (c *transparentPacketConn) OriginalDestination(remote net.Addr) (netip.Addr
 // rather than looked up by address.
 func (c *transparentPacketConn) exactOriginalDestination() bool { return origDstExact }
 
+func (c *transparentPacketConn) transparentReplies() bool { return c.tproxy }
+
+func (c *transparentPacketConn) replySocket(origin netip.AddrPort) (net.PacketConn, error) {
+	return listenTransparentReply(origin)
+}
+
 var _ PacketOriginalDestination = (*transparentPacketConn)(nil)
+var _ transparentReplier = (*transparentPacketConn)(nil)
