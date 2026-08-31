@@ -295,7 +295,7 @@ func (s *Session) Action() Action { return s.action }
 // the same origin, which then re-handshake and are decided again. The orphaned datagrams of
 // the closed connections are dropped for up to a minute rather than re-admitted, and closing
 // a raw UDP session drops its client's datagrams the same way. The drop applies even to a
-// session that already ended, unless its destination was decided again since.
+// session that already ended, unless a newer connection to its destination is live.
 func (s *Session) Close() error {
 	if s.closer == nil {
 		return nil
