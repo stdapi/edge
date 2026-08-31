@@ -47,9 +47,9 @@ type server struct {
 	// sessions is what [Proxy.Sessions] reports. A session enters it only once its target is
 	// resolved, so a caller never sees one it cannot pass to [Proxy.ActionFor].
 	sessions map[*Session]struct{}
-	// quics tracks the QUIC demultiplexers. Their peers own their sessions under a separate
-	// lock, merged when the sessions are read rather than mirrored here, so no invariant
-	// spans the two locks.
+	// quics tracks the QUIC demultiplexers. Their connections own their sessions under a
+	// separate lock, merged when the sessions are read rather than mirrored here, so no
+	// invariant spans the two locks.
 	quics    map[*quicDemux]struct{}
 	closed   chan struct{}
 	wg       sync.WaitGroup
@@ -411,8 +411,8 @@ func (p *Proxy) Sessions() iter.Seq[*Session] {
 	}
 	p.srv.mu.Unlock()
 
-	// A demux owns its peers under a lock of its own, taken here only once the server lock
-	// is released, so the two are never held at once.
+	// A demux owns its connections under a lock of its own, taken here only once the server
+	// lock is released, so the two are never held at once.
 	for _, d := range demuxes {
 		out = d.appendSessions(out)
 	}

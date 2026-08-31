@@ -68,8 +68,10 @@ func (c transparentConn) OriginalDestination() (netip.AddrPort, error) {
 // CloseWrite forwards the half-close, which the embedded net.Conn does not promote.
 func (c transparentConn) CloseWrite() error { return closeWrite(c.Conn) }
 
-// TransparentPacketConn returns pc with the socket options a redirected datagram needs. The
-// connection reports where each datagram was headed and [Proxy.ServeQUIC] reads it back.
+// TransparentPacketConn returns pc with the socket options a redirected datagram needs, so
+// [Proxy.ServeQUIC] can place each datagram by the address it was headed to. A Linux
+// redirect does not preserve that address, so there connections are placed by their server
+// name and [Session.Upstream] reports nothing.
 //
 // It needs a *net.UDPConn, and on Linux an nftables or an iptables redirect, on macOS an rdr
 // rule in pf with read access to /dev/pf. No other platform is supported.

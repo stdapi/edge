@@ -271,8 +271,8 @@ func dialQUICTo(addr netip.AddrPort, roots *x509.CertPool) *http3.Transport {
 	}
 }
 
-// A tunneled QUIC peer is decided once, when its ClientHello is read, and never again, so it
-// needs a session of its own for a sweep to reach it.
+// A tunneled QUIC connection is decided once, when its ClientHello is read, and never again,
+// so it needs a session of its own for a sweep to reach it.
 func TestQUIC_TunnelSessionIsListedAndClosed(t *testing.T) {
 	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
 	require.NoError(t, err)
@@ -311,7 +311,7 @@ func TestQUIC_TunnelSessionIsListedAndClosed(t *testing.T) {
 	assert.Empty(t, slices.Collect(p.Sessions()), "closing removes the peer under the demux lock")
 }
 
-// The proxy terminated the connection of an intercepted QUIC peer, so closing its session goes
+// The proxy terminated an intercepted QUIC connection itself, so closing its session goes
 // through CloseWithError rather than leaving the client to time out. What the client
 // then observes is not asserted, an http3.Transport is free to redial on its own.
 func TestQUIC_InterceptedSessionIsListedAndClosed(t *testing.T) {
@@ -359,7 +359,7 @@ func TestQUIC_InterceptedSessionIsListedAndClosed(t *testing.T) {
 }
 
 // A handler waiting on the session context has to be released when the session ends. A QUIC
-// peer owns its own, since nothing upstream of it cancels one.
+// connection owns its own, since nothing upstream of it cancels one.
 func TestQUIC_SessionContextEndsWithTheSession(t *testing.T) {
 	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
 	require.NoError(t, err)
@@ -608,9 +608,8 @@ func TestQUIC_CIDTagRecognizesOnlyItsOwnIDs(t *testing.T) {
 	assert.False(t, tag.matches(make([]byte, 20)))
 }
 
-// The session context of an intercepted QUIC peer follows the connection. A client that
-// closes it and leaves ends the context right away, not two minutes later when the idle
-// sweep gets to the peer.
+// The session context of an intercepted QUIC connection follows the connection. A client
+// that closes it and leaves ends the context right away rather than through a sweep.
 func TestQUIC_SessionContextEndsWhenTheClientLeaves(t *testing.T) {
 	proxyCA, err := GenerateCA()
 	require.NoError(t, err)

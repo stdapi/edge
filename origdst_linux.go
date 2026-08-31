@@ -20,8 +20,9 @@ import (
 // x/sys/unix does not export it.
 const ip6tSoOriginalDst = 80
 
-// origDstExact reports that the destination comes from the control message attached to each
-// datagram, so origins interleaving on one socket cannot be told wrong.
+// origDstExact reports that the destination is read from the control message attached to
+// each datagram. A redirect rewrites it before delivery, so the exact path only sees the
+// listener's own address there and stays dormant.
 const origDstExact = true
 
 // originalDstSocket asks netfilter, through the socket, which address the connection was

@@ -90,10 +90,12 @@ func (p *Proxy) ListenAndServeQUIC(addr string) error {
 // with a minted certificate and served over HTTP/3. One client socket may multiplex several
 // connections.
 //
-// Under Encrypted Client Hello only the outer server name is visible to the decision. QUIC
-// versions other than v1 and v2 are rejected. A tunneled client that changes address in
-// flight has to re-handshake. Tunneling more than one origin per client socket needs the
-// per-datagram destinations of [TransparentPacketConn] on Linux and degrades elsewhere.
+// Under Encrypted Client Hello the decision sees the outer server name only. QUIC versions
+// other than v1 and v2 are rejected. A tunneled client that changes address in flight has
+// to re-handshake. Behind a Linux redirect a client may tunnel several origins from one
+// socket. On macOS, and when pc is not wrapped in [TransparentPacketConn], a client socket
+// supports one tunneled origin, and connections to further origins drop shortly after
+// their handshake.
 func (p *Proxy) ServeQUIC(pc net.PacketConn) error {
 	if p.srv.closing.Load() {
 		return ErrProxyClosed
@@ -191,8 +193,7 @@ type quicConn struct {
 	cancel context.CancelFunc
 	relay  *quicRelay
 
-	odcid  string
-	target Target
+	odcid string
 	// origin is where the client was headed, resolved from the opening datagram since no
 	// later one can answer it.
 	origin       netip.AddrPort
@@ -773,6 +774,20 @@ func (d *quicDemux) originalDst(client net.Addr) netip.AddrPort {
 	return redirectedTo(origin, d.pc.LocalAddr())
 }
 
+// newQUICSession builds the session of one QUIC connection. The upstream is the address the
+// client was headed to, not a fresh resolution of the authority, which behind a redirect
+// may not resolve at all.
+func (d *quicDemux) newQUICSession(from netip.AddrPort, client net.Addr, conn *quicConn, target Target, action Action) (*Session, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	sess := newSession(ctx, nil, target, action, HTTP3)
+	sess.remoteAddr = client
+	sess.localAddr = d.pc.LocalAddr()
+	sess.transparent = true
+	sess.upstream = conn.origin
+	sess.closer = &quicConnCloser{d: d, flow: from, odcid: conn.odcid}
+	return sess, cancel
+}
+
 func (d *quicDemux) beginIntercept(from netip.AddrPort, client net.Addr, conn *quicConn, target Target, pending [][]byte) {
 	if err := d.startInterception(); err != nil {
 		if !errors.Is(err, ErrProxyClosed) {
@@ -782,15 +797,7 @@ func (d *quicDemux) beginIntercept(from netip.AddrPort, client net.Addr, conn *q
 		return
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	sess := newSession(ctx, nil, target, Intercept, HTTP3)
-	sess.remoteAddr = client
-	sess.localAddr = d.pc.LocalAddr()
-	sess.transparent = true
-	// Forwarding goes back to the address the client was headed to, not to a fresh
-	// resolution of the authority, which behind a redirect may not resolve at all.
-	sess.upstream = conn.origin
-	sess.closer = &quicConnCloser{d: d, flow: from, odcid: conn.odcid}
+	sess, cancel := d.newQUICSession(from, client, conn, target, Intercept)
 
 	d.mu.Lock()
 	flow := d.flows[from]
@@ -809,7 +816,6 @@ func (d *quicDemux) beginIntercept(from netip.AddrPort, client net.Addr, conn *q
 		return
 	}
 	d.setStateLocked(conn, connIntercepted)
-	conn.target = target
 	conn.pending = nil
 	conn.pendingBytes = 0
 	conn.sess = sess
@@ -830,16 +836,10 @@ func (d *quicDemux) beginIntercept(from netip.AddrPort, client net.Addr, conn *q
 }
 
 func (d *quicDemux) beginTunnel(from netip.AddrPort, client net.Addr, conn *quicConn, target Target, pending [][]byte) {
-	ctx, cancel := context.WithCancel(context.Background())
-	sess := newSession(ctx, nil, target, Tunnel, HTTP3)
-	sess.remoteAddr = client
-	sess.localAddr = d.pc.LocalAddr()
-	sess.transparent = true
-	sess.upstream = conn.origin
-	sess.closer = &quicConnCloser{d: d, flow: from, odcid: conn.odcid}
+	sess, cancel := d.newQUICSession(from, client, conn, target, Tunnel)
 
 	d.mu.Lock()
-	relay, ok := d.placeTunnelLocked(from, conn, conn.origin, nil, sess, cancel, target)
+	relay, ok := d.placeTunnelLocked(from, conn, conn.origin, nil, sess, cancel)
 	d.mu.Unlock()
 	if !ok {
 		cancel()
@@ -855,7 +855,7 @@ func (d *quicDemux) beginTunnel(from netip.AddrPort, client net.Addr, conn *quic
 			return
 		}
 		d.mu.Lock()
-		relay, ok = d.placeTunnelLocked(from, conn, addrPort(upstream.RemoteAddr()), upstream, sess, cancel, target)
+		relay, ok = d.placeTunnelLocked(from, conn, addrPort(upstream.RemoteAddr()), upstream, sess, cancel)
 		d.mu.Unlock()
 		if !ok {
 			_ = upstream.Close()
@@ -889,7 +889,7 @@ func (d *quicDemux) beginTunnel(from netip.AddrPort, client net.Addr, conn *quic
 // the caller when it returns no relay with ok true. The draining check, the relay start and
 // the placement share one critical section, so a shutdown refuses all of it or sweeps all
 // of it.
-func (d *quicDemux) placeTunnelLocked(from netip.AddrPort, conn *quicConn, key netip.AddrPort, upstream net.Conn, sess *Session, cancel context.CancelFunc, target Target) (*quicRelay, bool) {
+func (d *quicDemux) placeTunnelLocked(from netip.AddrPort, conn *quicConn, key netip.AddrPort, upstream net.Conn, sess *Session, cancel context.CancelFunc) (*quicRelay, bool) {
 	flow := d.flows[from]
 	if flow == nil || flow.conns[conn.odcid] != conn || conn.state != connSniffing {
 		return nil, false
@@ -915,7 +915,6 @@ func (d *quicDemux) placeTunnelLocked(from netip.AddrPort, conn *quicConn, key n
 	}
 
 	d.setStateLocked(conn, connTunneling)
-	conn.target = target
 	conn.pending = nil
 	conn.pendingBytes = 0
 	conn.sess = sess

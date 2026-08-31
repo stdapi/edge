@@ -147,7 +147,8 @@ type Session struct {
 	localAddr  net.Addr
 	ctx        context.Context
 	// closer ends the connection. Each listener sets its own, a connection, a CONNECT stream,
-	// or the bookkeeping a QUIC peer needs, before the session is registered and never after.
+	// or the bookkeeping a QUIC connection needs, before the session is registered and never
+	// after.
 	closer   io.Closer
 	closeErr error
 	// tlsState is atomic because the QUIC path fills it in once the handshake reaches the
