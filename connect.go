@@ -100,7 +100,11 @@ func (p *Proxy) connectHijack(w http.ResponseWriter, r *http.Request, target Tar
 		if werr := writeRawStatus(brw, http.StatusOK, ""); werr != nil {
 			return
 		}
-		if _, _, terr := tunnel(conn, upstream, p.cfg.server.tunnelIdleTimeout); terr != nil {
+		client := net.Conn(conn)
+		if p.cfg.rejectECH {
+			client = newECHGate(conn)
+		}
+		if _, _, terr := tunnel(client, upstream, p.cfg.server.tunnelIdleTimeout); terr != nil {
 			p.logf(r.Context(), slog.LevelDebug, "tunnel closed", sess, terr)
 		}
 		return
@@ -111,7 +115,16 @@ func (p *Proxy) connectHijack(w http.ResponseWriter, r *http.Request, target Tar
 	if werr := writeRawStatus(brw, http.StatusOK, ""); werr != nil {
 		return
 	}
-	if ierr := p.intercept(r.Context(), conn, sess); ierr != nil {
+	pc := conn
+	if p.cfg.rejectECH {
+		// The reader behind conn is sized for requests, not for a full ClientHello.
+		pc = newPeekConnSize(conn, clientHelloPeekSize)
+		if err := inspectECH(pc); err != nil {
+			p.logf(r.Context(), slog.LevelDebug, "intercepted connection closed", sess, err)
+			return
+		}
+	}
+	if ierr := p.intercept(r.Context(), pc, sess); ierr != nil {
 		p.logf(r.Context(), slog.LevelDebug, "intercepted connection closed", sess, ierr)
 	}
 }
@@ -171,7 +184,11 @@ func (p *Proxy) connectStream(w http.ResponseWriter, r *http.Request, target Tar
 		w.WriteHeader(http.StatusOK)
 		_ = http.NewResponseController(w).Flush()
 
-		if _, _, terr := tunnel(stream, upstream, p.cfg.server.tunnelIdleTimeout); terr != nil {
+		client := net.Conn(stream)
+		if p.cfg.rejectECH {
+			client = newECHGate(stream)
+		}
+		if _, _, terr := tunnel(client, upstream, p.cfg.server.tunnelIdleTimeout); terr != nil {
 			p.logf(r.Context(), slog.LevelDebug, "tunnel closed", sess, terr)
 		}
 		return
@@ -180,7 +197,15 @@ func (p *Proxy) connectStream(w http.ResponseWriter, r *http.Request, target Tar
 	w.WriteHeader(http.StatusOK)
 	_ = http.NewResponseController(w).Flush()
 
-	if err := p.intercept(r.Context(), newPeekConn(stream, nil), sess); err != nil {
+	pc := newPeekConn(stream, nil)
+	if p.cfg.rejectECH {
+		pc = newPeekConnSize(stream, clientHelloPeekSize)
+		if err := inspectECH(pc); err != nil {
+			p.logf(r.Context(), slog.LevelDebug, "intercepted stream closed", sess, err)
+			return
+		}
+	}
+	if err := p.intercept(r.Context(), pc, sess); err != nil {
 		p.logf(r.Context(), slog.LevelDebug, "intercepted stream closed", sess, err)
 	}
 }

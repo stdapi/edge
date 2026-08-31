@@ -174,7 +174,19 @@ func (p *Proxy) serveTransparentRaw(ctx context.Context, conn *peekConn, origin 
 // serveTransparentTLS reads the server name out of the ClientHello without consuming it,
 // decides what to do with the connection, and either relays it untouched or terminates it.
 func (p *Proxy) serveTransparentTLS(ctx context.Context, conn *peekConn, origin netip.AddrPort) error {
-	hello, _ := peekClientHello(conn.r)
+	raw, rerr := peekHandshakeRecords(conn.r)
+	if p.cfg.rejectECH {
+		if rerr != nil {
+			return errECHUnverifiable
+		}
+		if err := checkECH(raw); err != nil {
+			return err
+		}
+	}
+	var hello *ClientHello
+	if rerr == nil {
+		hello = clientHelloFromRecords(raw)
+	}
 
 	target := Target{Scheme: "https"}
 	if hello != nil && hello.ServerName != "" {
@@ -286,19 +298,6 @@ func (p *Proxy) dialTransparentUpstream(ctx context.Context, target Target, orig
 	return p.dialUpstream(ctx, target)
 }
 
-// peekClientHello parses the TLS ClientHello waiting in br without consuming it, so the
-// handshake can still be completed by whatever ends up owning the connection.
-func peekClientHello(br *bufio.Reader) (*ClientHello, error) {
-	raw, err := peekHandshakeRecords(br)
-	if err != nil {
-		return nil, err
-	}
-	if captured := clientHelloFromRecords(raw); captured != nil {
-		return captured, nil
-	}
-	return nil, errors.New("edge: no ClientHello in the peeked bytes")
-}
-
 // clientHelloFromRecords parses the TLS records in raw and returns what the client offered,
 // or nil when they hold no ClientHello. Go's own TLS server does the parsing, since a
 // hand-rolled parser would have to keep up with every extension a client may add, and would
@@ -350,6 +349,11 @@ func peekHandshakeRecords(br *bufio.Reader) ([]byte, error) {
 		next, err := br.Peek(total + recordHeader)
 		if err != nil {
 			return nil, fmt.Errorf("peek TLS record: %w", err)
+		}
+		if next[total] != tlsHandshakeRecord {
+			// Counting another record type into the message would build a ClientHello the
+			// origin's record layer never assembles.
+			return nil, errors.New("edge: non-handshake record inside the ClientHello")
 		}
 		length := int(next[total+3])<<8 | int(next[total+4])
 		total += recordHeader + length

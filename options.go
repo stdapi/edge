@@ -218,6 +218,19 @@ func WithRegexpParam(enable bool) ProxyOption {
 	})
 }
 
+// WithRejectECH refuses every connection offering the TLS Encrypted Client Hello
+// extension, tunneled and intercepted alike, and every TLS connection whose ClientHello
+// the proxy cannot read. ECH hides the real server name from the proxy, so the visible
+// name no longer says where the connection goes. Chrome offers the extension on most
+// connections by default, as a decoy, so enabling this refuses a stock Chrome client.
+// It is off by default.
+func WithRejectECH(enable bool) ProxyOption {
+	return optionFunc(func(s sealedOption) error {
+		s.proxy.cfg.rejectECH = enable
+		return nil
+	})
+}
+
 // WithMaxPatternParams bounds how many parameters a pattern may declare. It defaults to 255.
 func WithMaxPatternParams(n uint8) ProxyOption {
 	return optionFunc(func(s sealedOption) error {

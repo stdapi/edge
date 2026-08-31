@@ -94,7 +94,8 @@ func (p *Proxy) ListenAndServeQUIC(addr string) error {
 // with a minted certificate and served over HTTP/3. One client socket may multiplex several
 // connections.
 //
-// Under Encrypted Client Hello the decision sees the outer server name only. QUIC versions
+// Under Encrypted Client Hello the decision sees the outer server name only, unless
+// [WithRejectECH] refuses such connections. QUIC versions
 // other than v1 and v2 are rejected. A tunneled client that changes address in flight has
 // to re-handshake. Behind a Linux redirect a client may tunnel several origins from one
 // socket. Behind a Linux TPROXY rule every datagram reports its exact destination, replies
@@ -980,6 +981,18 @@ func (d *quicDemux) sniff(from netip.AddrPort, conn *quicConn, datagram []byte) 
 
 	if hello == nil {
 		return // still arriving
+	}
+
+	if d.p.cfg.rejectECH {
+		offered, ok := offersECH(hello)
+		if !ok {
+			d.rejectConn(from, conn, "ClientHello cannot be checked for Encrypted Client Hello")
+			return
+		}
+		if offered {
+			d.rejectConn(from, conn, "ClientHello offers Encrypted Client Hello")
+			return
+		}
 	}
 
 	ch := clientHelloFromQUIC(hello)

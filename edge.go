@@ -89,6 +89,7 @@ type config struct {
 
 	handleSlash TrailingSlashOption
 	allowRegexp bool
+	rejectECH   bool
 }
 
 func newConfig() *config {
