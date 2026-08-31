@@ -292,9 +292,9 @@ func (s *Session) Action() Action { return s.action }
 // Closing a connection that already ended is a no-op.
 //
 // Closing a tunneled QUIC connection also closes the connections the same client tunnels to
-// the same origin, which then re-handshake and are decided again. After closing a QUIC or
-// raw UDP session, datagrams the client keeps sending to that destination are dropped for a
-// minute.
+// the same origin, which then re-handshake and are decided again. The datagrams of the
+// closed connections are dropped for up to a minute, a closed raw UDP session's the same
+// way.
 func (s *Session) Close() error {
 	if s.closer == nil {
 		return nil

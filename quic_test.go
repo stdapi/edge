@@ -952,16 +952,18 @@ func TestQUIC_RawUDPSessionCloseBarsReadmission(t *testing.T) {
 
 	// Backdating the deadline stands in for its expiry.
 	from := netip.MustParseAddrPort(client.LocalAddr().String())
+	revoked := 0
 	d.mu.Lock()
 	flow := d.flows[from]
 	if flow != nil {
-		require.Len(t, flow.revoked, 1)
+		revoked = len(flow.revoked)
 		for o := range flow.revoked {
 			flow.revoked[o] = time.Now().Add(-time.Second)
 		}
 	}
 	d.mu.Unlock()
 	require.NotNil(t, flow)
+	require.Equal(t, 1, revoked)
 
 	_, err = client.Write([]byte("fresh"))
 	require.NoError(t, err)
@@ -970,6 +972,62 @@ func TestQUIC_RawUDPSessionCloseBarsReadmission(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "fresh", string(buf[:n]))
 	waitForSessions(t, p, 1)
+}
+
+// With exact per datagram destinations, closing one origin's session refuses that origin
+// alone and the flow's other relay keeps going.
+func TestQUIC_RawUDPSessionClosePerOrigin(t *testing.T) {
+	originA := udpEchoOrigin(t)
+	originB := udpEchoOrigin(t)
+
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(proxyCA))
+	require.NoError(t, err)
+	p.MustAddTunnel("+{any}")
+
+	proxyAddr := serveQUIC(t, p, func(pc net.PacketConn) net.PacketConn {
+		return &payloadOriginPacketConn{PacketConn: pc}
+	})
+
+	client, err := net.Dial("udp", proxyAddr.String())
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+
+	buf := make([]byte, 64)
+	for _, origin := range []netip.AddrPort{originA, originB} {
+		payload := rawPayloadFor(origin)
+		_, err = client.Write(payload)
+		require.NoError(t, err)
+		require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
+		n, rerr := client.Read(buf)
+		require.NoError(t, rerr)
+		assert.Equal(t, payload, buf[:n])
+	}
+
+	var sessA *Session
+	for _, sess := range waitForSessions(t, p, 2) {
+		if sess.Upstream() == originA {
+			sessA = sess
+		}
+	}
+	require.NotNil(t, sessA)
+	require.NoError(t, sessA.Close())
+
+	_, err = client.Write(rawPayloadFor(originA))
+	require.NoError(t, err)
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(300*time.Millisecond)))
+	_, err = client.Read(buf)
+	require.Error(t, err, "the closed origin must be refused")
+
+	payload := rawPayloadFor(originB)
+	_, err = client.Write(payload)
+	require.NoError(t, err)
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
+	n, err := client.Read(buf)
+	require.NoError(t, err, "the other origin's relay must keep going")
+	assert.Equal(t, payload, buf[:n])
+	assert.Len(t, slices.Collect(p.Sessions()), 1)
 }
 
 // Closing a tunneled QUIC session leaves the client's connection sending datagrams no

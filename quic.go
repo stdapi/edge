@@ -66,6 +66,8 @@ const (
 	// which has no connection, so the bound sits on the relays themselves.
 	maxRelaysPerFlow = 16
 	maxRelays        = 1024
+	// Revocations outlive their relay, so maxRelaysPerFlow does not bound them.
+	maxRevokedPerFlow = 64
 	// maxIntercepts bounds the terminating stacks, one per origin under TPROXY, each
 	// queueing up to interceptQueue datagrams of maxUDPPayload (the shared stack of the
 	// other paths four times as many). quicInterceptTTL reaps a stack no connection has
@@ -1476,15 +1478,31 @@ func (d *quicDemux) revokeRelay(from netip.AddrPort, relay *quicRelay) {
 func (d *quicDemux) teardownRelay(from netip.AddrPort, relay *quicRelay, revoke bool) {
 	d.mu.Lock()
 	flow := d.flows[from]
-	if flow == nil || relay.closed {
+	if flow == nil {
 		d.mu.Unlock()
 		return
 	}
+	// Revoked even when a transport failure closed the relay first, the revocation being
+	// about the destination, not this relay.
 	if revoke {
 		if flow.revoked == nil {
 			flow.revoked = make(map[netip.AddrPort]time.Time)
 		}
+		if len(flow.revoked) >= maxRevokedPerFlow {
+			var victim netip.AddrPort
+			var soonest time.Time
+			for origin, deadline := range flow.revoked {
+				if soonest.IsZero() || deadline.Before(soonest) {
+					victim, soonest = origin, deadline
+				}
+			}
+			delete(flow.revoked, victim)
+		}
 		flow.revoked[relay.key] = time.Now().Add(quicRevokeTTL)
+	}
+	if relay.closed {
+		d.mu.Unlock()
+		return
 	}
 	relay.closed = true
 	delete(flow.relays, relay.key)
