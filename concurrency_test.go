@@ -111,7 +111,7 @@ func TestConcurrency_AuthorityMutationDuringTraffic(t *testing.T) {
 			default:
 			}
 			pattern := fmt.Sprintf("churn-%d.example.test", i%32)
-			if err := p.AddTunnel(pattern); err != nil {
+			if _, err := p.AddTunnel(pattern); err != nil {
 				continue
 			}
 			if _, err := p.DeleteTunnel(pattern); err != nil {

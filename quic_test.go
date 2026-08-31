@@ -171,7 +171,7 @@ func TestQUIC_TunnelWithCurl(t *testing.T) {
 
 	p, err := New(WithCA(proxyCA))
 	require.NoError(t, err)
-	require.NoError(t, p.AddTunnel(h3Authority))
+	p.MustAddTunnel(h3Authority)
 
 	// On every other authority: the tunnel is the more precise entry and decides first.
 	// An interceptor on the tunneled authority itself is refused, since it could never run.
@@ -283,7 +283,7 @@ func TestQUIC_TunnelSessionIsListedAndClosed(t *testing.T) {
 	require.NoError(t, err)
 	p, err := New(WithCA(proxyCA))
 	require.NoError(t, err)
-	require.NoError(t, p.AddTunnel(h3Authority))
+	p.MustAddTunnel(h3Authority)
 
 	proxyAddr := startQUICRedirected(t, p, origin)
 
@@ -376,7 +376,7 @@ func TestQUIC_SessionContextEndsWithTheSession(t *testing.T) {
 	require.NoError(t, err)
 	p, err := New(WithCA(proxyCA))
 	require.NoError(t, err)
-	require.NoError(t, p.AddTunnel(h3Authority))
+	p.MustAddTunnel(h3Authority)
 
 	proxyAddr := startQUICRedirected(t, p, origin)
 	tr := dialQUICTo(proxyAddr, poolOf(originCA))
@@ -507,8 +507,8 @@ func TestQUIC_TunnelSiblingsShareOneRelayAndCloseTogether(t *testing.T) {
 	require.NoError(t, err)
 	p, err := New(WithCA(proxyCA))
 	require.NoError(t, err)
-	require.NoError(t, p.AddTunnel("a.example.test"))
-	require.NoError(t, p.AddTunnel("b.example.test"))
+	p.MustAddTunnel("a.example.test")
+	p.MustAddTunnel("b.example.test")
 
 	proxyAddr := startQUICRedirected(t, p, origin)
 
@@ -713,7 +713,7 @@ func TestQUIC_RawUDPTunnelByDestination(t *testing.T) {
 	require.NoError(t, err)
 	p, err := New(WithCA(proxyCA))
 	require.NoError(t, err)
-	require.NoError(t, p.AddTunnel(origin.String()))
+	p.MustAddTunnel(origin.String())
 
 	proxyAddr := startQUICRedirected(t, p, origin)
 
@@ -817,7 +817,7 @@ func TestQUIC_RawUDPWildcardTunnel(t *testing.T) {
 	require.NoError(t, err)
 	p, err := New(WithCA(proxyCA))
 	require.NoError(t, err)
-	require.NoError(t, p.AddTunnel("+{any}"))
+	p.MustAddTunnel("+{any}")
 
 	proxyAddr := startQUICRedirected(t, p, origin)
 
@@ -839,7 +839,7 @@ func TestQUIC_RawUDPRelayCapPerFlow(t *testing.T) {
 	require.NoError(t, err)
 	p, err := New(WithCA(proxyCA))
 	require.NoError(t, err)
-	require.NoError(t, p.AddTunnel("+{any}"))
+	p.MustAddTunnel("+{any}")
 
 	origins := make([]netip.AddrPort, maxRelaysPerFlow+1)
 	for i := range origins {
@@ -880,7 +880,7 @@ func TestQUIC_RawUDPSessionEndsOnProxyClose(t *testing.T) {
 	require.NoError(t, err)
 	p, err := New(WithCA(proxyCA))
 	require.NoError(t, err)
-	require.NoError(t, p.AddTunnel(origin.String()))
+	p.MustAddTunnel(origin.String())
 
 	proxyAddr := startQUICRedirected(t, p, origin)
 
@@ -966,7 +966,7 @@ func TestQUIC_TProxyRawRelayRepliesFromTheOrigin(t *testing.T) {
 	require.NoError(t, err)
 	p, err := New(WithCA(proxyCA))
 	require.NoError(t, err)
-	require.NoError(t, p.AddTunnel(origin.String()))
+	p.MustAddTunnel(origin.String())
 
 	wrapper, proxyAddr := startTProxyQUIC(t, p, origin)
 
@@ -1076,7 +1076,7 @@ func TestQUIC_TProxySecondInterceptedOriginIsRefused(t *testing.T) {
 func TestQUICDemux_CloseRefusesLatePublish(t *testing.T) {
 	p, err := New()
 	require.NoError(t, err)
-	require.NoError(t, p.AddTunnel("+{any}"))
+	p.MustAddTunnel("+{any}")
 
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	require.NoError(t, err)

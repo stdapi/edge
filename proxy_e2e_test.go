@@ -188,7 +188,7 @@ func TestProxy_TunnelKeepsOriginCertificate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new proxy: %v", err)
 	}
-	if err := p.AddTunnel(originHost(originURL)); err != nil {
+	if _, err := p.AddTunnel(originHost(originURL)); err != nil {
 		t.Fatalf("tunnel %s: %v", originHost(originURL), err)
 	}
 
@@ -302,7 +302,7 @@ func TestProxy_TunnelRelaysTheHalfClose(t *testing.T) {
 	require.NoError(t, err)
 	p, err := New(WithCA(ca))
 	require.NoError(t, err)
-	require.NoError(t, p.AddTunnel(originLn.Addr().String()))
+	p.MustAddTunnel(originLn.Addr().String())
 
 	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)

@@ -56,7 +56,7 @@ func TestAuthority_InterceptorArmsItsAuthority(t *testing.T) {
 
 func TestAuthority_AddTunnel(t *testing.T) {
 	p := testProxy(t)
-	require.NoError(t, p.AddTunnel("checkout.stripe.com"))
+	p.MustAddTunnel("checkout.stripe.com")
 
 	assert.Equal(t, Tunnel, p.ActionFor(target("checkout.stripe.com:443")))
 	assert.Equal(t, Reject, p.ActionFor(target("api.stripe.com:443")))
@@ -74,7 +74,7 @@ func TestAuthority_AddTunnel(t *testing.T) {
 func TestAuthority_StaticBeatsWildcard(t *testing.T) {
 	p := testProxy(t)
 	p.MustAddInterceptor(nil, "+{sub}.stripe.com/*{any}", DefaultNoInterceptorHandler)
-	require.NoError(t, p.AddTunnel("checkout.stripe.com"))
+	p.MustAddTunnel("checkout.stripe.com")
 
 	assert.Equal(t, Intercept, p.ActionFor(target("api.stripe.com:443")))
 	assert.Equal(t, Intercept, p.ActionFor(target("a.b.stripe.com:443")))
@@ -91,7 +91,7 @@ func TestAuthority_PortScoped(t *testing.T) {
 	assert.Equal(t, Intercept, p.ActionFor(target("localhost:8080")))
 	assert.Equal(t, Reject, p.ActionFor(target("localhost:9090")))
 
-	require.NoError(t, p.AddTunnel("localhost:9090"))
+	p.MustAddTunnel("localhost:9090")
 	assert.Equal(t, Tunnel, p.ActionFor(target("localhost:9090")))
 	assert.Equal(t, Intercept, p.ActionFor(target("localhost:8080")), "the interceptor keeps its port")
 }
@@ -103,7 +103,7 @@ func TestAuthority_RejectsSchemeAndPath(t *testing.T) {
 		{"https://api.stripe.com", "no scheme is known"},
 		{"api.stripe.com/v1", "must not carry a path"},
 	} {
-		err := p.AddTunnel(tc.pattern)
+		_, err := p.AddTunnel(tc.pattern)
 		var pe *PatternError
 		require.ErrorAs(t, err, &pe, tc.pattern)
 		assert.Contains(t, pe.Error(), tc.hint, tc.pattern)
@@ -115,7 +115,7 @@ func TestAuthority_RejectsSchemeAndPath(t *testing.T) {
 // with a handler that is silently dead, so it is refused instead.
 func TestAuthority_InterceptorUnderATunnelIsRefused(t *testing.T) {
 	p := testProxy(t)
-	require.NoError(t, p.AddTunnel("api.stripe.com"))
+	p.MustAddTunnel("api.stripe.com")
 
 	_, err := p.AddInterceptor([]string{http.MethodPost}, "api.stripe.com/v1/charges", noopHandler)
 	require.ErrorIs(t, err, ErrAuthorityConflict)
@@ -132,7 +132,7 @@ func TestAuthority_TunnelingAnInterceptedAuthorityIsRefused(t *testing.T) {
 	p.MustAddInterceptor([]string{http.MethodPost}, "api.stripe.com/v1/charges", noopHandler)
 	require.Equal(t, Intercept, p.ActionFor(target("api.stripe.com:443")))
 
-	err := p.AddTunnel("api.stripe.com")
+	_, err := p.AddTunnel("api.stripe.com")
 	require.ErrorIs(t, err, ErrAuthorityConflict)
 	assert.Contains(t, err.Error(), "1 interceptor(s) intercept")
 
@@ -144,9 +144,9 @@ func TestAuthority_TunnelingAnInterceptedAuthorityIsRefused(t *testing.T) {
 // different precision they coexist, which is the case above this one.
 func TestAuthority_DuplicateTunnelConflicts(t *testing.T) {
 	p := testProxy(t)
-	require.NoError(t, p.AddTunnel("api.stripe.com"))
+	p.MustAddTunnel("api.stripe.com")
 
-	err := p.AddTunnel("api.stripe.com")
+	_, err := p.AddTunnel("api.stripe.com")
 	var conflict *InterceptorConflictError
 	require.ErrorAs(t, err, &conflict)
 }
@@ -170,7 +170,7 @@ func TestAuthority_ImpliedEntryIsReferenceCounted(t *testing.T) {
 
 func TestAuthority_DeleteTunnel(t *testing.T) {
 	p := testProxy(t)
-	require.NoError(t, p.AddTunnel("checkout.stripe.com"))
+	p.MustAddTunnel("checkout.stripe.com")
 
 	tn, err := p.DeleteTunnel("checkout.stripe.com")
 	require.NoError(t, err)
@@ -185,7 +185,8 @@ func TestAuthority_InterceptionRequiresCA(t *testing.T) {
 	p, err := New()
 	require.NoError(t, err, "a proxy that only tunnels never mints a certificate")
 
-	require.NoError(t, p.AddTunnel("api.stripe.com"), "tunneling needs no authority")
+	_, err = p.AddTunnel("api.stripe.com")
+	require.NoError(t, err, "tunneling needs no authority")
 
 	_, err = p.AddInterceptor([]string{http.MethodGet}, "files.stripe.com/v1", noopHandler)
 	require.ErrorIs(t, err, ErrNoCertificateAuthority)
@@ -193,7 +194,7 @@ func TestAuthority_InterceptionRequiresCA(t *testing.T) {
 
 func TestAuthority_TruncateDropsEverything(t *testing.T) {
 	p := testProxy(t)
-	require.NoError(t, p.AddTunnel("kept.example.test"))
+	p.MustAddTunnel("kept.example.test")
 	p.MustAddInterceptor([]string{http.MethodGet}, "api.stripe.com/v1/charges", noopHandler)
 	require.Len(t, collectAuthorities(p), 2)
 	require.Equal(t, 1, p.InterceptorsLen())
@@ -219,7 +220,8 @@ func TestAuthority_SwapInterceptionForATunnelAtomically(t *testing.T) {
 		if _, err := txn.DeleteInterceptor([]string{http.MethodPost}, "api.stripe.com/v1/charges"); err != nil {
 			return err
 		}
-		return txn.AddTunnel("api.stripe.com")
+		_, err := txn.AddTunnel("api.stripe.com")
+		return err
 	})
 	require.NoError(t, err)
 
@@ -233,7 +235,7 @@ func TestAuthority_SwapInTheWrongOrderAbortsCleanly(t *testing.T) {
 	p.MustAddInterceptor([]string{http.MethodPost}, "api.stripe.com/v1/charges", noopHandler)
 
 	err := p.Updates(func(txn *Txn) error {
-		if err := txn.AddTunnel("api.stripe.com"); err != nil {
+		if _, err := txn.AddTunnel("api.stripe.com"); err != nil {
 			return err
 		}
 		_, err := txn.DeleteInterceptor([]string{http.MethodPost}, "api.stripe.com/v1/charges")
@@ -248,8 +250,9 @@ func TestAuthority_SwapInTheWrongOrderAbortsCleanly(t *testing.T) {
 func TestAuthority_TunnelOnAReadOnlyTxn(t *testing.T) {
 	p := testProxy(t)
 	require.NoError(t, p.View(func(txn *Txn) error {
-		assert.ErrorIs(t, txn.AddTunnel("api.stripe.com"), ErrReadOnlyTxn)
-		_, err := txn.DeleteTunnel("api.stripe.com")
+		_, err := txn.AddTunnel("api.stripe.com")
+		assert.ErrorIs(t, err, ErrReadOnlyTxn)
+		_, err = txn.DeleteTunnel("api.stripe.com")
 		assert.ErrorIs(t, err, ErrReadOnlyTxn)
 		return nil
 	}))
@@ -261,7 +264,7 @@ func TestAuthority_TunnelOnAReadOnlyTxn(t *testing.T) {
 func TestAuthority_InterceptorLookupsNeverReturnAnAuthority(t *testing.T) {
 	p := testProxy(t)
 	p.MustAddInterceptor(nil, "api.stripe.com/v1/charges", noopHandler)
-	require.NoError(t, p.AddTunnel("checkout.stripe.com:8443"))
+	p.MustAddTunnel("checkout.stripe.com:8443")
 
 	for _, pattern := range []string{"api.stripe.com", "checkout.stripe.com:8443"} {
 		t.Run(pattern, func(t *testing.T) {
@@ -289,7 +292,7 @@ func TestAuthority_InterceptorLookupsNeverReturnAnAuthority(t *testing.T) {
 func TestAuthority_IterAuthorities(t *testing.T) {
 	p := testProxy(t)
 	p.MustAddInterceptor(nil, "api.stripe.com/v1/charges", noopHandler)
-	require.NoError(t, p.AddTunnel("checkout.stripe.com:8443"))
+	p.MustAddTunnel("checkout.stripe.com:8443")
 
 	fromIter := slices.Collect(p.Iter().Authorities())
 	require.Len(t, fromIter, 2)
@@ -305,7 +308,7 @@ func TestAuthority_IterAuthorities(t *testing.T) {
 func TestTxn_ActionFor(t *testing.T) {
 	p := testProxy(t)
 	p.MustAddInterceptor(nil, "api.stripe.com/v1/charges", noopHandler)
-	require.NoError(t, p.AddTunnel("checkout.stripe.com"))
+	p.MustAddTunnel("checkout.stripe.com")
 
 	// A read transaction answers what the published tree answers.
 	require.NoError(t, p.View(func(txn *Txn) error {

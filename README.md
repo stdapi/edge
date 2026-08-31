@@ -34,7 +34,7 @@ p.MustAddInterceptor([]string{"POST"}, "api.stripe.com/v1/charges", func(c *edge
 })
 
 // Leave this one alone: its TLS stays end to end and the proxy never sees the plaintext.
-p.AddTunnel("checkout.stripe.com")
+p.MustAddTunnel("checkout.stripe.com")
 
 log.Fatal(p.ListenAndServe(":8080"))
 ```
@@ -73,7 +73,7 @@ The decision is taken from the authority alone, before any request is parsed, an
 p.MustAddInterceptor(nil, "+{sub}.stripe.com/*{any}", edge.DefaultNoInterceptorHandler)
 
 // Except this one, whose TLS must stay end to end. Static beats the wildcard.
-p.AddTunnel("checkout.stripe.com")
+p.MustAddTunnel("checkout.stripe.com")
 ```
 
 There are only these two ways to admit an authority, and both name it explicitly. An interceptor arms the authority in its own pattern, so a handler always sees the traffic it was written for; the entry it implies is reference counted and disappears with the last interceptor that needed it.
@@ -81,12 +81,12 @@ There are only these two ways to admit an authority, and both name it explicitly
 **Everything else is refused.** A proxy that captures the traffic of an application under test should say what it expects that application to reach, and hear about it when the application reaches somewhere else. One line restores a permissive proxy, and it is visible in the code:
 
 ```go
-p.AddTunnel("+{any}") // relay anything not named above
+p.MustAddTunnel("+{any}") // relay anything not named above
 ```
 
 An authority cannot be both tunneled and intercepted by the same pattern. Declaring the second is an error rather than a silent no-op, in either order, because one of the two would otherwise be dead.
 
-`p.Decide(target)` answers what would happen to an authority without opening a connection, and `p.Authorities()` iterates what is registered.
+`p.ActionFor(target)` answers what would happen to an authority without opening a connection, and `p.Iter().Authorities()` iterates what is registered.
 
 ## Patterns
 
@@ -122,7 +122,7 @@ p.MustAddInterceptor([]string{"GET"}, "localhost:3000/", ui)
 
 Two patterns differing only by their port are two interceptors, and each arms only its own authority. An interceptor naming no port matches every port, and one naming a port is tried first, ahead of a method or a matcher. The port compared against is always explicit, so `api.test:443/v1` matches a plain `https://api.test/v1` target.
 
-An authority pattern carries its port the same way: `p.AddTunnel("localhost:8080")`.
+An authority pattern carries its port the same way: `p.MustAddTunnel("localhost:8080")`.
 
 ### Scheme
 
@@ -273,13 +273,13 @@ A write transaction takes the proxy write lock; lookups never take it and never 
 On an M4 Max, with zero allocations on every lookup:
 
 ```
-BenchmarkLookup/static-16                 20.7 ns/op    0 B/op   0 allocs/op
-BenchmarkLookup/param-16                  28.1 ns/op    0 B/op   0 allocs/op
-BenchmarkLookup/wildcard_host-16          37.2 ns/op    0 B/op   0 allocs/op
-BenchmarkLookupDeepTree-16                40.4 ns/op    0 B/op   0 allocs/op
-BenchmarkDecide/hit_static-16             25.7 ns/op    0 B/op   0 allocs/op
-BenchmarkLeafCached-16                    60.7 ns/op   48 B/op   1 allocs/op
-BenchmarkLeafMint-16                     61.4 µs/op
+BenchmarkLookup/static-16                 19.2 ns/op    0 B/op   0 allocs/op
+BenchmarkLookup/param-16                  27.8 ns/op    0 B/op   0 allocs/op
+BenchmarkLookup/wildcard_host-16          38.7 ns/op    0 B/op   0 allocs/op
+BenchmarkLookupDeepTree-16                39.5 ns/op    0 B/op   0 allocs/op
+BenchmarkActionFor/hit_static-16          16.5 ns/op    0 B/op   0 allocs/op
+BenchmarkLeafCached-16                    58.1 ns/op   48 B/op   1 allocs/op
+BenchmarkLeafMint-16                      63.9 µs/op
 ```
 
 ## Testing

@@ -96,7 +96,7 @@ func ExampleProxy_AddTunnel() {
 	if _, err := p.AddInterceptor(nil, "+{sub}.stripe.com/*{any}", edge.DefaultNoInterceptorHandler); err != nil {
 		log.Fatal(err)
 	}
-	if err := p.AddTunnel("checkout.stripe.com"); err != nil {
+	if _, err := p.AddTunnel("checkout.stripe.com"); err != nil {
 		log.Fatal(err)
 	}
 

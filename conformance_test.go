@@ -238,7 +238,7 @@ func TestConformance_CurlTunnel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new proxy: %v", err)
 	}
-	if err := p.AddTunnel(originHost(originURL)); err != nil {
+	if _, err := p.AddTunnel(originHost(originURL)); err != nil {
 		t.Fatalf("tunnel %s: %v", originHost(originURL), err)
 	}
 

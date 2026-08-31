@@ -141,7 +141,7 @@ func TestTransparent_TLSTunnelLeavesTheHandshakeAlone(t *testing.T) {
 	require.NoError(t, err)
 	// The authority comes from the ClientHello, so it is the name the client asked for,
 	// not the address the upstream transport is pinned to.
-	require.NoError(t, p.AddTunnel("example.com"))
+	p.MustAddTunnel("example.com")
 
 	addr := startTransparent(t, p)
 
@@ -294,7 +294,7 @@ func TestTransparent_OriginalDestinationPlacesTheConnection(t *testing.T) {
 
 	p, err := New(WithCA(ca), WithTransport(tr))
 	require.NoError(t, err)
-	require.NoError(t, p.AddTunnel(originURL.Host))
+	p.MustAddTunnel(originURL.Host)
 
 	addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) {
 		return originAddr, nil
@@ -358,7 +358,7 @@ func TestTransparent_PlaintextRelaysATunneledAuthority(t *testing.T) {
 
 	p, err := New(WithCA(ca))
 	require.NoError(t, err)
-	require.NoError(t, p.AddTunnel(originURL.Host))
+	p.MustAddTunnel(originURL.Host)
 
 	// A tunneled authority stays unobserved even when it arrives as a plain request the
 	// proxy had to parse to place it at all.
@@ -591,7 +591,7 @@ func TestTransparent_RawTCPTunnelByDestination(t *testing.T) {
 	require.NoError(t, err)
 	p, err := New(WithCA(ca))
 	require.NoError(t, err)
-	require.NoError(t, p.AddTunnel(origin.String()))
+	p.MustAddTunnel(origin.String())
 
 	addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) {
 		return origin, nil
@@ -666,7 +666,7 @@ func TestTransparent_RawTCPTunnelWinsOverHTTPParsing(t *testing.T) {
 	require.NoError(t, err)
 	p, err := New(WithCA(ca))
 	require.NoError(t, err)
-	require.NoError(t, p.AddTunnel(origin.String()))
+	p.MustAddTunnel(origin.String())
 
 	addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) {
 		return origin, nil
@@ -745,7 +745,7 @@ func TestTransparent_TProxyTCPPlacesByTheSocketAddress(t *testing.T) {
 	require.NoError(t, err)
 	p, err := New(WithCA(ca))
 	require.NoError(t, err)
-	require.NoError(t, p.AddTunnel(origin.String()))
+	p.MustAddTunnel(origin.String())
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)

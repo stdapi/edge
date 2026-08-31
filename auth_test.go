@@ -67,7 +67,7 @@ func rawConnect(t *testing.T, addr, authority, credentials string) *http.Respons
 
 func TestProxyAuth_ChallengesAnUnauthenticatedConnect(t *testing.T) {
 	p := Must(WithProxyAuth(testBasic()))
-	require.NoError(t, p.AddTunnel("example.com"))
+	p.MustAddTunnel("example.com")
 	addr := startProxy(t, p)
 
 	resp := rawConnect(t, addr, "example.com:443", "")
@@ -78,7 +78,7 @@ func TestProxyAuth_ChallengesAnUnauthenticatedConnect(t *testing.T) {
 
 func TestProxyAuth_RefusesWrongCredentials(t *testing.T) {
 	p := Must(WithProxyAuth(testBasic()))
-	require.NoError(t, p.AddTunnel("example.com"))
+	p.MustAddTunnel("example.com")
 	addr := startProxy(t, p)
 
 	resp := rawConnect(t, addr, "example.com:443", "Basic YWxpY2U6d3Jvbmc=") // alice:wrong
@@ -108,7 +108,7 @@ func (noChallengeAuth) Challenges(*http.Request) []string         { return nil }
 
 func TestProxyAuth_NoChallengeAnswers403(t *testing.T) {
 	p := Must(WithProxyAuth(noChallengeAuth{}))
-	require.NoError(t, p.AddTunnel("example.com"))
+	p.MustAddTunnel("example.com")
 	addr := startProxy(t, p)
 
 	resp := rawConnect(t, addr, "example.com:443", "")
@@ -209,7 +209,7 @@ func TestProxyAuth_SessionCarriesTheIdentityOfItsConnect(t *testing.T) {
 
 func TestProxyAuth_NoAuthenticatorLeavesEveryoneIn(t *testing.T) {
 	p := Must()
-	require.NoError(t, p.AddTunnel("example.com"))
+	p.MustAddTunnel("example.com")
 	addr := startProxy(t, p)
 
 	// No authenticator, so the authority decision is what answers, and it admits this one.
@@ -289,7 +289,7 @@ func TestProxyAuth_CredentialsNeverReachTheOrigin(t *testing.T) {
 			})
 		}},
 		{"tunneled", func(p *Proxy) {
-			require.NoError(t, p.AddTunnel(originHost(originURL)))
+			p.MustAddTunnel(originHost(originURL))
 		}},
 	}
 
@@ -359,7 +359,7 @@ func TestProxyAuth_IdentityOnAnHTTP2Connect(t *testing.T) {
 	require.NoError(t, err)
 
 	p := Must(WithProxyAuth(testBasic()))
-	require.NoError(t, p.AddTunnel(originHost(originURL)))
+	p.MustAddTunnel(originHost(originURL))
 	addr := startProxy(t, p)
 
 	// h2c to the proxy, opened by hand since http2.Transport has no proxy support.
@@ -390,7 +390,7 @@ func TestProxyAuth_IdentityOnAnHTTP2Connect(t *testing.T) {
 
 func TestProxyAuth_RefusedHTTP2Connect(t *testing.T) {
 	p := Must(WithProxyAuth(testBasic()))
-	require.NoError(t, p.AddTunnel("example.com"))
+	p.MustAddTunnel("example.com")
 	addr := startProxy(t, p)
 
 	raw, err := net.Dial("tcp", addr)

@@ -188,7 +188,7 @@ func TestTransparent_RejectECHRefusesBeforeDialing(t *testing.T) {
 
 	p, err := New(WithRejectECH(true), WithTransport(tr))
 	require.NoError(t, err)
-	require.NoError(t, p.AddTunnel("allowed.test"))
+	p.MustAddTunnel("allowed.test")
 
 	addr := startTransparent(t, p)
 
@@ -230,7 +230,7 @@ func TestTransparent_WithoutRejectECHTheOuterNameDecides(t *testing.T) {
 
 	p, err := New(WithTransport(tr))
 	require.NoError(t, err)
-	require.NoError(t, p.AddTunnel("allowed.test"))
+	p.MustAddTunnel("allowed.test")
 
 	addr := startTransparent(t, p)
 
@@ -299,7 +299,7 @@ func TestConnect_RejectECHClosesTheTunnel(t *testing.T) {
 
 	p, err := New(WithRejectECH(true))
 	require.NoError(t, err)
-	require.NoError(t, p.AddTunnel(origin.Addr().String()))
+	p.MustAddTunnel(origin.Addr().String())
 
 	addr := startProxy(t, p)
 	conn := connectRaw(t, addr, origin.Addr().String())
@@ -346,7 +346,7 @@ func TestConnect_RejectECHLeavesOtherTrafficAlone(t *testing.T) {
 
 	p, err := New(WithRejectECH(true))
 	require.NoError(t, err)
-	require.NoError(t, p.AddTunnel(origin.Addr().String()))
+	p.MustAddTunnel(origin.Addr().String())
 
 	addr := startProxy(t, p)
 
@@ -420,7 +420,7 @@ func TestConnect_RejectECHClosesAnH2Stream(t *testing.T) {
 
 	p, err := New(WithRejectECH(true))
 	require.NoError(t, err)
-	require.NoError(t, p.AddTunnel(origin.Addr().String()))
+	p.MustAddTunnel(origin.Addr().String())
 
 	addr := startProxy(t, p)
 
@@ -479,7 +479,7 @@ func TestQUIC_RejectECHDropsTheConnection(t *testing.T) {
 		WithLogger(slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))),
 	)
 	require.NoError(t, err)
-	require.NoError(t, p.AddTunnel("allowed.test"))
+	p.MustAddTunnel("allowed.test")
 
 	addr := startQUIC(t, p)
 

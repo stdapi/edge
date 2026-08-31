@@ -36,13 +36,33 @@ func (r Authority) Implicit() bool { return r.entry.implicit }
 
 func (r Authority) String() string { return r.entry.String() }
 
-// AddTunnel marks the given authorities for end to end tunneling. The connection is relayed
+// MustAddTunnel marks the given authority for end to end tunneling and panics on error. It is
+// a convenience wrapper for [Proxy.AddTunnel].
+func (p *Proxy) MustAddTunnel(pattern string) Authority {
+	tn, err := p.AddTunnel(pattern)
+	if err != nil {
+		panic(err)
+	}
+	return tn
+}
+
+// AddTunnel marks the given authority for end to end tunneling. The connection is relayed
 // byte for byte, so the client's TLS stays intact and no interceptor is ever consulted.
 //
-// It fails with [ErrAuthorityConflict] when interceptors are registered under the same
-// authority pattern: tunneling it would leave them unreachable.
-func (p *Proxy) AddTunnel(patterns ...string) error {
-	return p.addAuthorities(Tunnel, patterns, false)
+// If an error occurs, it returns one of the following:
+//   - [*PatternError]: the pattern syntax is invalid.
+//   - [*InterceptorConflictError]: the authority is already declared.
+//   - [ErrAuthorityConflict]: interceptors are registered under the same authority pattern,
+//     so tunneling it would leave them unreachable.
+func (p *Proxy) AddTunnel(pattern string) (Authority, error) {
+	txn := p.Txn(true)
+	defer txn.Abort()
+	tn, err := txn.AddTunnel(pattern)
+	if err != nil {
+		return Authority{}, err
+	}
+	txn.Commit()
+	return tn, nil
 }
 
 // DeleteTunnel removes the tunnel registered for the given authority pattern and returns it.
@@ -61,26 +81,24 @@ func (p *Proxy) DeleteTunnel(pattern string) (Authority, error) {
 	return tn, nil
 }
 
-// AddTunnel marks the given authorities for end to end tunneling. See [Proxy.AddTunnel].
+// AddTunnel marks the given authority for end to end tunneling. See [Proxy.AddTunnel].
 // Adding a tunnel on a read-only transaction returns [ErrReadOnlyTxn].
-func (txn *Txn) AddTunnel(patterns ...string) error {
+func (txn *Txn) AddTunnel(pattern string) (Authority, error) {
 	if txn.rootTxn == nil {
 		panic(ErrSettledTxn)
 	}
 	if !txn.write {
-		return ErrReadOnlyTxn
+		return Authority{}, ErrReadOnlyTxn
 	}
 
-	for _, pattern := range patterns {
-		ic, err := txn.p.newAuthority(pattern, Tunnel, false)
-		if err != nil {
-			return err
-		}
-		if err := insertAuthority(txn.rootTxn, ic); err != nil {
-			return err
-		}
+	ic, err := txn.p.newAuthority(pattern, Tunnel, false)
+	if err != nil {
+		return Authority{}, err
 	}
-	return nil
+	if err := insertAuthority(txn.rootTxn, ic); err != nil {
+		return Authority{}, err
+	}
+	return Authority{entry: ic}, nil
 }
 
 // DeleteTunnel removes the tunnel registered for the given authority pattern and returns it.
@@ -153,37 +171,6 @@ func resolveAction(root *node, authorities int, c *Context, target Target) Actio
 		return Reject
 	}
 	return n.entries[idx].action
-}
-
-func (p *Proxy) addAuthorities(action Action, patterns []string, implicit bool) error {
-	if len(patterns) == 0 {
-		return nil
-	}
-
-	if action == Intercept && p.cfg.ca == nil {
-		return fmt.Errorf("%w: intercepting %s requires one", ErrNoCertificateAuthority, patterns[0])
-	}
-
-	rules := make([]*Interceptor, 0, len(patterns))
-	for _, pattern := range patterns {
-		ic, err := p.newAuthority(pattern, action, implicit)
-		if err != nil {
-			return err
-		}
-		rules = append(rules, ic)
-	}
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	txn := p.getTree().txn()
-	for _, ic := range rules {
-		if err := insertAuthority(txn, ic); err != nil {
-			return err
-		}
-	}
-	p.tree.Store(txn.commit())
-	return nil
 }
 
 // insertAuthority adds an authority entry, replacing an implied one registered for the same

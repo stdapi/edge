@@ -51,7 +51,7 @@ func tunneledOrigin(t *testing.T, p *Proxy) (*http.Client, *url.URL, *x509.CertP
 
 	u, err := url.Parse(origin.URL)
 	require.NoError(t, err)
-	require.NoError(t, p.AddTunnel(originHost(u)))
+	p.MustAddTunnel(originHost(u))
 
 	pool := originPool(t, origin)
 	return proxyClient(startProxy(t, p), pool), u, pool
@@ -211,7 +211,7 @@ func TestSession_CloseUnderTraffic(t *testing.T) {
 // after the delete committed reads the tree again and refuses itself.
 func TestSession_AdmitAfterDelete(t *testing.T) {
 	p := testProxy(t)
-	require.NoError(t, p.AddTunnel("example.test"))
+	p.MustAddTunnel("example.test")
 	target := Target{Scheme: "https", Host: "example.test", Port: "443"}
 
 	admitted := newSession(context.Background(), nil, target, Tunnel, HTTP11)

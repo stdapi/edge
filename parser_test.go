@@ -78,11 +78,12 @@ func TestParser_RegexpConstraintMayHoldAColon(t *testing.T) {
 		`{sub:[a-z]+}.tunnelled.test`,
 		`+{any:[a-z.]+}.also-tunnelled.test`,
 	} {
-		require.NoError(t, p.AddTunnel(pattern), pattern)
+		_, err := p.AddTunnel(pattern)
+		require.NoError(t, err, pattern)
 	}
 
 	// Past the last brace the colon is a port again, and both patterns split on it.
-	require.NoError(t, p.AddTunnel(`{sub:[a-z]+}.other.com:8080`))
+	p.MustAddTunnel(`{sub:[a-z]+}.other.com:8080`)
 	pat, _, err := p.parseAuthorityPattern(`{sub:[a-z]+}.other.com:8080`)
 	require.NoError(t, err)
 	assert.Equal(t, `{sub:[a-z]+}.other.com`, pat.host)

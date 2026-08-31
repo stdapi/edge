@@ -202,7 +202,7 @@ func TestLifecycle_TunnelOnlyProxyNeedsNoCA(t *testing.T) {
 	p, err := New()
 	require.NoError(t, err)
 	require.Nil(t, p.cfg.ca)
-	require.NoError(t, p.AddTunnel(originHost(originURL)))
+	p.MustAddTunnel(originHost(originURL))
 
 	addr := startProxy(t, p)
 	client := proxyClient(addr, originPool(t, origin))
@@ -601,7 +601,7 @@ func TestLifecycle_ShutdownCutsTunnelsAtTheDeadline(t *testing.T) {
 
 	p, err := New()
 	require.NoError(t, err)
-	require.NoError(t, p.AddTunnel(originHost(originURL)))
+	p.MustAddTunnel(originHost(originURL))
 
 	addr := startProxy(t, p)
 
