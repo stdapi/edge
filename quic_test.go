@@ -306,6 +306,9 @@ func TestQUIC_TunnelSessionIsListedAndClosed(t *testing.T) {
 	assert.Equal(t, Tunnel, sessions[0].Action())
 	assert.Equal(t, h3Authority, sessions[0].Target().Host)
 	assert.Equal(t, HTTP3, sessions[0].Protocol())
+	require.NotNil(t, sessions[0].ClientHello(), "the sniffed ClientHello belongs to the session")
+	assert.Equal(t, h3Authority, sessions[0].ClientHello().ServerName)
+	assert.Contains(t, sessions[0].ClientHello().ALPN, "h3")
 
 	require.NoError(t, sessions[0].Close())
 	assert.Empty(t, slices.Collect(p.Sessions()), "closing removes the peer under the demux lock")
@@ -353,6 +356,8 @@ func TestQUIC_InterceptedSessionIsListedAndClosed(t *testing.T) {
 	assert.Equal(t, Intercept, sessions[0].Action())
 	assert.Equal(t, h3Authority, sessions[0].Target().Host)
 	assert.NotNil(t, sessions[0].TLS(), "the handshake the proxy terminated is recorded")
+	require.NotNil(t, sessions[0].ClientHello(), "the sniffed ClientHello belongs to the session")
+	assert.Equal(t, h3Authority, sessions[0].ClientHello().ServerName)
 
 	require.NoError(t, sessions[0].Close())
 	assert.Empty(t, slices.Collect(p.Sessions()))

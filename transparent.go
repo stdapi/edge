@@ -239,17 +239,24 @@ func (p *Proxy) dialTransparentUpstream(ctx context.Context, target Target, orig
 
 // peekClientHello parses the TLS ClientHello waiting in br without consuming it, so the
 // handshake can still be completed by whatever ends up owning the connection.
-//
-// Go's own TLS server does the parsing: a hand-rolled ClientHello parser would have to keep
-// up with every extension a client may add, and would be a parser fed by the network.
 func peekClientHello(br *bufio.Reader) (*ClientHello, error) {
 	raw, err := peekHandshakeRecords(br)
 	if err != nil {
 		return nil, err
 	}
+	if captured := clientHelloFromRecords(raw); captured != nil {
+		return captured, nil
+	}
+	return nil, errors.New("edge: no ClientHello in the peeked bytes")
+}
 
+// clientHelloFromRecords parses the TLS records in raw and returns what the client offered,
+// or nil when they hold no ClientHello. Go's own TLS server does the parsing, since a
+// hand-rolled parser would have to keep up with every extension a client may add, and would
+// be a parser fed by the network.
+func clientHelloFromRecords(raw []byte) *ClientHello {
 	var captured *ClientHello
-	err = tls.Server(&replayConn{r: raw}, &tls.Config{
+	_ = tls.Server(&replayConn{r: raw}, &tls.Config{
 		GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
 			captured = &ClientHello{
 				ServerName:        chi.ServerName,
@@ -257,19 +264,12 @@ func peekClientHello(br *bufio.Reader) (*ClientHello, error) {
 				SupportedVersions: append([]uint16(nil), chi.SupportedVersions...),
 				CipherSuites:      append([]uint16(nil), chi.CipherSuites...),
 			}
-			// The handshake has served its purpose; stopping it here keeps the parse to
+			// The handshake has served its purpose. Stopping it here keeps the parse to
 			// exactly the ClientHello.
 			return nil, errStopHandshake
 		},
 	}).Handshake()
-
-	if captured != nil {
-		return captured, nil
-	}
-	if err == nil {
-		err = errors.New("edge: no ClientHello in the peeked bytes")
-	}
-	return nil, err
+	return captured
 }
 
 var errStopHandshake = errors.New("edge: client hello captured")

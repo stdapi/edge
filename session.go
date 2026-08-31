@@ -250,9 +250,8 @@ func (s *Session) TLS() *tls.ConnectionState {
 	return nil
 }
 
-// ClientHello returns what the client offered in its TLS handshake with the proxy, or nil
-// for a plaintext session. It is the ground truth for mirroring a client's capabilities
-// upstream.
+// ClientHello returns what the client offered in its TLS handshake, or nil for a plaintext
+// session. It is the ground truth for mirroring a client's capabilities upstream.
 func (s *Session) ClientHello() *ClientHello { return s.clientHello }
 
 // Upstream returns the address a transparently redirected connection was headed to before

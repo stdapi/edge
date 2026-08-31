@@ -727,7 +727,8 @@ func (d *quicDemux) sniff(from netip.AddrPort, conn *quicConn, datagram []byte) 
 		return // still arriving
 	}
 
-	target := d.targetFor(hello, conn.origin)
+	ch := clientHelloFromQUIC(hello)
+	target := d.targetFor(ch, conn.origin)
 	if target.Host == "" {
 		d.rejectConn(from, conn, "no server name in the ClientHello")
 		return
@@ -737,19 +738,19 @@ func (d *quicDemux) sniff(from netip.AddrPort, conn *quicConn, datagram []byte) 
 	case Reject:
 		d.rejectConn(from, conn, "no interceptor or tunnel matches this authority")
 	case Intercept:
-		d.beginIntercept(from, client, conn, target, pending)
+		d.beginIntercept(from, client, conn, target, ch, pending)
 	default:
-		d.beginTunnel(from, client, conn, target, pending)
+		d.beginTunnel(from, client, conn, target, ch, pending)
 	}
 }
 
 // targetFor works out where a QUIC connection was headed, from the server name it offered
 // and, when known, the address its first datagram was redirected from.
-func (d *quicDemux) targetFor(hello []byte, origin netip.AddrPort) Target {
+func (d *quicDemux) targetFor(hello *ClientHello, origin netip.AddrPort) Target {
 	target := Target{Scheme: "https", Port: "443"}
 
-	if name := serverNameFromHello(hello); name != "" {
-		target.Host = stringsutil.ToLowerASCIIString(name)
+	if hello != nil && hello.ServerName != "" {
+		target.Host = stringsutil.ToLowerASCIIString(hello.ServerName)
 	}
 
 	if origin.IsValid() {
@@ -777,18 +778,19 @@ func (d *quicDemux) originalDst(client net.Addr) netip.AddrPort {
 // newQUICSession builds the session of one QUIC connection. The upstream is the address the
 // client was headed to, not a fresh resolution of the authority, which behind a redirect
 // may not resolve at all.
-func (d *quicDemux) newQUICSession(from netip.AddrPort, client net.Addr, conn *quicConn, target Target, action Action) (*Session, context.CancelFunc) {
+func (d *quicDemux) newQUICSession(from netip.AddrPort, client net.Addr, conn *quicConn, target Target, hello *ClientHello, action Action) (*Session, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background())
 	sess := newSession(ctx, nil, target, action, HTTP3)
 	sess.remoteAddr = client
 	sess.localAddr = d.pc.LocalAddr()
 	sess.transparent = true
 	sess.upstream = conn.origin
+	sess.clientHello = hello
 	sess.closer = &quicConnCloser{d: d, flow: from, odcid: conn.odcid}
 	return sess, cancel
 }
 
-func (d *quicDemux) beginIntercept(from netip.AddrPort, client net.Addr, conn *quicConn, target Target, pending [][]byte) {
+func (d *quicDemux) beginIntercept(from netip.AddrPort, client net.Addr, conn *quicConn, target Target, hello *ClientHello, pending [][]byte) {
 	if err := d.startInterception(); err != nil {
 		if !errors.Is(err, ErrProxyClosed) {
 			d.p.cfg.logger.Error("edge: cannot intercept QUIC", slog.String("error", err.Error()))
@@ -797,7 +799,7 @@ func (d *quicDemux) beginIntercept(from netip.AddrPort, client net.Addr, conn *q
 		return
 	}
 
-	sess, cancel := d.newQUICSession(from, client, conn, target, Intercept)
+	sess, cancel := d.newQUICSession(from, client, conn, target, hello, Intercept)
 
 	d.mu.Lock()
 	flow := d.flows[from]
@@ -835,8 +837,8 @@ func (d *quicDemux) beginIntercept(from netip.AddrPort, client net.Addr, conn *q
 	}
 }
 
-func (d *quicDemux) beginTunnel(from netip.AddrPort, client net.Addr, conn *quicConn, target Target, pending [][]byte) {
-	sess, cancel := d.newQUICSession(from, client, conn, target, Tunnel)
+func (d *quicDemux) beginTunnel(from netip.AddrPort, client net.Addr, conn *quicConn, target Target, hello *ClientHello, pending [][]byte) {
+	sess, cancel := d.newQUICSession(from, client, conn, target, hello, Tunnel)
 
 	d.mu.Lock()
 	relay, ok := d.placeTunnelLocked(from, conn, conn.origin, nil, sess, cancel)
@@ -1231,12 +1233,11 @@ func quicInterceptKeys(ca *CA) (*quicCIDTag, quic.StatelessResetKey, error) {
 	return tag, reset, err
 }
 
-// serverNameFromHello reads the server name out of a raw ClientHello handshake message.
-// QUIC carries handshake messages without a record layer, so one is put back for the sake of
-// the parser.
-func serverNameFromHello(hello []byte) string {
+// clientHelloFromQUIC reads the ClientHello out of a raw handshake message. QUIC carries
+// handshake messages without a record layer, so one is put back for the sake of the parser.
+func clientHelloFromQUIC(hello []byte) *ClientHello {
 	if len(hello) == 0 || len(hello) > math.MaxUint16 {
-		return ""
+		return nil
 	}
 
 	record := make([]byte, 0, 5+len(hello))
@@ -1244,15 +1245,7 @@ func serverNameFromHello(hello []byte) string {
 	// Guarded above: the message is shorter than 65536 bytes.
 	record = binary.BigEndian.AppendUint16(record, uint16(len(hello))) //nolint:gosec // bounded by the check above
 	record = append(record, hello...)
-
-	var name string
-	_ = tls.Server(&replayConn{r: record}, &tls.Config{
-		GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
-			name = chi.ServerName
-			return nil, errStopHandshake
-		},
-	}).Handshake()
-	return name
+	return clientHelloFromRecords(record)
 }
 
 // demuxPacketConn is the socket the terminating QUIC server reads from. Datagrams are pushed
