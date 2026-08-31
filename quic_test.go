@@ -537,6 +537,53 @@ func TestQUIC_TunnelSiblingsShareOneRelayAndCloseTogether(t *testing.T) {
 	assert.Empty(t, slices.Collect(p.Sessions()))
 }
 
+// Closing an intercepted session before the HTTP/3 server has adopted the connection must
+// still end it. The tag keeps delivering its packets with no state to drop, so the demux
+// dooms the connection and the adoption is where it dies.
+func TestQUIC_CloseBeforeAdoptionEndsTheConnection(t *testing.T) {
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(proxyCA))
+	require.NoError(t, err)
+	p.MustAddInterceptor(nil, h3Authority+"/", func(c *Context) (*http.Response, error) {
+		return Text(http.StatusOK, "ok"), nil
+	})
+	proxyAddr := startQUIC(t, p)
+
+	pc, err := net.ListenUDP("udp", nil)
+	require.NoError(t, err)
+	defer func() { _ = pc.Close() }()
+
+	type dialed struct {
+		conn *quic.Conn
+		err  error
+	}
+	res := make(chan dialed, 1)
+	go func() {
+		conn, err := quic.Dial(t.Context(), pc, net.UDPAddrFromAddrPort(proxyAddr),
+			&tls.Config{ServerName: h3Authority, RootCAs: poolOf(proxyCA), NextProtos: []string{"h3"}, MinVersion: tls.VersionTLS13},
+			&quic.Config{MaxIdleTimeout: 30 * time.Second, HandshakeIdleTimeout: 5 * time.Second})
+		res <- dialed{conn, err}
+	}()
+
+	// The session is published before the first Initial reaches the QUIC server, so this
+	// close often lands before adoption, and either side of that race must end the
+	// connection.
+	sess := waitForSessions(t, p, 1)[0]
+	require.NoError(t, sess.Close())
+	assert.Empty(t, slices.Collect(p.Sessions()))
+
+	d := <-res
+	if d.err != nil {
+		return // the close landed inside the handshake and killed it outright
+	}
+	select {
+	case <-d.conn.Context().Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the connection survived a close that preceded its adoption")
+	}
+}
+
 // The tag routes a connection with no flow state, a client whose address changed included,
 // so it must recognize exactly the IDs its own generator minted.
 func TestQUIC_CIDTagRecognizesOnlyItsOwnIDs(t *testing.T) {

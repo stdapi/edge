@@ -199,6 +199,8 @@ type quicConn struct {
 	pending      [][]byte
 	pendingBytes int
 	state        quicConnState
+	// doomed marks an intercepted connection closed before the HTTP/3 server adopted it.
+	doomed bool
 }
 
 // end ends the context of the connection's session. Whoever removes a connection, or marks
@@ -250,13 +252,21 @@ func (c *quicConnCloser) Close() error {
 		c.d.closeRelay(c.flow, relay)
 		return nil
 	}
+	if conn.state == connIntercepted && conn.qc == nil {
+		// The tag delivers this connection's packets with no state to drop, so removing it
+		// would let the handshake finish unobserved. attach ends a doomed connection when
+		// the server adopts it, the adopt TTL when it never does.
+		conn.doomed = true
+		conn.sess = nil
+		conn.end()
+		c.d.mu.Unlock()
+		return nil
+	}
 	qc := conn.qc
 	c.d.removeConnLocked(flow, conn)
 	c.d.mu.Unlock()
 
 	if qc == nil {
-		// An intercepted connection still handshaking, or one never adopted. Dropping the
-		// state starves it.
 		return nil
 	}
 	// Outside the lock, quic-go writes a CONNECTION_CLOSE from here.
@@ -297,7 +307,6 @@ func newQUICDemux(p *Proxy, pc net.PacketConn) (*quicDemux, error) {
 // Tracer fills it, and the HTTP/3 server reads it back.
 type quicCarrier struct {
 	client net.Addr
-	sess   *Session
 	odcid  string
 }
 
@@ -344,7 +353,7 @@ func (d *quicDemux) startInterception() error {
 		// destination connection ID, pre-Retry even when a Retry happened.
 		if carrier, ok := ctx.Value(quicCarrierKey{}).(*quicCarrier); ok {
 			carrier.odcid = string(odcid.Bytes())
-			carrier.sess = d.adopt(ctx, carrier.client, carrier.odcid)
+			d.adopt(ctx, carrier.client, carrier.odcid)
 		}
 		return nil
 	}
@@ -363,15 +372,18 @@ func (d *quicDemux) startInterception() error {
 		Logger:         d.p.cfg.logger,
 		ConnContext: func(ctx context.Context, c *quic.Conn) context.Context {
 			carrier, _ := c.Context().Value(quicCarrierKey{}).(*quicCarrier)
-			if carrier == nil || carrier.sess == nil {
+			if carrier == nil {
+				return ctx
+			}
+			sess := d.attach(carrier, c)
+			if sess == nil {
 				return ctx
 			}
 			// The session is registered before the handshake, so this is the first point
 			// where its TLS state exists.
 			state := c.ConnectionState().TLS
-			carrier.sess.tlsState.Store(&state)
-			d.attach(carrier, c)
-			return context.WithValue(ctx, sessionKey{}, carrier.sess)
+			sess.tlsState.Store(&state)
+			return context.WithValue(ctx, sessionKey{}, sess)
 		},
 	}
 
@@ -387,22 +399,19 @@ func (d *quicDemux) startInterception() error {
 	return nil
 }
 
-// adopt hands the QUIC server the session of the connection it is accepting. The AfterFunc
-// removes the connection when its context ends, a failed handshake included.
-func (d *quicDemux) adopt(ctx context.Context, client net.Addr, odcid string) *Session {
+// adopt ties the removal of an intercepted connection to its context, which ends with the
+// connection however that happens, a failed handshake included.
+func (d *quicDemux) adopt(ctx context.Context, client net.Addr, odcid string) {
 	from := addrPort(client)
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	flow := d.flows[from]
 	if flow == nil {
-		return nil
+		return
 	}
-	conn := flow.conns[odcid]
-	if conn == nil || conn.state != connIntercepted {
-		return nil
+	if conn := flow.conns[odcid]; conn != nil && conn.state == connIntercepted {
+		context.AfterFunc(ctx, func() { d.endIntercepted(from, odcid) })
 	}
-	context.AfterFunc(ctx, func() { d.endIntercepted(from, odcid) })
-	return conn.sess
 }
 
 func (d *quicDemux) endIntercepted(from netip.AddrPort, odcid string) {
@@ -417,16 +426,28 @@ func (d *quicDemux) endIntercepted(from netip.AddrPort, odcid string) {
 	}
 }
 
-// attach records the terminated connection so Session.Close can send a CONNECTION_CLOSE.
-func (d *quicDemux) attach(carrier *quicCarrier, c *quic.Conn) {
+// attach hands the HTTP/3 server the session of the connection it accepted, recording the
+// connection for Session.Close to end. One doomed or dropped meanwhile is closed here
+// instead, the tag having no state left to stop delivering it.
+func (d *quicDemux) attach(carrier *quicCarrier, c *quic.Conn) *Session {
 	from := addrPort(carrier.client)
 	d.mu.Lock()
-	defer d.mu.Unlock()
+	var conn *quicConn
 	if flow := d.flows[from]; flow != nil {
-		if conn := flow.conns[carrier.odcid]; conn != nil && conn.state == connIntercepted {
-			conn.qc = c
+		conn = flow.conns[carrier.odcid]
+		if conn != nil && conn.doomed {
+			d.removeConnLocked(flow, conn)
 		}
 	}
+	if conn == nil || conn.doomed || conn.state != connIntercepted {
+		d.mu.Unlock()
+		_ = c.CloseWithError(h3NoError, "")
+		return nil
+	}
+	conn.qc = c
+	sess := conn.sess
+	d.mu.Unlock()
+	return sess
 }
 
 func (d *quicDemux) quicTLSConfig() *tls.Config {
