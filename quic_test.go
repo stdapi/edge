@@ -906,6 +906,121 @@ func TestQUIC_RawUDPSessionEndsOnProxyClose(t *testing.T) {
 	}
 }
 
+// Closing a raw UDP session bars its destination, or the client's next datagram would
+// re-open a relay under the tunnel that still matches, undoing the close. Once the bar
+// expires the destination is decided afresh.
+func TestQUIC_RawUDPSessionCloseBarsReadmission(t *testing.T) {
+	origin := udpEchoOrigin(t)
+
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(proxyCA))
+	require.NoError(t, err)
+	p.MustAddTunnel("+{any}")
+
+	proxyAddr := startQUICRedirected(t, p, origin)
+
+	client, err := net.Dial("udp", proxyAddr.String())
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+
+	buf := make([]byte, 64)
+	_, err = client.Write([]byte("ping"))
+	require.NoError(t, err)
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
+	n, err := client.Read(buf)
+	require.NoError(t, err)
+	require.Equal(t, "ping", string(buf[:n]))
+
+	sess := waitForSessions(t, p, 1)[0]
+	require.NoError(t, sess.Close())
+
+	_, err = client.Write([]byte("zombie"))
+	require.NoError(t, err)
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(300*time.Millisecond)))
+	_, err = client.Read(buf)
+	require.Error(t, err, "the tunnel still matches, only the bar can refuse this datagram")
+	assert.Empty(t, slices.Collect(p.Sessions()))
+
+	var d *quicDemux
+	p.srv.mu.Lock()
+	for dd := range p.srv.quics {
+		d = dd
+	}
+	p.srv.mu.Unlock()
+	require.NotNil(t, d)
+
+	// Backdating the deadline stands in for its expiry.
+	from := netip.MustParseAddrPort(client.LocalAddr().String())
+	d.mu.Lock()
+	flow := d.flows[from]
+	if flow != nil {
+		require.Len(t, flow.revoked, 1)
+		for o := range flow.revoked {
+			flow.revoked[o] = time.Now().Add(-time.Second)
+		}
+	}
+	d.mu.Unlock()
+	require.NotNil(t, flow)
+
+	_, err = client.Write([]byte("fresh"))
+	require.NoError(t, err)
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
+	n, err = client.Read(buf)
+	require.NoError(t, err)
+	require.Equal(t, "fresh", string(buf[:n]))
+	waitForSessions(t, p, 1)
+}
+
+// Closing a tunneled QUIC session leaves the client's connection sending datagrams no
+// header can attribute, which land in raw admission. With a catch-all tunnel still
+// matching the destination they would re-open a relay and the connection would survive
+// its own close, never re-handshaking, never re-decided.
+func TestQUIC_TunnelSessionCloseBarsOrphanedDatagrams(t *testing.T) {
+	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
+	require.NoError(t, err)
+	origin := h3Origin(t, originCA)
+
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(proxyCA))
+	require.NoError(t, err)
+	p.MustAddTunnel("+{any}")
+
+	proxyAddr := startQUICRedirected(t, p, origin)
+
+	pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	defer func() { _ = pc.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := quic.Dial(ctx, pc, net.UDPAddrFromAddrPort(proxyAddr), &tls.Config{
+		ServerName: h3Authority,
+		RootCAs:    poolOf(originCA),
+		NextProtos: []string{"h3"},
+		MinVersion: tls.VersionTLS13,
+	}, &quic.Config{MaxIdleTimeout: time.Second})
+	require.NoError(t, err)
+	defer func() { _ = conn.CloseWithError(0, "") }()
+
+	sess := waitForSessions(t, p, 1)[0]
+	require.Equal(t, Tunnel, sess.Action())
+	require.NoError(t, sess.Close())
+	require.Empty(t, slices.Collect(p.Sessions()))
+
+	// A short header from the closed connection, past its handshake, reaches raw admission.
+	orphan := make([]byte, 48)
+	_, err = rand.Read(orphan)
+	require.NoError(t, err)
+	orphan[0] = orphan[0]&0x3f | 0x40
+	_, err = pc.WriteToUDP(orphan, net.UDPAddrFromAddrPort(proxyAddr))
+	require.NoError(t, err)
+
+	time.Sleep(300 * time.Millisecond)
+	assert.Empty(t, slices.Collect(p.Sessions()), "an orphaned datagram must not become a session")
+}
+
 // tproxyOriginPacketConn stands in for a TPROXY socket: exact per datagram origins, reply
 // sockets that are plain loopback ones, and a shared socket that black-holes every direct
 // client write so a reply sneaking around the reply sockets fails the test. perClient is

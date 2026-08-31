@@ -53,6 +53,9 @@ const (
 	quicSniffTTL  = 10 * time.Second
 	quicRejectTTL = 30 * time.Second
 	quicAdoptTTL  = time.Minute
+	// quicRevokeTTL refuses a policy-closed destination in raw admission until the closed
+	// connection gives up, its idle timeout being negotiated encrypted.
+	quicRevokeTTL = time.Minute
 	// The state caps. Everything below is allocated for an unauthenticated peer on a
 	// spoofable transport, so the worst case is the product of these bounds.
 	maxQUICFlows       = 4096
@@ -207,6 +210,9 @@ type quicFlow struct {
 	// relay, and lens records which lengths are present, since a short header does not say
 	// where its connection ID ends.
 	learned map[string]*quicRelay
+	// revoked refuses an origin in raw admission until its deadline. Only a policy close
+	// grows it, never the peer.
+	revoked map[netip.AddrPort]time.Time
 	lens    uint32
 }
 
@@ -331,7 +337,7 @@ func (c *quicConnCloser) Close() error {
 	if conn.state == connTunneling {
 		relay := conn.relay
 		c.d.mu.Unlock()
-		c.d.closeRelay(c.flow, relay)
+		c.d.revokeRelay(c.flow, relay)
 		return nil
 	}
 	if conn.state == connIntercepted && conn.qc == nil {
@@ -364,7 +370,7 @@ type rawRelayCloser struct {
 }
 
 func (c *rawRelayCloser) Close() error {
-	c.d.closeRelay(c.flow, c.relay)
+	c.d.revokeRelay(c.flow, c.relay)
 	return nil
 }
 
@@ -937,6 +943,18 @@ func (d *quicDemux) rawAdmit(client net.Addr, from netip.AddrPort, datagram []by
 			_, _ = up.Write(datagram)
 			return
 		}
+		// Never a fresh handshake, an Initial is sniffed before raw admission sees it.
+		if deadline, ok := flow.revoked[origin]; ok {
+			if time.Now().Before(deadline) {
+				d.mu.Unlock()
+				d.p.cfg.logger.Debug("edge: raw datagram dropped",
+					slog.String("client", from.String()),
+					slog.String("origin", origin.String()),
+					slog.String("reason", "a session to this destination was closed by policy"))
+				return
+			}
+			delete(flow.revoked, origin)
+		}
 	}
 	d.mu.Unlock()
 
@@ -1002,6 +1020,10 @@ func (d *quicDemux) publishRawLocked(from netip.AddrPort, client net.Addr, relay
 	}
 	flow := d.flowLocked(from, client, time.Now())
 	if flow == nil || len(flow.relays) >= maxRelaysPerFlow || flow.relays[relay.key] != nil {
+		return false
+	}
+	// Re-checked under the lock, a revocation may have landed since raw admission looked.
+	if deadline, ok := flow.revoked[relay.key]; ok && time.Now().Before(deadline) {
 		return false
 	}
 	if d.replier != nil {
@@ -1307,7 +1329,7 @@ func (d *quicDemux) beginTunnel(from netip.AddrPort, client net.Addr, conn *quic
 	// See beginIntercept. Enforcement is per relay, the packets of siblings being
 	// indistinguishable, so a tree that no longer accepts the authority costs the relay.
 	if d.p.ActionFor(target) == Reject {
-		d.closeRelay(from, relay)
+		d.revokeRelay(from, relay)
 		d.p.cfg.logger.Debug("edge: QUIC connection dropped",
 			slog.String("client", from.String()),
 			slog.String("reason", "the authority was withdrawn while the connection was starting"))
@@ -1364,6 +1386,8 @@ func (d *quicDemux) placeTunnelLocked(from netip.AddrPort, conn *quicConn, key n
 	// ahead of its Initial typically. Learning has to resume, a Retry is unroutable
 	// without the origin's IDs.
 	relay.raw = false
+	// A fresh handshake re-allowed this origin, so an earlier revocation is stale.
+	delete(flow.revoked, key)
 
 	d.setStateLocked(conn, connTunneling)
 	conn.pending = nil
@@ -1440,11 +1464,27 @@ func (d *quicDemux) learnOrigin(from netip.AddrPort, relay *quicRelay, datagram 
 // closeRelay tears down the relay, its learned IDs and every connection on it, whose
 // sessions end here.
 func (d *quicDemux) closeRelay(from netip.AddrPort, relay *quicRelay) {
+	d.teardownRelay(from, relay, false)
+}
+
+// revokeRelay is the close for a policy decision. It also refuses the origin in raw
+// admission, in the same critical section, or an orphaned datagram would re-open the relay.
+func (d *quicDemux) revokeRelay(from netip.AddrPort, relay *quicRelay) {
+	d.teardownRelay(from, relay, true)
+}
+
+func (d *quicDemux) teardownRelay(from netip.AddrPort, relay *quicRelay, revoke bool) {
 	d.mu.Lock()
 	flow := d.flows[from]
 	if flow == nil || relay.closed {
 		d.mu.Unlock()
 		return
+	}
+	if revoke {
+		if flow.revoked == nil {
+			flow.revoked = make(map[netip.AddrPort]time.Time)
+		}
+		flow.revoked[relay.key] = time.Now().Add(quicRevokeTTL)
 	}
 	relay.closed = true
 	delete(flow.relays, relay.key)
@@ -1520,7 +1560,13 @@ func (d *quicDemux) sweepIdle() {
 				// the relay's return traffic is the only liveness signal.
 			}
 		}
-		if len(flow.conns) == 0 && len(flow.relays) == 0 && now.Sub(flow.lastSeen) > quicSniffTTL {
+		for origin, deadline := range flow.revoked {
+			if now.After(deadline) {
+				delete(flow.revoked, origin)
+			}
+		}
+		if len(flow.conns) == 0 && len(flow.relays) == 0 && len(flow.revoked) == 0 &&
+			now.Sub(flow.lastSeen) > quicSniffTTL {
 			delete(d.flows, from)
 		}
 	}
