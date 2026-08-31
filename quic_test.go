@@ -908,8 +908,9 @@ func TestQUIC_RawUDPSessionEndsOnProxyClose(t *testing.T) {
 
 // tproxyOriginPacketConn stands in for a TPROXY socket: exact per datagram origins, reply
 // sockets that are plain loopback ones, and a shared socket that black-holes every direct
-// client write so a reply sneaking around the reply sockets fails the test. A client not in
-// perClient reports the shared origin, so a test may hold one origin live per client socket.
+// client write so a reply sneaking around the reply sockets fails the test. perClient is
+// keyed by the client address as the proxy reads it off its socket, and a client not in it
+// reports the shared origin, so a test may hold one origin live per client socket.
 type tproxyOriginPacketConn struct {
 	net.PacketConn
 	origin    atomic.Value
@@ -1036,8 +1037,8 @@ func TestQUIC_TProxyInterceptRepliesFromTheOrigin(t *testing.T) {
 
 // Two intercepted origins reached from one client socket each get a terminating stack of
 // their own, each replying from its origin's address. The wrapper reports one origin per
-// client at a time, so the two run in sequence here, and the concurrent case lives in the
-// TPROXY end to end harness with its real per datagram attribution.
+// client at a time, so the two run in sequence here, the concurrent case needing the per
+// datagram attribution only a real TPROXY deployment gives.
 func TestQUIC_TProxyTwoInterceptedOriginsOnOneSocket(t *testing.T) {
 	first := netip.MustParseAddrPort("127.0.0.1:4431")
 	second := netip.MustParseAddrPort("127.0.0.1:4432")
@@ -1162,7 +1163,9 @@ func TestQUIC_ShutdownDrainsEveryInterceptStack(t *testing.T) {
 	defer func() { _ = h3tr.Close() }()
 
 	dialFrom := func(origin netip.AddrPort, sni string) (*quic.Transport, *http3.ClientConn) {
-		pc, err := net.ListenUDP("udp", nil)
+		// Bound to 127.0.0.1 so the address stored here is the one the proxy reads off
+		// its own socket, or the per client lookup misses and one stack serves both.
+		pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 		require.NoError(t, err)
 		wrapper.perClient.Store(pc.LocalAddr().String(), origin)
 		tr := &quic.Transport{Conn: pc}
@@ -1171,10 +1174,32 @@ func TestQUIC_ShutdownDrainsEveryInterceptStack(t *testing.T) {
 	}
 	_, ccA := dialFrom(first, "first.test")
 	_, ccB := dialFrom(second, "second.test")
+	replyA, replyB := <-wrapper.replies, <-wrapper.replies
+	require.NotEqual(t, replyA.String(), replyB.String(), "each origin must hold a stack of its own")
 
-	got := make(chan string, 2)
-	go func() { got <- h3Get(t, ccA, "first.test", proxyAddr.Port()) }()
-	go func() { got <- h3Get(t, ccB, "second.test", proxyAddr.Port()) }()
+	results := make(chan string, 2)
+	errs := make(chan error, 2)
+	do := func(cc *http3.ClientConn, sni string) {
+		req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("https://%s:%d/", sni, proxyAddr.Port()), nil)
+		if err != nil {
+			errs <- err
+			return
+		}
+		resp, err := cc.RoundTrip(req)
+		if err != nil {
+			errs <- err
+			return
+		}
+		body, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if err != nil {
+			errs <- err
+			return
+		}
+		results <- string(body)
+	}
+	go do(ccA, "first.test")
+	go do(ccB, "second.test")
 	<-inflight
 	<-inflight
 
@@ -1185,13 +1210,21 @@ func TestQUIC_ShutdownDrainsEveryInterceptStack(t *testing.T) {
 	close(release)
 
 	require.NoError(t, <-done, "the drain must cover both stacks")
-	bodies := []string{<-got, <-got}
+	var bodies []string
+	for range 2 {
+		select {
+		case body := <-results:
+			bodies = append(bodies, body)
+		case err := <-errs:
+			t.Fatal(err)
+		}
+	}
 	slices.Sort(bodies)
 	assert.Equal(t, []string{"first.test", "second.test"}, bodies)
 }
 
-// The eviction at the stack cap takes the least recently used idle stack and never one with
-// live connections.
+// The eviction candidate at the stack cap is the least recently used idle stack and never
+// one with live connections.
 func TestQUICDemux_EvictInterceptPrefersIdleLRU(t *testing.T) {
 	d := &quicDemux{intercepts: map[netip.AddrPort]*quicIntercept{}}
 	busy := &quicIntercept{origin: netip.MustParseAddrPort("10.0.0.1:443"), conns: 1, lastSeen: time.Unix(1, 0)}
@@ -1200,9 +1233,11 @@ func TestQUICDemux_EvictInterceptPrefersIdleLRU(t *testing.T) {
 	for _, it := range []*quicIntercept{busy, older, newer} {
 		d.intercepts[it.origin] = it
 	}
-	assert.Same(t, older, d.evictInterceptLocked())
-	assert.Same(t, newer, d.evictInterceptLocked())
-	assert.Nil(t, d.evictInterceptLocked(), "a stack with live connections is never evicted")
+	require.Same(t, older, d.evictableLocked())
+	delete(d.intercepts, older.origin)
+	require.Same(t, newer, d.evictableLocked())
+	delete(d.intercepts, newer.origin)
+	assert.Nil(t, d.evictableLocked(), "a stack with live connections is never evicted")
 	assert.Contains(t, d.intercepts, busy.origin)
 }
 

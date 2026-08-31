@@ -63,9 +63,12 @@ const (
 	// which has no connection, so the bound sits on the relays themselves.
 	maxRelaysPerFlow = 16
 	maxRelays        = 1024
-	// maxIntercepts bounds the terminating stacks, one per origin under TPROXY, and
-	// quicInterceptTTL reaps a stack no connection has fed for a while.
+	// maxIntercepts bounds the terminating stacks, one per origin under TPROXY, each
+	// queueing up to interceptQueue datagrams of maxUDPPayload (the shared stack of the
+	// other paths four times as many). quicInterceptTTL reaps a stack no connection has
+	// fed for a while.
 	maxIntercepts    = 64
+	interceptQueue   = 64
 	quicInterceptTTL = time.Minute
 	// quicResetSize is the size of the stateless resets the demux sends itself. Only a
 	// datagram strictly larger gets one, which keeps two proxies from bouncing resets at
@@ -108,9 +111,12 @@ func (p *Proxy) ListenAndServeQUIC(addr string) error {
 // other than v1 and v2 are rejected. A tunneled client that changes address in flight has
 // to re-handshake. Behind a Linux redirect a client may tunnel several origins from one
 // socket. Behind a Linux TPROXY rule every datagram reports its exact destination and
-// replies are sent from the address the client targeted. On macOS, and when pc is not
-// wrapped in [TransparentPacketConn], a client socket supports one tunneled origin, and
-// connections to further origins drop shortly after their handshake.
+// replies are sent from the address the client targeted. At most 64 origins are terminated
+// at once there. Beyond that the origin longest without an intercepted connection is
+// reclaimed, and with every origin holding one a connection to a new origin is refused. On
+// macOS, and when pc is not wrapped in [TransparentPacketConn], a client socket supports
+// one tunneled origin, and connections to further origins drop shortly after their
+// handshake.
 //
 // A datagram that is not QUIC is placed by the address it was headed to, when the platform
 // reports one. A tunnel registered for that authority relays the traffic in both
@@ -137,7 +143,7 @@ func (p *Proxy) ServeQUIC(pc net.PacketConn) error {
 }
 
 // quicDemux owns one UDP socket and decides, per connection, whether its datagrams are
-// relayed to the origin or handed to the QUIC server the proxy terminates.
+// relayed to the origin or terminated by the proxy.
 type quicDemux struct {
 	pc net.PacketConn
 	// origins is pc when it reports where its datagrams were headed, nil otherwise.
@@ -295,6 +301,11 @@ func (d *quicDemux) closeIntercept(it *quicIntercept) {
 // h3NoError is HTTP/3's H3_NO_ERROR, what a peer sends when it closes a connection with
 // nothing to report.
 const h3NoError quic.ApplicationErrorCode = 0x100
+
+var (
+	errNoReplyDestination = errors.New("no destination to source the replies from")
+	errInterceptsBusy     = errors.New("every terminating stack has live connections")
+)
 
 // quicConnCloser ends one QUIC connection. A tunneled one cannot be cut alone, its packets
 // being indistinguishable from its siblings' once the client rotates its connection IDs, so
@@ -462,15 +473,15 @@ func (d *quicDemux) startInterception() error {
 }
 
 // interceptForLocked returns the stack terminating connections to origin, created on first
-// use. Creation shares the draining critical section with shutdown, so no listener joins
-// the HTTP/3 server after it was told to send GOAWAY, and the caller closes any evicted
-// stack once off the lock.
-func (d *quicDemux) interceptForLocked(origin netip.AddrPort) (*quicIntercept, []*quicIntercept, error) {
-	var evicted []*quicIntercept
+// use. Creation shares the draining critical section with shutdown, so no stack appears
+// once draining began, and the caller closes any evicted stack once off the lock. The serve
+// goroutine can still lose its race with a shutdown and leave the stack unserved, which the
+// adopt TTL and the close that ends every drain both bound.
+func (d *quicDemux) interceptForLocked(origin netip.AddrPort) (*quicIntercept, *quicIntercept, error) {
 	key := netip.AddrPort{}
 	if d.replier != nil {
 		if !origin.IsValid() {
-			return nil, nil, errors.New("no destination to source the replies from")
+			return nil, nil, errNoReplyDestination
 		}
 		key = origin
 	}
@@ -479,19 +490,24 @@ func (d *quicDemux) interceptForLocked(origin netip.AddrPort) (*quicIntercept, [
 		return it, nil, nil
 	}
 
+	// Selected now so a full cap refuses before anything is built, removed only once the
+	// stack is up, so a failed creation costs no live stack.
+	var victim *quicIntercept
 	if len(d.intercepts) >= maxIntercepts {
-		victim := d.evictInterceptLocked()
-		if victim == nil {
-			return nil, nil, errors.New("every terminating stack has live connections")
+		if victim = d.evictableLocked(); victim == nil {
+			return nil, nil, errInterceptsBusy
 		}
-		evicted = []*quicIntercept{victim}
 	}
 
-	dpc := newDemuxPacketConn(d.pc)
+	queue := interceptQueue
+	if !key.IsValid() {
+		queue = 4 * interceptQueue
+	}
+	dpc := newDemuxPacketConn(d.pc, queue)
 	if d.replier != nil {
 		reply, rerr := d.replySocketLocked(key)
 		if rerr != nil {
-			return nil, evicted, rerr
+			return nil, nil, rerr
 		}
 		from := key.String()
 		dpc.reply = func(b []byte, addr net.Addr) (int, error) {
@@ -527,9 +543,12 @@ func (d *quicDemux) interceptForLocked(origin netip.AddrPort) (*quicIntercept, [
 	if err != nil {
 		dpc.Close()
 		_ = transport.Close()
-		return nil, evicted, fmt.Errorf("listen QUIC: %w", err)
+		return nil, nil, fmt.Errorf("listen QUIC: %w", err)
 	}
 
+	if victim != nil {
+		delete(d.intercepts, victim.origin)
+	}
 	it := &quicIntercept{origin: key, transport: transport, listener: ln, conn: dpc, lastSeen: time.Now()}
 	d.intercepts[key] = it
 	srv := d.h3
@@ -541,12 +560,12 @@ func (d *quicDemux) interceptForLocked(origin netip.AddrPort) (*quicIntercept, [
 			d.p.cfg.logger.Debug("edge: HTTP/3 server stopped", slog.String("error", err.Error()))
 		}
 	})
-	return it, evicted, nil
+	return it, victim, nil
 }
 
-// evictInterceptLocked removes and returns the stack unused the longest, or nil when every
-// one has live connections.
-func (d *quicDemux) evictInterceptLocked() *quicIntercept {
+// evictableLocked returns the stack unused the longest, or nil when every one has live
+// connections. The caller removes it from the map.
+func (d *quicDemux) evictableLocked() *quicIntercept {
 	var victim *quicIntercept
 	for _, it := range d.intercepts {
 		if it.conns > 0 {
@@ -555,9 +574,6 @@ func (d *quicDemux) evictInterceptLocked() *quicIntercept {
 		if victim == nil || it.lastSeen.Before(victim.lastSeen) {
 			victim = it
 		}
-	}
-	if victim != nil {
-		delete(d.intercepts, victim.origin)
 	}
 	return victim
 }
@@ -1209,7 +1225,7 @@ func (d *quicDemux) beginIntercept(from netip.AddrPort, client net.Addr, conn *q
 
 	d.mu.Lock()
 	flow := d.flows[from]
-	if flow == nil || flow.conns[conn.odcid] != conn {
+	if flow == nil || flow.conns[conn.odcid] != conn || conn.state != connSniffing {
 		d.mu.Unlock()
 		cancel()
 		return
@@ -1227,9 +1243,6 @@ func (d *quicDemux) beginIntercept(from netip.AddrPort, client net.Addr, conn *q
 	if err != nil {
 		d.mu.Unlock()
 		cancel()
-		for _, e := range evicted {
-			d.closeIntercept(e)
-		}
 		d.rejectConn(from, conn, err.Error())
 		return
 	}
@@ -1241,8 +1254,8 @@ func (d *quicDemux) beginIntercept(from netip.AddrPort, client net.Addr, conn *q
 	conn.stack = it
 	it.conns++
 	d.mu.Unlock()
-	for _, e := range evicted {
-		d.closeIntercept(e)
+	if evicted != nil {
+		d.closeIntercept(evicted)
 	}
 
 	// The session is published, so a sweep started after the tree changed either found it or
@@ -1661,7 +1674,7 @@ func (d *quicDemux) close() {
 	})
 }
 
-// quicCIDTag mints and recognizes the connection IDs of the terminating QUIC server, 4
+// quicCIDTag mints and recognizes the connection IDs the terminating stacks emit, 4
 // random bytes and 4 of a keyed MAC over them, so a packet of an intercepted connection is
 // recognizable with no per connection state, NAT rebinding and restarts included. A random
 // Initial DCID passes with probability 2^-32, the one way past the policy decision.
@@ -1752,7 +1765,7 @@ func clientHelloFromQUIC(hello []byte) *ClientHello {
 	return clientHelloFromRecords(record)
 }
 
-// demuxPacketConn is the socket the terminating QUIC server reads from. Datagrams are pushed
+// demuxPacketConn is the socket a terminating stack's transport reads from. Datagrams are pushed
 // into it by the demultiplexer rather than read from the network, while writes go straight
 // out of the real socket so the client sees answers from the address it wrote to.
 type demuxPacketConn struct {
@@ -1774,10 +1787,10 @@ type datagram struct {
 	b    []byte
 }
 
-func newDemuxPacketConn(real net.PacketConn) *demuxPacketConn {
+func newDemuxPacketConn(real net.PacketConn, queue int) *demuxPacketConn {
 	return &demuxPacketConn{
 		real:   real,
-		in:     make(chan datagram, 256),
+		in:     make(chan datagram, queue),
 		closed: make(chan struct{}),
 	}
 }
@@ -1845,7 +1858,8 @@ func (c *demuxPacketConn) SetWriteDeadline(time.Time) error { return nil }
 
 // SetReadBuffer and SetWriteBuffer are delegated to the real socket, which is the one that
 // actually touches the network. QUIC needs a large receive buffer to avoid dropping packets
-// under load, and looks for these methods to size it.
+// under load, and looks for these methods to size it. Every stack sizes the same socket,
+// which is idempotent.
 //
 // SyscallConn is deliberately not exposed: it would let the QUIC stack read from the real
 // socket directly, behind the demultiplexer that decides where each datagram belongs.
