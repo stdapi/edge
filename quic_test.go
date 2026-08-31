@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -647,5 +648,256 @@ func TestQUIC_SessionContextEndsWhenTheClientLeaves(t *testing.T) {
 	case <-sessCtx.Done():
 	case <-time.After(3 * time.Second):
 		t.Fatal("the client leaving did not end the session context")
+	}
+}
+
+// udpEchoOrigin starts a UDP echo server and returns its address.
+func udpEchoOrigin(t *testing.T) netip.AddrPort {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, addr, rerr := pc.ReadFrom(buf)
+			if rerr != nil {
+				return
+			}
+			_, _ = pc.WriteTo(buf[:n], addr)
+		}
+	}()
+	t.Cleanup(func() { _ = pc.Close() })
+	addr, err := netip.ParseAddrPort(pc.LocalAddr().String())
+	require.NoError(t, err)
+	return addr
+}
+
+// payloadOriginPacketConn reads the destination of each datagram out of its first two
+// bytes, standing in for a platform reporting exact per datagram origins.
+type payloadOriginPacketConn struct {
+	net.PacketConn
+	mu  sync.Mutex
+	dst netip.AddrPort
+}
+
+func (c *payloadOriginPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
+	n, addr, err := c.PacketConn.ReadFrom(b)
+	if err == nil && n >= 2 {
+		port := uint16(b[0])<<8 | uint16(b[1])
+		c.mu.Lock()
+		c.dst = netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), port)
+		c.mu.Unlock()
+	}
+	return n, addr, err
+}
+
+func (c *payloadOriginPacketConn) OriginalDestination(net.Addr) (netip.AddrPort, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.dst, nil
+}
+
+func (c *payloadOriginPacketConn) exactOriginalDestination() bool { return true }
+
+// rawPayloadFor spells a datagram whose first two bytes name the origin's port, for
+// payloadOriginPacketConn to read back.
+func rawPayloadFor(origin netip.AddrPort) []byte {
+	return []byte{byte(origin.Port() >> 8), byte(origin.Port()), 'p', 'i', 'n', 'g'}
+}
+
+func TestQUIC_RawUDPTunnelByDestination(t *testing.T) {
+	origin := udpEchoOrigin(t)
+
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(proxyCA))
+	require.NoError(t, err)
+	require.NoError(t, p.AddTunnel(origin.String()))
+
+	proxyAddr := startQUICRedirected(t, p, origin)
+
+	client, err := net.Dial("udp", proxyAddr.String())
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+
+	buf := make([]byte, 128)
+	for _, payload := range [][]byte{
+		[]byte("raw-low-bit"),
+		{0x81, 0xde, 0xad, 0xbe, 0xef, 0x78, 0x01, 0x02}, // the high bit set, but not QUIC
+	} {
+		_, err = client.Write(payload)
+		require.NoError(t, err)
+		require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
+		n, rerr := client.Read(buf)
+		require.NoError(t, rerr)
+		assert.Equal(t, payload, buf[:n])
+	}
+
+	sessions := waitForSessions(t, p, 1)
+	sess := sessions[0]
+	assert.Equal(t, Tunnel, sess.Action())
+	assert.Equal(t, UDP, sess.Protocol())
+	assert.Equal(t, origin.Addr().String(), sess.Target().Host)
+	assert.Equal(t, fmt.Sprint(origin.Port()), sess.Target().Port)
+	assert.Equal(t, origin, sess.Upstream())
+	assert.True(t, sess.Transparent())
+	assert.Nil(t, sess.ClientHello())
+
+	_, err = p.DeleteTunnel(origin.String())
+	require.NoError(t, err)
+	require.NoError(t, sess.Close())
+	assert.Empty(t, slices.Collect(p.Sessions()))
+	select {
+	case <-sess.Context().Done():
+	default:
+		t.Fatal("closing the session must end its context")
+	}
+
+	_, err = client.Write([]byte("after-close"))
+	require.NoError(t, err)
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(300*time.Millisecond)))
+	_, err = client.Read(buf)
+	require.Error(t, err, "a withdrawn destination must not be relayed")
+}
+
+func TestQUIC_RawUDPRejectedByDefault(t *testing.T) {
+	origin := udpEchoOrigin(t)
+
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(proxyCA))
+	require.NoError(t, err)
+
+	proxyAddr := startQUICRedirected(t, p, origin)
+
+	client, err := net.Dial("udp", proxyAddr.String())
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+
+	_, err = client.Write([]byte("nobody-said-yes"))
+	require.NoError(t, err)
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(300*time.Millisecond)))
+	_, err = client.Read(make([]byte, 64))
+	require.Error(t, err)
+	assert.Empty(t, slices.Collect(p.Sessions()))
+}
+
+// An authority held by an interceptor names traffic the operator chose to inspect, and raw
+// bytes offer nothing to terminate, so they drop rather than slipping through as a tunnel.
+func TestQUIC_RawUDPInterceptedAuthorityDrops(t *testing.T) {
+	origin := udpEchoOrigin(t)
+
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(proxyCA))
+	require.NoError(t, err)
+	p.MustAddInterceptor(nil, fmt.Sprintf("%s/+{any}", origin.String()), func(c *Context) (*http.Response, error) {
+		return c.Forward()
+	})
+
+	proxyAddr := startQUICRedirected(t, p, origin)
+
+	client, err := net.Dial("udp", proxyAddr.String())
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+
+	_, err = client.Write([]byte("raw-to-an-intercepted-ip"))
+	require.NoError(t, err)
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(300*time.Millisecond)))
+	_, err = client.Read(make([]byte, 64))
+	require.Error(t, err)
+	assert.Empty(t, slices.Collect(p.Sessions()))
+}
+
+func TestQUIC_RawUDPWildcardTunnel(t *testing.T) {
+	origin := udpEchoOrigin(t)
+
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(proxyCA))
+	require.NoError(t, err)
+	require.NoError(t, p.AddTunnel("+{any}"))
+
+	proxyAddr := startQUICRedirected(t, p, origin)
+
+	client, err := net.Dial("udp", proxyAddr.String())
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+
+	_, err = client.Write([]byte("anything-goes"))
+	require.NoError(t, err)
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
+	buf := make([]byte, 64)
+	n, err := client.Read(buf)
+	require.NoError(t, err)
+	assert.Equal(t, "anything-goes", string(buf[:n]))
+}
+
+func TestQUIC_RawUDPRelayCapPerFlow(t *testing.T) {
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(proxyCA))
+	require.NoError(t, err)
+	require.NoError(t, p.AddTunnel("+{any}"))
+
+	origins := make([]netip.AddrPort, maxRelaysPerFlow+1)
+	for i := range origins {
+		origins[i] = udpEchoOrigin(t)
+	}
+
+	proxyAddr := serveQUIC(t, p, func(pc net.PacketConn) net.PacketConn {
+		return &payloadOriginPacketConn{PacketConn: pc}
+	})
+
+	client, err := net.Dial("udp", proxyAddr.String())
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+
+	buf := make([]byte, 64)
+	for i, origin := range origins[:maxRelaysPerFlow] {
+		payload := rawPayloadFor(origin)
+		_, err = client.Write(payload)
+		require.NoError(t, err)
+		require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
+		n, rerr := client.Read(buf)
+		require.NoError(t, rerr, "origin %d must be relayed", i)
+		assert.Equal(t, payload, buf[:n])
+	}
+
+	_, err = client.Write(rawPayloadFor(origins[maxRelaysPerFlow]))
+	require.NoError(t, err)
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(300*time.Millisecond)))
+	_, err = client.Read(buf)
+	require.Error(t, err, "the relay cap refuses the next origin")
+	assert.Len(t, slices.Collect(p.Sessions()), maxRelaysPerFlow)
+}
+
+func TestQUIC_RawUDPSessionEndsOnProxyClose(t *testing.T) {
+	origin := udpEchoOrigin(t)
+
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(proxyCA))
+	require.NoError(t, err)
+	require.NoError(t, p.AddTunnel(origin.String()))
+
+	proxyAddr := startQUICRedirected(t, p, origin)
+
+	client, err := net.Dial("udp", proxyAddr.String())
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+
+	_, err = client.Write([]byte("warm-up"))
+	require.NoError(t, err)
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
+	_, err = client.Read(make([]byte, 64))
+	require.NoError(t, err)
+
+	sessions := waitForSessions(t, p, 1)
+	require.NoError(t, p.Close())
+	select {
+	case <-sessions[0].Context().Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("closing the proxy must end the raw session")
 	}
 }

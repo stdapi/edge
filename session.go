@@ -19,7 +19,7 @@ import (
 	"github.com/fox-toolkit/edge/internal/stringsutil"
 )
 
-// Protocol is the HTTP version spoken on a connection.
+// Protocol is the protocol spoken on a connection.
 type Protocol uint8
 
 const (
@@ -29,6 +29,8 @@ const (
 	HTTP2
 	// HTTP3 is HTTP/3 over QUIC.
 	HTTP3
+	// UDP is datagrams relayed untouched, with no protocol read into them.
+	UDP
 )
 
 func (p Protocol) String() string {
@@ -39,6 +41,8 @@ func (p Protocol) String() string {
 		return "HTTP/2.0"
 	case HTTP3:
 		return "HTTP/3.0"
+	case UDP:
+		return "UDP"
 	default:
 		return "unknown"
 	}

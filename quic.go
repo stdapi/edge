@@ -58,6 +58,10 @@ const (
 	maxConnsPerFlow    = 64
 	maxSniffingConns   = 512
 	maxLearnedPerRelay = 32
+	// Relays were bounded through the connections that create them until raw admission,
+	// which has no connection, so the bound sits on the relays themselves.
+	maxRelaysPerFlow = 16
+	maxRelays        = 1024
 )
 
 // ListenAndServeQUIC listens for UDP on addr and serves the QUIC connections routed to it. It
@@ -96,6 +100,10 @@ func (p *Proxy) ListenAndServeQUIC(addr string) error {
 // socket. On macOS, and when pc is not wrapped in [TransparentPacketConn], a client socket
 // supports one tunneled origin, and connections to further origins drop shortly after
 // their handshake.
+//
+// A datagram that is not QUIC is decided by the address it was headed to, when the platform
+// reports one. A tunnel matching that authority relays the bytes untouched, in both
+// directions, and anything else drops them.
 func (p *Proxy) ServeQUIC(pc net.PacketConn) error {
 	if p.srv.closing.Load() {
 		return ErrProxyClosed
@@ -141,8 +149,9 @@ type quicDemux struct {
 	wg    sync.WaitGroup
 
 	// sniffing counts the connections buffering a ClientHello across every flow, the memory
-	// an unauthenticated peer controls.
+	// an unauthenticated peer controls, and relays counts the sockets one holds open.
 	sniffing int
+	relays   int
 
 	closeOnce sync.Once
 
@@ -216,10 +225,16 @@ func (c *quicConn) end() {
 // headed there. The origin tells them apart by their connection IDs (RFC 9000 section 5.2).
 type quicRelay struct {
 	upstream net.Conn
-	key      netip.AddrPort
-	conns    []*quicConn
-	learned  int
-	closed   bool
+	// sess and cancel belong to a raw relay, which has no connection to hang them on.
+	sess    *Session
+	cancel  context.CancelFunc
+	key     netip.AddrPort
+	conns   []*quicConn
+	learned int
+	closed  bool
+	// raw marks a relay whose client sent datagrams no protocol was read into. It learns no
+	// connection IDs off its return traffic, arbitrary bytes being able to spell one.
+	raw bool
 }
 
 // h3NoError is HTTP/3's H3_NO_ERROR, what a peer sends when it closes a connection with
@@ -274,6 +289,19 @@ func (c *quicConnCloser) Close() error {
 	return qc.CloseWithError(h3NoError, "")
 }
 
+// rawRelayCloser ends one raw relay. The relay is the whole of what its session covers, so
+// closing the session closes exactly that.
+type rawRelayCloser struct {
+	d     *quicDemux
+	relay *quicRelay
+	flow  netip.AddrPort
+}
+
+func (c *rawRelayCloser) Close() error {
+	c.d.closeRelay(c.flow, c.relay)
+	return nil
+}
+
 // appendSessions adds the sessions of the connections this demux serves to out.
 func (d *quicDemux) appendSessions(out []*Session) []*Session {
 	d.mu.Lock()
@@ -282,6 +310,11 @@ func (d *quicDemux) appendSessions(out []*Session) []*Session {
 		for _, conn := range flow.conns {
 			if conn.sess != nil {
 				out = append(out, conn.sess)
+			}
+		}
+		for _, relay := range flow.relays {
+			if relay.sess != nil {
+				out = append(out, relay.sess)
 			}
 		}
 	}
@@ -525,6 +558,9 @@ func (d *quicDemux) dispatch(addr net.Addr, datagram []byte) {
 func (d *quicDemux) dispatchLong(addr net.Addr, from netip.AddrPort, datagram []byte) {
 	version, dcid, _, ok := quicsniff.ParseLongHeader(datagram)
 	if !ok {
+		// A raw protocol is free to set the high bit, so failing the parse places the
+		// datagram by its destination rather than dropping it.
+		d.dispatchRaw(addr, from, datagram)
 		return
 	}
 
@@ -580,7 +616,9 @@ func (d *quicDemux) dispatchLong(addr net.Addr, from netip.AddrPort, datagram []
 	d.mu.Unlock()
 	if up != nil {
 		_, _ = up.Write(datagram)
+		return
 	}
+	d.rawAdmit(addr, from, datagram)
 }
 
 // dispatchShort places a short header datagram, whose connection ID length is not on the
@@ -614,7 +652,26 @@ func (d *quicDemux) dispatchShort(addr net.Addr, from netip.AddrPort, datagram [
 	d.mu.Unlock()
 	if up != nil {
 		_, _ = up.Write(datagram)
+		return
 	}
+	d.rawAdmit(addr, from, datagram)
+}
+
+// dispatchRaw places a datagram whose bytes rule out QUIC. An existing relay of its flow
+// takes it, or raw admission decides it.
+func (d *quicDemux) dispatchRaw(addr net.Addr, from netip.AddrPort, datagram []byte) {
+	d.mu.Lock()
+	flow := d.flows[from]
+	if flow != nil {
+		flow.lastSeen = time.Now()
+	}
+	up := d.fallbackLocked(flow, addr)
+	d.mu.Unlock()
+	if up != nil {
+		_, _ = up.Write(datagram)
+		return
+	}
+	d.rawAdmit(addr, from, datagram)
 }
 
 // fallbackLocked places a datagram no connection ID could attribute, the steady state of
@@ -643,10 +700,101 @@ func (d *quicDemux) fallbackLocked(flow *quicFlow, client net.Addr) net.Conn {
 	return nil
 }
 
-func (d *quicDemux) admitConnLocked(from netip.AddrPort, client net.Addr, odcid string, now time.Time) *quicConn {
-	if d.draining.Load() || d.sniffing >= maxSniffingConns {
-		return nil
+// rawAdmit is the terminal step of dispatch, for a datagram nothing QUIC could attribute.
+// With no server name to decide on, the authority tree answers for the destination the
+// client wrote, and a Tunnel entry there opens a relay carrying the bytes untouched.
+func (d *quicDemux) rawAdmit(client net.Addr, from netip.AddrPort, datagram []byte) {
+	origin := d.originalDst(client)
+	if !origin.IsValid() {
+		return
 	}
+
+	d.mu.Lock()
+	if flow := d.flows[from]; flow != nil {
+		// The platform answered with an origin the fallback could not see, natlook on a
+		// flow with several relays typically.
+		if relay := flow.relays[origin]; relay != nil {
+			up := relay.upstream
+			d.mu.Unlock()
+			_, _ = up.Write(datagram)
+			return
+		}
+	}
+	d.mu.Unlock()
+
+	target := Target{Host: origin.Addr().String(), Port: fmt.Sprint(origin.Port())}
+	action := d.p.ActionFor(target)
+	if action != Tunnel {
+		reason := "no tunnel matches this destination"
+		if action == Intercept {
+			reason = "an intercepted authority cannot carry raw datagrams"
+		}
+		d.p.cfg.logger.Debug("edge: raw datagram dropped",
+			slog.String("client", from.String()),
+			slog.String("origin", origin.String()),
+			slog.String("reason", reason))
+		return
+	}
+
+	upstream, err := d.dialUpstreamUDP(target, origin)
+	if err != nil {
+		d.p.cfg.logger.Debug("edge: cannot reach the origin",
+			slog.String("origin", origin.String()), slog.String("error", err.Error()))
+		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	sess := newSession(ctx, nil, target, Tunnel, UDP)
+	sess.remoteAddr = client
+	sess.localAddr = d.pc.LocalAddr()
+	sess.transparent = true
+	sess.upstream = origin
+	relay := &quicRelay{upstream: upstream, key: origin, raw: true, sess: sess, cancel: cancel}
+	sess.closer = &rawRelayCloser{d: d, flow: from, relay: relay}
+
+	d.mu.Lock()
+	ok := d.publishRawLocked(from, client, relay)
+	d.mu.Unlock()
+	if !ok {
+		cancel()
+		_ = upstream.Close()
+		d.p.cfg.logger.Debug("edge: raw datagram dropped",
+			slog.String("client", from.String()),
+			slog.String("origin", origin.String()),
+			slog.String("reason", "the proxy is at capacity or shutting down"))
+		return
+	}
+
+	// See beginTunnel. Published, so a sweep started after the tree changed either found
+	// the session or ran before this read, which then observes the change.
+	if d.p.ActionFor(target) == Reject {
+		d.closeRelay(from, relay)
+		return
+	}
+
+	_, _ = relay.upstream.Write(datagram)
+}
+
+// publishRawLocked places a raw relay in its flow, created when the datagram is the first
+// of its socket. It shares the draining critical section with shutdown, so the relay is
+// either refused or in the snapshot a shutdown sweeps.
+func (d *quicDemux) publishRawLocked(from netip.AddrPort, client net.Addr, relay *quicRelay) bool {
+	if d.draining.Load() || d.relays >= maxRelays {
+		return false
+	}
+	flow := d.flowLocked(from, client, time.Now())
+	if flow == nil || len(flow.relays) >= maxRelaysPerFlow || flow.relays[relay.key] != nil {
+		return false
+	}
+	flow.relays[relay.key] = relay
+	d.relays++
+	d.wg.Go(func() { d.runRelay(from, client, relay) })
+	return true
+}
+
+// flowLocked returns the flow of one client socket, created on first sight, or nil at the
+// flow cap.
+func (d *quicDemux) flowLocked(from netip.AddrPort, client net.Addr, now time.Time) *quicFlow {
 	flow := d.flows[from]
 	if flow == nil {
 		if len(d.flows) >= maxQUICFlows {
@@ -660,6 +808,17 @@ func (d *quicDemux) admitConnLocked(from netip.AddrPort, client net.Addr, odcid 
 			learned:  make(map[string]*quicRelay),
 		}
 		d.flows[from] = flow
+	}
+	return flow
+}
+
+func (d *quicDemux) admitConnLocked(from netip.AddrPort, client net.Addr, odcid string, now time.Time) *quicConn {
+	if d.draining.Load() || d.sniffing >= maxSniffingConns {
+		return nil
+	}
+	flow := d.flowLocked(from, client, now)
+	if flow == nil {
+		return nil
 	}
 	if len(flow.conns) >= maxConnsPerFlow {
 		return nil
@@ -905,16 +1064,24 @@ func (d *quicDemux) placeTunnelLocked(from netip.AddrPort, conn *quicConn, key n
 		relay = flow.relays[key]
 	}
 	if relay == nil {
+		if len(flow.relays) >= maxRelaysPerFlow || d.relays >= maxRelays {
+			return nil, false
+		}
 		if upstream == nil {
 			return nil, true
 		}
 		relay = &quicRelay{upstream: upstream, key: key}
 		flow.relays[key] = relay
+		d.relays++
 		// The relay's Add shares the critical section with the close that waits on the
 		// group, so it either precedes the wait or does not happen.
 		client := flow.client
 		d.wg.Go(func() { d.runRelay(from, client, relay) })
 	}
+	// A raw relay reached first can end up carrying a QUIC connection, reordered 0-RTT
+	// ahead of its Initial typically. Learning has to resume, a Retry is unroutable
+	// without the origin's IDs.
+	relay.raw = false
 
 	d.setStateLocked(conn, connTunneling)
 	conn.pending = nil
@@ -971,7 +1138,7 @@ func (d *quicDemux) learnOrigin(from netip.AddrPort, relay *quicRelay, datagram 
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	flow := d.flows[from]
-	if flow == nil || relay.closed || relay.learned >= maxLearnedPerRelay {
+	if flow == nil || relay.closed || relay.raw || relay.learned >= maxLearnedPerRelay {
 		return
 	}
 	if _, seen := flow.learned[string(scid)]; seen {
@@ -993,6 +1160,10 @@ func (d *quicDemux) closeRelay(from netip.AddrPort, relay *quicRelay) {
 	}
 	relay.closed = true
 	delete(flow.relays, relay.key)
+	d.relays--
+	if relay.cancel != nil {
+		relay.cancel()
+	}
 	for cid, r := range flow.learned {
 		if r == relay {
 			delete(flow.learned, cid)
@@ -1126,6 +1297,9 @@ func (d *quicDemux) close() {
 		for _, flow := range d.flows {
 			for _, relay := range flow.relays {
 				relay.closed = true
+				if relay.cancel != nil {
+					relay.cancel()
+				}
 				sockets = append(sockets, relay.upstream)
 			}
 			for _, conn := range flow.conns {
@@ -1134,6 +1308,7 @@ func (d *quicDemux) close() {
 		}
 		clear(d.flows)
 		d.sniffing = 0
+		d.relays = 0
 		d.mu.Unlock()
 
 		for _, s := range sockets {
