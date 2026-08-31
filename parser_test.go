@@ -6,6 +6,7 @@ package edge
 
 import (
 	"net/http"
+	"net/netip"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -15,10 +16,9 @@ import (
 func TestParser_KeyIsThePatternWithoutItsPort(t *testing.T) {
 	p := testProxy(t)
 
-	// Without a port, the pattern is the key byte for byte.
+	// Without a port, a name pattern is the key byte for byte.
 	for _, raw := range []string{
 		"api.stripe.com/v1/charges",
-		"127.0.0.1/health",
 		"+{any}/v1/charges",
 		"+{sub}.stripe.com/v1/{id}",
 	} {
@@ -28,19 +28,24 @@ func TestParser_KeyIsThePatternWithoutItsPort(t *testing.T) {
 	}
 
 	// With one, the key drops it, so a pattern naming a port and one naming none land on the
-	// same node and are told apart by the port alone.
+	// same node and are told apart by the port alone. An address host is keyed on its encoded
+	// form, brackets and port dropped the same way.
+	loKey := prefixKey(netip.PrefixFrom(netip.MustParseAddr("127.0.0.1"), 32))
+	v6Key := prefixKey(netip.PrefixFrom(netip.MustParseAddr("::1"), 128))
 	for _, tc := range []struct{ raw, key, port string }{
 		{"api.stripe.com:8443/v1/charges", "api.stripe.com/v1/charges", "8443"},
-		{"127.0.0.1:8080/health", "127.0.0.1/health", "8080"},
-		{"[::1]:8080/health", "::1/health", "8080"},
-		{"[::1]/health", "::1/health", ""},
+		{"127.0.0.1/health", loKey + "/health", ""},
+		{"127.0.0.1:8080/health", loKey + "/health", "8080"},
+		{"[::1]:8080/health", v6Key + "/health", "8080"},
+		{"[::1]/health", v6Key + "/health", ""},
 	} {
 		pat, _, err := p.parsePattern(tc.raw)
 		require.NoError(t, err, tc.raw)
 		assert.Equal(t, tc.key, pat.key, tc.raw)
 		assert.Equal(t, tc.port, pat.port, tc.raw)
 		assert.Equal(t, tc.raw, pat.str, tc.raw)
-		assert.Equal(t, tc.key, patternKey(tc.raw), tc.raw)
+		key, _ := patternKey(tc.raw)
+		assert.Equal(t, tc.key, key, tc.raw)
 	}
 }
 func TestParser_SchemeIsRefusedInAnInterceptorPattern(t *testing.T) {
@@ -107,7 +112,7 @@ func TestParser_AddressLiteralMustBeCanonical(t *testing.T) {
 	pat, _, err := p.parsePattern("[::1]/health")
 	require.NoError(t, err)
 	assert.Equal(t, "::1", pat.host)
-	assert.Equal(t, "::1/health", pat.key)
+	assert.Equal(t, prefixKey(netip.PrefixFrom(netip.MustParseAddr("::1"), 128))+"/health", pat.key)
 
 	for _, tc := range []struct{ pattern, hint string }{
 		{"::1/health", "IPv6 literal must be bracketed"},

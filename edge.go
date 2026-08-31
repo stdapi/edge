@@ -155,6 +155,7 @@ func (p *Proxy) newTree() *iTree {
 	tree := new(iTree)
 	tree.p = p
 	tree.patterns = new(node)
+	tree.addrs = new(node)
 	tree.names = new(node)
 	tree.methods = make(map[string]uint)
 	tree.pool = sync.Pool{
@@ -185,8 +186,10 @@ func (p *Proxy) MustAddInterceptor(methods []string, pattern string, handler Han
 //
 //	api.stripe.com/v1/charges       one host
 //	+{sub}.corp.internal/health     every subdomain
-//	+{any}/health                   every authority
+//	+{any}/health                   every hostname
 //	api.stripe.com/*{any}           every path on one host, which is how to just watch it
+//	[10.0.0.0/8]/health             every address in a range
+//	[::/0]/health                   every IPv6 address
 //
 // The port belongs to the pattern, as "host:port/path". The scheme is a matcher: see [WithScheme].
 //
@@ -281,7 +284,7 @@ func (p *Proxy) InterceptorsLen() int { return p.getTree().interceptors }
 // Iter returns a set of range iterators over a point-in-time snapshot of the routing tree.
 func (p *Proxy) Iter() Iter {
 	tree := p.getTree()
-	return Iter{patterns: tree.patterns, names: tree.names, methods: tree.methods, maxDepth: tree.maxDepth}
+	return Iter{patterns: tree.patterns, addrs: tree.addrs, names: tree.names, methods: tree.methods, maxDepth: tree.maxDepth}
 }
 
 // Updates runs fn in a write transaction on the routing tree. The transaction is committed

@@ -66,7 +66,7 @@ The two combine freely. Most test setups want an explicit proxy that intercepts 
 
 ## What happens to a connection
 
-The decision is taken from the authority alone, before any request is parsed, and the most specific pattern wins: a static authority beats a parameter, which beats a wildcard. It is taken again for every request that names another authority, through its `Host` header or through a transparent listener carrying many, so nothing is reached on the strength of a decision taken for something else.
+The decision is taken from the authority alone, before any request is parsed, and the most specific pattern wins. A hostname is decided among the name patterns, a static authority beating a parameter, which beats a wildcard. An address is decided among the address patterns, the longest registered prefix winning like a routing table entry, an exact address being the longest of all. A host is one or the other, never both, so the two kinds of pattern never compete for a connection. The decision is taken again for every request that names another authority, through its `Host` header or through a transparent listener carrying many, so nothing is reached on the strength of a decision taken for something else.
 
 ```go
 // Watch every Stripe subdomain, forwarding untouched unless a narrower interceptor matches.
@@ -78,11 +78,15 @@ p.MustAddTunnel("checkout.stripe.com")
 
 There are only these two ways to admit an authority, and both name it explicitly. An interceptor arms the authority in its own pattern, so a handler always sees the traffic it was written for; the entry it implies is reference counted and disappears with the last interceptor that needed it.
 
-**Everything else is refused.** A proxy that captures the traffic of an application under test should say what it expects that application to reach, and hear about it when the application reaches somewhere else. One line restores a permissive proxy, and it is visible in the code:
+**Everything else is refused.** A proxy that captures the traffic of an application under test should say what it expects that application to reach, and hear about it when the application reaches somewhere else. A permissive proxy is restored by naming hostnames and addresses separately, and every line is visible in the code:
 
 ```go
-p.MustAddTunnel("+{any}") // relay anything not named above
+p.MustAddTunnel("+{any}")      // relay any hostname not named above
+p.MustAddTunnel("[0.0.0.0/0]") // relay any IPv4 address
+p.MustAddTunnel("[::/0]")      // relay any IPv6 address
 ```
+
+The split is deliberate. An application reaching a raw IP instead of a name is often exactly what a test wants to hear about, and allowing it is a decision worth a line of its own.
 
 An authority cannot be both tunneled and intercepted by the same pattern. Declaring the second is an error rather than a silent no-op, in either order, because one of the two would otherwise be dead.
 
@@ -96,10 +100,12 @@ A pattern is an authority and a path. The authority is required: it is what the 
 api.stripe.com/v1/charges           any scheme, any port
 api.stripe.com:8443/v1/charges      one port
 +{sub}.corp.internal/health         every subdomain
-+{any}/v1/charges                   every authority
++{any}/v1/charges                   every hostname
 api.stripe.com/*{any}               every path on one host, which is how to just watch it
 127.0.0.1/health                    address literal
 [::1]:8080/health                   IPv6, bracketed
+[10.0.0.0/8]/health                 every address in a range
+[::/0]/health                       every IPv6 address
 ```
 
 Parameters use Fox's syntax:
@@ -109,7 +115,9 @@ Parameters use Fox's syntax:
 
 Matching priority is static, then regex parameter, then parameter, then regex wildcard, then wildcard, with backtracking to the last decision point.
 
-An address literal has one spelling, the one an authority carries: `[::1]`, not `::1` or `[::0001]`.
+A pattern names either hostnames or addresses, never both. A parameter or a wildcard captures name labels only, so `{a}/api` matches no address and `127.0.{a}.1` is a four label hostname, not a range. RFC 3986 decides the kind of an incoming host the same way, address first, and the lookup reduces whatever spelling the client wrote to the canonical one, so `2001:0db8::1` and `2001:db8::1` reach the same entry.
+
+An address literal has one spelling, the one an authority carries: `[::1]`, not `::1` or `[::0001]`. A range is bracketed for its `/`, masked, and shorter than a full address: `[10.0.0.0/8]`, not `10.0.0.0/8`, `[10.0.0.1/8]` or `[10.0.0.1/32]`. Every other spelling is refused with the one to write. Ranges may overlap freely, the longest deciding, and a range matches the address a client names, never what a hostname resolves to.
 
 ### Port
 

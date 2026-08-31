@@ -9,7 +9,6 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/fox-toolkit/edge/internal/netutil"
 	"github.com/fox-toolkit/edge/internal/stringsutil"
 )
 
@@ -58,12 +57,64 @@ type node struct {
 	host bool
 }
 
-// lookup walks the hostname, then the path under it. Every key starts with a hostname and
-// ends with a path, so the walk always starts on the hostname portion and lookupByHostname is the only
-// way into lookupByPath.
-func (n *node) lookup(method, hostPort, path string, c *Context, lazy bool) (int, *node) {
-	*c.skipStack = (*c.skipStack)[:0]
-	return lookupByHostname(n, method, netutil.StripHostPort(hostPort), path, c, lazy, false)
+// lookupByAddr resolves key, the encoded address of a target, against the address root. The
+// walk is a longest-prefix match: every node the key fully covers is a candidate, the
+// deepest answers first, and a refusal falls back to the next shorter prefix. With authority
+// set a candidate answers through its authority entries, otherwise through the path subtree
+// under its '/' edge.
+//
+// A registered prefix always ends on a node boundary. The insert splits nodes to attach its
+// entries or its path subtree, and a delete never merges a node that still carries either,
+// which is what lets the walk test candidacy only where a child key was consumed whole.
+func lookupByAddr(root *node, method string, key []byte, path string, c *Context, lazy, authority bool) (int, *node) {
+	// One slot per consumed-key position, the root included even though it can never
+	// qualify today, so a new candidate class cannot overflow the array.
+	var cands [maxAddrKey + 1]*node
+	n := 0
+
+	matched := root
+	search := key
+	for {
+		if authority {
+			if matched.isLeaf() {
+				cands[n] = matched
+				n++
+			}
+		} else if _, pathChild := matched.getStaticEdge(slashDelim); pathChild != nil {
+			cands[n] = matched
+			n++
+		}
+		if len(search) == 0 {
+			break
+		}
+		_, child := matched.getStaticEdge(search[0])
+		if child == nil {
+			break
+		}
+		keyLen := len(child.key)
+		if keyLen > len(search) || string(search[:keyLen]) != child.key {
+			break
+		}
+		matched = child
+		search = search[keyLen:]
+	}
+
+	for i := n - 1; i >= 0; i-- {
+		cand := cands[i]
+		if authority {
+			if idx, ok := findAuthority(cand, c); ok {
+				return idx, cand
+			}
+			continue
+		}
+		paramCnt := len(*c.params)
+		if idx, subNode := lookupByPath(cand, method, path, c, lazy, 0); subNode != nil {
+			return idx, subNode
+		}
+		*c.skipStack = (*c.skipStack)[:0]
+		*c.params = (*c.params)[:paramCnt]
+	}
+	return 0, nil
 }
 
 // lookupByHostname walks the hostname portion of the key. With authority set it stops there

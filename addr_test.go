@@ -1,0 +1,404 @@
+// Copyright 2025 Sylvain Müller. All rights reserved.
+// Mount of this source code is governed by a Apache-2.0 license that can be found
+// at https://github.com/fox-toolkit/edge/blob/master/LICENSE.txt.
+
+package edge
+
+import (
+	"net/http"
+	"slices"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// An IPv6 literal starting with a hex letter is an address like any other. The old fast path
+// tested the first byte against digits and ':' only, which silently made half the IPv6 space
+// unregistrable, fc00::/7 and fe80::/10 included.
+func TestAddr_HexFirstLiteralsAreRegistrable(t *testing.T) {
+	p := testProxy(t)
+
+	for _, pattern := range []string{"[fd00::1]", "[fe80::1]", "[dead:beef::1]", "[2001:db8::1]"} {
+		_, err := p.AddTunnel(pattern)
+		require.NoError(t, err, pattern)
+	}
+	assert.Equal(t, Tunnel, p.ActionFor(target("[fd00::1]:443")))
+
+	_, err := p.AddInterceptor(nil, "[cafe::2]/api", noopHandler)
+	require.NoError(t, err)
+	assert.Equal(t, Intercept, p.ActionFor(target("[cafe::2]:443")))
+}
+
+// A range has exactly one spelling: bracketed, masked, lowercase, unmapped, and shorter than
+// a full address. Anything the parser could canonicalize is refused with the form to write.
+func TestAddr_RangeSpellingIsCanonical(t *testing.T) {
+	p := testProxy(t)
+
+	for _, pattern := range []string{
+		"[10.0.0.0/8]", "[fd00::/8]", "[0.0.0.0/0]", "[::/0]", "[10.0.0.0/8]:443", "[2001:db8::/32]",
+	} {
+		_, err := p.AddTunnel(pattern)
+		require.NoError(t, err, pattern)
+	}
+
+	for _, tc := range []struct{ pattern, hint string }{
+		{"[10.0.0.1/8]", "write [10.0.0.0/8]"},
+		{"[FD00::/8]", "write [fd00::/8]"},
+		{"[fd00:0000::/8]", "write [fd00::/8]"},
+		{"[fd00::/08]", "invalid address range"},
+		{"[10.0.0.1/32]", "a full-length prefix is an address, write 10.0.0.1"},
+		{"[::1/128]", "a full-length prefix is an address, write [::1]"},
+		{"[::ffff:10.0.0.0/104]", "write [10.0.0.0/8]"},
+		{"[::ffff:0:0/80]", "a mapped address range has no canonical form"},
+		{"[fe80::%eth0/64]", "invalid address range"},
+	} {
+		_, err := p.AddTunnel(tc.pattern)
+		var pe *PatternError
+		require.ErrorAs(t, err, &pe, tc.pattern)
+		assert.Contains(t, pe.Error(), tc.hint, tc.pattern)
+	}
+}
+
+// A range written without brackets reads as something else: a path on an authority pattern,
+// an address and a path on an interceptor pattern. Both are refused with the bracketed form
+// rather than silently registered as what they parse as.
+func TestAddr_UnbracketedRangeIsRefused(t *testing.T) {
+	p := testProxy(t)
+
+	_, err := p.AddTunnel("10.0.0.0/8")
+	var pe *PatternError
+	require.ErrorAs(t, err, &pe)
+	assert.Contains(t, pe.Error(), "an address range is written in brackets: [10.0.0.0/8]")
+
+	_, err = p.AddInterceptor(nil, "10.0.0.0/8", noopHandler)
+	require.ErrorAs(t, err, &pe)
+	assert.Contains(t, pe.Error(), "[10.0.0.0/8]")
+
+	_, err = p.AddInterceptor(nil, "10.0.0.0/8/api", noopHandler)
+	require.ErrorAs(t, err, &pe)
+	assert.Contains(t, pe.Error(), "[10.0.0.0/8]/api")
+
+	// A numeric first segment past the address width is a path, not a range gone wrong.
+	_, err = p.AddInterceptor(nil, "10.0.0.0/1234", noopHandler)
+	require.NoError(t, err)
+}
+
+// The refusal covers only spellings whose range reading is valid: unbracketed, masked, and
+// shorter than a full address. Everything else is a path, brackets included, since the
+// brackets already said the host is an address.
+func TestAddr_NumericPathsOnAddressHosts(t *testing.T) {
+	p := testProxy(t)
+
+	for _, pattern := range []string{
+		"[::1]/8/metrics",
+		"[2001:db8::1]/2/items",
+		"10.1.2.3/8/metrics",
+		"10.0.0.1/32",
+	} {
+		_, err := p.AddInterceptor(nil, pattern, noopHandler)
+		require.NoError(t, err, pattern)
+	}
+	assert.NotNil(t, match(t, p, http.MethodGet, "https", "[::1]:443", "/8/metrics"))
+	assert.NotNil(t, match(t, p, http.MethodGet, "https", "10.0.0.1:443", "/32"))
+}
+
+// Every refusal hint names a spelling the parser accepts. A hint pointing at a pattern that
+// is itself refused is a dead end.
+func TestAddr_HintsAreRegistrable(t *testing.T) {
+	p := testProxy(t)
+
+	for _, tc := range []struct{ pattern, hint string }{
+		{"10.0.0.1/32", "a full-length prefix is an address, write 10.0.0.1"},
+		{"[::ffff:10.0.0.1/128]", "a full-length prefix is an address, write 10.0.0.1"},
+		{"10.0.0.0/33", "an authority pattern must not carry a path"},
+		{"10.0.0.0/8/x", "an authority pattern must not carry a path"},
+		{"10.1.2.3/8", "an authority pattern must not carry a path"},
+	} {
+		_, err := p.AddTunnel(tc.pattern)
+		var pe *PatternError
+		require.ErrorAs(t, err, &pe, tc.pattern)
+		assert.Contains(t, pe.Error(), tc.hint, tc.pattern)
+	}
+}
+
+// A zoned literal is decided as its address, zone dropped. Left to the name patterns it
+// would slip past every address rule while the dial still reaches the address.
+func TestAddr_ZonedLiteralIsDecidedAsItsAddress(t *testing.T) {
+	p := testProxy(t)
+	p.MustAddTunnel("+{any}")
+	assert.Equal(t, Reject, p.ActionFor(target("[fe80::1%eth0]:443")))
+	assert.Equal(t, Reject, p.ActionFor(Target{Host: "fe80::1%eth", Port: "443"}))
+
+	p.MustAddTunnel("[fe80::/10]")
+	assert.Equal(t, Tunnel, p.ActionFor(target("[fe80::1%eth0]:443")))
+	assert.Equal(t, Tunnel, p.ActionFor(Target{Host: "fe80::1%eth", Port: "443"}))
+
+	p2 := testProxy(t)
+	ic := p2.MustAddInterceptor(nil, "[fe80::1]/api", noopHandler)
+	assert.Same(t, ic, match(t, p2, http.MethodGet, "https", "[fe80::1%25eth0]:443", "/api"))
+}
+
+// A target host parses as an address or it is a name, never both. A host
+// parameter captures name labels only, the name wildcard covers every name and no address,
+// and a parameterized pattern that looks like an address is a name that resembles one.
+func TestAddr_HostKindsRouteSeparately(t *testing.T) {
+	p := testProxy(t)
+	p.MustAddInterceptor(nil, "{a}/api", noopHandler)
+	p.MustAddInterceptor(nil, "127.0.{a}.1/api", noopHandler)
+
+	assert.NotNil(t, match(t, p, http.MethodGet, "https", "somename:443", "/api"))
+	assert.Nil(t, match(t, p, http.MethodGet, "https", "[2001:db8::1]:443", "/api"))
+
+	assert.NotNil(t, match(t, p, http.MethodGet, "https", "127.0.foo.1:443", "/api"))
+	assert.Nil(t, match(t, p, http.MethodGet, "https", "127.0.5.1:443", "/api"))
+
+	p2 := testProxy(t)
+	p2.MustAddTunnel("+{any}")
+	assert.Equal(t, Tunnel, p2.ActionFor(target("example.com:443")))
+	assert.Equal(t, Reject, p2.ActionFor(target("127.0.0.1:443")))
+	assert.Equal(t, Reject, p2.ActionFor(target("[2001:db8::1]:443")))
+
+	p2.MustAddTunnel("[0.0.0.0/0]")
+	p2.MustAddTunnel("[::/0]")
+	assert.Equal(t, Tunnel, p2.ActionFor(target("127.0.0.1:443")))
+	assert.Equal(t, Tunnel, p2.ActionFor(target("[2001:db8::1]:443")))
+	// A mapped target names an IPv4 address and falls under the IPv4 catch-all.
+	assert.Equal(t, Tunnel, p2.ActionFor(target("[::ffff:127.0.0.1]:443")))
+}
+
+// The pattern requires the canonical spelling, and the lookup reduces whatever the client
+// wrote to the same form. No alternative spelling reaches a different entry, which with a
+// permissive fallback registered used to bypass interception.
+func TestAddr_LookupNormalizesTheWireSpelling(t *testing.T) {
+	p := testProxy(t)
+	p.MustAddTunnel("[0.0.0.0/0]")
+	p.MustAddTunnel("[::/0]")
+	p.MustAddInterceptor(nil, "[2001:db8::1]/+{rest}", noopHandler)
+	p.MustAddInterceptor(nil, "127.0.0.1/+{rest}", noopHandler)
+
+	for _, host := range []string{"2001:db8::1", "2001:db8:0:0:0:0:0:1", "2001:0DB8::0001", "2001:db8::1."} {
+		assert.Equal(t, Intercept, p.ActionFor(Target{Host: host, Port: "443"}), host)
+		assert.NotNil(t, match(t, p, http.MethodGet, "https", "["+host+"]:443", "/x"), host)
+	}
+	for _, host := range []string{"127.0.0.1", "::ffff:127.0.0.1", "127.0.0.1."} {
+		assert.Equal(t, Intercept, p.ActionFor(Target{Host: host, Port: "443"}), host)
+	}
+	assert.Equal(t, Tunnel, p.ActionFor(target("[2001:db8::2]:443")))
+}
+
+// The authority decision cuts a trailing root dot the way the request lookup always has.
+// example.com and example.com. are the same name, and the dotted form used to slip past an
+// interceptor into whatever fallback was registered.
+func TestAddr_AuthorityLookupCutsTheRootDot(t *testing.T) {
+	p := testProxy(t)
+	p.MustAddInterceptor(nil, "example.com/+{rest}", noopHandler)
+	assert.Equal(t, Intercept, p.ActionFor(Target{Host: "example.com.", Port: "443"}))
+	assert.Equal(t, Reject, p.ActionFor(Target{Host: "other.com.", Port: "443"}))
+}
+
+// The longest registered prefix that accepts the port decides, an exact address is a
+// full-length prefix, and overlapping ranges are precision, not a conflict.
+func TestAddr_LongestPrefixDecides(t *testing.T) {
+	p := testProxy(t)
+	p.MustAddTunnel("[10.0.0.0/8]")
+	p.MustAddInterceptor(nil, "[10.1.0.0/16]/+{rest}", noopHandler)
+	p.MustAddInterceptor(nil, "10.1.2.3/metrics", noopHandler)
+
+	assert.Equal(t, Tunnel, p.ActionFor(target("10.9.9.9:443")))
+	assert.Equal(t, Intercept, p.ActionFor(target("10.1.9.9:443")))
+	assert.Equal(t, Intercept, p.ActionFor(target("10.1.2.3:443")))
+	assert.Equal(t, Reject, p.ActionFor(target("11.0.0.1:443")))
+}
+
+// A candidate that refuses the port hands the decision to the next shorter prefix rather
+// than ending the lookup, the same fallback a name walk gets from its skip stack.
+func TestAddr_PortMismatchFallsBackToTheShorterPrefix(t *testing.T) {
+	p := testProxy(t)
+	p.MustAddTunnel("[10.0.0.0/8]")
+	p.MustAddInterceptor(nil, "[10.1.0.0/16]:8443/+{rest}", noopHandler)
+
+	assert.Equal(t, Intercept, p.ActionFor(target("10.1.2.3:8443")))
+	assert.Equal(t, Tunnel, p.ActionFor(target("10.1.2.3:443")))
+}
+
+// Requests route on the same rule. A path that misses under the longest prefix falls back to
+// a shorter one that serves it, and the exact address outranks every range covering it.
+func TestAddr_RequestRoutingUsesLongestPrefix(t *testing.T) {
+	p := testProxy(t)
+	eight := p.MustAddInterceptor(nil, "[10.0.0.0/8]/api", noopHandler)
+	sixteen := p.MustAddInterceptor(nil, "[10.1.0.0/16]/api", noopHandler)
+	exact := p.MustAddInterceptor(nil, "10.1.2.3/api", noopHandler)
+	only16 := p.MustAddInterceptor(nil, "[10.1.0.0/16]/deep", noopHandler)
+	wide := p.MustAddInterceptor(nil, "[10.0.0.0/8]/wide", noopHandler)
+
+	assert.Same(t, exact, match(t, p, http.MethodGet, "https", "10.1.2.3:443", "/api"))
+	assert.Same(t, sixteen, match(t, p, http.MethodGet, "https", "10.1.9.9:443", "/api"))
+	assert.Same(t, eight, match(t, p, http.MethodGet, "https", "10.9.9.9:443", "/api"))
+	assert.Same(t, only16, match(t, p, http.MethodGet, "https", "10.1.9.9:443", "/deep"))
+	// /deep exists only under the /16, so an address outside it finds nothing.
+	assert.Nil(t, match(t, p, http.MethodGet, "https", "10.9.9.9:443", "/deep"))
+	// /wide misses under the /16, so the walk falls back to the /8 that serves it.
+	assert.Same(t, wide, match(t, p, http.MethodGet, "https", "10.1.9.9:443", "/wide"))
+}
+
+// The path under a range is an ordinary path, parameters and wildcards capture there as
+// under any host. The range itself captures nothing, the real address is on the context.
+func TestAddr_PathParamsUnderARange(t *testing.T) {
+	p := testProxy(t)
+	ic := p.MustAddInterceptor(nil, "[10.0.0.0/8]/v1/{id}", func(c *Context) (*http.Response, error) {
+		assert.Equal(t, "42", c.Param("id"))
+		assert.Equal(t, "10.5.6.7", c.Host())
+		return Status(http.StatusOK), nil
+	})
+	assert.Equal(t, 1, ic.ParamsLen())
+
+	got := match(t, p, http.MethodGet, "https", "10.5.6.7:443", "/v1/42")
+	require.Same(t, ic, got)
+}
+
+// The same prefix declared twice is the same conflict a duplicated authority always was, and
+// a tunneled range refuses interceptors on that exact range in either order. Different
+// precision is not a conflict, which TestAddr_LongestPrefixDecides holds.
+func TestAddr_SamePrefixConflicts(t *testing.T) {
+	p := testProxy(t)
+	p.MustAddTunnel("[10.0.0.0/8]")
+
+	_, err := p.AddTunnel("[10.0.0.0/8]")
+	var ce *InterceptorConflictError
+	require.ErrorAs(t, err, &ce)
+
+	_, err = p.AddInterceptor(nil, "[10.0.0.0/8]/api", noopHandler)
+	require.ErrorIs(t, err, ErrAuthorityConflict)
+
+	p2 := testProxy(t)
+	p2.MustAddInterceptor(nil, "[10.0.0.0/8]/api", noopHandler)
+	_, err = p2.AddTunnel("[10.0.0.0/8]")
+	require.ErrorIs(t, err, ErrAuthorityConflict)
+}
+
+// A range interceptor implies the interception of its range, reference counted like any
+// authority, and deleting the last one hands the range back to nothing.
+func TestAddr_RangeInterceptorImpliesItsAuthority(t *testing.T) {
+	p := testProxy(t)
+	p.MustAddInterceptor(nil, "[fd00::/8]/api", noopHandler)
+
+	entries := collectAuthorities(p)
+	require.Len(t, entries, 1)
+	assert.Equal(t, "[fd00::/8]", entries[0].Pattern())
+	assert.Equal(t, "fd00::/8", entries[0].Host())
+	assert.True(t, entries[0].Implicit())
+	assert.Equal(t, Intercept, p.ActionFor(target("[fd42::1]:443")))
+
+	_, err := p.DeleteInterceptor(nil, "[fd00::/8]/api")
+	require.NoError(t, err)
+	assert.Empty(t, collectAuthorities(p))
+	assert.Equal(t, Reject, p.ActionFor(target("[fd42::1]:443")))
+}
+
+// The port of a range interceptor scopes the implied interception, so the proxy never
+// terminates TLS on a port no interceptor can serve. Same rule as a name, held on a range.
+func TestAddr_RangeInterceptorPortScopesTheAuthority(t *testing.T) {
+	p := testProxy(t)
+	p.MustAddInterceptor(nil, "[10.0.0.0/8]:8443/api", noopHandler)
+
+	assert.Equal(t, Intercept, p.ActionFor(target("10.1.2.3:8443")))
+	assert.Equal(t, Reject, p.ActionFor(target("10.1.2.3:443")))
+}
+
+// The name index covers both roots. An interceptor on an address host registers,
+// resolves, renames and deletes by name exactly as one on a name host does.
+func TestAddr_NameIndexSpansBothWorlds(t *testing.T) {
+	p := testProxy(t)
+	ic := p.MustAddInterceptor(nil, "[10.0.0.0/8]/api", noopHandler, WithName("ranged"))
+	require.Same(t, ic, p.Name("ranged"))
+
+	_, err := p.AddInterceptor(nil, "other.test/api", noopHandler, WithName("ranged"))
+	var nce *InterceptorNameConflictError
+	require.ErrorAs(t, err, &nce)
+
+	renamed, err := p.UpdateInterceptor(nil, "[10.0.0.0/8]/api", noopHandler, WithName("renamed"))
+	require.NoError(t, err)
+	assert.Nil(t, p.Name("ranged"))
+	require.Same(t, renamed, p.Name("renamed"))
+
+	_, err = p.DeleteInterceptor(nil, "[10.0.0.0/8]/api")
+	require.NoError(t, err)
+	assert.Nil(t, p.Name("renamed"))
+}
+
+// Iteration and the exact-match lookups surface address entries with the spelling they were
+// registered under, encoded keys staying internal to the tree.
+func TestAddr_IterationAndLookupByPattern(t *testing.T) {
+	p := testProxy(t)
+	tn := p.MustAddTunnel("[fd00::/8]")
+	ic := p.MustAddInterceptor(nil, "[10.0.0.0/8]/api", noopHandler)
+	named := p.MustAddInterceptor([]string{http.MethodGet}, "api.test/v1", noopHandler)
+
+	// Three authorities: the declared tunnel and the two the interceptors imply.
+	assert.Equal(t, 3, p.AuthoritiesLen())
+	assert.Equal(t, 2, p.InterceptorsLen())
+
+	require.Same(t, ic, p.Interceptor(nil, "[10.0.0.0/8]/api"))
+	assert.True(t, p.Has(nil, "[10.0.0.0/8]/api"))
+	assert.Nil(t, p.Interceptor(nil, "[10.0.0.1/8]/api"), "an unregistrable spelling finds nothing")
+
+	all := slices.Collect(p.Iter().All())
+	assert.Contains(t, all, ic)
+	assert.Contains(t, all, named)
+
+	patterns := make([]string, 0, 3)
+	for a := range p.Iter().Authorities() {
+		patterns = append(patterns, a.Pattern())
+	}
+	assert.ElementsMatch(t, []string{tn.Pattern(), "[10.0.0.0/8]", "api.test"}, patterns)
+
+	found := slices.Collect(p.Iter().Interceptors("[10.0.0.0/8]/api"))
+	require.Len(t, found, 1)
+	assert.Same(t, ic, found[0])
+}
+
+// A transaction sees its own pending address entries and an abort leaves the published tree
+// untouched, the address root committing with the others or not at all.
+func TestAddr_TransactionCoversTheAddressRoot(t *testing.T) {
+	p := testProxy(t)
+
+	txn := p.Txn(true)
+	_, err := txn.AddTunnel("[10.0.0.0/8]")
+	require.NoError(t, err)
+	assert.Equal(t, Tunnel, txn.ActionFor(target("10.1.2.3:443")))
+	assert.Equal(t, Reject, p.ActionFor(target("10.1.2.3:443")))
+	txn.Abort()
+	assert.Equal(t, Reject, p.ActionFor(target("10.1.2.3:443")))
+
+	require.NoError(t, p.Updates(func(txn *Txn) error {
+		_, err := txn.AddTunnel("[10.0.0.0/8]")
+		return err
+	}))
+	assert.Equal(t, Tunnel, p.ActionFor(target("10.1.2.3:443")))
+
+	require.NoError(t, p.Updates(func(txn *Txn) error { return txn.Truncate() }))
+	assert.Equal(t, Reject, p.ActionFor(target("10.1.2.3:443")))
+}
+
+// Deleting a prefix must not fold the surviving nodes across a registered boundary. The
+// prefixes that remain keep answering exactly what they answered before.
+func TestAddr_DeleteKeepsTheSurvivingPrefixes(t *testing.T) {
+	p := testProxy(t)
+	p.MustAddTunnel("[10.0.0.0/8]")
+	p.MustAddTunnel("[10.1.0.0/16]")
+	p.MustAddTunnel("[10.1.2.0/24]")
+
+	_, err := p.DeleteTunnel("[10.1.0.0/16]")
+	require.NoError(t, err)
+
+	assert.Equal(t, Tunnel, p.ActionFor(target("10.1.2.3:443")))
+	assert.Equal(t, Tunnel, p.ActionFor(target("10.1.9.9:443")))
+	assert.Equal(t, Tunnel, p.ActionFor(target("10.9.9.9:443")))
+	assert.Equal(t, Reject, p.ActionFor(target("11.0.0.1:443")))
+
+	_, err = p.DeleteTunnel("[10.0.0.0/8]")
+	require.NoError(t, err)
+	assert.Equal(t, Tunnel, p.ActionFor(target("10.1.2.3:443")))
+	assert.Equal(t, Reject, p.ActionFor(target("10.1.9.9:443")))
+}

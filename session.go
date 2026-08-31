@@ -116,7 +116,8 @@ func (a Action) String() string {
 }
 
 // Target is a request target authority: the scheme, the hostname and the port. The port is
-// always explicit, defaulted from the scheme when the client did not send one.
+// always explicit, defaulted from the scheme when the client did not send one. An IPv6 host
+// is carried unbracketed, the way [splitHostPort] returns it.
 type Target struct {
 	Scheme string
 	Host   string

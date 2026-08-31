@@ -3,6 +3,7 @@ package edge
 import (
 	"fmt"
 	"maps"
+	"net/netip"
 	"regexp"
 	"slices"
 	"strings"
@@ -18,6 +19,7 @@ type iTree struct {
 	pool         sync.Pool
 	p            *Proxy
 	patterns     *node
+	addrs        *node
 	names        *node
 	methods      map[string]uint
 	interceptors int
@@ -30,6 +32,7 @@ func (t *iTree) txn() *tXn {
 	return &tXn{
 		tree:         t,
 		patterns:     t.patterns,
+		addrs:        t.addrs,
 		names:        t.names,
 		methods:      t.methods,
 		interceptors: t.interceptors,
@@ -39,16 +42,33 @@ func (t *iTree) txn() *tXn {
 	}
 }
 
-func (t *iTree) lookup(method, hostPort, path string, c *Context, lazy bool) (int, *node) {
-	return t.patterns.lookup(method, hostPort, path, c, lazy)
+func (t *iTree) lookup(method, host, path string, c *Context, lazy bool) (int, *node) {
+	return lookupTarget(t.patterns, t.addrs, method, host, path, c, lazy, false)
 }
 
-// lookupAuthority resolves the entry deciding what happens to a connection to host. It walks
-// the hostname and stops there, so it can only ever reach an authority entry, and it takes
-// no method because an authority has none to be compared against.
-func lookupAuthority(root *node, host string, c *Context) (int, *node) {
+// lookupTarget is the single entry of both lookups, the request routing and the authority
+// decision. It canonicalizes the host and routes it to the root of its kind: an address
+// consults addrs, a name consults patterns, and neither ever falls back to the other. Both
+// entries share this so the two cannot canonicalize differently, which is an interception
+// bypass: a host normalized by one and not the other gets its TLS terminated on a decision
+// its requests then miss.
+//
+// With authority set the walks stop on the host and answer with an authority entry, and no
+// method is compared because an authority carries none.
+func lookupTarget(patterns, addrs *node, method, host, path string, c *Context, lazy, authority bool) (int, *node) {
 	*c.skipStack = (*c.skipStack)[:0]
-	return lookupByHostname(root, "", host, "", c, true, true)
+	// The canonical form exists only inside the lookup, like the routing path of a request.
+	if len(host) > 0 && host[len(host)-1] == '.' {
+		host = host[:len(host)-1]
+	}
+	if maybeRoutingAddr(host) {
+		if addr, ok := routingAddr(host); ok {
+			var buf [maxAddrKey]byte
+			key := appendPrefixKey(buf[:0], netip.PrefixFrom(addr, addr.BitLen()))
+			return lookupByAddr(addrs, method, key, path, c, lazy, authority)
+		}
+	}
+	return lookupByHostname(patterns, method, host, path, c, lazy, authority)
 }
 
 func (t *iTree) allocateContext() *Context {
@@ -65,7 +85,12 @@ func (t *iTree) allocateContext() *Context {
 // interceptor returns the interceptor registered for the exact combination of methods, pattern and
 // matchers, or nil.
 func (t *iTree) interceptor(methods []string, pattern string, matchers []Matcher) *Interceptor {
-	matched := t.patterns.searchPattern(patternKey(pattern))
+	key, isAddr := patternKey(pattern)
+	root := t.patterns
+	if isAddr {
+		root = t.addrs
+	}
+	matched := root.searchPattern(key)
 	if matched == nil || !matched.isLeaf() {
 		return nil
 	}
@@ -96,6 +121,7 @@ type tXn struct {
 	tree         *iTree
 	writable     *simplelru.LRU[*node, struct{}]
 	patterns     *node
+	addrs        *node
 	names        *node
 	methods      map[string]uint
 	interceptors int
@@ -109,6 +135,7 @@ type tXn struct {
 func (t *tXn) commit() *iTree {
 	tc := &iTree{
 		patterns:     t.patterns,
+		addrs:        t.addrs,
 		names:        t.names,
 		methods:      t.methods,
 		p:            t.tree.p,
@@ -136,6 +163,7 @@ func (t *tXn) clone() *tXn {
 	tx := &tXn{
 		tree:         t.tree,
 		patterns:     t.patterns,
+		addrs:        t.addrs,
 		names:        t.names,
 		methods:      t.methods,
 		interceptors: t.interceptors,
@@ -144,6 +172,23 @@ func (t *tXn) clone() *tXn {
 		maxDepth:     t.maxDepth,
 	}
 	return tx
+}
+
+// rootFor returns the root ic's pattern lives under. The insert, delete and search
+// machinery walks whatever root it is handed, so this is the whole of the dispatch.
+func (t *tXn) rootFor(ic *Interceptor) *node {
+	if ic.pattern.prefix.IsValid() {
+		return t.addrs
+	}
+	return t.patterns
+}
+
+func (t *tXn) setRootFor(ic *Interceptor, root *node) {
+	if ic.pattern.prefix.IsValid() {
+		t.addrs = root
+		return
+	}
+	t.patterns = root
 }
 
 func (t *tXn) insertName(ic *Interceptor, mode insertMode) error {
@@ -281,12 +326,12 @@ func (t *tXn) deleteNameIn(root, n *node, search string) *node {
 func (t *tXn) insert(ic *Interceptor, mode insertMode) error {
 	t.mode = mode
 
-	newRoot, err := t.insertTokens(nil, t.patterns, ic.pattern.tokens, ic)
+	newRoot, err := t.insertTokens(nil, t.rootFor(ic), ic.pattern.tokens, ic)
 	if err != nil {
 		return err
 	}
 	if newRoot != nil {
-		t.patterns = newRoot
+		t.setRootFor(ic, newRoot)
 		t.maxDepth = max(t.maxDepth, t.computePathDepth(newRoot, ic.pattern.tokens))
 		t.maxParams = max(t.maxParams, len(ic.params))
 		if t.mode == modeInsert {
@@ -641,7 +686,7 @@ func (t *tXn) insertWildcard(n *node, tk token, remaining []token, ic *Intercept
 // searchAuthority returns the entry registered for the same authority pattern as ic,
 // whatever its action, or nil. An authority carries no method, so it identifies at most one.
 func (t *tXn) searchAuthority(ic *Interceptor) *Interceptor {
-	matched := t.patterns.searchPattern(ic.pattern.key)
+	matched := t.rootFor(ic).searchPattern(ic.pattern.key)
 	if matched == nil || !matched.isLeaf() {
 		return nil
 	}
@@ -654,10 +699,10 @@ func (t *tXn) searchAuthority(ic *Interceptor) *Interceptor {
 }
 
 func (t *tXn) delete(ic *Interceptor) (*Interceptor, bool) {
-
-	newRoot, oldIC := t.deleteTokens(t.patterns, t.patterns, ic.pattern.tokens, ic)
+	root := t.rootFor(ic)
+	newRoot, oldIC := t.deleteTokens(root, root, ic.pattern.tokens, ic)
 	if newRoot != nil {
-		t.patterns = newRoot
+		t.setRootFor(ic, newRoot)
 		if !t.forked && len(ic.methods) > 0 {
 			t.methods = maps.Clone(t.methods)
 			t.forked = true
@@ -847,6 +892,7 @@ func (t *tXn) deleteWildcard(root, n *node, key string, remaining []token, ic *I
 
 func (t *tXn) truncate() {
 	t.patterns = new(node)
+	t.addrs = new(node)
 	t.names = new(node)
 	t.methods = make(map[string]uint)
 	t.maxDepth = 0

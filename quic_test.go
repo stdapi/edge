@@ -820,7 +820,7 @@ func TestQUIC_RawUDPWildcardTunnel(t *testing.T) {
 	require.NoError(t, err)
 	p, err := New(WithCA(proxyCA))
 	require.NoError(t, err)
-	p.MustAddTunnel("+{any}")
+	p.MustAddTunnel("[0.0.0.0/0]")
 
 	proxyAddr := startQUICRedirected(t, p, origin)
 
@@ -842,7 +842,7 @@ func TestQUIC_RawUDPRelayCapPerFlow(t *testing.T) {
 	require.NoError(t, err)
 	p, err := New(WithCA(proxyCA))
 	require.NoError(t, err)
-	p.MustAddTunnel("+{any}")
+	p.MustAddTunnel("[0.0.0.0/0]")
 
 	origins := make([]netip.AddrPort, maxRelaysPerFlow+1)
 	for i := range origins {
@@ -916,7 +916,7 @@ func TestQUIC_RawUDPSessionCloseBarsReadmission(t *testing.T) {
 	require.NoError(t, err)
 	p, err := New(WithCA(proxyCA))
 	require.NoError(t, err)
-	p.MustAddTunnel("+{any}")
+	p.MustAddTunnel("[0.0.0.0/0]")
 
 	proxyAddr := startQUICRedirected(t, p, origin)
 
@@ -984,7 +984,7 @@ func TestQUIC_RawUDPSessionClosePerOrigin(t *testing.T) {
 	require.NoError(t, err)
 	p, err := New(WithCA(proxyCA))
 	require.NoError(t, err)
-	p.MustAddTunnel("+{any}")
+	p.MustAddTunnel("[0.0.0.0/0]")
 
 	proxyAddr := serveQUIC(t, p, func(pc net.PacketConn) net.PacketConn {
 		return &payloadOriginPacketConn{PacketConn: pc}
@@ -1050,7 +1050,7 @@ func TestQUIC_RawUDPStaleSessionCloseIsNoOp(t *testing.T) {
 	require.NoError(t, err)
 	p, err := New(WithCA(proxyCA))
 	require.NoError(t, err)
-	p.MustAddTunnel("+{any}")
+	p.MustAddTunnel("[0.0.0.0/0]")
 
 	proxyAddr := startQUICRedirected(t, p, origin)
 

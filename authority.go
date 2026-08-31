@@ -4,16 +4,24 @@
 
 package edge
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // Authority is what the proxy does with connections to one authority: relay them, terminate
-// their TLS, or refuse them. Entries share the tree with the interceptors and are evaluated
-// most specific first, a static authority beating a parameter, which beats a wildcard.
+// their TLS, or refuse them. Entries share the trees with the interceptors and are evaluated
+// most specific first. Among hostnames a static authority beats a parameter, which beats a
+// wildcard. Among addresses the longest registered prefix wins, and an exact address is the
+// longest of all. A host is a hostname or an address, never both, so the two kinds of entry
+// never compete for one connection.
 //
 // An authority named by neither an interceptor nor a tunnel is refused.
 //
 //	p.AddInterceptor(nil, "+{sub}.stripe.com/*{rest}", h) // every subdomain, implicitly
 //	p.AddTunnel("checkout.stripe.com")                    // except this one, static wins
+//	p.AddTunnel("[10.0.0.0/8]")                           // a range of addresses
+//	p.AddInterceptor(nil, "10.1.2.3/*{rest}", h)          // except this one, /32 wins
 type Authority struct {
 	entry *Interceptor
 }
@@ -21,7 +29,9 @@ type Authority struct {
 // Pattern returns the authority pattern as registered.
 func (r Authority) Pattern() string { return r.entry.pattern.str }
 
-// Host returns the hostname pattern of the authority entry.
+// Host returns the host of the authority pattern as registered, brackets dropped: a
+// hostname, an address, or a range such as "10.0.0.0/8". [Authority.Pattern] carries the
+// registrable spelling.
 func (r Authority) Host() string { return r.entry.pattern.host }
 
 // Port returns the port the authority entry is restricted to, or an empty string for any port.
@@ -48,6 +58,9 @@ func (p *Proxy) MustAddTunnel(pattern string) Authority {
 
 // AddTunnel marks the given authority for end to end tunneling. The connection is relayed
 // byte for byte, so the client's TLS stays intact and no interceptor is ever consulted.
+//
+// The pattern is a host with an optional port: a hostname, possibly parameterized, an
+// address literal, or a bracketed address range such as "[10.0.0.0/8]" or "[fd00::/8]".
 //
 // If an error occurs, it returns one of the following:
 //   - [*PatternError]: the pattern syntax is invalid.
@@ -145,13 +158,13 @@ func (p *Proxy) ActionFor(target Target) Action {
 }
 
 func (t *iTree) actionFor(c *Context, target Target) Action {
-	return resolveAction(t.patterns, t.authorities, c, target)
+	return resolveAction(t.patterns, t.addrs, t.authorities, c, target)
 }
 
-// resolveAction walks the authority entries under root and returns what the matching one says
-// to do. A transaction and the published tree share the node structure under a different root,
-// so the root is passed in rather than read off a receiver.
-func resolveAction(root *node, authorities int, c *Context, target Target) Action {
+// resolveAction walks the authority entries under the given roots and returns what the
+// matching one says to do. A transaction and the published tree share the node structure
+// under different roots, so the roots are passed in rather than read off a receiver.
+func resolveAction(patterns, addrs *node, authorities int, c *Context, target Target) Action {
 	if authorities == 0 {
 		return Reject
 	}
@@ -166,7 +179,7 @@ func resolveAction(root *node, authorities int, c *Context, target Target) Actio
 	}
 	c.resetForAuthority(nil, scheme, target.Host, port)
 
-	idx, n := lookupAuthority(root, target.Host, c)
+	idx, n := lookupTarget(patterns, addrs, "", target.Host, "", c, true, true)
 	if n == nil {
 		return Reject
 	}
@@ -236,5 +249,20 @@ func (p *Proxy) newAuthority(pattern string, action Action, implicit bool) (*Int
 // interception terminates TLS, and doing that on a port no interceptor can serve would be
 // visible to the client for nothing.
 func (p *Proxy) impliedAuthorityFor(ic *Interceptor) (*Interceptor, error) {
-	return p.newAuthority(joinHostPort(ic.pattern.host, ic.pattern.port), Intercept, true)
+	return p.newAuthority(authorityPattern(ic.pattern), Intercept, true)
+}
+
+// authorityPattern spells the authority pattern naming pat's host and port. Only an address
+// host is ever bracketed, a range for its '/' as an IPv6 literal is for its colons. A name
+// is left alone, the colon of a regexp constraint lives inside braces and the parser reads
+// it back there.
+func authorityPattern(pat pattern) string {
+	host := pat.host
+	if pat.prefix.IsValid() && strings.ContainsAny(host, ":/") {
+		host = "[" + host + "]"
+	}
+	if pat.port == "" {
+		return host
+	}
+	return host + ":" + pat.port
 }

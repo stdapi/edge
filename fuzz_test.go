@@ -11,7 +11,7 @@ import (
 )
 
 // FuzzParsePattern checks that no input makes the pattern parser panic, and that a pattern
-// it accepts is indexed under itself. The tree key is the pattern byte for byte, which is
+// it accepts is indexed under itself, an address host under its encoded form. The key is
 // what makes a registered interceptor findable again by the string it was registered with.
 func FuzzParsePattern(f *testing.F) {
 	seeds := []string{
@@ -35,6 +35,15 @@ func FuzzParsePattern(f *testing.F) {
 		"{}/",
 		"a.com/%2F",
 		"a.com/%zz",
+		"[10.0.0.0/8]/api",
+		"[fd00::/8]/v1/{id}",
+		"[0.0.0.0/0]/+{rest}",
+		"[::/0]/health",
+		"[10.0.0.0/8]:8443/api",
+		"[10.0.0.1/8]/api",
+		"10.0.0.0/8",
+		"10.0.0.0/8/api",
+		"[10.0.0.0/8",
 	}
 	for _, s := range seeds {
 		f.Add(s)
@@ -51,13 +60,22 @@ func FuzzParsePattern(f *testing.F) {
 		if pat.str != raw {
 			t.Fatalf("pattern.str = %q, want the input %q", pat.str, raw)
 		}
-		// The key is the pattern minus its port and the brackets of an address literal, so
-		// two patterns differing only by their port share one node.
-		if pat.key != pat.host+pat.path {
-			t.Fatalf("pattern.key = %q, want host %q plus path %q", pat.key, pat.host, pat.path)
+		// The key is the pattern minus its port and the brackets of an address literal, with
+		// an address host in its encoded form, so two patterns differing only by their port
+		// share one node.
+		wantKey := pat.host + pat.path
+		if pat.prefix.IsValid() {
+			wantKey = prefixKey(pat.prefix) + pat.path
 		}
-		if pat.key != patternKey(raw) {
-			t.Fatalf("patternKey(%q) = %q, want the parsed key %q", raw, patternKey(raw), pat.key)
+		if pat.key != wantKey {
+			t.Fatalf("pattern.key = %q, want %q", pat.key, wantKey)
+		}
+		key, isAddr := patternKey(raw)
+		if pat.key != key {
+			t.Fatalf("patternKey(%q) = %q, want the parsed key %q", raw, key, pat.key)
+		}
+		if isAddr != pat.prefix.IsValid() {
+			t.Fatalf("patternKey(%q) reports addr=%v, the parser says %v", raw, isAddr, pat.prefix.IsValid())
 		}
 		if pat.port != "" && strings.Index(raw, ":"+pat.port) < 0 {
 			t.Fatalf("pattern.port = %q, which the input %q does not carry", pat.port, raw)
@@ -73,6 +91,11 @@ func FuzzRoundTripRegistration(f *testing.F) {
 		"127.0.0.1/health",
 		"+{sub}.corp.internal/health",
 		"/v1/charges",
+		"[10.0.0.0/8]/api",
+		"[fd00::/8]/v1/{id}",
+		"[::1]/8/metrics",
+		"10.0.0.1/32",
+		"[::/0]/+{rest}",
 	}
 	for _, s := range seeds {
 		f.Add(s)
@@ -121,6 +144,13 @@ func FuzzParseAuthorityPattern(f *testing.F) {
 		"",
 		":443",
 		"a.com:",
+		"[10.0.0.0/8]",
+		"[fd00::/8]:443",
+		"[0.0.0.0/0]",
+		"[::/0]",
+		"[10.0.0.1/8]",
+		"10.0.0.0/8",
+		"[fd00::1]",
 	}
 	for _, s := range seeds {
 		f.Add(s)
@@ -138,8 +168,12 @@ func FuzzParseAuthorityPattern(f *testing.F) {
 		if pat.path != "" {
 			t.Fatalf("authority path = %q, want empty", pat.path)
 		}
-		if pat.key != pat.host {
-			t.Fatalf("authority key %q is not the host %q", pat.key, pat.host)
+		wantKey := pat.host
+		if pat.prefix.IsValid() {
+			wantKey = prefixKey(pat.prefix)
+		}
+		if pat.key != wantKey {
+			t.Fatalf("authority key %q is not %q", pat.key, wantKey)
 		}
 		if strings.Contains(pat.key, "/") {
 			t.Fatalf("authority key %q must hold no path separator", pat.key)

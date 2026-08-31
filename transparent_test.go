@@ -393,7 +393,8 @@ func TestTransparent_PlaintextServesH2C(t *testing.T) {
 	require.NoError(t, err)
 
 	var seen, session atomic.Value
-	p.MustAddInterceptor(nil, "+{any}/+{rest}", func(c *Context) (*http.Response, error) {
+	// The redirected target is an address, which the name wildcard does not cover.
+	p.MustAddInterceptor(nil, "[0.0.0.0/0]/+{rest}", func(c *Context) (*http.Response, error) {
 		seen.Store(c.Protocol())
 		session.Store(c.Session().Protocol())
 		return c.Forward()

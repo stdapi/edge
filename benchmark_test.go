@@ -41,6 +41,9 @@ func BenchmarkLookup(b *testing.B) {
 		{name: "wildcard path", pattern: "api.stripe.com/files/+{path}", host: "api.stripe.com", path: "/files/a/b/c/d"},
 		{name: "wildcard host", pattern: "+{sub}.stripe.com/v1/charges", host: "eu.west.stripe.com", path: "/v1/charges"},
 		{name: "any authority", pattern: "+{any}/v1/charges", host: "anything.example.test", path: "/v1/charges"},
+		{name: "exact address", pattern: "10.1.2.3/v1/charges", host: "10.1.2.3", path: "/v1/charges"},
+		{name: "range", pattern: "[10.0.0.0/8]/v1/charges", host: "10.1.2.3", path: "/v1/charges"},
+		{name: "range v6", pattern: "[fd00::/8]/v1/charges", host: "fd12:3456::1", path: "/v1/charges"},
 	}
 
 	for _, tc := range cases {
@@ -111,6 +114,9 @@ func BenchmarkActionFor(b *testing.B) {
 		{name: "hit static", authorities: []string{"api.stripe.com"}, host: "api.stripe.com"},
 		{name: "hit wildcard", authorities: []string{"+{sub}.stripe.com"}, host: "eu.west.stripe.com"},
 		{name: "miss", authorities: []string{"api.stripe.com"}, host: "example.test"},
+		{name: "hit address", authorities: []string{"10.1.2.3"}, host: "10.1.2.3"},
+		{name: "hit range", authorities: []string{"[10.0.0.0/8]"}, host: "10.9.9.9"},
+		{name: "miss address", authorities: []string{"[10.0.0.0/8]"}, host: "11.0.0.1"},
 	}
 
 	for _, tc := range cases {

@@ -157,7 +157,7 @@ func TestRouting_HostnameIsRequired(t *testing.T) {
 	_, err := p.AddInterceptor([]string{http.MethodGet}, "/v1/charges", noopHandler)
 	var pe *PatternError
 	require.ErrorAs(t, err, &pe)
-	assert.Contains(t, pe.Error(), "write +{any} to match every one")
+	assert.Contains(t, pe.Error(), "write +{any} to match every hostname")
 }
 
 func TestRouting_IPLiteralHost(t *testing.T) {

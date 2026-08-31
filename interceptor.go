@@ -57,8 +57,10 @@ func (r *Interceptor) Methods() iter.Seq[string] {
 // Pattern returns the pattern as registered.
 func (r *Interceptor) Pattern() string { return r.pattern.str }
 
-// Hostname returns the hostname part of the pattern, or an empty string when the interceptor
-// matches every authority.
+// Hostname returns the host part of the pattern as it was registered, brackets dropped: a
+// hostname, an address, or a range such as "10.0.0.0/8". An IPv6 literal or a range needs
+// its brackets back to appear in a pattern again; [Interceptor.Pattern] carries the
+// registrable spelling.
 func (r *Interceptor) Hostname() string { return r.pattern.host }
 
 // Path returns the path part of the pattern.

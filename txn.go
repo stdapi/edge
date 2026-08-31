@@ -267,8 +267,12 @@ func (txn *Txn) Interceptor(methods []string, pattern string, matchers ...Matche
 		panic(ErrSettledTxn)
 	}
 
+	key, isAddr := patternKey(pattern)
 	root := txn.rootTxn.patterns
-	matched := root.searchPattern(patternKey(pattern))
+	if isAddr {
+		root = txn.rootTxn.addrs
+	}
+	matched := root.searchPattern(key)
 	if matched == nil || !matched.isLeaf() {
 		return nil
 	}
@@ -299,7 +303,7 @@ func (txn *Txn) ActionFor(target Target) Action {
 	c := pool.Get().(*Context)
 	defer pool.Put(c)
 
-	return resolveAction(t.patterns, t.authorities, c, target)
+	return resolveAction(t.patterns, t.addrs, t.authorities, c, target)
 }
 
 // Name performs a lookup for a registered interceptor matching the given name. It returns
