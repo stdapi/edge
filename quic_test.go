@@ -1069,3 +1069,37 @@ func TestQUIC_TProxySecondInterceptedOriginIsRefused(t *testing.T) {
 	}, &quic.Config{HandshakeIdleTimeout: time.Second})
 	require.Error(t, err, "a second intercepted origin on one client socket must be refused")
 }
+
+// The read loop holds no lock between reading a datagram and publishing the relay it leads
+// to, so an immediate close can run to completion in between. The publication must be
+// refused, not land in a demux already swept.
+func TestQUICDemux_CloseRefusesLatePublish(t *testing.T) {
+	p, err := New()
+	require.NoError(t, err)
+	require.NoError(t, p.AddTunnel("+{any}"))
+
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	origin, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = origin.Close() }()
+
+	originAddr, err := netip.ParseAddrPort(origin.LocalAddr().String())
+	require.NoError(t, err)
+
+	d, err := newQUICDemux(p, fixedOriginPacketConn{pc, originAddr})
+	require.NoError(t, err)
+
+	d.close()
+
+	// The dispatch a read-loop goroutine had in flight when close ran. The datagram sets
+	// the long-header bit but is not QUIC, so it is placed by its destination.
+	client := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40000}
+	d.dispatch(client, []byte{0xC0, 0xDE})
+
+	d.mu.Lock()
+	flows := len(d.flows)
+	relays := d.relays
+	d.mu.Unlock()
+	require.Zerof(t, relays, "%d relay(s) published into a closed demux, %d flow(s) recreated", relays, flows)
+}

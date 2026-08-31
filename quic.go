@@ -1456,6 +1456,9 @@ func (d *quicDemux) close() {
 		close(d.done)
 
 		d.mu.Lock()
+		// The read loop publishes with no lock held across its dials, so close must refuse
+		// a late publication the way a shutdown does.
+		d.draining.Store(true)
 		h3, listener, transport := d.h3, d.listener, d.transport
 		var sockets []net.Conn
 		for _, flow := range d.flows {
