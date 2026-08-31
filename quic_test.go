@@ -6,6 +6,9 @@ package edge
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
@@ -905,12 +908,14 @@ func TestQUIC_RawUDPSessionEndsOnProxyClose(t *testing.T) {
 
 // tproxyOriginPacketConn stands in for a TPROXY socket: exact per datagram origins, reply
 // sockets that are plain loopback ones, and a shared socket that black-holes every direct
-// client write so a reply sneaking around the reply sockets fails the test.
+// client write so a reply sneaking around the reply sockets fails the test. A client not in
+// perClient reports the shared origin, so a test may hold one origin live per client socket.
 type tproxyOriginPacketConn struct {
 	net.PacketConn
-	origin  atomic.Value
-	replies chan net.Addr
-	direct  atomic.Int64
+	origin    atomic.Value
+	perClient sync.Map
+	replies   chan net.Addr
+	direct    atomic.Int64
 }
 
 func newTProxyOriginPacketConn(pc net.PacketConn, origin netip.AddrPort) *tproxyOriginPacketConn {
@@ -919,7 +924,10 @@ func newTProxyOriginPacketConn(pc net.PacketConn, origin netip.AddrPort) *tproxy
 	return c
 }
 
-func (c *tproxyOriginPacketConn) OriginalDestination(net.Addr) (netip.AddrPort, error) {
+func (c *tproxyOriginPacketConn) OriginalDestination(remote net.Addr) (netip.AddrPort, error) {
+	if origin, ok := c.perClient.Load(remote.String()); ok {
+		return origin.(netip.AddrPort), nil
+	}
 	return c.origin.Load().(netip.AddrPort), nil
 }
 
@@ -1026,29 +1034,23 @@ func TestQUIC_TProxyInterceptRepliesFromTheOrigin(t *testing.T) {
 	assert.Zero(t, wrapper.direct.Load(), "every handshake byte must leave from the origin's socket")
 }
 
-// The terminating server's writes are addressed by client alone, so under TPROXY one client
-// socket holds one intercepted origin and a connection towards a second is dropped.
-func TestQUIC_TProxySecondInterceptedOriginIsRefused(t *testing.T) {
-	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
-	require.NoError(t, err)
-	first := h3Origin(t, originCA)
-	second := h3Origin(t, originCA, "second.test")
+// Two intercepted origins reached from one client socket each get a terminating stack of
+// their own, each replying from its origin's address. The wrapper reports one origin per
+// client at a time, so the two run in sequence here, and the concurrent case lives in the
+// TPROXY end to end harness with its real per datagram attribution.
+func TestQUIC_TProxyTwoInterceptedOriginsOnOneSocket(t *testing.T) {
+	first := netip.MustParseAddrPort("127.0.0.1:4431")
+	second := netip.MustParseAddrPort("127.0.0.1:4432")
 
 	proxyCA, err := GenerateCA()
 	require.NoError(t, err)
-
-	upstream := DefaultTransport()
-	upstream.AllowHTTP3 = true
-	upstream.RootCAs = poolOf(originCA)
-
-	p, err := New(WithCA(proxyCA), WithTransport(upstream))
+	p, err := New(WithCA(proxyCA))
 	require.NoError(t, err)
-	p.MustAddInterceptor(nil, h3Authority+"/+{any}", func(c *Context) (*http.Response, error) {
-		return c.Forward()
-	})
-	p.MustAddInterceptor(nil, "second.test/+{any}", func(c *Context) (*http.Response, error) {
-		return c.Forward()
-	})
+	handler := func(c *Context) (*http.Response, error) {
+		return Text(http.StatusOK, c.Session().Target().Host), nil
+	}
+	p.MustAddInterceptor(nil, "first.test/", handler)
+	p.MustAddInterceptor(nil, "second.test/", handler)
 
 	wrapper, proxyAddr := startTProxyQUIC(t, p, first)
 
@@ -1056,18 +1058,152 @@ func TestQUIC_TProxySecondInterceptedOriginIsRefused(t *testing.T) {
 	require.NoError(t, err)
 	tr := &quic.Transport{Conn: clientPC}
 	defer func() { _ = tr.Close(); _ = clientPC.Close() }()
+	h3tr := &http3.Transport{}
+	defer func() { _ = h3tr.Close() }()
 
-	connA := dialSharedQUIC(t, tr, proxyAddr, h3Authority, poolOf(proxyCA))
-	defer func() { _ = connA.CloseWithError(0, "") }()
+	connA := dialSharedQUIC(t, tr, proxyAddr, "first.test", poolOf(proxyCA))
+	require.Equal(t, "first.test", h3Get(t, h3tr.NewClientConn(connA), "first.test", proxyAddr.Port()))
+	_ = connA.CloseWithError(0, "")
 
 	wrapper.origin.Store(second)
-	_, err = tr.Dial(t.Context(), net.UDPAddrFromAddrPort(proxyAddr), &tls.Config{
-		ServerName: "second.test",
-		RootCAs:    poolOf(proxyCA),
-		NextProtos: []string{"h3"},
-		MinVersion: tls.VersionTLS13,
-	}, &quic.Config{HandshakeIdleTimeout: time.Second})
-	require.Error(t, err, "a second intercepted origin on one client socket must be refused")
+	connB := dialSharedQUIC(t, tr, proxyAddr, "second.test", poolOf(proxyCA))
+	require.Equal(t, "second.test", h3Get(t, h3tr.NewClientConn(connB), "second.test", proxyAddr.Port()))
+	_ = connB.CloseWithError(0, "")
+
+	assert.Zero(t, wrapper.direct.Load(), "every reply must leave from an origin's socket")
+	replyA, replyB := <-wrapper.replies, <-wrapper.replies
+	assert.NotEqual(t, replyA.String(), replyB.String(), "each origin replies from its own socket")
+}
+
+// A tagged short header with no stack left behind it is answered with a stateless reset
+// holding the token the stack advertised, from the reply socket of the origin the client
+// targeted.
+func TestQUIC_StatelessResetForOrphanedTag(t *testing.T) {
+	first := netip.MustParseAddrPort("127.0.0.1:4431")
+	orphanOrigin := udpEchoOrigin(t)
+
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(proxyCA))
+	require.NoError(t, err)
+	p.MustAddInterceptor(nil, "first.test/", func(c *Context) (*http.Response, error) {
+		return Text(http.StatusOK, "ok"), nil
+	})
+	p.MustAddTunnel(orphanOrigin.String())
+
+	wrapper, proxyAddr := startTProxyQUIC(t, p, first)
+
+	// Arms the tag and the reset key.
+	clientA, err := net.ListenUDP("udp", nil)
+	require.NoError(t, err)
+	tr := &quic.Transport{Conn: clientA}
+	defer func() { _ = tr.Close(); _ = clientA.Close() }()
+	connA := dialSharedQUIC(t, tr, proxyAddr, "first.test", poolOf(proxyCA))
+	_ = connA.CloseWithError(0, "")
+
+	// A raw relay to the orphan origin, so its reply socket exists with no stack behind it.
+	wrapper.origin.Store(orphanOrigin)
+	client, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+	_, err = client.WriteTo([]byte("warm-up"), net.UDPAddrFromAddrPort(proxyAddr))
+	require.NoError(t, err)
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
+	buf := make([]byte, 128)
+	_, _, err = client.ReadFrom(buf)
+	require.NoError(t, err)
+
+	// The same derivation the demux ran, so the minted ID and the token are the ones a
+	// previous process would have handed a client.
+	tag, resetKey, err := quicInterceptKeys(proxyCA)
+	require.NoError(t, err)
+	cid, err := tag.GenerateConnectionID()
+	require.NoError(t, err)
+
+	orphan := make([]byte, 60)
+	_, err = rand.Read(orphan)
+	require.NoError(t, err)
+	orphan[0] = orphan[0]&0x3f | 0x40
+	copy(orphan[1:], cid.Bytes())
+	_, err = client.WriteTo(orphan, net.UDPAddrFromAddrPort(proxyAddr))
+	require.NoError(t, err)
+
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
+	n, _, err := client.ReadFrom(buf)
+	require.NoError(t, err, "the orphaned tag must be answered")
+	require.Equal(t, 42, n)
+	mac := hmac.New(sha256.New, resetKey[:])
+	mac.Write(cid.Bytes())
+	assert.Equal(t, mac.Sum(nil)[:16], buf[n-16:n], "the reset must end with the advertised token")
+}
+
+// One shutdown drains every terminating stack, its single HTTP/3 server sending the GOAWAYs.
+func TestQUIC_ShutdownDrainsEveryInterceptStack(t *testing.T) {
+	first := netip.MustParseAddrPort("127.0.0.1:4431")
+	second := netip.MustParseAddrPort("127.0.0.1:4432")
+
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(proxyCA))
+	require.NoError(t, err)
+	release := make(chan struct{})
+	inflight := make(chan struct{}, 2)
+	handler := func(c *Context) (*http.Response, error) {
+		inflight <- struct{}{}
+		<-release
+		return Text(http.StatusOK, c.Session().Target().Host), nil
+	}
+	p.MustAddInterceptor(nil, "first.test/", handler)
+	p.MustAddInterceptor(nil, "second.test/", handler)
+
+	wrapper, proxyAddr := startTProxyQUIC(t, p, first)
+
+	h3tr := &http3.Transport{}
+	defer func() { _ = h3tr.Close() }()
+
+	dialFrom := func(origin netip.AddrPort, sni string) (*quic.Transport, *http3.ClientConn) {
+		pc, err := net.ListenUDP("udp", nil)
+		require.NoError(t, err)
+		wrapper.perClient.Store(pc.LocalAddr().String(), origin)
+		tr := &quic.Transport{Conn: pc}
+		t.Cleanup(func() { _ = tr.Close(); _ = pc.Close() })
+		return tr, h3tr.NewClientConn(dialSharedQUIC(t, tr, proxyAddr, sni, poolOf(proxyCA)))
+	}
+	_, ccA := dialFrom(first, "first.test")
+	_, ccB := dialFrom(second, "second.test")
+
+	got := make(chan string, 2)
+	go func() { got <- h3Get(t, ccA, "first.test", proxyAddr.Port()) }()
+	go func() { got <- h3Get(t, ccB, "second.test", proxyAddr.Port()) }()
+	<-inflight
+	<-inflight
+
+	done := make(chan error, 1)
+	go func() { done <- p.Shutdown(t.Context()) }()
+	// The requests in flight hold the drain open, and once released both must complete.
+	time.Sleep(100 * time.Millisecond)
+	close(release)
+
+	require.NoError(t, <-done, "the drain must cover both stacks")
+	bodies := []string{<-got, <-got}
+	slices.Sort(bodies)
+	assert.Equal(t, []string{"first.test", "second.test"}, bodies)
+}
+
+// The eviction at the stack cap takes the least recently used idle stack and never one with
+// live connections.
+func TestQUICDemux_EvictInterceptPrefersIdleLRU(t *testing.T) {
+	d := &quicDemux{intercepts: map[netip.AddrPort]*quicIntercept{}}
+	busy := &quicIntercept{origin: netip.MustParseAddrPort("10.0.0.1:443"), conns: 1, lastSeen: time.Unix(1, 0)}
+	older := &quicIntercept{origin: netip.MustParseAddrPort("10.0.0.2:443"), lastSeen: time.Unix(2, 0)}
+	newer := &quicIntercept{origin: netip.MustParseAddrPort("10.0.0.3:443"), lastSeen: time.Unix(3, 0)}
+	for _, it := range []*quicIntercept{busy, older, newer} {
+		d.intercepts[it.origin] = it
+	}
+	assert.Same(t, older, d.evictInterceptLocked())
+	assert.Same(t, newer, d.evictInterceptLocked())
+	assert.Nil(t, d.evictInterceptLocked(), "a stack with live connections is never evicted")
+	assert.Contains(t, d.intercepts, busy.origin)
 }
 
 // The read loop holds no lock between reading a datagram and publishing the relay it leads

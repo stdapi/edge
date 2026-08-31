@@ -10,6 +10,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hkdf"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -62,6 +63,14 @@ const (
 	// which has no connection, so the bound sits on the relays themselves.
 	maxRelaysPerFlow = 16
 	maxRelays        = 1024
+	// maxIntercepts bounds the terminating stacks, one per origin under TPROXY, and
+	// quicInterceptTTL reaps a stack no connection has fed for a while.
+	maxIntercepts    = 64
+	quicInterceptTTL = time.Minute
+	// quicResetSize is the size of the stateless resets the demux sends itself. Only a
+	// datagram strictly larger gets one, which keeps two proxies from bouncing resets at
+	// each other.
+	quicResetSize = 42
 )
 
 // ListenAndServeQUIC listens for UDP on addr and serves the QUIC connections routed to it. It
@@ -98,11 +107,10 @@ func (p *Proxy) ListenAndServeQUIC(addr string) error {
 // [WithRejectECH] refuses such connections. QUIC versions
 // other than v1 and v2 are rejected. A tunneled client that changes address in flight has
 // to re-handshake. Behind a Linux redirect a client may tunnel several origins from one
-// socket. Behind a Linux TPROXY rule every datagram reports its exact destination, replies
-// are sent from the address the client targeted, and a client socket supports one
-// intercepted origin at a time. On macOS, and when pc is not wrapped in
-// [TransparentPacketConn], a client socket supports one tunneled origin, and connections to
-// further origins drop shortly after their handshake.
+// socket. Behind a Linux TPROXY rule every datagram reports its exact destination and
+// replies are sent from the address the client targeted. On macOS, and when pc is not
+// wrapped in [TransparentPacketConn], a client socket supports one tunneled origin, and
+// connections to further origins drop shortly after their handshake.
 //
 // A datagram that is not QUIC is placed by the address it was headed to, when the platform
 // reports one. A tunnel registered for that authority relays the traffic in both
@@ -136,31 +144,28 @@ type quicDemux struct {
 	origins PacketOriginalDestination
 
 	// replier is set when replies must leave from the address each client targeted, the
-	// TPROXY contract. replySockets holds one sending socket per origin, and
-	// interceptedOrigins pins the origin of each client socket the terminating server
-	// answers, its writes being addressed by client alone.
+	// TPROXY contract. replySockets holds one sending socket per origin.
 	replier transparentReplier
+
+	// ctx ends when the demux closes, bounding the resolver lookups the sniff path waits on.
+	ctx context.Context
 
 	p *Proxy
 
-	// intercepted feeds the terminating QUIC server that every intercepted connection shares.
-	intercepted *demuxPacketConn
-	h3          *http3.Server
-	listener    *quic.EarlyListener
-	transport   *quic.Transport
+	// h3 serves every terminating stack, so one shutdown sends every GOAWAY.
+	h3 *http3.Server
 
-	// tag recognizes the connection IDs the terminating server emits, with no per
-	// connection state. It is set once, when interception starts.
-	tag atomic.Pointer[quicCIDTag]
-
-	// ctx ends when the demux closes, bounding the resolver lookups the sniff path waits on.
-	ctx    context.Context
+	// tag recognizes the connection IDs the terminating stacks emit, with no per
+	// connection state. It and resetKey are set once, when interception starts.
+	tag    atomic.Pointer[quicCIDTag]
 	cancel context.CancelFunc
 
-	done               chan struct{}
-	flows              map[netip.AddrPort]*quicFlow
-	replySockets       map[netip.AddrPort]net.PacketConn
-	interceptedOrigins map[netip.AddrPort]netip.AddrPort
+	done         chan struct{}
+	flows        map[netip.AddrPort]*quicFlow
+	replySockets map[netip.AddrPort]net.PacketConn
+	// intercepts holds the terminating stacks, one per origin under TPROXY so replies
+	// leave from the address the client targeted, and one under the zero key anywhere else.
+	intercepts map[netip.AddrPort]*quicIntercept
 
 	wg sync.WaitGroup
 
@@ -176,6 +181,8 @@ type quicDemux struct {
 	// written and, on the paths that publish state, read under mu, so a publication is
 	// either refused or visible to the first snapshot the shutdown takes.
 	draining atomic.Bool
+
+	resetKey quic.StatelessResetKey
 
 	// exactOrigins is set when pc reads each datagram's destination from the datagram
 	// itself, exact enough to attribute it by.
@@ -217,6 +224,8 @@ type quicConn struct {
 	qc     *quic.Conn
 	cancel context.CancelFunc
 	relay  *quicRelay
+	// stack terminates an intercepted connection, nil in every other state.
+	stack *quicIntercept
 
 	odcid string
 	// origin is where the client was headed, resolved from the opening datagram since no
@@ -254,6 +263,33 @@ type quicRelay struct {
 	// raw marks a relay whose client sent datagrams no protocol was read into. It learns no
 	// connection IDs off its return traffic, arbitrary bytes being able to spell one.
 	raw bool
+}
+
+// quicIntercept terminates the QUIC connections of one origin. Under TPROXY its replies
+// leave from that origin's address, and the zero origin is the stack shared by every path
+// replying from the proxy's own socket.
+type quicIntercept struct {
+	lastSeen  time.Time
+	transport *quic.Transport
+	listener  *quic.EarlyListener
+	conn      *demuxPacketConn
+	origin    netip.AddrPort
+	// conns counts the live connections, and a stack holding any is neither swept nor
+	// evicted.
+	conns int
+}
+
+// deliver hands a datagram to the stack's QUIC transport.
+func (it *quicIntercept) deliver(addr net.Addr, datagram []byte) {
+	it.conn.deliver(addr, datagram)
+}
+
+// closeIntercept tears one stack down. The listener goes first, so the serve loop returns
+// the error it filters, then the packet conn, unblocking the read Transport.Close waits on.
+func (d *quicDemux) closeIntercept(it *quicIntercept) {
+	_ = it.listener.Close()
+	it.conn.Close()
+	_ = it.transport.Close()
 }
 
 // h3NoError is HTTP/3's H3_NO_ERROR, what a peer sends when it closes a connection with
@@ -352,12 +388,10 @@ func newQUICDemux(p *Proxy, pc net.PacketConn) (*quicDemux, error) {
 	if e, ok := pc.(interface{ exactOriginalDestination() bool }); ok && d.origins != nil {
 		d.exactOrigins = e.exactOriginalDestination()
 	}
-	d.intercepted = newDemuxPacketConn(pc)
+	d.intercepts = make(map[netip.AddrPort]*quicIntercept)
 	if r, ok := pc.(transparentReplier); ok && r.transparentReplies() {
 		d.replier = r
 		d.replySockets = make(map[netip.AddrPort]net.PacketConn)
-		d.interceptedOrigins = make(map[netip.AddrPort]netip.AddrPort)
-		d.intercepted.reply = d.replyIntercepted
 	}
 	return d, nil
 }
@@ -372,22 +406,21 @@ type quicCarrier struct {
 
 type quicCarrierKey struct{}
 
-// startInterception brings up the terminating QUIC server on first use, so a proxy that only
-// ever tunnels never needs a certificate authority.
+// startInterception derives the keys and brings up the shared HTTP/3 server on first use, so
+// a proxy that only ever tunnels never needs a certificate authority.
 //
-// The server fields are written under the lock because a shutdown may read them from another
+// The fields are written under the lock because a shutdown may read them from another
 // goroutine at any point after the first intercepted connection.
 func (d *quicDemux) startInterception() error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	// Before the listener check: a shutdown already told the server it has to send GOAWAY
-	// on, and one brought up now would be missed. It also spares a proxy that never
-	// intercepted from minting one on its way out.
+	// Checked before the server field, since a shutdown already told the HTTP/3 server to
+	// send GOAWAY and one brought up now would be missed.
 	if d.draining.Load() {
 		return ErrProxyClosed
 	}
-	if d.listener != nil {
+	if d.h3 != nil {
 		return nil
 	}
 	if d.p.cfg.ca == nil {
@@ -398,32 +431,6 @@ func (d *quicDemux) startInterception() error {
 	if err != nil {
 		return err
 	}
-
-	transport := &quic.Transport{
-		Conn:                  d.intercepted,
-		ConnectionIDGenerator: tag,
-		StatelessResetKey:     &resetKey,
-		ConnContext: func(ctx context.Context, info *quic.ClientInfo) (context.Context, error) {
-			return context.WithValue(ctx, quicCarrierKey{}, &quicCarrier{client: info.RemoteAddr}), nil
-		},
-	}
-	cfg := d.quicConfig()
-	cfg.Tracer = func(ctx context.Context, _ bool, odcid quic.ConnectionID) qlogwriter.Trace {
-		// Returns no trace. This callback is the one place quic-go reveals the original
-		// destination connection ID, pre-Retry even when a Retry happened.
-		if carrier, ok := ctx.Value(quicCarrierKey{}).(*quicCarrier); ok {
-			carrier.odcid = string(odcid.Bytes())
-			d.adopt(ctx, carrier.client, carrier.odcid)
-		}
-		return nil
-	}
-	ln, err := transport.ListenEarly(d.quicTLSConfig(), cfg)
-	if err != nil {
-		return fmt.Errorf("listen QUIC: %w", err)
-	}
-	d.transport = transport
-	d.listener = ln
-	d.tag.Store(tag)
 
 	d.h3 = &http3.Server{
 		Handler:        http.HandlerFunc(d.p.serveInterceptedRequest),
@@ -448,7 +455,83 @@ func (d *quicDemux) startInterception() error {
 			return context.WithValue(ctx, sessionKey{}, sess)
 		},
 	}
+	d.resetKey = resetKey
+	// Stored last, so a loaded tag guarantees the reset key beside it is readable.
+	d.tag.Store(tag)
+	return nil
+}
 
+// interceptForLocked returns the stack terminating connections to origin, created on first
+// use. Creation shares the draining critical section with shutdown, so no listener joins
+// the HTTP/3 server after it was told to send GOAWAY, and the caller closes any evicted
+// stack once off the lock.
+func (d *quicDemux) interceptForLocked(origin netip.AddrPort) (*quicIntercept, []*quicIntercept, error) {
+	var evicted []*quicIntercept
+	key := netip.AddrPort{}
+	if d.replier != nil {
+		if !origin.IsValid() {
+			return nil, nil, errors.New("no destination to source the replies from")
+		}
+		key = origin
+	}
+	if it := d.intercepts[key]; it != nil {
+		it.lastSeen = time.Now()
+		return it, nil, nil
+	}
+
+	if len(d.intercepts) >= maxIntercepts {
+		victim := d.evictInterceptLocked()
+		if victim == nil {
+			return nil, nil, errors.New("every terminating stack has live connections")
+		}
+		evicted = []*quicIntercept{victim}
+	}
+
+	dpc := newDemuxPacketConn(d.pc)
+	if d.replier != nil {
+		reply, rerr := d.replySocketLocked(key)
+		if rerr != nil {
+			return nil, evicted, rerr
+		}
+		from := key.String()
+		dpc.reply = func(b []byte, addr net.Addr) (int, error) {
+			// Errors are absorbed. A datagram is droppable, and an error returned here
+			// ends the whole connection inside quic-go.
+			if _, err := reply.WriteTo(b, addr); err != nil {
+				d.p.cfg.logger.Debug("edge: intercepted reply dropped",
+					slog.String("origin", from), slog.String("error", err.Error()))
+			}
+			return len(b), nil
+		}
+	}
+
+	transport := &quic.Transport{
+		Conn:                  dpc,
+		ConnectionIDGenerator: d.tag.Load(),
+		StatelessResetKey:     &d.resetKey,
+		ConnContext: func(ctx context.Context, info *quic.ClientInfo) (context.Context, error) {
+			return context.WithValue(ctx, quicCarrierKey{}, &quicCarrier{client: info.RemoteAddr}), nil
+		},
+	}
+	cfg := d.quicConfig()
+	cfg.Tracer = func(ctx context.Context, _ bool, odcid quic.ConnectionID) qlogwriter.Trace {
+		// Returns no trace. This callback is the one place quic-go reveals the original
+		// destination connection ID, pre-Retry even when a Retry happened.
+		if carrier, ok := ctx.Value(quicCarrierKey{}).(*quicCarrier); ok {
+			carrier.odcid = string(odcid.Bytes())
+			d.adopt(ctx, carrier.client, carrier.odcid)
+		}
+		return nil
+	}
+	ln, err := transport.ListenEarly(d.quicTLSConfig(), cfg)
+	if err != nil {
+		dpc.Close()
+		_ = transport.Close()
+		return nil, evicted, fmt.Errorf("listen QUIC: %w", err)
+	}
+
+	it := &quicIntercept{origin: key, transport: transport, listener: ln, conn: dpc, lastSeen: time.Now()}
+	d.intercepts[key] = it
 	srv := d.h3
 	d.wg.Go(func() {
 		// ServeListener answers a shutdown with http.ErrServerClosed, and a listener closed
@@ -458,7 +541,25 @@ func (d *quicDemux) startInterception() error {
 			d.p.cfg.logger.Debug("edge: HTTP/3 server stopped", slog.String("error", err.Error()))
 		}
 	})
-	return nil
+	return it, evicted, nil
+}
+
+// evictInterceptLocked removes and returns the stack unused the longest, or nil when every
+// one has live connections.
+func (d *quicDemux) evictInterceptLocked() *quicIntercept {
+	var victim *quicIntercept
+	for _, it := range d.intercepts {
+		if it.conns > 0 {
+			continue
+		}
+		if victim == nil || it.lastSeen.Before(victim.lastSeen) {
+			victim = it
+		}
+	}
+	if victim != nil {
+		delete(d.intercepts, victim.origin)
+	}
+	return victim
 }
 
 // adopt ties the removal of an intercepted connection to its context, which ends with the
@@ -605,8 +706,9 @@ func (d *quicDemux) dispatchLong(addr net.Addr, from netip.AddrPort, datagram []
 				_, _ = up.Write(datagram)
 			case connIntercepted:
 				conn.lastSeen = now
+				stack := conn.stack
 				d.mu.Unlock()
-				d.deliverIntercepted(addr, from, datagram)
+				stack.deliver(addr, datagram)
 			case connRejected:
 				conn.lastSeen = now
 				d.mu.Unlock()
@@ -625,10 +727,14 @@ func (d *quicDemux) dispatchLong(addr net.Addr, from netip.AddrPort, datagram []
 		}
 	}
 	if tag := d.tag.Load(); tag != nil && tag.matches(dcid) {
-		// Initials are not exempt. After a Retry the client's next Initial addresses the
-		// server's chosen ID and is only routable this way.
+		// Initials are not exempt, since after a Retry the client's next Initial addresses
+		// the server's chosen ID and is only routable this way. With the stack gone the
+		// datagram is dropped, only a short header gets a reset.
+		it, _, _ := d.lookupInterceptLocked(addr)
 		d.mu.Unlock()
-		d.deliverIntercepted(addr, from, datagram)
+		if it != nil {
+			it.deliver(addr, datagram)
+		}
 		return
 	}
 	if quicsniff.IsInitial(datagram[0], version) &&
@@ -672,8 +778,13 @@ func (d *quicDemux) dispatchShort(addr net.Addr, from netip.AddrPort, datagram [
 	if tag := d.tag.Load(); tag != nil && len(datagram) >= 1+8 && tag.matches(datagram[1:9]) {
 		// No flow needed. The tag survives a client whose address changed in flight, and
 		// quic-go validates the new path itself.
+		it, origin, ok := d.lookupInterceptLocked(addr)
 		d.mu.Unlock()
-		d.deliverIntercepted(addr, from, datagram)
+		if it != nil {
+			it.deliver(addr, datagram)
+		} else if ok {
+			d.statelessReset(addr, origin, datagram)
+		}
 		return
 	}
 	up := d.fallbackLocked(flow, addr)
@@ -742,57 +853,53 @@ func (d *quicDemux) replySocketLocked(origin netip.AddrPort) (net.PacketConn, er
 	return sock, nil
 }
 
-// replyIntercepted sends one of the terminating server's datagrams from the address its
-// client targeted. Errors are absorbed: a datagram is droppable, and an error returned here
-// ends the whole connection inside quic-go.
-func (d *quicDemux) replyIntercepted(b []byte, addr net.Addr) (int, error) {
-	from := addrPort(addr)
-	d.mu.Lock()
-	sock := d.replySockets[d.interceptedOrigins[from]]
-	d.mu.Unlock()
-	if sock == nil {
-		d.p.cfg.logger.Debug("edge: intercepted reply dropped",
-			slog.String("client", from.String()),
-			slog.String("reason", "no origin recorded for this client"))
-		return len(b), nil
+// lookupInterceptLocked resolves the stack a tagged datagram feeds, by its original
+// destination under TPROXY and the zero key anywhere else. A nil stack with ok set may be
+// answered with a stateless reset. Not ok means the destination is unknown and the datagram
+// undeliverable.
+func (d *quicDemux) lookupInterceptLocked(client net.Addr) (it *quicIntercept, origin netip.AddrPort, ok bool) {
+	key := netip.AddrPort{}
+	if d.replier != nil {
+		key = d.originalDst(client)
+		if !key.IsValid() {
+			return nil, netip.AddrPort{}, false
+		}
 	}
-	if _, err := sock.WriteTo(b, addr); err != nil {
-		d.p.cfg.logger.Debug("edge: intercepted reply dropped",
-			slog.String("client", from.String()), slog.String("error", err.Error()))
+	it = d.intercepts[key]
+	if it != nil {
+		it.lastSeen = time.Now()
 	}
-	return len(b), nil
+	return it, key, true
 }
 
-// deliverIntercepted hands a datagram to the terminating server. Under TPROXY it first pins
-// the origin the client targeted, since the server's writes say only which client they are
-// for. One client socket holds one intercepted origin there, and a second is refused.
-func (d *quicDemux) deliverIntercepted(client net.Addr, from netip.AddrPort, datagram []byte) {
-	if d.replier != nil {
-		origin := d.originalDst(client)
-		if !origin.IsValid() {
-			d.p.cfg.logger.Debug("edge: intercepted datagram dropped",
-				slog.String("client", from.String()),
-				slog.String("reason", "no destination to source the replies from"))
-			return
-		}
-		d.mu.Lock()
-		if pinned, ok := d.interceptedOrigins[from]; ok && pinned != origin {
-			d.mu.Unlock()
-			d.p.cfg.logger.Debug("edge: intercepted datagram dropped",
-				slog.String("client", from.String()),
-				slog.String("reason", "another intercepted origin holds this client socket"))
-			return
-		}
-		if _, err := d.replySocketLocked(origin); err != nil {
-			d.mu.Unlock()
-			d.p.cfg.logger.Debug("edge: intercepted datagram dropped",
-				slog.String("client", from.String()), slog.String("error", err.Error()))
-			return
-		}
-		d.interceptedOrigins[from] = origin
-		d.mu.Unlock()
+// statelessReset answers a tagged short header packet with no stack left behind it, so the
+// client learns its connection is dead instead of waiting out its idle timeout. The token
+// matches the one the stack advertised, both derived from the same key (RFC 9000 section
+// 10.3). Under TPROXY the reset leaves from a reply socket the demux already holds, since
+// opening one for an unauthenticated datagram would hand an attacker file descriptors.
+func (d *quicDemux) statelessReset(client net.Addr, origin netip.AddrPort, datagram []byte) {
+	if len(datagram) <= quicResetSize {
+		return
 	}
-	d.intercepted.deliver(client, datagram)
+	pkt := make([]byte, quicResetSize)
+	if _, err := rand.Read(pkt[:quicResetSize-16]); err != nil {
+		return
+	}
+	pkt[0] = pkt[0]&0x3f | 0x40
+	mac := hmac.New(sha256.New, d.resetKey[:])
+	mac.Write(datagram[1:9])
+	copy(pkt[quicResetSize-16:], mac.Sum(nil)[:16])
+
+	if origin.IsValid() {
+		d.mu.Lock()
+		sock := d.replySockets[origin]
+		d.mu.Unlock()
+		if sock != nil {
+			_, _ = sock.WriteTo(pkt, client)
+		}
+		return
+	}
+	_, _ = d.pc.WriteTo(pkt, client)
 }
 
 // rawAdmit is the terminal step of dispatch, for a datagram nothing QUIC could attribute.
@@ -937,10 +1044,14 @@ func (d *quicDemux) admitConnLocked(from netip.AddrPort, client net.Addr, odcid 
 	return conn
 }
 
-// setStateLocked keeps the sniffing count in step with the state changes.
+// setStateLocked keeps the sniffing count and the stack references in step with the state
+// changes.
 func (d *quicDemux) setStateLocked(conn *quicConn, s quicConnState) {
 	if conn.state == connSniffing && s != connSniffing {
 		d.sniffing--
+	}
+	if conn.state == connIntercepted && s != connIntercepted {
+		d.releaseInterceptLocked(conn)
 	}
 	conn.state = s
 }
@@ -949,8 +1060,19 @@ func (d *quicDemux) removeConnLocked(flow *quicFlow, conn *quicConn) {
 	if conn.state == connSniffing {
 		d.sniffing--
 	}
+	if conn.state == connIntercepted {
+		d.releaseInterceptLocked(conn)
+	}
 	delete(flow.conns, conn.odcid)
 	conn.end()
+}
+
+func (d *quicDemux) releaseInterceptLocked(conn *quicConn) {
+	if conn.stack != nil {
+		conn.stack.conns--
+		conn.stack.lastSeen = time.Now()
+		conn.stack = nil
+	}
 }
 
 // sniff feeds a datagram to the reassembler and decides the connection once its ClientHello
@@ -1101,12 +1223,27 @@ func (d *quicDemux) beginIntercept(from netip.AddrPort, client net.Addr, conn *q
 		d.rejectConn(from, conn, "the proxy is shutting down")
 		return
 	}
+	it, evicted, err := d.interceptForLocked(conn.origin)
+	if err != nil {
+		d.mu.Unlock()
+		cancel()
+		for _, e := range evicted {
+			d.closeIntercept(e)
+		}
+		d.rejectConn(from, conn, err.Error())
+		return
+	}
 	d.setStateLocked(conn, connIntercepted)
 	conn.pending = nil
 	conn.pendingBytes = 0
 	conn.sess = sess
 	conn.cancel = cancel
+	conn.stack = it
+	it.conns++
 	d.mu.Unlock()
+	for _, e := range evicted {
+		d.closeIntercept(e)
+	}
 
 	// The session is published, so a sweep started after the tree changed either found it or
 	// ran before this read, which then observes the change. Nothing has been handed to the
@@ -1117,7 +1254,7 @@ func (d *quicDemux) beginIntercept(from netip.AddrPort, client net.Addr, conn *q
 	}
 
 	for _, dg := range pending {
-		d.deliverIntercepted(client, from, dg)
+		it.deliver(client, dg)
 	}
 }
 
@@ -1348,7 +1485,6 @@ func (d *quicDemux) rejectConn(from netip.AddrPort, conn *quicConn, reason strin
 func (d *quicDemux) sweepIdle() {
 	now := time.Now()
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	for from, flow := range d.flows {
 		for _, conn := range flow.conns {
 			switch conn.state {
@@ -1375,31 +1511,33 @@ func (d *quicDemux) sweepIdle() {
 			delete(d.flows, from)
 		}
 	}
+	idle := d.sweepInterceptsLocked(now)
 	d.sweepRepliesLocked()
+	d.mu.Unlock()
+	for _, it := range idle {
+		d.closeIntercept(it)
+	}
 }
 
-// sweepRepliesLocked drops the origin pins with no intercepted connection behind them and
-// the reply sockets nothing uses any more. A pin removed too early, one whose client the
-// tag alone routes, comes back with that client's next datagram.
+// sweepInterceptsLocked removes the stacks no connection has fed for a while. The caller
+// closes them off the lock, Transport.Close waiting on goroutines of its own.
+func (d *quicDemux) sweepInterceptsLocked(now time.Time) []*quicIntercept {
+	var idle []*quicIntercept
+	for key, it := range d.intercepts {
+		if it.conns == 0 && now.Sub(it.lastSeen) > quicInterceptTTL {
+			delete(d.intercepts, key)
+			idle = append(idle, it)
+		}
+	}
+	return idle
+}
+
+// sweepRepliesLocked closes the reply sockets nothing uses any more, after the stack sweep
+// so a stack removed this pass frees its socket immediately.
 func (d *quicDemux) sweepRepliesLocked() {
 	if d.replier == nil {
 		return
 	}
-	live := make(map[netip.AddrPort]bool, len(d.interceptedOrigins))
-	for from, flow := range d.flows {
-		for _, conn := range flow.conns {
-			if conn.state == connIntercepted {
-				live[from] = true
-				break
-			}
-		}
-	}
-	for from := range d.interceptedOrigins {
-		if !live[from] {
-			delete(d.interceptedOrigins, from)
-		}
-	}
-
 	used := make(map[netip.AddrPort]bool, len(d.replySockets))
 	for _, flow := range d.flows {
 		for key, relay := range flow.relays {
@@ -1408,7 +1546,7 @@ func (d *quicDemux) sweepRepliesLocked() {
 			}
 		}
 	}
-	for _, origin := range d.interceptedOrigins {
+	for origin := range d.intercepts {
 		used[origin] = true
 	}
 	for origin, sock := range d.replySockets {
@@ -1476,7 +1614,7 @@ func (d *quicDemux) close() {
 		// The read loop publishes with no lock held across its dials, so close must refuse
 		// a late publication the way a shutdown does.
 		d.draining.Store(true)
-		h3, listener, transport := d.h3, d.listener, d.transport
+		h3 := d.h3
 		var sockets []net.Conn
 		for _, flow := range d.flows {
 			for _, relay := range flow.relays {
@@ -1494,8 +1632,12 @@ func (d *quicDemux) close() {
 		for _, sock := range d.replySockets {
 			replies = append(replies, sock)
 		}
+		intercepts := make([]*quicIntercept, 0, len(d.intercepts))
+		for _, it := range d.intercepts {
+			intercepts = append(intercepts, it)
+		}
 		clear(d.replySockets)
-		clear(d.interceptedOrigins)
+		clear(d.intercepts)
 		clear(d.flows)
 		d.sniffing = 0
 		d.relays = 0
@@ -1504,20 +1646,14 @@ func (d *quicDemux) close() {
 		for _, s := range sockets {
 			_ = s.Close()
 		}
-		for _, s := range replies {
-			_ = s.Close()
-		}
 		if h3 != nil {
 			_ = h3.Close()
 		}
-		if listener != nil {
-			_ = listener.Close()
+		for _, it := range intercepts {
+			d.closeIntercept(it)
 		}
-		// The packet conn goes before the transport: the transport's listen goroutine is
-		// parked in ReadFrom, and Transport.Close waits for it to return.
-		d.intercepted.Close()
-		if transport != nil {
-			_ = transport.Close()
+		for _, s := range replies {
+			_ = s.Close()
 		}
 
 		_ = d.pc.Close()
