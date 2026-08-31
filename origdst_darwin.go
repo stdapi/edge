@@ -48,6 +48,10 @@ const (
 	afInet6        = 30 // AF_INET6 on Darwin
 )
 
+// origDstExact stays false because DIOCNATLOOK keys on the client and proxy addresses
+// alone, ambiguous when one client port reaches two origins.
+const origDstExact = false
+
 var (
 	pfOnce sync.Once
 	pfDev  *os.File

@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -28,13 +29,21 @@ import (
 
 const h3Authority = "h3.example.test"
 
-// h3Origin starts an HTTP/3 origin holding a certificate for h3Authority signed by ca, and
-// returns its address.
-func h3Origin(t *testing.T, ca *CA) netip.AddrPort {
+// h3Origin starts an HTTP/3 origin holding a certificate signed by ca for each of names,
+// h3Authority when none is given, and returns its address.
+func h3Origin(t *testing.T, ca *CA, names ...string) netip.AddrPort {
 	t.Helper()
 
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	require.NoError(t, err)
+
+	if len(names) == 0 {
+		names = []string{h3Authority}
+	}
+	certs := make([]tls.Certificate, 0, len(names))
+	for _, name := range names {
+		certs = append(certs, selfSignedFor(t, ca, name))
+	}
 
 	srv := &http3.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -42,7 +51,7 @@ func h3Origin(t *testing.T, ca *CA) netip.AddrPort {
 			fmt.Fprintf(w, "origin method=%s path=%s proto=%s host=%s", r.Method, r.URL.Path, r.Proto, r.Host)
 		}),
 		TLSConfig: http3.ConfigureTLSConfig(&tls.Config{
-			Certificates: []tls.Certificate{selfSignedFor(t, ca, h3Authority)},
+			Certificates: certs,
 			MinVersion:   tls.VersionTLS13,
 		}),
 		QUICConfig: &quic.Config{},
@@ -388,6 +397,168 @@ func TestQUIC_SessionContextEndsWithTheSession(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("closing the session did not end its context")
 	}
+}
+
+// dialSharedQUIC dials a QUIC connection to addr from tr, so several connections share one
+// client socket.
+func dialSharedQUIC(t *testing.T, tr *quic.Transport, addr netip.AddrPort, sni string, roots *x509.CertPool) *quic.Conn {
+	t.Helper()
+	conn, err := tr.Dial(t.Context(), net.UDPAddrFromAddrPort(addr), &tls.Config{
+		ServerName: sni,
+		RootCAs:    roots,
+		NextProtos: []string{"h3"},
+		MinVersion: tls.VersionTLS13,
+	}, &quic.Config{
+		MaxIdleTimeout:       10 * time.Second,
+		KeepAlivePeriod:      200 * time.Millisecond,
+		HandshakeIdleTimeout: 3 * time.Second,
+	})
+	require.NoError(t, err, "handshake for %s", sni)
+	return conn
+}
+
+func h3Get(t *testing.T, cc *http3.ClientConn, authority string, port uint16) string {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("https://%s:%d/", authority, port), nil)
+	require.NoError(t, err)
+	resp, err := cc.RoundTrip(req)
+	require.NoError(t, err)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	return string(body)
+}
+
+// Two intercepted connections multiplexed on one client socket each get a session of their
+// own.
+func TestQUIC_TwoInterceptedConnectionsOnOneSocket(t *testing.T) {
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(proxyCA))
+	require.NoError(t, err)
+	handler := func(c *Context) (*http.Response, error) {
+		// A request served under its sibling's session would echo the wrong authority.
+		return Text(http.StatusOK, c.Session().Target().Host), nil
+	}
+	p.MustAddInterceptor(nil, "a.example.test/", handler)
+	p.MustAddInterceptor(nil, "b.example.test/", handler)
+
+	proxyAddr := startQUIC(t, p)
+
+	clientPC, err := net.ListenUDP("udp", nil)
+	require.NoError(t, err)
+	ctr := &quic.Transport{Conn: clientPC}
+	defer func() { _ = ctr.Close(); _ = clientPC.Close() }()
+
+	connA := dialSharedQUIC(t, ctr, proxyAddr, "a.example.test", poolOf(proxyCA))
+	connB := dialSharedQUIC(t, ctr, proxyAddr, "b.example.test", poolOf(proxyCA))
+
+	h3tr := &http3.Transport{}
+	defer func() { _ = h3tr.Close() }()
+	ccA, ccB := h3tr.NewClientConn(connA), h3tr.NewClientConn(connB)
+
+	require.Equal(t, "a.example.test", h3Get(t, ccA, "a.example.test", proxyAddr.Port()))
+	require.Equal(t, "b.example.test", h3Get(t, ccB, "b.example.test", proxyAddr.Port()))
+
+	sessions := waitForSessions(t, p, 2)
+	slices.SortFunc(sessions, func(x, y *Session) int { return strings.Compare(x.Target().Host, y.Target().Host) })
+	a, b := sessions[0], sessions[1]
+	assert.Equal(t, "a.example.test", a.Target().Host)
+	assert.Equal(t, "b.example.test", b.Target().Host)
+	require.NotNil(t, a.TLS())
+	require.NotNil(t, b.TLS())
+	assert.Equal(t, "a.example.test", a.TLS().ServerName, "each session records its own handshake")
+	assert.Equal(t, "b.example.test", b.TLS().ServerName)
+
+	require.NoError(t, a.Close())
+	select {
+	case <-a.Context().Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("closing the session did not end its context")
+	}
+	select {
+	case <-b.Context().Done():
+		t.Fatal("closing one session ended its sibling")
+	default:
+	}
+	require.Equal(t, "b.example.test", h3Get(t, ccB, "b.example.test", proxyAddr.Port()),
+		"the sibling keeps serving after the close")
+	remaining := waitForSessions(t, p, 1)
+	assert.Equal(t, "b.example.test", remaining[0].Target().Host)
+}
+
+// A second tunneled connection from the same client socket used to be fed into the first
+// one's tunnel and could never establish. Each is now decided on its own server name, and
+// closing either cuts the relay they share, so a survivor would re-handshake.
+func TestQUIC_TunnelSiblingsShareOneRelayAndCloseTogether(t *testing.T) {
+	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
+	require.NoError(t, err)
+	origin := h3Origin(t, originCA, "a.example.test", "b.example.test")
+
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(proxyCA))
+	require.NoError(t, err)
+	require.NoError(t, p.AddTunnel("a.example.test"))
+	require.NoError(t, p.AddTunnel("b.example.test"))
+
+	proxyAddr := startQUICRedirected(t, p, origin)
+
+	clientPC, err := net.ListenUDP("udp", nil)
+	require.NoError(t, err)
+	ctr := &quic.Transport{Conn: clientPC}
+	defer func() { _ = ctr.Close(); _ = clientPC.Close() }()
+
+	connA := dialSharedQUIC(t, ctr, proxyAddr, "a.example.test", poolOf(originCA))
+	connB := dialSharedQUIC(t, ctr, proxyAddr, "b.example.test", poolOf(originCA))
+
+	h3tr := &http3.Transport{}
+	defer func() { _ = h3tr.Close() }()
+	ccA, ccB := h3tr.NewClientConn(connA), h3tr.NewClientConn(connB)
+	assert.Contains(t, h3Get(t, ccA, "a.example.test", proxyAddr.Port()), "host=a.example.test")
+	assert.Contains(t, h3Get(t, ccB, "b.example.test", proxyAddr.Port()), "host=b.example.test")
+
+	sessions := waitForSessions(t, p, 2)
+	slices.SortFunc(sessions, func(x, y *Session) int { return strings.Compare(x.Target().Host, y.Target().Host) })
+	assert.Equal(t, "a.example.test", sessions[0].Target().Host)
+	assert.Equal(t, "b.example.test", sessions[1].Target().Host)
+	assert.Equal(t, Tunnel, sessions[0].Action())
+	assert.Equal(t, Tunnel, sessions[1].Action())
+
+	require.NoError(t, sessions[0].Close())
+	for _, sess := range sessions {
+		select {
+		case <-sess.Context().Done():
+		case <-time.After(3 * time.Second):
+			t.Fatal("cutting the relay did not end every session riding it")
+		}
+	}
+	assert.Empty(t, slices.Collect(p.Sessions()))
+}
+
+// The tag routes a connection with no flow state, a client whose address changed included,
+// so it must recognize exactly the IDs its own generator minted.
+func TestQUIC_CIDTagRecognizesOnlyItsOwnIDs(t *testing.T) {
+	tag, err := newQUICCIDTag([16]byte{1: 0xa5, 7: 0x5a})
+	require.NoError(t, err)
+	other, err := newQUICCIDTag([16]byte{2: 0xff})
+	require.NoError(t, err)
+
+	for range 64 {
+		cid, err := tag.GenerateConnectionID()
+		require.NoError(t, err)
+		require.Equal(t, 8, cid.Len(), "quic-go parses short headers at the generator's length")
+		b := cid.Bytes()
+		assert.True(t, tag.matches(b))
+		assert.False(t, other.matches(b), "a demux with another key may not adopt it")
+		flipped := slices.Clone(b)
+		flipped[7] ^= 1
+		assert.False(t, tag.matches(flipped))
+	}
+	assert.False(t, tag.matches(nil))
+	assert.False(t, tag.matches(make([]byte, 7)))
+	assert.False(t, tag.matches(make([]byte, 20)))
 }
 
 // The session context of an intercepted QUIC peer follows the connection. A client that

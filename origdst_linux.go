@@ -20,6 +20,10 @@ import (
 // x/sys/unix does not export it.
 const ip6tSoOriginalDst = 80
 
+// origDstExact reports that the destination comes from the control message attached to each
+// datagram, so origins interleaving on one socket cannot be told wrong.
+const origDstExact = true
+
 // originalDstSocket asks netfilter, through the socket, which address the connection was
 // headed to before the redirect. A connection that was not redirected answers with the
 // address of the listener itself.

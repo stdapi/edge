@@ -39,9 +39,14 @@ var (
 )
 
 // maxCryptoBytes bounds how much CRYPTO data one connection may buffer before being given
-// up on. A ClientHello has no business being larger, and the buffer is filled straight from
-// the network by an unauthenticated peer.
-const maxCryptoBytes = 64 * 1024
+// up on. A ClientHello with post-quantum key shares runs to a few kilobytes, so this leaves
+// generous room, and the buffer is filled straight from the network by an unauthenticated
+// peer who controls the offsets it is grown to.
+const maxCryptoBytes = 16 * 1024
+
+// MinClientInitialDatagram is the size RFC 9000 section 14.1 makes a client pad its Initial
+// datagrams to, so anything shorter cannot open a conformant connection.
+const MinClientInitialDatagram = 1200
 
 // Version numbers of the QUIC versions whose initial keys are known.
 const (
@@ -65,8 +70,10 @@ var (
 // carries is complete. A Reassembler follows a single client and is not safe for concurrent
 // use.
 type Reassembler struct {
-	crypto   []byte
-	received []bool
+	crypto []byte
+	// received marks the bytes of crypto that have arrived, one bit each, so tracking a
+	// hostile offset costs a sixty-fourth of the buffer it grows.
+	received []uint64
 	filled   int
 	total    int
 	done     bool
@@ -199,20 +206,20 @@ func (r *Reassembler) store(offset uint64, data []byte) error {
 		copy(grown, r.crypto)
 		r.crypto = grown
 
-		seen := make([]bool, end)
+		seen := make([]uint64, (end+63)/64)
 		copy(seen, r.received)
 		r.received = seen
 	}
 
 	copy(r.crypto[offset:end], data)
 	for i := offset; i < end; i++ {
-		if !r.received[i] {
-			r.received[i] = true
+		if r.received[i/64]&(1<<(i%64)) == 0 {
+			r.received[i/64] |= 1 << (i % 64)
 			r.filled++
 		}
 	}
 
-	if r.total == 0 && r.filled >= 4 && allReceived(r.received[:4]) {
+	if r.total == 0 && r.filled >= 4 && r.received[0]&0b1111 == 0b1111 {
 		if r.crypto[0] != 0x01 {
 			return fmt.Errorf("%w: first handshake message is not a ClientHello", ErrMalformed)
 		}
@@ -224,15 +231,6 @@ func (r *Reassembler) store(offset uint64, data []byte) error {
 	}
 
 	return nil
-}
-
-func allReceived(b []bool) bool {
-	for _, ok := range b {
-		if !ok {
-			return false
-		}
-	}
-	return true
 }
 
 // packet is one QUIC long header packet located inside a datagram.
@@ -321,6 +319,41 @@ func splitPacket(b []byte) (packet, []byte, error) {
 		raw:       b[:end],
 		pnOffset:  pos,
 	}, b[end:], nil
+}
+
+// ParseLongHeader reads the fields of a long header packet laid out the same way in every
+// QUIC version (RFC 8999), without touching any cryptography. A connection ID past the 20
+// bytes of RFC 9000 is refused.
+func ParseLongHeader(b []byte) (version uint32, dcid, scid []byte, ok bool) {
+	if len(b) < 7 || b[0]&0x80 == 0 {
+		return 0, nil, nil, false
+	}
+	version = binary.BigEndian.Uint32(b[1:5])
+	pos := 5
+
+	dcidLen := int(b[pos])
+	pos++
+	if dcidLen > 20 || pos+dcidLen > len(b) {
+		return 0, nil, nil, false
+	}
+	dcid = b[pos : pos+dcidLen]
+	pos += dcidLen
+
+	if pos >= len(b) {
+		return 0, nil, nil, false
+	}
+	scidLen := int(b[pos])
+	pos++
+	if scidLen > 20 || pos+scidLen > len(b) {
+		return 0, nil, nil, false
+	}
+	return version, dcid, b[pos : pos+scidLen], true
+}
+
+// IsInitial reports whether a long header packet is an Initial of a known QUIC version.
+func IsInitial(first byte, version uint32) bool {
+	initial, err := isInitialPacket(first, version)
+	return err == nil && initial
 }
 
 // isInitialPacket reports whether a long header packet is an Initial. The type bits moved

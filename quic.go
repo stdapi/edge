@@ -5,8 +5,16 @@
 package edge
 
 import (
+	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/hkdf"
+	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -24,18 +32,32 @@ import (
 	"github.com/fox-toolkit/edge/internal/stringsutil"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
+	"github.com/quic-go/quic-go/qlogwriter"
 )
 
 const (
-	// maxDatagramSize is larger than any QUIC datagram a peer may send, which is bounded by
-	// the path MTU.
-	maxDatagramSize = 1500
-	// maxPendingDatagrams bounds what one client may make the proxy buffer while its
-	// ClientHello is still arriving. A ClientHello with post-quantum key shares spans a
-	// handful of packets; well past that the peer is not trying to connect.
+	// maxUDPPayload accepts any datagram UDP can deliver. A shorter buffer truncates rather
+	// than drops, and a truncated QUIC packet fails its AEAD at the receiver.
+	maxUDPPayload = 65535
+	// maxPendingDatagrams and maxPendingBytes bound what one connection may make the proxy
+	// buffer while its ClientHello is still arriving.
 	maxPendingDatagrams = 32
-	// quicPeerIdle is how long a peer with no traffic is kept before its state is dropped.
-	quicPeerIdle = 2 * time.Minute
+	maxPendingBytes     = 64 * 1024
+	// quicRelayIdle reaps a relay with no return traffic, the only liveness a tunnel shows
+	// since a live QUIC connection always acknowledges.
+	quicRelayIdle = 2 * time.Minute
+	// quicSniffTTL reaps a connection whose ClientHello never completes, quicRejectTTL a
+	// rejected one kept so Initial retransmits are not decrypted again, and quicAdoptTTL an
+	// intercepted one the QUIC server never adopted.
+	quicSniffTTL  = 10 * time.Second
+	quicRejectTTL = 30 * time.Second
+	quicAdoptTTL  = time.Minute
+	// The state caps. Everything below is allocated for an unauthenticated peer on a
+	// spoofable transport, so the worst case is the product of these bounds.
+	maxQUICFlows       = 4096
+	maxConnsPerFlow    = 64
+	maxSniffingConns   = 512
+	maxLearnedPerRelay = 32
 )
 
 // ListenAndServeQUIC listens for UDP on addr and serves the QUIC connections routed to it. It
@@ -63,10 +85,15 @@ func (p *Proxy) ListenAndServeQUIC(addr string) error {
 // ServeQUIC serves the QUIC connections arriving on pc. Wrap pc in [TransparentPacketConn]
 // to place a client by the address it was headed to rather than by its server name alone.
 //
-// Each client is placed by reading the server name out of its first packets, which are
-// protected with keys derived from a connection ID sent in clear. A tunneled client has its
-// datagrams relayed untouched, so its handshake stays end to end; an intercepted one is
-// handed to a QUIC server that answers with a minted certificate.
+// Each connection is placed by the server name in its Initial packets. A tunneled connection
+// is relayed untouched and its handshake stays end to end. An intercepted one is terminated
+// with a minted certificate and served over HTTP/3. One client socket may multiplex several
+// connections.
+//
+// Under Encrypted Client Hello only the outer server name is visible to the decision. QUIC
+// versions other than v1 and v2 are rejected. A tunneled client that changes address in
+// flight has to re-handshake. Tunneling more than one origin per client socket needs the
+// per-datagram destinations of [TransparentPacketConn] on Linux and degrades elsewhere.
 func (p *Proxy) ServeQUIC(pc net.PacketConn) error {
 	if p.srv.closing.Load() {
 		return ErrProxyClosed
@@ -88,8 +115,8 @@ func (p *Proxy) ServeQUIC(pc net.PacketConn) error {
 	return d.run()
 }
 
-// quicDemux owns one UDP socket and decides, per client, whether its datagrams are relayed
-// to the origin or handed to the QUIC server the proxy terminates.
+// quicDemux owns one UDP socket and decides, per connection, whether its datagrams are
+// relayed to the origin or handed to the QUIC server the proxy terminates.
 type quicDemux struct {
 	pc net.PacketConn
 	// origins is pc when it reports where its datagrams were headed, nil otherwise.
@@ -97,135 +124,184 @@ type quicDemux struct {
 
 	p *Proxy
 
-	// intercepted feeds the terminating QUIC server. Every intercepted client shares it, so
-	// one server and one connection ID space serve them all.
+	// intercepted feeds the terminating QUIC server that every intercepted connection shares.
 	intercepted *demuxPacketConn
 	h3          *http3.Server
 	listener    *quic.EarlyListener
 	transport   *quic.Transport
 
-	peers map[string]*quicPeer
+	// tag recognizes the connection IDs the terminating server emits, with no per
+	// connection state. It is set once, when interception starts.
+	tag atomic.Pointer[quicCIDTag]
 
-	done chan struct{}
-	wg   sync.WaitGroup
+	done  chan struct{}
+	flows map[netip.AddrPort]*quicFlow
+	wg    sync.WaitGroup
+
+	// sniffing counts the connections buffering a ClientHello across every flow, the memory
+	// an unauthenticated peer controls.
+	sniffing int
 
 	closeOnce sync.Once
 
 	mu sync.Mutex
-	// draining refuses new peers while the ones already placed finish. It is written and,
-	// on the paths that publish a peer, read under mu, so a publication is either refused
-	// or visible to the first snapshot the shutdown takes.
+	// draining refuses new placements while the connections already placed finish. It is
+	// written and, on the paths that publish state, read under mu, so a publication is
+	// either refused or visible to the first snapshot the shutdown takes.
 	draining atomic.Bool
+
+	// exactOrigins is set when pc reads each datagram's destination from the datagram
+	// itself, exact enough to attribute it by.
+	exactOrigins bool
 }
 
-type peerState uint8
+// quicFlow is the state of one client socket, pinned to its source address. Re-pointing the
+// return path on a cleartext signal would let anyone on the client's path redirect it.
+type quicFlow struct {
+	lastSeen time.Time
+	client   net.Addr
+	// conns is keyed by the DCID of each connection's first Initial.
+	conns  map[string]*quicConn
+	relays map[netip.AddrPort]*quicRelay
+	// learned maps the connection IDs read off the origins' long headers back to their
+	// relay, and lens records which lengths are present, since a short header does not say
+	// where its connection ID ends.
+	learned map[string]*quicRelay
+	lens    uint32
+}
+
+type quicConnState uint8
 
 const (
-	peerSniffing peerState = iota
-	peerTunneling
-	peerIntercepted
-	peerRejected
+	connSniffing quicConnState = iota
+	connTunneling
+	connIntercepted
+	connRejected
 )
 
-type quicPeer struct {
+// quicConn is one QUIC connection. Its decision is taken once, on its Initial packets, and
+// nothing after the handshake feeds back into it.
+type quicConn struct {
 	lastSeen time.Time
-	upstream net.Conn
 	sniffer  *quicsniff.Reassembler
 	sess     *Session
-	// qc is the connection the proxy terminated for an intercepted peer. It stays nil until
-	// the handshake reaches the QUIC server, which is the only place it is handed out.
+	// qc is the terminated connection of an intercepted client, nil until the HTTP/3
+	// server adopts it.
 	qc     *quic.Conn
 	cancel context.CancelFunc
+	relay  *quicRelay
 
-	target  Target
-	pending [][]byte
-	state   peerState
+	odcid  string
+	target Target
+	// origin is where the client was headed, resolved from the opening datagram since no
+	// later one can answer it.
+	origin       netip.AddrPort
+	pending      [][]byte
+	pendingBytes int
+	state        quicConnState
 }
 
-// end ends the context of the peer's session. Whoever removes a peer from the map, or marks it
-// refused, has to call it.
-func (p *quicPeer) end() {
-	if p.cancel != nil {
-		p.cancel()
+// end ends the context of the connection's session. Whoever removes a connection, or marks
+// it rejected, has to call it.
+func (c *quicConn) end() {
+	if c.cancel != nil {
+		c.cancel()
 	}
+}
+
+// quicRelay is one connected socket to one origin, shared by every connection of its flow
+// headed there. The origin tells them apart by their connection IDs (RFC 9000 section 5.2).
+type quicRelay struct {
+	upstream net.Conn
+	key      netip.AddrPort
+	conns    []*quicConn
+	learned  int
+	closed   bool
 }
 
 // h3NoError is HTTP/3's H3_NO_ERROR, what a peer sends when it closes a connection with
 // nothing to report.
 const h3NoError quic.ApplicationErrorCode = 0x100
 
-// quicPeerCloser ends one QUIC peer. An intercepted peer is told about it, with a
-// CONNECTION_CLOSE the proxy can write because it terminated the handshake. A tunneled one is
-// not, its handshake stayed end to end, so the client simply stops hearing back until its own
-// idle timeout fires.
-type quicPeerCloser struct {
-	d   *quicDemux
-	key string
+// quicConnCloser ends one QUIC connection. A tunneled one cannot be cut alone, its packets
+// being indistinguishable from its siblings' once the client rotates its connection IDs, so
+// closing it closes its relay and the siblings re-handshake.
+type quicConnCloser struct {
+	d     *quicDemux
+	odcid string
+	flow  netip.AddrPort
 }
 
-func (c *quicPeerCloser) Close() error {
+func (c *quicConnCloser) Close() error {
 	c.d.mu.Lock()
-	peer := c.d.peers[c.key]
-	if peer == nil {
+	flow := c.d.flows[c.flow]
+	if flow == nil {
 		c.d.mu.Unlock()
 		return nil
 	}
-	qc := peer.qc
-	if peer.upstream != nil {
-		_ = peer.upstream.Close()
+	conn := flow.conns[c.odcid]
+	if conn == nil {
+		c.d.mu.Unlock()
+		return nil
 	}
-	peer.end()
-	delete(c.d.peers, c.key)
+	if conn.state == connTunneling {
+		relay := conn.relay
+		c.d.mu.Unlock()
+		c.d.closeRelay(c.flow, relay)
+		return nil
+	}
+	qc := conn.qc
+	c.d.removeConnLocked(flow, conn)
 	c.d.mu.Unlock()
 
 	if qc == nil {
-		// A tunnel, ended by closing the upstream socket, or an intercepted peer still
-		// handshaking. Dropping the peer starves both.
+		// An intercepted connection still handshaking, or one never adopted. Dropping the
+		// state starves it.
 		return nil
 	}
 	// Outside the lock, quic-go writes a CONNECTION_CLOSE from here.
 	return qc.CloseWithError(h3NoError, "")
 }
 
-// appendSessions adds the sessions of the peers this demux serves to out.
+// appendSessions adds the sessions of the connections this demux serves to out.
 func (d *quicDemux) appendSessions(out []*Session) []*Session {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	for _, peer := range d.peers {
-		if peer.sess != nil {
-			out = append(out, peer.sess)
+	for _, flow := range d.flows {
+		for _, conn := range flow.conns {
+			if conn.sess != nil {
+				out = append(out, conn.sess)
+			}
 		}
 	}
 	return out
-}
-
-// attach records the connection the QUIC server terminated for an intercepted peer, and
-// returns the session it belongs to. It is the only point where that connection is handed
-// out, so it is the only place the session can learn how to close it.
-func (d *quicDemux) attach(c *quic.Conn) *Session {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	peer := d.peers[c.RemoteAddr().String()]
-	if peer == nil {
-		return nil
-	}
-	peer.qc = c
-	// Ends the session context with the connection instead of waiting for the idle sweep.
-	context.AfterFunc(c.Context(), peer.end)
-	return peer.sess
 }
 
 func newQUICDemux(p *Proxy, pc net.PacketConn) (*quicDemux, error) {
 	d := &quicDemux{
 		p:     p,
 		pc:    pc,
-		peers: make(map[string]*quicPeer),
+		flows: make(map[netip.AddrPort]*quicFlow),
 		done:  make(chan struct{}),
 	}
 	d.origins, _ = pc.(PacketOriginalDestination)
+	if e, ok := pc.(interface{ exactOriginalDestination() bool }); ok && d.origins != nil {
+		d.exactOrigins = e.exactOriginalDestination()
+	}
 	d.intercepted = newDemuxPacketConn(pc)
 	return d, nil
 }
+
+// quicCarrier links a connection the QUIC server accepts back to the state it was sniffed
+// under, through the connection context. Transport.ConnContext stores an empty one, the
+// Tracer fills it, and the HTTP/3 server reads it back.
+type quicCarrier struct {
+	client net.Addr
+	sess   *Session
+	odcid  string
+}
+
+type quicCarrierKey struct{}
 
 // startInterception brings up the terminating QUIC server on first use, so a proxy that only
 // ever tunnels never needs a certificate authority.
@@ -249,13 +325,36 @@ func (d *quicDemux) startInterception() error {
 		return fmt.Errorf("%w: %w", ErrNoCertificateAuthority, errNoCA)
 	}
 
-	transport := &quic.Transport{Conn: d.intercepted}
-	ln, err := transport.ListenEarly(d.quicTLSConfig(), d.quicConfig())
+	tag, resetKey, err := quicInterceptKeys(d.p.cfg.ca)
+	if err != nil {
+		return err
+	}
+
+	transport := &quic.Transport{
+		Conn:                  d.intercepted,
+		ConnectionIDGenerator: tag,
+		StatelessResetKey:     &resetKey,
+		ConnContext: func(ctx context.Context, info *quic.ClientInfo) (context.Context, error) {
+			return context.WithValue(ctx, quicCarrierKey{}, &quicCarrier{client: info.RemoteAddr}), nil
+		},
+	}
+	cfg := d.quicConfig()
+	cfg.Tracer = func(ctx context.Context, _ bool, odcid quic.ConnectionID) qlogwriter.Trace {
+		// Returns no trace. This callback is the one place quic-go reveals the original
+		// destination connection ID, pre-Retry even when a Retry happened.
+		if carrier, ok := ctx.Value(quicCarrierKey{}).(*quicCarrier); ok {
+			carrier.odcid = string(odcid.Bytes())
+			carrier.sess = d.adopt(ctx, carrier.client, carrier.odcid)
+		}
+		return nil
+	}
+	ln, err := transport.ListenEarly(d.quicTLSConfig(), cfg)
 	if err != nil {
 		return fmt.Errorf("listen QUIC: %w", err)
 	}
 	d.transport = transport
 	d.listener = ln
+	d.tag.Store(tag)
 
 	d.h3 = &http3.Server{
 		Handler:        http.HandlerFunc(d.p.serveInterceptedRequest),
@@ -263,14 +362,16 @@ func (d *quicDemux) startInterception() error {
 		IdleTimeout:    d.p.cfg.server.idleTimeout,
 		Logger:         d.p.cfg.logger,
 		ConnContext: func(ctx context.Context, c *quic.Conn) context.Context {
-			if sess := d.attach(c); sess != nil {
-				// The session is created before the handshake, so this is the first point
-				// where the TLS state exists, and it is already registered by then.
-				state := c.ConnectionState().TLS
-				sess.tlsState.Store(&state)
-				return context.WithValue(ctx, sessionKey{}, sess)
+			carrier, _ := c.Context().Value(quicCarrierKey{}).(*quicCarrier)
+			if carrier == nil || carrier.sess == nil {
+				return ctx
 			}
-			return ctx
+			// The session is registered before the handshake, so this is the first point
+			// where its TLS state exists.
+			state := c.ConnectionState().TLS
+			carrier.sess.tlsState.Store(&state)
+			d.attach(carrier, c)
+			return context.WithValue(ctx, sessionKey{}, carrier.sess)
 		},
 	}
 
@@ -284,6 +385,48 @@ func (d *quicDemux) startInterception() error {
 		}
 	})
 	return nil
+}
+
+// adopt hands the QUIC server the session of the connection it is accepting. The AfterFunc
+// removes the connection when its context ends, a failed handshake included.
+func (d *quicDemux) adopt(ctx context.Context, client net.Addr, odcid string) *Session {
+	from := addrPort(client)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	flow := d.flows[from]
+	if flow == nil {
+		return nil
+	}
+	conn := flow.conns[odcid]
+	if conn == nil || conn.state != connIntercepted {
+		return nil
+	}
+	context.AfterFunc(ctx, func() { d.endIntercepted(from, odcid) })
+	return conn.sess
+}
+
+func (d *quicDemux) endIntercepted(from netip.AddrPort, odcid string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	flow := d.flows[from]
+	if flow == nil {
+		return
+	}
+	if conn := flow.conns[odcid]; conn != nil && conn.state == connIntercepted {
+		d.removeConnLocked(flow, conn)
+	}
+}
+
+// attach records the terminated connection so Session.Close can send a CONNECTION_CLOSE.
+func (d *quicDemux) attach(carrier *quicCarrier, c *quic.Conn) {
+	from := addrPort(carrier.client)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if flow := d.flows[from]; flow != nil {
+		if conn := flow.conns[carrier.odcid]; conn != nil && conn.state == connIntercepted {
+			conn.qc = c
+		}
+	}
 }
 
 func (d *quicDemux) quicTLSConfig() *tls.Config {
@@ -311,7 +454,7 @@ func (d *quicDemux) quicConfig() *quic.Config {
 }
 
 func (d *quicDemux) run() error {
-	sweep := time.NewTicker(30 * time.Second)
+	sweep := time.NewTicker(5 * time.Second)
 	defer sweep.Stop()
 	d.wg.Go(func() {
 		for {
@@ -324,7 +467,7 @@ func (d *quicDemux) run() error {
 		}
 	})
 
-	buf := make([]byte, maxDatagramSize)
+	buf := make([]byte, maxUDPPayload)
 	for {
 		n, addr, err := d.pc.ReadFrom(buf)
 		if err != nil {
@@ -346,95 +489,248 @@ func (d *quicDemux) run() error {
 }
 
 func (d *quicDemux) dispatch(addr net.Addr, datagram []byte) {
-	key := addr.String()
-
-	d.mu.Lock()
-	peer, ok := d.peers[key]
-	if !ok {
-		peer = &quicPeer{sniffer: quicsniff.New()}
-		d.peers[key] = peer
-	}
-	peer.lastSeen = time.Now()
-	state := peer.state
-	upstream := peer.upstream
-	d.mu.Unlock()
-
-	switch state {
-	case peerRejected:
+	from := addrPort(addr)
+	if !from.IsValid() {
 		return
-	case peerIntercepted:
+	}
+	if datagram[0]&0x80 != 0 {
+		d.dispatchLong(addr, from, datagram)
+		return
+	}
+	d.dispatchShort(addr, from, datagram)
+}
+
+func (d *quicDemux) dispatchLong(addr net.Addr, from netip.AddrPort, datagram []byte) {
+	version, dcid, _, ok := quicsniff.ParseLongHeader(datagram)
+	if !ok {
+		return
+	}
+
+	now := time.Now()
+	d.mu.Lock()
+	flow := d.flows[from]
+	if flow != nil {
+		flow.lastSeen = now
+		if conn := flow.conns[string(dcid)]; conn != nil {
+			switch conn.state {
+			case connTunneling:
+				up := conn.relay.upstream
+				d.mu.Unlock()
+				_, _ = up.Write(datagram)
+			case connIntercepted:
+				conn.lastSeen = now
+				d.mu.Unlock()
+				d.intercepted.deliver(addr, datagram)
+			case connRejected:
+				conn.lastSeen = now
+				d.mu.Unlock()
+			default:
+				conn.lastSeen = now
+				d.mu.Unlock()
+				d.sniff(from, conn, datagram)
+			}
+			return
+		}
+		if relay := flow.learned[string(dcid)]; relay != nil {
+			up := relay.upstream
+			d.mu.Unlock()
+			_, _ = up.Write(datagram)
+			return
+		}
+	}
+	if tag := d.tag.Load(); tag != nil && tag.matches(dcid) {
+		// Initials are not exempt. After a Retry the client's next Initial addresses the
+		// server's chosen ID and is only routable this way.
+		d.mu.Unlock()
 		d.intercepted.deliver(addr, datagram)
 		return
-	case peerTunneling:
-		if upstream != nil {
-			_, _ = upstream.Write(datagram)
+	}
+	if quicsniff.IsInitial(datagram[0], version) &&
+		len(datagram) >= quicsniff.MinClientInitialDatagram && len(dcid) >= 8 {
+		conn := d.admitConnLocked(from, addr, string(dcid), now)
+		d.mu.Unlock()
+		if conn != nil {
+			d.sniff(from, conn, datagram)
 		}
 		return
 	}
-
-	d.sniff(addr, key, peer, datagram)
+	up := d.fallbackLocked(flow, addr)
+	d.mu.Unlock()
+	if up != nil {
+		_, _ = up.Write(datagram)
+	}
 }
 
-// sniff feeds a datagram to the reassembler and, once the ClientHello is complete, decides
-// what happens to the connection.
-func (d *quicDemux) sniff(addr net.Addr, key string, peer *quicPeer, datagram []byte) {
-	kept := make([]byte, len(datagram))
-	copy(kept, datagram)
-
-	hello, err := peer.sniffer.Feed(kept)
-	switch {
-	case errors.Is(err, quicsniff.ErrNotInitial):
-		// A datagram from a connection whose Initial was never seen, typically a client
-		// resuming across a proxy restart. There is nothing to place it by.
-		d.reject(key, addr, "no Initial packet")
+// dispatchShort places a short header datagram, whose connection ID length is not on the
+// wire, so the learned IDs are probed at each length the origins use.
+func (d *quicDemux) dispatchShort(addr net.Addr, from netip.AddrPort, datagram []byte) {
+	now := time.Now()
+	d.mu.Lock()
+	flow := d.flows[from]
+	if flow != nil {
+		flow.lastSeen = now
+		for l := 1; l <= 20; l++ {
+			if flow.lens&(1<<l) == 0 || len(datagram) < 1+l {
+				continue
+			}
+			if relay := flow.learned[string(datagram[1:1+l])]; relay != nil {
+				up := relay.upstream
+				d.mu.Unlock()
+				_, _ = up.Write(datagram)
+				return
+			}
+		}
+	}
+	if tag := d.tag.Load(); tag != nil && len(datagram) >= 1+8 && tag.matches(datagram[1:9]) {
+		// No flow needed. The tag survives a client whose address changed in flight, and
+		// quic-go validates the new path itself.
+		d.mu.Unlock()
+		d.intercepted.deliver(addr, datagram)
 		return
-	case err != nil:
+	}
+	up := d.fallbackLocked(flow, addr)
+	d.mu.Unlock()
+	if up != nil {
+		_, _ = up.Write(datagram)
+	}
+}
+
+// fallbackLocked places a datagram no connection ID could attribute, the steady state of
+// every tunnel once the client rotates to IDs it received encrypted (RFC 9000 section 5.1).
+// The destination picks the relay when the platform reports it exactly, and a flow with a
+// single relay leaves one place to send.
+func (d *quicDemux) fallbackLocked(flow *quicFlow, client net.Addr) net.Conn {
+	if flow == nil || len(flow.relays) == 0 {
+		return nil
+	}
+	if d.exactOrigins {
+		if origin := d.originalDst(client); origin.IsValid() {
+			if relay := flow.relays[origin]; relay != nil {
+				return relay.upstream
+			}
+			// The destination is known and no relay goes there. Anywhere else would be
+			// the wrong origin.
+			return nil
+		}
+	}
+	if len(flow.relays) == 1 {
+		for _, relay := range flow.relays {
+			return relay.upstream
+		}
+	}
+	return nil
+}
+
+func (d *quicDemux) admitConnLocked(from netip.AddrPort, client net.Addr, odcid string, now time.Time) *quicConn {
+	if d.draining.Load() || d.sniffing >= maxSniffingConns {
+		return nil
+	}
+	flow := d.flows[from]
+	if flow == nil {
+		if len(d.flows) >= maxQUICFlows {
+			return nil
+		}
+		flow = &quicFlow{
+			lastSeen: now,
+			client:   client,
+			conns:    make(map[string]*quicConn),
+			relays:   make(map[netip.AddrPort]*quicRelay),
+			learned:  make(map[string]*quicRelay),
+		}
+		d.flows[from] = flow
+	}
+	if len(flow.conns) >= maxConnsPerFlow {
+		return nil
+	}
+	conn := &quicConn{
+		lastSeen: now,
+		odcid:    odcid,
+		sniffer:  quicsniff.New(),
+		origin:   d.originalDst(client),
+		state:    connSniffing,
+	}
+	flow.conns[odcid] = conn
+	d.sniffing++
+	return conn
+}
+
+// setStateLocked keeps the sniffing count in step with the state changes.
+func (d *quicDemux) setStateLocked(conn *quicConn, s quicConnState) {
+	if conn.state == connSniffing && s != connSniffing {
+		d.sniffing--
+	}
+	conn.state = s
+}
+
+func (d *quicDemux) removeConnLocked(flow *quicFlow, conn *quicConn) {
+	if conn.state == connSniffing {
+		d.sniffing--
+	}
+	delete(flow.conns, conn.odcid)
+	conn.end()
+}
+
+// sniff feeds a datagram to the reassembler and decides the connection once its ClientHello
+// is complete. A first flight datagram with no Initial in it, 0-RTT typically, still joins
+// the pending ones, so the winning side receives the flight whole.
+func (d *quicDemux) sniff(from netip.AddrPort, conn *quicConn, datagram []byte) {
+	kept := bytes.Clone(datagram)
+
+	hello, err := conn.sniffer.Feed(kept)
+	if err != nil && !errors.Is(err, quicsniff.ErrNotInitial) {
 		d.p.cfg.logger.Debug("edge: cannot read the QUIC ClientHello",
-			slog.String("client", key), slog.String("error", err.Error()))
-		d.reject(key, addr, err.Error())
+			slog.String("client", from.String()), slog.String("error", err.Error()))
+		d.rejectConn(from, conn, err.Error())
 		return
 	}
 
 	d.mu.Lock()
-	if len(peer.pending) >= maxPendingDatagrams {
+	flow := d.flows[from]
+	if flow == nil || flow.conns[conn.odcid] != conn || conn.state != connSniffing {
 		d.mu.Unlock()
-		d.reject(key, addr, "ClientHello spans too many datagrams")
 		return
 	}
-	peer.pending = append(peer.pending, kept)
-	pending := peer.pending
+	if len(conn.pending) >= maxPendingDatagrams || conn.pendingBytes+len(kept) > maxPendingBytes {
+		d.mu.Unlock()
+		d.rejectConn(from, conn, "ClientHello spans too many datagrams")
+		return
+	}
+	conn.pending = append(conn.pending, kept)
+	conn.pendingBytes += len(kept)
+	client := flow.client
+	pending := conn.pending
 	d.mu.Unlock()
 
 	if hello == nil {
 		return // still arriving
 	}
 
-	target := d.targetFor(hello, addr)
+	target := d.targetFor(hello, conn.origin)
 	if target.Host == "" {
-		d.reject(key, addr, "no server name in the ClientHello")
+		d.rejectConn(from, conn, "no server name in the ClientHello")
 		return
 	}
 
 	switch d.p.ActionFor(target) {
 	case Reject:
-		d.reject(key, addr, "no interceptor or tunnel matches this authority")
+		d.rejectConn(from, conn, "no interceptor or tunnel matches this authority")
 	case Intercept:
-		d.beginIntercept(key, addr, target, pending)
+		d.beginIntercept(from, client, conn, target, pending)
 	default:
-		d.beginTunnel(key, addr, target, pending)
+		d.beginTunnel(from, client, conn, target, pending)
 	}
 }
 
 // targetFor works out where a QUIC connection was headed, from the server name it offered
-// and, when available, the address the datagram was redirected from.
-func (d *quicDemux) targetFor(hello []byte, addr net.Addr) Target {
+// and, when known, the address its first datagram was redirected from.
+func (d *quicDemux) targetFor(hello []byte, origin netip.AddrPort) Target {
 	target := Target{Scheme: "https", Port: "443"}
 
 	if name := serverNameFromHello(hello); name != "" {
 		target.Host = stringsutil.ToLowerASCIIString(name)
 	}
 
-	if origin := d.originalDst(addr); origin.IsValid() {
+	if origin.IsValid() {
 		target.Port = fmt.Sprint(origin.Port())
 		if target.Host == "" {
 			target.Host = origin.Addr().String()
@@ -443,8 +739,8 @@ func (d *quicDemux) targetFor(hello []byte, addr net.Addr) Target {
 	return target
 }
 
-// originalDst resolves where a datagram from client was headed before the redirect, or the
-// zero value when there was none.
+// originalDst resolves where the datagram last read from client was headed before the
+// redirect, or the zero value when there was none.
 func (d *quicDemux) originalDst(client net.Addr) netip.AddrPort {
 	if d.origins == nil {
 		return netip.AddrPort{}
@@ -456,199 +752,303 @@ func (d *quicDemux) originalDst(client net.Addr) netip.AddrPort {
 	return redirectedTo(origin, d.pc.LocalAddr())
 }
 
-func (d *quicDemux) beginIntercept(key string, addr net.Addr, target Target, pending [][]byte) {
+func (d *quicDemux) beginIntercept(from netip.AddrPort, client net.Addr, conn *quicConn, target Target, pending [][]byte) {
 	if err := d.startInterception(); err != nil {
 		if !errors.Is(err, ErrProxyClosed) {
 			d.p.cfg.logger.Error("edge: cannot intercept QUIC", slog.String("error", err.Error()))
 		}
-		d.reject(key, addr, err.Error())
+		d.rejectConn(from, conn, err.Error())
 		return
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	sess := newSession(ctx, nil, target, Intercept, HTTP3)
-	sess.remoteAddr = addr
+	sess.remoteAddr = client
 	sess.localAddr = d.pc.LocalAddr()
 	sess.transparent = true
 	// Forwarding goes back to the address the client was headed to, not to a fresh
 	// resolution of the authority, which behind a redirect may not resolve at all.
-	sess.upstream = d.originalDst(addr)
-	sess.closer = &quicPeerCloser{d: d, key: key}
+	sess.upstream = conn.origin
+	sess.closer = &quicConnCloser{d: d, flow: from, odcid: conn.odcid}
 
 	d.mu.Lock()
-	peer := d.peers[key]
-	if peer == nil {
+	flow := d.flows[from]
+	if flow == nil || flow.conns[conn.odcid] != conn {
 		d.mu.Unlock()
 		cancel()
 		return
 	}
-	// Inside the publish critical section, so a shutdown either refuses this peer or finds
-	// it in the snapshot it takes under the same lock; startInterception alone cannot
+	// Inside the publish critical section, so a shutdown either refuses this connection or
+	// finds it in the snapshot it takes under the same lock. startInterception alone cannot
 	// guarantee that once the server is already up.
 	if d.draining.Load() {
 		d.mu.Unlock()
 		cancel()
-		d.reject(key, addr, "the proxy is shutting down")
+		d.rejectConn(from, conn, "the proxy is shutting down")
 		return
 	}
-	peer.state = peerIntercepted
-	peer.target = target
-	peer.pending = nil
-	peer.sess = sess
-	peer.cancel = cancel
+	d.setStateLocked(conn, connIntercepted)
+	conn.target = target
+	conn.pending = nil
+	conn.pendingBytes = 0
+	conn.sess = sess
+	conn.cancel = cancel
 	d.mu.Unlock()
 
 	// The session is published, so a sweep started after the tree changed either found it or
 	// ran before this read, which then observes the change. Nothing has been handed to the
-	// QUIC server yet, so a peer refused here never completes a handshake.
+	// QUIC server yet, so a connection refused here never completes a handshake.
 	if d.p.ActionFor(target) == Reject {
-		d.reject(key, addr, "the authority was withdrawn while the connection was starting")
+		d.rejectConn(from, conn, "the authority was withdrawn while the connection was starting")
 		return
 	}
 
 	for _, dg := range pending {
-		d.intercepted.deliver(addr, dg)
+		d.intercepted.deliver(client, dg)
 	}
 }
 
-func (d *quicDemux) beginTunnel(key string, addr net.Addr, target Target, pending [][]byte) {
-	upstream, err := d.dialUpstreamUDP(target, addr)
-	if err != nil {
-		d.p.cfg.logger.Debug("edge: cannot reach the QUIC origin",
-			slog.String("target", target.String()), slog.String("error", err.Error()))
-		d.reject(key, addr, err.Error())
-		return
-	}
-
-	// A tunneled peer needs a session of its own. Its action is read once, here, so without
-	// one nothing would report that it is still relaying after the tree changed.
+func (d *quicDemux) beginTunnel(from netip.AddrPort, client net.Addr, conn *quicConn, target Target, pending [][]byte) {
 	ctx, cancel := context.WithCancel(context.Background())
 	sess := newSession(ctx, nil, target, Tunnel, HTTP3)
-	sess.remoteAddr = addr
+	sess.remoteAddr = client
 	sess.localAddr = d.pc.LocalAddr()
 	sess.transparent = true
-	sess.upstream = d.originalDst(addr)
-	sess.closer = &quicPeerCloser{d: d, key: key}
+	sess.upstream = conn.origin
+	sess.closer = &quicConnCloser{d: d, flow: from, odcid: conn.odcid}
 
 	d.mu.Lock()
-	peer := d.peers[key]
-	if peer == nil {
-		d.mu.Unlock()
-		_ = upstream.Close()
-		cancel()
-		return
-	}
-	// See beginIntercept for why the check sits in the publish critical section. The relay
-	// starts here too: its Add shares the critical section with the close that waits on the
-	// group, so it either precedes the wait or does not happen.
-	if d.draining.Load() {
-		d.mu.Unlock()
-		_ = upstream.Close()
-		cancel()
-		d.reject(key, addr, "the proxy is shutting down")
-		return
-	}
-	peer.state = peerTunneling
-	peer.upstream = upstream
-	peer.target = target
-	peer.pending = nil
-	peer.sess = sess
-	peer.cancel = cancel
-	// Relay what the origin sends back to the client it belongs to.
-	d.wg.Go(func() {
-		defer func() { _ = upstream.Close() }()
-		buf := make([]byte, maxDatagramSize)
-		for {
-			_ = upstream.SetReadDeadline(time.Now().Add(quicPeerIdle))
-			n, err := upstream.Read(buf)
-			if n > 0 {
-				if _, werr := d.pc.WriteTo(buf[:n], addr); werr != nil {
-					return
-				}
-			}
-			if err != nil {
-				d.drop(key)
-				return
-			}
-			select {
-			case <-d.done:
-				return
-			default:
-			}
-		}
-	})
+	relay, ok := d.placeTunnelLocked(from, conn, conn.origin, nil, sess, cancel, target)
 	d.mu.Unlock()
+	if !ok {
+		cancel()
+		return
+	}
+	if relay == nil {
+		upstream, err := d.dialUpstreamUDP(target, conn.origin)
+		if err != nil {
+			cancel()
+			d.p.cfg.logger.Debug("edge: cannot reach the QUIC origin",
+				slog.String("target", target.String()), slog.String("error", err.Error()))
+			d.rejectConn(from, conn, err.Error())
+			return
+		}
+		d.mu.Lock()
+		relay, ok = d.placeTunnelLocked(from, conn, addrPort(upstream.RemoteAddr()), upstream, sess, cancel, target)
+		d.mu.Unlock()
+		if !ok {
+			_ = upstream.Close()
+			cancel()
+			return
+		}
+		if relay.upstream != upstream {
+			// Another decision resolved the same origin first and this socket is redundant.
+			_ = upstream.Close()
+		}
+	}
 
-	// See beginIntercept. Refusing here happens before the first datagram reaches the origin,
-	// so a tunnel the tree no longer accepts never relays a byte.
+	// See beginIntercept. Enforcement is per relay, the packets of siblings being
+	// indistinguishable, so a tree that no longer accepts the authority costs the relay.
 	if d.p.ActionFor(target) == Reject {
-		d.drop(key)
+		d.closeRelay(from, relay)
 		d.p.cfg.logger.Debug("edge: QUIC connection dropped",
-			slog.String("client", addr.String()),
+			slog.String("client", from.String()),
 			slog.String("reason", "the authority was withdrawn while the connection was starting"))
 		return
 	}
 
 	for _, dg := range pending {
-		if _, err := upstream.Write(dg); err != nil {
+		if _, err := relay.upstream.Write(dg); err != nil {
 			break
 		}
 	}
 }
 
-func (d *quicDemux) dialUpstreamUDP(target Target, client net.Addr) (net.Conn, error) {
+// placeTunnelLocked publishes a tunneled connection onto the relay for key, dialing left to
+// the caller when it returns no relay with ok true. The draining check, the relay start and
+// the placement share one critical section, so a shutdown refuses all of it or sweeps all
+// of it.
+func (d *quicDemux) placeTunnelLocked(from netip.AddrPort, conn *quicConn, key netip.AddrPort, upstream net.Conn, sess *Session, cancel context.CancelFunc, target Target) (*quicRelay, bool) {
+	flow := d.flows[from]
+	if flow == nil || flow.conns[conn.odcid] != conn || conn.state != connSniffing {
+		return nil, false
+	}
+	if d.draining.Load() {
+		return nil, false
+	}
+
+	var relay *quicRelay
+	if key.IsValid() {
+		relay = flow.relays[key]
+	}
+	if relay == nil {
+		if upstream == nil {
+			return nil, true
+		}
+		relay = &quicRelay{upstream: upstream, key: key}
+		flow.relays[key] = relay
+		// The relay's Add shares the critical section with the close that waits on the
+		// group, so it either precedes the wait or does not happen.
+		client := flow.client
+		d.wg.Go(func() { d.runRelay(from, client, relay) })
+	}
+
+	d.setStateLocked(conn, connTunneling)
+	conn.target = target
+	conn.pending = nil
+	conn.pendingBytes = 0
+	conn.sess = sess
+	conn.cancel = cancel
+	conn.relay = relay
+	relay.conns = append(relay.conns, conn)
+	return relay, true
+}
+
+// runRelay relays what the origin sends back to its client, learning the origin's
+// connection IDs on the way. Learning happens before the write to the client, so by
+// causality a client can never use an ID before the demux knows it, a Retry included.
+func (d *quicDemux) runRelay(from netip.AddrPort, client net.Addr, relay *quicRelay) {
+	defer func() { _ = relay.upstream.Close() }()
+	buf := make([]byte, maxUDPPayload)
+	for {
+		_ = relay.upstream.SetReadDeadline(time.Now().Add(quicRelayIdle))
+		n, err := relay.upstream.Read(buf)
+		if n > 0 {
+			d.learnOrigin(from, relay, buf[:n])
+			// Verbatim, parseable or not. A stateless reset is a short header packet the
+			// client depends on receiving.
+			if _, werr := d.pc.WriteTo(buf[:n], client); werr != nil {
+				d.closeRelay(from, relay)
+				return
+			}
+		}
+		if err != nil {
+			d.closeRelay(from, relay)
+			return
+		}
+		select {
+		case <-d.done:
+			return
+		default:
+		}
+	}
+}
+
+// learnOrigin records the source connection ID of an origin's long header packet, the only
+// place the origin's IDs are ever readable on this path.
+func (d *quicDemux) learnOrigin(from netip.AddrPort, relay *quicRelay, datagram []byte) {
+	if len(datagram) == 0 || datagram[0]&0x80 == 0 {
+		return
+	}
+	version, _, scid, ok := quicsniff.ParseLongHeader(datagram)
+	// Version Negotiation echoes the client's own IDs and teaches nothing, and a zero
+	// length ID would put an empty key in the table, matching every probe.
+	if !ok || version == 0 || len(scid) == 0 {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	flow := d.flows[from]
+	if flow == nil || relay.closed || relay.learned >= maxLearnedPerRelay {
+		return
+	}
+	if _, seen := flow.learned[string(scid)]; seen {
+		return
+	}
+	relay.learned++
+	flow.learned[string(scid)] = relay
+	flow.lens |= 1 << len(scid)
+}
+
+// closeRelay tears down the relay, its learned IDs and every connection on it, whose
+// sessions end here.
+func (d *quicDemux) closeRelay(from netip.AddrPort, relay *quicRelay) {
+	d.mu.Lock()
+	flow := d.flows[from]
+	if flow == nil || relay.closed {
+		d.mu.Unlock()
+		return
+	}
+	relay.closed = true
+	delete(flow.relays, relay.key)
+	for cid, r := range flow.learned {
+		if r == relay {
+			delete(flow.learned, cid)
+		}
+	}
+	flow.lens = 0
+	for cid := range flow.learned {
+		flow.lens |= 1 << len(cid)
+	}
+	for _, conn := range relay.conns {
+		d.removeConnLocked(flow, conn)
+	}
+	d.mu.Unlock()
+	_ = relay.upstream.Close()
+}
+
+func (d *quicDemux) dialUpstreamUDP(target Target, origin netip.AddrPort) (net.Conn, error) {
 	addr := target.Authority()
-	if origin := d.originalDst(client); origin.IsValid() {
+	if origin.IsValid() {
 		addr = origin.String()
 	}
 	return net.DialTimeout("udp", addr, 10*time.Second)
 }
 
-func (d *quicDemux) reject(key string, addr net.Addr, reason string) {
+// rejectConn marks a connection refused. The state stays as a tombstone until its TTL, so
+// the client's Initial retransmits are dropped without being decrypted again, and a fresh
+// Initial with a new connection ID from the same socket is evaluated from scratch.
+func (d *quicDemux) rejectConn(from netip.AddrPort, conn *quicConn, reason string) {
 	d.mu.Lock()
-	if peer, ok := d.peers[key]; ok {
-		peer.state = peerRejected
-		peer.pending = nil
-		peer.sniffer = nil
-		peer.sess = nil
-		peer.end()
+	if flow := d.flows[from]; flow != nil && flow.conns[conn.odcid] == conn {
+		d.setStateLocked(conn, connRejected)
+		conn.lastSeen = time.Now()
+		conn.sniffer = nil
+		conn.pending = nil
+		conn.pendingBytes = 0
+		conn.sess = nil
+		conn.end()
 	}
 	d.mu.Unlock()
 	d.p.cfg.logger.Debug("edge: QUIC connection dropped",
-		slog.String("client", addr.String()), slog.String("reason", reason))
-}
-
-func (d *quicDemux) drop(key string) {
-	d.mu.Lock()
-	if peer, ok := d.peers[key]; ok {
-		if peer.upstream != nil {
-			_ = peer.upstream.Close()
-		}
-		peer.end()
-	}
-	delete(d.peers, key)
-	d.mu.Unlock()
+		slog.String("client", from.String()), slog.String("reason", reason))
 }
 
 func (d *quicDemux) sweepIdle() {
-	cutoff := time.Now().Add(-quicPeerIdle)
+	now := time.Now()
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	for key, peer := range d.peers {
-		if peer.lastSeen.After(cutoff) {
-			continue
+	for from, flow := range d.flows {
+		for _, conn := range flow.conns {
+			switch conn.state {
+			case connSniffing:
+				if now.Sub(conn.lastSeen) > quicSniffTTL {
+					d.removeConnLocked(flow, conn)
+				}
+			case connRejected:
+				if now.Sub(conn.lastSeen) > quicRejectTTL {
+					d.removeConnLocked(flow, conn)
+				}
+			case connIntercepted:
+				// Removed when its connection context ends, unless the handshake never
+				// reached the server and no AfterFunc was registered.
+				if conn.qc == nil && now.Sub(conn.lastSeen) > quicAdoptTTL {
+					d.removeConnLocked(flow, conn)
+				}
+			case connTunneling:
+				// Lives and dies with its relay. The connection's own end is encrypted, so
+				// the relay's return traffic is the only liveness signal.
+			}
 		}
-		if peer.upstream != nil {
-			_ = peer.upstream.Close()
+		if len(flow.conns) == 0 && len(flow.relays) == 0 && now.Sub(flow.lastSeen) > quicSniffTTL {
+			delete(d.flows, from)
 		}
-		peer.end()
-		delete(d.peers, key)
 	}
 }
 
-// shutdown drains the demux: no peer is placed any more, the terminating server tells its
-// clients with a GOAWAY and waits for their requests, and the tunnels are relayed until they
-// go quiet or ctx is done. The read loop keeps running through all of it, because the
+// shutdown drains the demux. Nothing new is placed, the terminating server tells its clients
+// with a GOAWAY and waits for their requests, and the tunnels are relayed until they go
+// quiet or ctx is done. The read loop keeps running through all of it, because the
 // connections being drained only finish if their datagrams still arrive.
 func (d *quicDemux) shutdown(ctx context.Context) error {
 	d.mu.Lock()
@@ -661,9 +1061,9 @@ func (d *quicDemux) shutdown(ctx context.Context) error {
 		err = h3.Shutdown(ctx)
 	}
 
-	// A tunnel ends invisibly: the far side stops answering and the peer ages out through
-	// its read deadline or the sweep. Polling for that is all there is to wait on. The done
-	// case covers a teardown that started elsewhere; joining the close waits for it.
+	// A tunnel ends invisibly, the far side stops answering and the relay ages out through
+	// its read deadline. Polling for that is all there is to wait on. The done case covers
+	// a teardown that started elsewhere, and joining the close waits for it.
 	tick := time.Tick(500 * time.Millisecond)
 poll:
 	for d.tunneling() {
@@ -680,12 +1080,12 @@ poll:
 	return err
 }
 
-// tunneling reports whether any peer is still being relayed.
+// tunneling reports whether any relay is still up.
 func (d *quicDemux) tunneling() bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	for _, peer := range d.peers {
-		if peer.state == peerTunneling {
+	for _, flow := range d.flows {
+		if len(flow.relays) > 0 {
 			return true
 		}
 	}
@@ -700,15 +1100,23 @@ func (d *quicDemux) close() {
 
 		d.mu.Lock()
 		h3, listener, transport := d.h3, d.listener, d.transport
-		for _, peer := range d.peers {
-			if peer.upstream != nil {
-				_ = peer.upstream.Close()
+		var sockets []net.Conn
+		for _, flow := range d.flows {
+			for _, relay := range flow.relays {
+				relay.closed = true
+				sockets = append(sockets, relay.upstream)
 			}
-			peer.end()
+			for _, conn := range flow.conns {
+				conn.end()
+			}
 		}
-		clear(d.peers)
+		clear(d.flows)
+		d.sniffing = 0
 		d.mu.Unlock()
 
+		for _, s := range sockets {
+			_ = s.Close()
+		}
 		if h3 != nil {
 			_ = h3.Close()
 		}
@@ -725,6 +1133,82 @@ func (d *quicDemux) close() {
 		_ = d.pc.Close()
 		d.wg.Wait()
 	})
+}
+
+// quicCIDTag mints and recognizes the connection IDs of the terminating QUIC server, 4
+// random bytes and 4 of a keyed MAC over them, so a packet of an intercepted connection is
+// recognizable with no per connection state, NAT rebinding and restarts included. A random
+// Initial DCID passes with probability 2^-32, the one way past the policy decision.
+type quicCIDTag struct {
+	block cipher.Block
+}
+
+func newQUICCIDTag(key [16]byte) (*quicCIDTag, error) {
+	block, err := aes.NewCipher(key[:])
+	if err != nil {
+		return nil, err
+	}
+	return &quicCIDTag{block: block}, nil
+}
+
+// GenerateConnectionID implements quic.ConnectionIDGenerator. quic-go parses short headers
+// at the generator's length, so an ID of any other length is silently unroutable.
+func (t *quicCIDTag) GenerateConnectionID() (quic.ConnectionID, error) {
+	var cid [8]byte
+	if _, err := rand.Read(cid[:4]); err != nil {
+		return quic.ConnectionID{}, err
+	}
+	mac := t.mac(cid[:4])
+	copy(cid[4:], mac[:])
+	return quic.ConnectionIDFromBytes(cid[:]), nil
+}
+
+func (t *quicCIDTag) ConnectionIDLen() int { return 8 }
+
+func (t *quicCIDTag) matches(cid []byte) bool {
+	if len(cid) != 8 {
+		return false
+	}
+	mac := t.mac(cid[:4])
+	return subtle.ConstantTimeCompare(cid[4:], mac[:]) == 1
+}
+
+// mac is one AES block over the random half, a MAC nothing short of the key can forge at
+// the cost of one block on the dispatch path.
+func (t *quicCIDTag) mac(r []byte) [4]byte {
+	var in, out [16]byte
+	copy(in[:], r)
+	t.block.Encrypt(out[:], in[:])
+	return [4]byte(out[:4])
+}
+
+// quicInterceptKeys derives the tag and stateless reset keys from the CA key so both survive
+// a restart, which lets a connection minted by a previous process be recognized and reset
+// instead of expiring on its idle timeout. A key that cannot be serialized, hardware backed
+// for instance, falls back to per process random keys.
+func quicInterceptKeys(ca *CA) (*quicCIDTag, quic.StatelessResetKey, error) {
+	var tagKey [16]byte
+	var reset quic.StatelessResetKey
+
+	if der, err := x509.MarshalPKCS8PrivateKey(ca.key); err == nil {
+		t, terr := hkdf.Key(sha256.New, der, nil, "edge quic cid tag", len(tagKey))
+		r, rerr := hkdf.Key(sha256.New, der, nil, "edge quic stateless reset", len(reset))
+		if terr == nil && rerr == nil {
+			copy(tagKey[:], t)
+			copy(reset[:], r)
+			tag, err := newQUICCIDTag(tagKey)
+			return tag, reset, err
+		}
+	}
+
+	if _, err := rand.Read(tagKey[:]); err != nil {
+		return nil, reset, err
+	}
+	if _, err := rand.Read(reset[:]); err != nil {
+		return nil, reset, err
+	}
+	tag, err := newQUICCIDTag(tagKey)
+	return tag, reset, err
 }
 
 // serverNameFromHello reads the server name out of a raw ClientHello handshake message.

@@ -12,6 +12,8 @@ import (
 	"net/netip"
 )
 
+const origDstExact = false
+
 func originalDstSocket(net.Conn) (netip.AddrPort, error) {
 	return netip.AddrPort{}, errors.New("edge: original destination lookup is not implemented on this platform")
 }

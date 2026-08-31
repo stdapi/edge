@@ -269,6 +269,9 @@ func (s *Session) Action() Action { return s.action }
 // Close ends the connection immediately, without draining it. A tunnel is cut in both
 // directions, an intercepted connection is dropped along with the requests in flight on it.
 // Closing a connection that already ended is a no-op.
+//
+// Closing a tunneled QUIC connection also closes the connections the same client tunnels to
+// the same origin, which then re-handshake and are decided again.
 func (s *Session) Close() error {
 	if s.closer == nil {
 		return nil

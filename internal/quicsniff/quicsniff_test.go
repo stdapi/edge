@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"net"
+	"slices"
 	"testing"
 	"time"
 
@@ -174,4 +175,37 @@ func TestReassembler_RejectsGarbage(t *testing.T) {
 	binary.BigEndian.PutUint32(dg[1:5], 0xdeadbeef)
 	_, err = quicsniff.New().Feed(dg)
 	assert.ErrorIs(t, err, quicsniff.ErrUnsupportedVersion)
+}
+
+func TestParseLongHeader(t *testing.T) {
+	dcid := []byte{1, 2, 3, 4, 5, 6, 7, 8}
+	scid := []byte{9, 10, 11, 12}
+	packet := append([]byte{0xc3, 0x00, 0x00, 0x00, 0x01, byte(len(dcid))}, dcid...)
+	packet = append(packet, byte(len(scid)))
+	packet = append(packet, scid...)
+
+	version, gotDCID, gotSCID, ok := quicsniff.ParseLongHeader(packet)
+	require.True(t, ok)
+	assert.Equal(t, quicsniff.Version1, version)
+	assert.Equal(t, dcid, gotDCID)
+	assert.Equal(t, scid, gotSCID)
+
+	_, _, _, ok = quicsniff.ParseLongHeader([]byte{0x43, 0, 0, 0, 1, 0, 0})
+	assert.False(t, ok, "a short header has no long header fields")
+	_, _, _, ok = quicsniff.ParseLongHeader(packet[:10])
+	assert.False(t, ok, "truncated inside the connection ID")
+	tooLong := slices.Clone(packet)
+	tooLong[5] = 21
+	_, _, _, ok = quicsniff.ParseLongHeader(tooLong)
+	assert.False(t, ok, "RFC 9000 caps a connection ID at 20 bytes")
+
+	vn := slices.Clone(packet)
+	vn[1], vn[2], vn[3], vn[4] = 0, 0, 0, 0
+	version, _, _, ok = quicsniff.ParseLongHeader(vn)
+	require.True(t, ok, "Version Negotiation keeps the version independent layout")
+	assert.Equal(t, uint32(0), version)
+
+	assert.True(t, quicsniff.IsInitial(0xc3, quicsniff.Version1))
+	assert.False(t, quicsniff.IsInitial(0xc3, quicsniff.Version2), "the type bits moved in v2")
+	assert.False(t, quicsniff.IsInitial(0xc3, 0x12345678))
 }

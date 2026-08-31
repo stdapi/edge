@@ -128,4 +128,8 @@ func (c *transparentPacketConn) OriginalDestination(remote net.Addr) (netip.Addr
 	return c.dst, nil
 }
 
+// exactOriginalDestination reports whether the destination is read from the datagram itself
+// rather than looked up by address.
+func (c *transparentPacketConn) exactOriginalDestination() bool { return origDstExact }
+
 var _ PacketOriginalDestination = (*transparentPacketConn)(nil)
