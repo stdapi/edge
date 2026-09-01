@@ -485,25 +485,3 @@ func WithMatchersPriority(priority uint) EntryOption {
 		return nil
 	})
 }
-
-type serverConfig struct {
-	readHeaderTimeout    time.Duration
-	readTimeout          time.Duration
-	writeTimeout         time.Duration
-	idleTimeout          time.Duration
-	sniffTimeout         time.Duration
-	maxHeaderBytes       int
-	maxFrameBytes        int
-	maxConcurrentStreams int
-}
-
-func defaultServerConfig() serverConfig {
-	return serverConfig{
-		readHeaderTimeout:    10 * time.Second,
-		idleTimeout:          90 * time.Second,
-		sniffTimeout:         time.Second,
-		maxHeaderBytes:       1 << 20,
-		maxFrameBytes:        1 << 20,
-		maxConcurrentStreams: 250,
-	}
-}

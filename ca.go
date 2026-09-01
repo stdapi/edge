@@ -36,6 +36,8 @@ const (
 	clockSkew = time.Hour
 )
 
+var errNoCA = errors.New("interception requires a certificate authority")
+
 // CA is the certificate authority the proxy signs intercepted authorities with. Leaf
 // certificates are minted on demand and cached. Every leaf shares one key pair, so a cache
 // miss costs a signature rather than a key generation.
@@ -427,5 +429,3 @@ func publicKeyMatches(certPub, keyPub crypto.PublicKey) bool {
 	eq, ok := certPub.(equaler)
 	return ok && eq.Equal(keyPub)
 }
-
-var errNoCA = errors.New("interception requires a certificate authority")

@@ -10,8 +10,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"runtime"
-	"strconv"
 	"strings"
 )
 
@@ -138,38 +136,38 @@ func runHTTPHandler(c *HTTPCtx, handler HTTP) (resp *http.Response, err error) {
 	return handler(c)
 }
 
-const (
-	// panicStackFrames bounds what a capture costs.
-	panicStackFrames = 16
-	// panicStackSkip drops runtime.Callers, stacktrace, the deferred closure and
-	// runtime.gopanic, so the first frame reported is the one that panicked.
-	panicStackSkip = 3
-)
-
-// stacktrace formats the call stack of its caller, dropping the first skip frames and keeping
-// at most panicStackFrames of what is left.
-func stacktrace(skip int) string {
-	pcs := make([]uintptr, panicStackFrames)
-	n := runtime.Callers(skip+1, pcs)
-	if n == 0 {
-		return ""
-	}
-
-	var sb strings.Builder
-	frames := runtime.CallersFrames(pcs[:n])
-	for {
-		frame, more := frames.Next()
-		sb.WriteString(frame.Function)
-		sb.WriteString("\n\t")
-		sb.WriteString(frame.File)
-		sb.WriteByte(':')
-		sb.WriteString(strconv.Itoa(frame.Line))
-		if !more {
-			break
+// runKindHandler calls a handler that produces no response and turns a panic into an error the
+// caller reports. A response handler routes its panic through the [ErrorHandler] instead.
+func runKindHandler(p *Proxy, sess *Session, fn func() error) (err error) {
+	defer func() {
+		rec := recover()
+		if rec == nil {
+			return
 		}
-		sb.WriteByte('\n')
+		err = &PanicError{Value: rec, Stack: stacktrace(panicStackSkip)}
+		p.cfg.logger.Error("edge: handler panic",
+			slog.String("target", sess.target.String()),
+			slog.Any("panic", rec))
+	}()
+	return fn()
+}
+
+// flushWriter flushes after every write so a streamed response reaches the client as it is
+// produced. Without it a server-sent event stream sits in the response buffer.
+type flushWriter struct {
+	w  io.Writer
+	rc *http.ResponseController
+}
+
+func (f flushWriter) Write(b []byte) (int, error) {
+	n, err := f.w.Write(b)
+	if err != nil {
+		return n, err
 	}
-	return sb.String()
+	if ferr := f.rc.Flush(); ferr != nil && !errors.Is(ferr, http.ErrNotSupported) {
+		return n, ferr
+	}
+	return n, nil
 }
 
 // writeResponse relays resp to the client.
@@ -236,24 +234,6 @@ func bodyAllowed(method string, status int) bool {
 		return false
 	}
 	return true
-}
-
-// flushWriter flushes after every write so a streamed response reaches the client as it is
-// produced. Without it a server-sent event stream sits in the response buffer.
-type flushWriter struct {
-	w  io.Writer
-	rc *http.ResponseController
-}
-
-func (f flushWriter) Write(b []byte) (int, error) {
-	n, err := f.w.Write(b)
-	if err != nil {
-		return n, err
-	}
-	if ferr := f.rc.Flush(); ferr != nil && !errors.Is(ferr, http.ErrNotSupported) {
-		return n, ferr
-	}
-	return n, nil
 }
 
 // isExtendedConnect reports whether the request is an RFC 8441 CONNECT, which carries a

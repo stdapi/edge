@@ -30,9 +30,6 @@ const (
 
 var copyBufPool = sync.Pool{New: func() any { return new([copyBufSize]byte) }}
 
-func getCopyBuf() []byte  { return copyBufPool.Get().(*[copyBufSize]byte)[:] }
-func putCopyBuf(b []byte) { copyBufPool.Put((*[copyBufSize]byte)(b[:copyBufSize])) }
-
 // peekConn is a net.Conn whose reads go through a buffered reader, so bytes consumed to
 // sniff the protocol are still delivered to whatever ends up serving the connection.
 type peekConn struct {
@@ -212,68 +209,6 @@ func (l cancelListener) Accept() (net.Conn, error) {
 		return c, nil
 	}
 	return &cancelConn{Conn: c}, nil
-}
-
-// cancelConnOf finds the wrapper under a connection, reaching through the TLS layer
-// [Proxy.ServeTLS] adds.
-func cancelConnOf(c net.Conn) *cancelConn {
-	if cc, ok := c.(*cancelConn); ok {
-		return cc
-	}
-	if tc, ok := c.(*tls.Conn); ok {
-		if cc, ok := tc.NetConn().(*cancelConn); ok {
-			return cc
-		}
-	}
-	return nil
-}
-
-func copyStream(dst io.Writer, src io.Reader, idle *idleTracker) (int64, error) {
-	buf := getCopyBuf()
-	defer putCopyBuf(buf)
-
-	var total int64
-	for {
-		n, rerr := src.Read(buf)
-		if n > 0 {
-			idle.touch()
-			w, werr := dst.Write(buf[:n])
-			total += int64(w)
-			if werr != nil {
-				return total, werr
-			}
-			if w != n {
-				return total, io.ErrShortWrite
-			}
-		}
-		if rerr != nil {
-			if errors.Is(rerr, io.EOF) {
-				return total, nil
-			}
-			return total, rerr
-		}
-	}
-}
-
-func halfClose(c net.Conn) { _ = closeWrite(c) }
-
-// closeWrite ends the write direction of c, or closes it when it cannot half-close.
-func closeWrite(c net.Conn) error {
-	if cw, ok := c.(closeWriter); ok {
-		return cw.CloseWrite()
-	}
-	return c.Close()
-}
-
-// filterCopyErr drops the errors that are the normal end of a relay rather than a fault.
-func filterCopyErr(err error) error {
-	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
-		return nil
-	}
-	if ne, ok := errors.AsType[net.Error](err); ok && ne.Timeout() {
-		return nil
-	}
-	return err
 }
 
 // idleTracker closes both ends of a relay once neither direction has moved a byte for the
@@ -500,6 +435,76 @@ func (d *deadlineReader) Read(b []byte) (int, error) {
 	case <-timeout:
 		return 0, os.ErrDeadlineExceeded
 	}
+}
+
+type emptyAddr struct{}
+
+func (emptyAddr) Network() string { return "peek" }
+func (emptyAddr) String() string  { return "peek" }
+
+func getCopyBuf() []byte  { return copyBufPool.Get().(*[copyBufSize]byte)[:] }
+func putCopyBuf(b []byte) { copyBufPool.Put((*[copyBufSize]byte)(b[:copyBufSize])) }
+
+// cancelConnOf finds the wrapper under a connection, reaching through the TLS layer
+// [Proxy.ServeTLS] adds.
+func cancelConnOf(c net.Conn) *cancelConn {
+	if cc, ok := c.(*cancelConn); ok {
+		return cc
+	}
+	if tc, ok := c.(*tls.Conn); ok {
+		if cc, ok := tc.NetConn().(*cancelConn); ok {
+			return cc
+		}
+	}
+	return nil
+}
+
+func copyStream(dst io.Writer, src io.Reader, idle *idleTracker) (int64, error) {
+	buf := getCopyBuf()
+	defer putCopyBuf(buf)
+
+	var total int64
+	for {
+		n, rerr := src.Read(buf)
+		if n > 0 {
+			idle.touch()
+			w, werr := dst.Write(buf[:n])
+			total += int64(w)
+			if werr != nil {
+				return total, werr
+			}
+			if w != n {
+				return total, io.ErrShortWrite
+			}
+		}
+		if rerr != nil {
+			if errors.Is(rerr, io.EOF) {
+				return total, nil
+			}
+			return total, rerr
+		}
+	}
+}
+
+func halfClose(c net.Conn) { _ = closeWrite(c) }
+
+// closeWrite ends the write direction of c, or closes it when it cannot half-close.
+func closeWrite(c net.Conn) error {
+	if cw, ok := c.(closeWriter); ok {
+		return cw.CloseWrite()
+	}
+	return c.Close()
+}
+
+// filterCopyErr drops the errors that are the normal end of a relay rather than a fault.
+func filterCopyErr(err error) error {
+	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+		return nil
+	}
+	if ne, ok := errors.AsType[net.Error](err); ok && ne.Timeout() {
+		return nil
+	}
+	return err
 }
 
 var _ net.Conn = (*h2Stream)(nil)

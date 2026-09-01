@@ -7,6 +7,8 @@ package edge
 import (
 	"errors"
 	"fmt"
+	"runtime"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 )
@@ -160,4 +162,38 @@ func (e *PanicError) Error() string { return fmt.Sprintf("handler panic: %v", e.
 func (e *PanicError) Unwrap() error {
 	err, _ := e.Value.(error)
 	return err
+}
+
+const (
+	// panicStackFrames bounds what a capture costs.
+	panicStackFrames = 16
+	// panicStackSkip drops runtime.Callers, stacktrace, the deferred closure and
+	// runtime.gopanic, so the first frame reported is the one that panicked.
+	panicStackSkip = 3
+)
+
+// stacktrace formats the call stack of its caller, dropping the first skip frames and keeping
+// at most panicStackFrames of what is left.
+func stacktrace(skip int) string {
+	pcs := make([]uintptr, panicStackFrames)
+	n := runtime.Callers(skip+1, pcs)
+	if n == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	frames := runtime.CallersFrames(pcs[:n])
+	for {
+		frame, more := frames.Next()
+		sb.WriteString(frame.Function)
+		sb.WriteString("\n\t")
+		sb.WriteString(frame.File)
+		sb.WriteByte(':')
+		sb.WriteString(strconv.Itoa(frame.Line))
+		if !more {
+			break
+		}
+		sb.WriteByte('\n')
+	}
+	return sb.String()
 }

@@ -409,3 +409,39 @@ func TestSession_FrontContextEndsWithTheConnectionOverTLS(t *testing.T) {
 	}
 	frontSessionContext(t, p, client)
 }
+
+// FuzzSplitHostPort checks the authority splitter against its inverse. Everything the proxy
+// routes on goes through it, including hostile authorities off the wire.
+func FuzzSplitHostPort(f *testing.F) {
+	seeds := []string{
+		"api.stripe.com:443",
+		"api.stripe.com",
+		"[::1]:8080",
+		"[::1]",
+		"::1",
+		"",
+		":",
+		":443",
+		"a:b:c",
+		"[",
+		"]",
+		"[]:1",
+	}
+	for _, s := range seeds {
+		f.Add(s)
+	}
+
+	f.Fuzz(func(t *testing.T, authority string) {
+		host, port := splitHostPort(authority)
+
+		// Splitting and rejoining is idempotent. A malformed authority has no canonical
+		// form to round-trip to, but once the pair has been through joinHostPort it must
+		// survive every further pass: targets are split and rejoined all along the path a
+		// request takes.
+		joined := joinHostPort(host, port)
+		host2, port2 := splitHostPort(joined)
+		if host2 != host || port2 != port {
+			t.Fatalf("split(%q) = (%q, %q), then split(join(...)) = (%q, %q)", authority, host, port, host2, port2)
+		}
+	})
+}

@@ -17,6 +17,10 @@ import (
 	"strings"
 )
 
+// maxGRPCMessage bounds one message the proxy will buffer to hand a handler. The gRPC
+// protocol puts a 4 byte length on the wire, so a peer can announce 4 GiB.
+const maxGRPCMessage = 16 << 20
+
 // Code is a gRPC status code, as defined by the gRPC protocol.
 type Code uint32
 
@@ -347,10 +351,6 @@ func grpcPercentEncode(msg string) string {
 	}
 	return string(out)
 }
-
-// maxGRPCMessage bounds one message the proxy will buffer to hand a handler. The gRPC
-// protocol puts a 4 byte length on the wire, so a peer can announce 4 GiB.
-const maxGRPCMessage = 16 << 20
 
 // grpcPump reads length-prefixed messages off src as its own reader is read, hands each to the
 // callback, and serves what the callback passed on. A message the callback neither forwards nor

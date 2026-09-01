@@ -9,7 +9,6 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net"
 	"net/http"
 	"slices"
@@ -153,22 +152,6 @@ func (p *Proxy) serveTerminatedStream(ctx context.Context, conn net.Conn, sess *
 		return err
 	}
 	return nil
-}
-
-// runKindHandler calls a handler that produces no response and turns a panic into an error the
-// caller reports. A response handler routes its panic through the [ErrorHandler] instead.
-func runKindHandler(p *Proxy, sess *Session, fn func() error) (err error) {
-	defer func() {
-		rec := recover()
-		if rec == nil {
-			return
-		}
-		err = &PanicError{Value: rec, Stack: stacktrace(panicStackSkip)}
-		p.cfg.logger.Error("edge: handler panic",
-			slog.String("target", sess.target.String()),
-			slog.Any("panic", rec))
-	}()
-	return fn()
 }
 
 // serverTLSConfig builds the configuration the proxy presents to a terminated client. The

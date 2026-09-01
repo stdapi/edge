@@ -716,13 +716,6 @@ func (n *node) addEntry(ic *entry) {
 	n.entries = slices.Insert(n.entries, pos, ic)
 }
 
-// narrowed reports whether anything selects this entry beyond its pattern: a port, a kind
-// that refines the kind it rides on, or a matcher. An entry narrowed by nothing is the
-// fallback of its node.
-func (e *entry) narrowed() bool {
-	return e.pattern.port != "" || e.kind.refines() || len(e.matchers) > 0
-}
-
 func (n *node) replaceEntry(idx int, ic *entry) {
 	// Priority unchanged or nothing to order on, replace in place. A port is part of the
 	// pattern, so an update never changes it: the two would be different entries.

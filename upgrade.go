@@ -114,28 +114,6 @@ func (p *Proxy) spliceWebSocket(c *routeCtx, w http.ResponseWriter, r *http.Requ
 	return runKindHandler(p, sess, func() error { return handler(wc) })
 }
 
-// readWriteCloser joins the buffered reader and writer of a hijacked connection to the
-// connection's own Close. Anything the reader buffered past the handshake is already frame
-// data, so reads must go through it rather than around it.
-type readWriteCloser struct {
-	r io.Reader
-	w io.Writer
-	c io.Closer
-}
-
-func (rw readWriteCloser) Read(b []byte) (int, error) { return rw.r.Read(b) }
-func (rw readWriteCloser) Close() error               { return rw.c.Close() }
-func (rw readWriteCloser) Write(b []byte) (int, error) {
-	n, err := rw.w.Write(b)
-	if err != nil {
-		return n, err
-	}
-	if f, ok := rw.w.(interface{ Flush() error }); ok {
-		return n, f.Flush()
-	}
-	return n, nil
-}
-
 // serveUpgradedStream serves what an upgrade left behind as the byte stream it now is. The
 // entry that answered the handshake was an HTTP one, and HTTP ends at the 101: the bytes past
 // it are served by the stream entry admitting the authority, or by nothing at all.
@@ -210,6 +188,28 @@ func (p *Proxy) serveUpgradedStream(c *routeCtx, w http.ResponseWriter, r *http.
 	sc.dialOnce.Do(func() {})
 
 	return runKindHandler(p, upSess, func() error { return handler(sc) })
+}
+
+// readWriteCloser joins the buffered reader and writer of a hijacked connection to the
+// connection's own Close. Anything the reader buffered past the handshake is already frame
+// data, so reads must go through it rather than around it.
+type readWriteCloser struct {
+	r io.Reader
+	w io.Writer
+	c io.Closer
+}
+
+func (rw readWriteCloser) Read(b []byte) (int, error) { return rw.r.Read(b) }
+func (rw readWriteCloser) Close() error               { return rw.c.Close() }
+func (rw readWriteCloser) Write(b []byte) (int, error) {
+	n, err := rw.w.Write(b)
+	if err != nil {
+		return n, err
+	}
+	if f, ok := rw.w.(interface{ Flush() error }); ok {
+		return n, f.Flush()
+	}
+	return n, nil
 }
 
 // hijackedConn reads through the buffer the hijack handed back, since anything it holds past

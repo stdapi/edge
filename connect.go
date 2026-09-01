@@ -215,21 +215,3 @@ func writeRawStatus(brw *bufio.ReadWriter, code int, detail string) error {
 	}
 	return brw.Flush()
 }
-
-func (p *Proxy) logf(ctx context.Context, level slog.Level, msg string, sess *Session, err error) {
-	if !p.cfg.logger.Enabled(ctx, level) {
-		return
-	}
-	attrs := []any{slog.String("target", sess.target.String())}
-	if sess.remoteAddr != nil {
-		attrs = append(attrs, slog.String("client", sess.remoteAddr.String()))
-	}
-	attrs = append(attrs,
-		slog.Uint64("session", sess.id),
-		slog.String("kind", sess.kind.String()),
-	)
-	if err != nil {
-		attrs = append(attrs, slog.String("error", err.Error()))
-	}
-	p.cfg.logger.Log(ctx, level, "edge: "+msg, attrs...)
-}

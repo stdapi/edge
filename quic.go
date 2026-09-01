@@ -282,17 +282,6 @@ func (c *QUICCtx) runStream(st *QUICStream, cfg *quicRelayConfig) {
 	}
 }
 
-// closePeer ends to with the error that ended the connection this side was accepting on, so a
-// close on one side reaches the other with the code it carried.
-func closePeer(to *quic.Conn, err error) {
-	var appErr *quic.ApplicationError
-	if errors.As(err, &appErr) {
-		_ = to.CloseWithError(appErr.ErrorCode, appErr.ErrorMessage)
-		return
-	}
-	_ = closeNoError(to)
-}
-
 // QUICStream is one stream of a relayed connection. Its content is opaque: what the peers put
 // in a stream is theirs, and nothing here decodes it.
 type QUICStream struct {
@@ -361,4 +350,15 @@ func (s *QUICStream) closeAll() {
 	if s.dstW != nil {
 		_ = s.dstW.Close()
 	}
+}
+
+// closePeer ends to with the error that ended the connection this side was accepting on, so a
+// close on one side reaches the other with the code it carried.
+func closePeer(to *quic.Conn, err error) {
+	var appErr *quic.ApplicationError
+	if errors.As(err, &appErr) {
+		_ = to.CloseWithError(appErr.ErrorCode, appErr.ErrorMessage)
+		return
+	}
+	_ = closeNoError(to)
 }

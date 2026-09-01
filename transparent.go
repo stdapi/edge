@@ -321,9 +321,4 @@ func (c *replayConn) SetDeadline(time.Time) error      { return nil }
 func (c *replayConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *replayConn) SetWriteDeadline(time.Time) error { return nil }
 
-type emptyAddr struct{}
-
-func (emptyAddr) Network() string { return "peek" }
-func (emptyAddr) String() string  { return "peek" }
-
 var _ net.Conn = (*replayConn)(nil)

@@ -71,3 +71,16 @@ func testProxyWithCA(t *testing.T, ca *CA, opts ...ProxyOption) *Proxy {
 	}
 	return p
 }
+
+func mustFuzzProxy(tb testing.TB) *Proxy {
+	tb.Helper()
+	ca, err := GenerateCA()
+	if err != nil {
+		tb.Fatal(err)
+	}
+	p, err := New(WithCA(ca), WithRegexpParam(true))
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return p
+}

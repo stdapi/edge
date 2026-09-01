@@ -10,6 +10,8 @@ import (
 	"strings"
 )
 
+var quoteEscaper = strings.NewReplacer(`\`, `\\`, `"`, `\"`)
+
 // ProxyAuthenticator authenticates the clients of an explicit forward proxy. It is consulted
 // once per request addressed to the proxy, so the CONNECT that opens a connection authenticates
 // everything carried on it. Implementations must be safe for concurrent use.
@@ -39,8 +41,6 @@ func BasicAuth(realm string, verify func(username, password string) bool) ProxyA
 		verify:    verify,
 	}
 }
-
-var quoteEscaper = strings.NewReplacer(`\`, `\\`, `"`, `\"`)
 
 type basicAuth struct {
 	verify    func(username, password string) bool

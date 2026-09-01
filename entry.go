@@ -77,6 +77,13 @@ func (e *entry) matchSlow(c *routeCtx) bool {
 	return true
 }
 
+// narrowed reports whether anything selects this entry beyond its pattern: a port, a kind
+// that refines the kind it rides on, or a matcher. An entry narrowed by nothing is the
+// fallback of its node.
+func (e *entry) narrowed() bool {
+	return e.pattern.port != "" || e.kind.refines() || len(e.matchers) > 0
+}
+
 // kindAccepts reports whether the unit being routed is what this entry's kind serves. It is
 // the precondition that lets a refined kind share a key with the kind it rides on: a gRPC
 // entry and an HTTP entry on one path are told apart by the request, never by the tree.
@@ -132,45 +139,6 @@ func (e *entry) String() string {
 	sb := new(strings.Builder)
 	entryf(sb, e, 0, true)
 	return sb.String()
-}
-
-func entryf(sb *strings.Builder, e *entry, pad int, showName bool) {
-	sb.WriteString(strings.Repeat(" ", pad))
-	sb.WriteString("kind:")
-	sb.WriteString(e.kind.String())
-	if e.handler == nil {
-		sb.WriteString(" admits:")
-		sb.WriteString(e.pattern.str)
-		if e.implied {
-			sb.WriteString(" implied")
-		}
-		return
-	}
-
-	sb.WriteString(" pattern:")
-	sb.WriteString(e.pattern.str)
-
-	if e.name != "" && showName {
-		sb.WriteString(" name:")
-		sb.WriteString(e.name)
-	}
-
-	size := sb.Len()
-	for _, matcher := range e.matchers {
-		m, ok := matcher.(fmt.Stringer)
-		if !ok {
-			continue
-		}
-		if sb.Len() > size {
-			sb.WriteByte(',')
-		} else {
-			sb.WriteString(" matchers:{")
-		}
-		sb.WriteString(m.String())
-	}
-	if sb.Len() > size {
-		sb.WriteByte('}')
-	}
 }
 
 // Entry is a registration as the caller can read it back. Its type parameter is the handler
@@ -268,3 +236,42 @@ func (v EntryView) Implied() bool { return v.e.implied }
 func (v EntryView) Matchers() iter.Seq[Matcher] { return slices.Values(v.e.matchers) }
 
 func (v EntryView) String() string { return v.e.String() }
+
+func entryf(sb *strings.Builder, e *entry, pad int, showName bool) {
+	sb.WriteString(strings.Repeat(" ", pad))
+	sb.WriteString("kind:")
+	sb.WriteString(e.kind.String())
+	if e.handler == nil {
+		sb.WriteString(" admits:")
+		sb.WriteString(e.pattern.str)
+		if e.implied {
+			sb.WriteString(" implied")
+		}
+		return
+	}
+
+	sb.WriteString(" pattern:")
+	sb.WriteString(e.pattern.str)
+
+	if e.name != "" && showName {
+		sb.WriteString(" name:")
+		sb.WriteString(e.name)
+	}
+
+	size := sb.Len()
+	for _, matcher := range e.matchers {
+		m, ok := matcher.(fmt.Stringer)
+		if !ok {
+			continue
+		}
+		if sb.Len() > size {
+			sb.WriteByte(',')
+		} else {
+			sb.WriteString(" matchers:{")
+		}
+		sb.WriteString(m.String())
+	}
+	if sb.Len() > size {
+		sb.WriteByte('}')
+	}
+}

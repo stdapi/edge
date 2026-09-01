@@ -33,25 +33,6 @@ type Matcher interface {
 	Equal(matcher Matcher) bool
 }
 
-func compileAnchoredRegexp(expr string) (*regexp.Regexp, error) {
-	if expr == "" {
-		return nil, fmt.Errorf("%w: empty expression", ErrInvalidMatcher)
-	}
-	// A source that is invalid on its own can still balance inside the wrapper, such as
-	// "a)|(?:", and defeat the anchoring, so it must compile standalone first.
-	if _, err := syntax.Parse(expr, syntax.Perl); err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrInvalidMatcher, err)
-	}
-	re, err := regexp.Compile("^(?:" + expr + ")$")
-	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrInvalidMatcher, err)
-	}
-	if re.NumSubexp() > 0 {
-		return nil, fmt.Errorf("%w: capture group, use (?:...) instead", ErrInvalidMatcher)
-	}
-	return re, nil
-}
-
 // SchemeMatcher matches the scheme of the request target. Attach one with [WithScheme].
 type SchemeMatcher struct {
 	scheme string
@@ -284,17 +265,6 @@ func (f MatcherFunc) Match(c RequestContext) bool { return f(c) }
 
 func (f MatcherFunc) Equal(Matcher) bool { return false }
 
-var (
-	_ Matcher = SchemeMatcher{}
-	_ Matcher = QueryMatcher{}
-	_ Matcher = QueryRegexpMatcher{}
-	_ Matcher = HeaderMatcher{}
-	_ Matcher = HeaderRegexpMatcher{}
-	_ Matcher = RemoteIPMatcher{}
-	_ Matcher = ProtocolMatcher{}
-	_ Matcher = MatcherFunc(nil)
-)
-
 // MethodMatcher matches the request method against a set. Attach one with [WithMethods].
 type MethodMatcher struct {
 	methods []string
@@ -342,6 +312,40 @@ func (m MethodMatcher) Equal(matcher Matcher) bool {
 
 func (m MethodMatcher) String() string { return "method=" + strings.Join(m.methods, ",") }
 
+func compileAnchoredRegexp(expr string) (*regexp.Regexp, error) {
+	if expr == "" {
+		return nil, fmt.Errorf("%w: empty expression", ErrInvalidMatcher)
+	}
+	// A source that is invalid on its own can still balance inside the wrapper, such as
+	// "a)|(?:", and defeat the anchoring, so it must compile standalone first.
+	if _, err := syntax.Parse(expr, syntax.Perl); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidMatcher, err)
+	}
+	re, err := regexp.Compile("^(?:" + expr + ")$")
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidMatcher, err)
+	}
+	if re.NumSubexp() > 0 {
+		return nil, fmt.Errorf("%w: capture group, use (?:...) instead", ErrInvalidMatcher)
+	}
+	return re, nil
+}
+
+func rawExpr(re *regexp.Regexp) string {
+	expr := re.String()
+	if strings.HasPrefix(expr, "(?i)") {
+		return expr[8 : len(expr)-2]
+	}
+	return expr[4 : len(expr)-2]
+}
+
+func firstHeader(headers http.Header, k string) (string, bool) {
+	if v := headers[k]; len(v) > 0 {
+		return v[0], true
+	}
+	return "", false
+}
+
 // validMethod reports whether s is a valid HTTP method token (RFC 9110 section 9).
 func validMethod(method string) bool {
 	return len(method) > 0 && strings.IndexFunc(method, isNotToken) == -1
@@ -350,5 +354,13 @@ func validMethod(method string) bool {
 func isNotToken(r rune) bool { return !httpguts.IsTokenRune(r) }
 
 var (
+	_ Matcher = SchemeMatcher{}
+	_ Matcher = QueryMatcher{}
+	_ Matcher = QueryRegexpMatcher{}
+	_ Matcher = HeaderMatcher{}
+	_ Matcher = HeaderRegexpMatcher{}
+	_ Matcher = RemoteIPMatcher{}
+	_ Matcher = ProtocolMatcher{}
+	_ Matcher = MatcherFunc(nil)
 	_ Matcher = MethodMatcher{}
 )

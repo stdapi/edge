@@ -152,6 +152,32 @@ type Session struct {
 	transparent bool
 }
 
+func newSession(ctx context.Context, c net.Conn, target Target, kind Kind, proto Protocol) *Session {
+	s := &Session{
+		id:        sessionSeq.Add(1),
+		target:    target,
+		kind:      kind,
+		createdAt: time.Now(),
+		ctx:       ctx,
+	}
+	s.setProtocol(proto)
+	if c != nil {
+		s.remoteAddr = c.RemoteAddr()
+		s.localAddr = c.LocalAddr()
+		if tc, ok := c.(*tls.Conn); ok {
+			if state := tc.ConnectionState(); state.HandshakeComplete {
+				s.tlsState.Store(&state)
+			} else {
+				// http.Server calls ConnContext before it performs the handshake, so the
+				// state read here would be the zero one. Keeping the connection lets it be
+				// read once it exists, which is any time a request is being served.
+				s.tlsConn = tc
+			}
+		}
+	}
+	return s
+}
+
 // ID returns a process-unique identifier for this session.
 func (s *Session) ID() uint64 { return s.id }
 
@@ -168,27 +194,6 @@ func (s *Session) RemoteAddr() netip.AddrPort { return addrPort(s.remoteAddr) }
 // LocalAddr returns the proxy-side address of the connection, or the zero value when it has
 // none.
 func (s *Session) LocalAddr() netip.AddrPort { return addrPort(s.localAddr) }
-
-// addrPort converts a connection address to a netip.AddrPort. The two concrete types the
-// listeners produce are converted without parsing; anything else, a test harness address or
-// a unix socket, falls back to parsing and yields the zero value when it is not an IP.
-func addrPort(a net.Addr) netip.AddrPort {
-	var ap netip.AddrPort
-	switch v := a.(type) {
-	case nil:
-		return netip.AddrPort{}
-	case *net.TCPAddr:
-		ap = v.AddrPort()
-	case *net.UDPAddr:
-		ap = v.AddrPort()
-	default:
-		var err error
-		if ap, err = netip.ParseAddrPort(a.String()); err != nil {
-			return netip.AddrPort{}
-		}
-	}
-	return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
-}
 
 // Target returns the authority the client asked for. For a CONNECT it is the request target,
 // and in transparent mode it comes from the TLS server name or the Host header.
@@ -321,6 +326,27 @@ type ClientHello struct {
 	SupportedVersions []uint16
 	// CipherSuites lists the cipher suites the client offered.
 	CipherSuites []uint16
+}
+
+// addrPort converts a connection address to a netip.AddrPort. The two concrete types the
+// listeners produce are converted without parsing; anything else, a test harness address or
+// a unix socket, falls back to parsing and yields the zero value when it is not an IP.
+func addrPort(a net.Addr) netip.AddrPort {
+	var ap netip.AddrPort
+	switch v := a.(type) {
+	case nil:
+		return netip.AddrPort{}
+	case *net.TCPAddr:
+		ap = v.AddrPort()
+	case *net.UDPAddr:
+		ap = v.AddrPort()
+	default:
+		var err error
+		if ap, err = netip.ParseAddrPort(a.String()); err != nil {
+			return netip.AddrPort{}
+		}
+	}
+	return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
 }
 
 // joinHostPort joins a hostname and a port, bracketing an IPv6 literal.

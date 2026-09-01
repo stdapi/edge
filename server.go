@@ -28,6 +28,28 @@ import (
 
 type sessionKey struct{}
 
+type serverConfig struct {
+	readHeaderTimeout    time.Duration
+	readTimeout          time.Duration
+	writeTimeout         time.Duration
+	idleTimeout          time.Duration
+	sniffTimeout         time.Duration
+	maxHeaderBytes       int
+	maxFrameBytes        int
+	maxConcurrentStreams int
+}
+
+func defaultServerConfig() serverConfig {
+	return serverConfig{
+		readHeaderTimeout:    10 * time.Second,
+		idleTimeout:          90 * time.Second,
+		sniffTimeout:         time.Second,
+		maxHeaderBytes:       1 << 20,
+		maxFrameBytes:        1 << 20,
+		maxConcurrentStreams: 250,
+	}
+}
+
 // server owns everything that is not routing: the listeners, the connections accepted on
 // them, and the transports used to reach upstreams.
 type server struct {
@@ -271,6 +293,141 @@ func (p *Proxy) Close() error {
 	return err
 }
 
+// Sessions returns an iterator over a point-in-time snapshot of the connections the proxy is
+// serving. Each [Session] is one client connection, a CONNECT tunnel, a redirected TLS or
+// QUIC connection, or a datagram flow, and covers every request or stream multiplexed on it.
+// A protocol upgrade is reported as a session of its own, under the authority its request
+// was routed on. Connections addressed to the proxy itself are not reported, and neither is
+// a redirected plaintext connection decided on the Host header of each request.
+//
+// Deleting an entry does not close the connections already open. Use Sessions with
+// [Session.Close] to end them.
+//
+//	p.Delete[edge.TCP]("example.com")
+//	for s := range p.Sessions() {
+//		if !p.Admits(s.Target(), s.Kind()) {
+//			s.Close()
+//		}
+//	}
+func (p *Proxy) Sessions() iter.Seq[*Session] {
+	p.srv.mu.Lock()
+	out := make([]*Session, 0, len(p.srv.sessions))
+	for sess := range p.srv.sessions {
+		out = append(out, sess)
+	}
+	demuxes := make([]*quicDemux, 0, len(p.srv.quics))
+	for d := range p.srv.quics {
+		demuxes = append(demuxes, d)
+	}
+	p.srv.mu.Unlock()
+
+	// A demux owns its connections under a lock of its own, taken here only once the server
+	// lock is released, so the two are never held at once.
+	for _, d := range demuxes {
+		out = d.appendSessions(out)
+	}
+	return slices.Values(out)
+}
+
+// ServeHTTP serves one request with explicit forward proxy semantics: a CONNECT opens a
+// connection, anything else is a plain HTTP request carrying an absolute target.
+//
+// It makes a Proxy an [http.Handler], so it can be mounted in a server you already own
+// rather than given a listener of its own. The server must leave hijacking available, which
+// authorities out anything that wraps the response writer without forwarding [http.Hijacker].
+func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	p.serveProxyRequest(w, r)
+}
+
+var _ http.Handler = (*Proxy)(nil)
+
+// serveProxyRequest is the explicit forward proxy entry point: a CONNECT opens a connection,
+// anything else is a plain HTTP request carrying an absolute target.
+func (p *Proxy) serveProxyRequest(w http.ResponseWriter, r *http.Request) {
+	// Before anything else, including the origin-form refusal below, so that an
+	// unauthenticated client learns nothing from the answer it gets.
+	identity, ok := p.authenticate(w, r)
+	if !ok {
+		return
+	}
+
+	if sess := sessionFromRequest(r); sess != nil {
+		// ConnContext builds the session before ALPN or the h2c preface has set the protocol.
+		sess.setProtocol(protoOfRequest(r))
+	}
+
+	if r.Method == http.MethodConnect {
+		if isExtendedConnect(r) {
+			http.Error(w, "edge: extended CONNECT is not served, WebSocket goes over HTTP/1.1",
+				http.StatusNotImplemented)
+			return
+		}
+		p.serveConnect(w, r, identity)
+		return
+	}
+
+	target, ok := proxyTarget(r)
+	if !ok {
+		// An origin-form target on the proxy port means the client is not configured to use
+		// a proxy. Answering with the target it should have sent is the only useful reply.
+		http.Error(w, "edge: expected an absolute request target or CONNECT, this is a forward proxy", http.StatusBadRequest)
+		return
+	}
+
+	sess := sessionFromRequest(r)
+	if sess == nil {
+		sess = newSession(r.Context(), nil, target, KindHTTP, protoOfRequest(r))
+	}
+
+	p.dispatchRequest(w, r, sess, target, identity)
+}
+
+// authenticate runs the configured proxy authenticator and answers the client itself when it
+// refuses. It reports the identity and whether the request may go on.
+func (p *Proxy) authenticate(w http.ResponseWriter, r *http.Request) (string, bool) {
+	auth := p.cfg.proxyAuth
+	if auth == nil {
+		return "", true
+	}
+
+	if identity, ok := auth.Authenticate(r); ok {
+		return identity, true
+	}
+
+	challenges := auth.Challenges(r)
+	if len(challenges) == 0 {
+		// Nothing the client could present would change the answer, so asking it to
+		// authenticate would be a lie, and a 407 carrying no challenge is malformed.
+		http.Error(w, "edge: proxy access denied", http.StatusForbidden)
+		return "", false
+	}
+
+	header := w.Header()
+	for _, challenge := range challenges {
+		header.Add(HeaderProxyAuthenticate, challenge)
+	}
+	http.Error(w, "edge: proxy authentication required", http.StatusProxyAuthRequired)
+	return "", false
+}
+
+func (p *Proxy) logf(ctx context.Context, level slog.Level, msg string, sess *Session, err error) {
+	if !p.cfg.logger.Enabled(ctx, level) {
+		return
+	}
+	attrs := []any{slog.String("target", sess.target.String())}
+	if sess.remoteAddr != nil {
+		attrs = append(attrs, slog.String("client", sess.remoteAddr.String()))
+	}
+	attrs = append(attrs,
+		slog.Uint64("session", sess.id),
+		slog.String("kind", sess.kind.String()),
+	)
+	if err != nil {
+		attrs = append(attrs, slog.String("error", err.Error()))
+	}
+	p.cfg.logger.Log(ctx, level, "edge: "+msg, attrs...)
+}
+
 // beginClose marks the proxy as stopping. Writing closing under the lock orders it against
 // every registration: one that saw it unset committed inside a critical section that ran
 // first, so the snapshots a shutdown takes under the same lock cannot miss it.
@@ -382,42 +539,6 @@ func (s *server) admitSession(sess *Session) bool {
 	return false
 }
 
-// Sessions returns an iterator over a point-in-time snapshot of the connections the proxy is
-// serving. Each [Session] is one client connection, a CONNECT tunnel, a redirected TLS or
-// QUIC connection, or a datagram flow, and covers every request or stream multiplexed on it.
-// A protocol upgrade is reported as a session of its own, under the authority its request
-// was routed on. Connections addressed to the proxy itself are not reported, and neither is
-// a redirected plaintext connection decided on the Host header of each request.
-//
-// Deleting an entry does not close the connections already open. Use Sessions with
-// [Session.Close] to end them.
-//
-//	p.Delete[edge.TCP]("example.com")
-//	for s := range p.Sessions() {
-//		if !p.Admits(s.Target(), s.Kind()) {
-//			s.Close()
-//		}
-//	}
-func (p *Proxy) Sessions() iter.Seq[*Session] {
-	p.srv.mu.Lock()
-	out := make([]*Session, 0, len(p.srv.sessions))
-	for sess := range p.srv.sessions {
-		out = append(out, sess)
-	}
-	demuxes := make([]*quicDemux, 0, len(p.srv.quics))
-	for d := range p.srv.quics {
-		demuxes = append(demuxes, d)
-	}
-	p.srv.mu.Unlock()
-
-	// A demux owns its connections under a lock of its own, taken here only once the server
-	// lock is released, so the two are never held at once.
-	for _, d := range demuxes {
-		out = d.appendSessions(out)
-	}
-	return slices.Values(out)
-}
-
 // closeListeners closes the listeners the proxy accepts on itself. A listener http.Server
 // serves is not among them, it closes that one itself.
 func (s *server) closeListeners() error {
@@ -452,87 +573,6 @@ func (s *server) closeActive() {
 		wg.Go(func() { _ = c.Close() })
 	}
 	wg.Wait()
-}
-
-// ServeHTTP serves one request with explicit forward proxy semantics: a CONNECT opens a
-// connection, anything else is a plain HTTP request carrying an absolute target.
-//
-// It makes a Proxy an [http.Handler], so it can be mounted in a server you already own
-// rather than given a listener of its own. The server must leave hijacking available, which
-// authorities out anything that wraps the response writer without forwarding [http.Hijacker].
-func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	p.serveProxyRequest(w, r)
-}
-
-var _ http.Handler = (*Proxy)(nil)
-
-// serveProxyRequest is the explicit forward proxy entry point: a CONNECT opens a connection,
-// anything else is a plain HTTP request carrying an absolute target.
-func (p *Proxy) serveProxyRequest(w http.ResponseWriter, r *http.Request) {
-	// Before anything else, including the origin-form refusal below, so that an
-	// unauthenticated client learns nothing from the answer it gets.
-	identity, ok := p.authenticate(w, r)
-	if !ok {
-		return
-	}
-
-	if sess := sessionFromRequest(r); sess != nil {
-		// ConnContext builds the session before ALPN or the h2c preface has set the protocol.
-		sess.setProtocol(protoOfRequest(r))
-	}
-
-	if r.Method == http.MethodConnect {
-		if isExtendedConnect(r) {
-			http.Error(w, "edge: extended CONNECT is not served, WebSocket goes over HTTP/1.1",
-				http.StatusNotImplemented)
-			return
-		}
-		p.serveConnect(w, r, identity)
-		return
-	}
-
-	target, ok := proxyTarget(r)
-	if !ok {
-		// An origin-form target on the proxy port means the client is not configured to use
-		// a proxy. Answering with the target it should have sent is the only useful reply.
-		http.Error(w, "edge: expected an absolute request target or CONNECT, this is a forward proxy", http.StatusBadRequest)
-		return
-	}
-
-	sess := sessionFromRequest(r)
-	if sess == nil {
-		sess = newSession(r.Context(), nil, target, KindHTTP, protoOfRequest(r))
-	}
-
-	p.dispatchRequest(w, r, sess, target, identity)
-}
-
-// authenticate runs the configured proxy authenticator and answers the client itself when it
-// refuses. It reports the identity and whether the request may go on.
-func (p *Proxy) authenticate(w http.ResponseWriter, r *http.Request) (string, bool) {
-	auth := p.cfg.proxyAuth
-	if auth == nil {
-		return "", true
-	}
-
-	if identity, ok := auth.Authenticate(r); ok {
-		return identity, true
-	}
-
-	challenges := auth.Challenges(r)
-	if len(challenges) == 0 {
-		// Nothing the client could present would change the answer, so asking it to
-		// authenticate would be a lie, and a 407 carrying no challenge is malformed.
-		http.Error(w, "edge: proxy access denied", http.StatusForbidden)
-		return "", false
-	}
-
-	header := w.Header()
-	for _, challenge := range challenges {
-		header.Add(HeaderProxyAuthenticate, challenge)
-	}
-	http.Error(w, "edge: proxy authentication required", http.StatusProxyAuthRequired)
-	return "", false
 }
 
 // proxyTarget resolves the authority of an explicit proxy request, reporting false when the
@@ -581,32 +621,6 @@ func protoOfRequest(r *http.Request) Protocol {
 func sessionFromRequest(r *http.Request) *Session {
 	sess, _ := r.Context().Value(sessionKey{}).(*Session)
 	return sess
-}
-
-func newSession(ctx context.Context, c net.Conn, target Target, kind Kind, proto Protocol) *Session {
-	s := &Session{
-		id:        sessionSeq.Add(1),
-		target:    target,
-		kind:      kind,
-		createdAt: time.Now(),
-		ctx:       ctx,
-	}
-	s.setProtocol(proto)
-	if c != nil {
-		s.remoteAddr = c.RemoteAddr()
-		s.localAddr = c.LocalAddr()
-		if tc, ok := c.(*tls.Conn); ok {
-			if state := tc.ConnectionState(); state.HandshakeComplete {
-				s.tlsState.Store(&state)
-			} else {
-				// http.Server calls ConnContext before it performs the handshake, so the
-				// state read here would be the zero one. Keeping the connection lets it be
-				// read once it exists, which is any time a request is being served.
-				s.tlsConn = tc
-			}
-		}
-	}
-	return s
 }
 
 // slogWriter adapts the net/http error log to the configured structured logger.
