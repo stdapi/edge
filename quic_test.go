@@ -997,3 +997,37 @@ func TestQUICDemux_CloseRefusesLatePublish(t *testing.T) {
 	d.mu.Unlock()
 	require.Zerof(t, udps, "%d datagram flow(s) published into a closed demux, %d flow(s) recreated", udps, flows)
 }
+
+// Shutdown can win the race against a ServeQUIC that is tracked but has not reached run yet,
+// and the demux WaitGroup has to survive that ordering.
+func TestQUICDemux_ShutdownRacesServeQUICStartup(t *testing.T) {
+	for range 200 {
+		p := testProxy(t)
+
+		pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+		require.NoError(t, err)
+		served := make(chan error, 1)
+		go func() { served <- p.ServeQUIC(pc) }()
+
+		for {
+			p.srv.mu.Lock()
+			tracked := len(p.srv.quics) == 1
+			p.srv.mu.Unlock()
+			if tracked {
+				break
+			}
+			runtime.Gosched()
+		}
+
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		require.NoError(t, p.Shutdown(ctx))
+		cancel()
+
+		select {
+		case err := <-served:
+			assert.ErrorIs(t, err, ErrProxyClosed)
+		case <-time.After(5 * time.Second):
+			t.Fatal("ServeQUIC did not return after Shutdown")
+		}
+	}
+}

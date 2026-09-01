@@ -437,6 +437,19 @@ func newQUICDemux(p *Proxy, pc net.PacketConn) (*quicDemux, error) {
 		d.replier = r
 		d.replySockets = make(map[netip.AddrPort]net.PacketConn)
 	}
+	// Started before the demux is visible to anyone, so this Add cannot race the Wait in close.
+	d.wg.Go(func() {
+		sweep := time.NewTicker(5 * time.Second)
+		defer sweep.Stop()
+		for {
+			select {
+			case <-sweep.C:
+				d.sweepIdle()
+			case <-d.done:
+				return
+			}
+		}
+	})
 	return d, nil
 }
 
@@ -771,19 +784,6 @@ func (d *quicDemux) quicConfig() *quic.Config {
 }
 
 func (d *quicDemux) run() error {
-	sweep := time.NewTicker(5 * time.Second)
-	defer sweep.Stop()
-	d.wg.Go(func() {
-		for {
-			select {
-			case <-sweep.C:
-				d.sweepIdle()
-			case <-d.done:
-				return
-			}
-		}
-	})
-
 	buf := make([]byte, maxUDPPayload)
 	for {
 		n, addr, err := d.pc.ReadFrom(buf)
