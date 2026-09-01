@@ -370,7 +370,7 @@ func TestLifecycle_ShutdownDrainsInterceptedHTTP3(t *testing.T) {
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	require.NoError(t, err)
 	served := make(chan error, 1)
-	go func() { served <- p.ServeQUIC(pc) }()
+	go func() { served <- p.ServeTransparentUDP(pc) }()
 	t.Cleanup(func() { _ = p.Close() })
 
 	proxyAddr, err := netip.ParseAddrPort(pc.LocalAddr().String())
@@ -416,7 +416,7 @@ func TestLifecycle_ShutdownDrainsInterceptedHTTP3(t *testing.T) {
 	case err := <-served:
 		assert.ErrorIs(t, err, ErrProxyClosed)
 	case <-time.After(5 * time.Second):
-		t.Fatal("ServeQUIC did not return after Shutdown")
+		t.Fatal("ServeTransparentUDP did not return after Shutdown")
 	}
 }
 
@@ -428,7 +428,7 @@ func TestLifecycle_ShutdownStopsQUIC(t *testing.T) {
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	require.NoError(t, err)
 	served := make(chan error, 1)
-	go func() { served <- p.ServeQUIC(pc) }()
+	go func() { served <- p.ServeTransparentUDP(pc) }()
 
 	require.Eventually(t, func() bool {
 		p.srv.mu.Lock()
@@ -444,13 +444,13 @@ func TestLifecycle_ShutdownStopsQUIC(t *testing.T) {
 	case err := <-served:
 		assert.ErrorIs(t, err, ErrProxyClosed)
 	case <-time.After(5 * time.Second):
-		t.Fatal("ServeQUIC did not return after Shutdown")
+		t.Fatal("ServeTransparentUDP did not return after Shutdown")
 	}
 
 	pc2, err := net.ListenPacket("udp", "127.0.0.1:0")
 	require.NoError(t, err)
 	defer func() { _ = pc2.Close() }()
-	assert.ErrorIs(t, p.ServeQUIC(pc2), ErrProxyClosed)
+	assert.ErrorIs(t, p.ServeTransparentUDP(pc2), ErrProxyClosed)
 }
 
 // A handler that ignores its cancellation cannot hold Shutdown past its deadline. The cut
@@ -514,7 +514,7 @@ func TestLifecycle_ShutdownDeadlineBoundsAStuckHTTP3Handler(t *testing.T) {
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	require.NoError(t, err)
 	served := make(chan error, 1)
-	go func() { served <- p.ServeQUIC(pc) }()
+	go func() { served <- p.ServeTransparentUDP(pc) }()
 	t.Cleanup(func() { _ = p.Close() })
 
 	proxyAddr, err := netip.ParseAddrPort(pc.LocalAddr().String())
@@ -579,7 +579,7 @@ func TestLifecycle_ShutdownDeadlineBoundsAStuckHTTP3Handler(t *testing.T) {
 	case err := <-served:
 		assert.ErrorIs(t, err, ErrProxyClosed)
 	case <-time.After(10 * time.Second):
-		t.Fatal("ServeQUIC did not return after the release")
+		t.Fatal("ServeTransparentUDP did not return after the release")
 	}
 }
 

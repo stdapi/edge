@@ -320,3 +320,25 @@ func BenchmarkDatagramAdmission(b *testing.B) {
 		}
 	}
 }
+
+// BenchmarkDatagramAdmissionCaptured is the same walk on a hostname target whose entry
+// captures a parameter, with the buffer a flow keeps across its datagrams.
+func BenchmarkDatagramAdmissionCaptured(b *testing.B) {
+	p, err := New()
+	if err != nil {
+		b.Fatal(err)
+	}
+	if _, err := p.Add("{name}.udp.test:53", func(*DatagramCtx) error { return nil }); err != nil {
+		b.Fatal(err)
+	}
+	target := Target{Scheme: "http", Host: "echo.udp.test", Port: "53"}
+
+	var buf []Param
+	b.ReportAllocs()
+	for b.Loop() {
+		var e *entry
+		if e, buf = p.admitInto(target, KindUDP, buf); e == nil || len(buf) != 1 {
+			b.Fatal("no entry or no capture")
+		}
+	}
+}

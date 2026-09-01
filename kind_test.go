@@ -6,6 +6,7 @@ package edge
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -765,4 +766,89 @@ func TestKindGRPC_ReturnBeforeTheAnswerCancelsTheCall(t *testing.T) {
 	_ = resp.Body.Close()
 
 	assert.Equal(t, "1", resp.Header.Get("Grpc-Status"), "the proxy canceled the call")
+}
+
+// grpcStreamingOrigin answers a call with one message at once, then a second one when release
+// is closed, then an OK status.
+func grpcStreamingOrigin(t *testing.T, release <-chan struct{}) *httptest.Server {
+	t.Helper()
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/grpc")
+		w.Header().Set("Trailer", "Grpc-Status")
+		w.WriteHeader(http.StatusOK)
+		rc := http.NewResponseController(w)
+		_, _ = w.Write(grpcPayload("one"))
+		_ = rc.Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		_, _ = w.Write(grpcPayload("two"))
+		_ = rc.Flush()
+		w.Header().Set(http.TrailerPrefix+"Grpc-Status", "0")
+	}))
+	t.Cleanup(origin.Close)
+	return origin
+}
+
+// A call keeps its handler, but every message is checked against the tree as it arrives.
+// Deleting the entry mid-stream refuses the next message and ends the call on a status the
+// client can read, however the handler chose to serve it.
+func TestKindGRPC_DeleteReachesTheCallAtItsNextMessage(t *testing.T) {
+	handlers := map[string]GRPC{
+		"forward": func(c *GRPCCtx) error { return c.Forward() },
+		"readers": func(c *GRPCCtx) error {
+			if err := c.Open(); err != nil {
+				return err
+			}
+			src := MergeMessages(c.Outbound(), c.Inbound())
+			for {
+				m, err := src.ReadMessage()
+				if err != nil {
+					if errors.Is(err, io.EOF) {
+						return nil
+					}
+					return err
+				}
+				if ferr := m.Forward(); ferr != nil {
+					return ferr
+				}
+			}
+		},
+	}
+
+	for name, handler := range handlers {
+		t.Run(name, func(t *testing.T) {
+			release := make(chan struct{})
+			origin := grpcStreamingOrigin(t, release)
+			p, host, client := interceptingProxy(t, origin)
+			_, err := p.Delete[HTTP](host + "/*{any}")
+			require.NoError(t, err)
+			p.MustAdd(host+"/pkg.Svc/Stream", handler)
+
+			req, err := http.NewRequest(http.MethodPost, origin.URL+"/pkg.Svc/Stream",
+				strings.NewReader(string(grpcPayload("hello"))))
+			require.NoError(t, err)
+			req.Header.Set("Content-Type", "application/grpc")
+			resp, err := client.Do(req)
+			require.NoError(t, err)
+			defer func() { _ = resp.Body.Close() }()
+
+			first := make([]byte, len(grpcPayload("one")))
+			_, err = io.ReadFull(resp.Body, first)
+			require.NoError(t, err)
+			assert.Equal(t, grpcPayload("one"), first, "the first message passes while the entry stands")
+
+			_, err = p.Delete[GRPC](host + "/pkg.Svc/Stream")
+			require.NoError(t, err)
+			close(release)
+
+			rest, err := io.ReadAll(resp.Body)
+			require.NoError(t, err, "the body ends cleanly on the refusal")
+			assert.Empty(t, rest, "the message that arrived after the delete is refused")
+			assert.Equal(t, "14", resp.Trailer.Get("Grpc-Status"), "the client reads Unavailable")
+		})
+	}
 }

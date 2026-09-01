@@ -246,9 +246,9 @@ func WithRejectECH(enable bool) ProxyOption {
 	})
 }
 
-// WithNameVerification checks the server name of a transparent connection against the proxy's
-// own resolution of it. The name is confirmed when the client's destination is among the
-// resolved addresses. [VerifyLoose] matches an unconfirmed connection on its destination alone
+// WithNameVerification checks the server name of a connection against the proxy's own
+// resolution of it, on a redirected connection and on a CONNECT naming an address literal.
+// The name is confirmed when that destination is among the resolved addresses. [VerifyLoose] matches an unconfirmed connection on its destination alone
 // and [VerifyReject] refuses it. The default is [VerifyOff], the name is trusted as sent, and
 // a client can then reach any address under a permitted name.
 //
@@ -256,8 +256,8 @@ func WithRejectECH(enable bool) ProxyOption {
 // confirmation. Under [VerifyLoose] a rule on the address admits the connection, and
 // [WithNameResolver] can point the check at the resolver the clients use.
 //
-// The name is resolved at most once per connection. Only the transparent listeners verify. An
-// explicit proxy resolves the authority itself, so the name and the destination cannot diverge.
+// The name is resolved at most once per connection. A CONNECT naming a hostname has no
+// destination the name could disagree with, so it is not verified.
 func WithNameVerification(mode NameVerification) ProxyOption {
 	return optionFunc(func(s sealedOption) error {
 		if mode >= verifySentinel {

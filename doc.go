@@ -77,9 +77,17 @@ authority carries it, and a range is bracketed, masked and shorter than a full a
 Orthogonal to all of the above. A client reaches the proxy explicitly, configured with a proxy
 setting, or transparently, its traffic redirected by the network.
 
-	go p.ListenAndServe(":8080")            // CONNECT and absolute request targets
-	go p.ListenAndServeTransparent(":8888") // redirected by the network
-	go p.ListenAndServeQUIC(":443")         // one UDP socket, QUIC and datagrams
+	go p.ListenAndServe(":8080")                // CONNECT and absolute request targets, over TCP
+	go p.ListenAndServeQUIC(":8443", cert)      // the same over HTTP/3, plus CONNECT-UDP
+	go p.ListenAndServeTransparent(":8888")     // TCP redirected by the network
+	go p.ListenAndServeTransparentUDP(":8888")  // UDP redirected by the network, QUIC and datagrams
+
+A CONNECT names where the packets go and the server name inside says what the client expects
+there. The server name selects the entry, the CONNECT target is what the proxy dials, and
+[WithNameVerification] checks one against the other when the target is an address. A
+CONNECT-UDP tunnel, RFC 9298, is how a configured client sends UDP, HTTP/3 to an origin
+included. The tunnel is a [Session] of its own, and so is every connection or datagram flow
+inside it, each decided on its own, see [Session.Via].
 
 # Invisibility
 

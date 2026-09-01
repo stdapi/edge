@@ -138,21 +138,3 @@ func offersECH(msg []byte) (offered, ok bool) {
 	}
 	return false, true
 }
-
-// inspectECH refuses the connection when the bytes waiting in pc are a TLS ClientHello
-// offering Encrypted Client Hello. Bytes that are not a TLS handshake pass untouched, and
-// a read error is left for the caller's own reads to surface.
-func inspectECH(pc *peekConn) error {
-	head, err := pc.Peek(1)
-	if err != nil {
-		return nil
-	}
-	if head[0] != tlsHandshakeRecord {
-		return nil
-	}
-	raw, err := peekHandshakeRecords(pc.r)
-	if err != nil {
-		return errECHUnverifiable
-	}
-	return checkECH(raw)
-}

@@ -83,6 +83,7 @@ func (p *Proxy) connectHijack(w http.ResponseWriter, r *http.Request, target Tar
 	sess.remoteAddr = client.RemoteAddr()
 	sess.localAddr = client.LocalAddr()
 	sess.identity = identity
+	sess.setDestination(target)
 	if s := sessionFromRequest(r); s != nil {
 		sess.remoteAddr = s.remoteAddr
 		sess.localAddr = s.localAddr
@@ -103,15 +104,9 @@ func (p *Proxy) connectHijack(w http.ResponseWriter, r *http.Request, target Tar
 	if werr := writeRawStatus(brw, http.StatusOK, ""); werr != nil {
 		return
 	}
-	pc := conn
-	if p.cfg.rejectECH {
-		// The reader behind conn is sized for requests, not for a full ClientHello.
-		pc = newPeekConnSize(conn, clientHelloPeekSize)
-		if err := inspectECH(pc); err != nil {
-			p.logf(ctx, slog.LevelDebug, "connection closed", sess, err)
-			return
-		}
-	}
+	// The reader behind conn is sized for requests, and the placement reads a whole
+	// ClientHello before the handshake.
+	pc := newPeekConnSize(conn, clientHelloPeekSize)
 	if ierr := p.terminate(ctx, pc, sess); ierr != nil {
 		p.logf(ctx, slog.LevelDebug, "connection closed", sess, ierr)
 	}
@@ -130,6 +125,7 @@ func (p *Proxy) connectStream(w http.ResponseWriter, r *http.Request, target Tar
 	sess := newSession(r.Context(), nil, target, 0, 0)
 	sess.localAddr, sess.remoteAddr = local, remote
 	sess.identity = identity
+	sess.setDestination(target)
 
 	// A refused registration means the proxy is stopping. Returning would let net/http answer
 	// 200 for a connection that is already gone, so the stream is reset instead.
@@ -144,14 +140,7 @@ func (p *Proxy) connectStream(w http.ResponseWriter, r *http.Request, target Tar
 	w.WriteHeader(http.StatusOK)
 	_ = http.NewResponseController(w).Flush()
 
-	pc := newPeekConn(stream, nil)
-	if p.cfg.rejectECH {
-		pc = newPeekConnSize(stream, clientHelloPeekSize)
-		if err := inspectECH(pc); err != nil {
-			p.logf(r.Context(), slog.LevelDebug, "stream closed", sess, err)
-			return
-		}
-	}
+	pc := newPeekConnSize(stream, clientHelloPeekSize)
 	if err := p.terminate(r.Context(), pc, sess); err != nil {
 		p.logf(r.Context(), slog.LevelDebug, "stream closed", sess, err)
 	}

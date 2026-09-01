@@ -200,10 +200,12 @@ func (c *HTTPCtx) outboundRequest(r *http.Request) (*http.Request, error) {
 	}
 
 	ctx := r.Context()
-	if c.r.sess != nil && c.r.sess.upstream.IsValid() {
-		// A transparently redirected connection is sent back to the address the client had
-		// already resolved, rather than to a fresh resolution of the authority.
-		ctx = context.WithValue(ctx, upstreamAddrKey{}, c.r.sess.upstream)
+	if c.r.sess != nil {
+		// The connection fixed where its traffic goes, the redirect destination or the
+		// CONNECT target.
+		if addr := c.r.sess.dialAddr(); addr != "" {
+			ctx = context.WithValue(ctx, upstreamAddrKey{}, addr)
+		}
 	}
 
 	out := r.Clone(ctx)

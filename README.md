@@ -45,12 +45,12 @@ Point the application at it with `HTTPS_PROXY=http://localhost:8080` and install
 
 |                      | HTTP/1.1 | HTTP/2 | HTTP/3 |
 | -------------------- | -------- | ------ | ------ |
-| Explicit proxy       | yes      | yes    | n/a    |
+| Explicit proxy       | yes      | yes    | yes    |
 | Transparent redirect | yes      | yes    | yes    |
 | Tunnel end to end    | yes      | yes    | yes    |
 | Intercept and route  | yes      | yes    | yes    |
 
-A classic proxy setting sends an HTTP/3 client back to TCP, since `CONNECT` tunnels a stream and HTTP/3 needs datagrams. Tunneling those is what MASQUE standardizes, and no general purpose client implements it, so HTTP/3 is reached by routing the client to the proxy rather than by configuring it.
+A classic proxy setting sends an HTTP/3 client back to TCP, since `CONNECT` tunnels a stream and HTTP/3 needs datagrams. `CONNECT-UDP` (RFC 9298, the MASQUE tunnel) tunnels them, and `ListenAndServeQUIC` serves it over an HTTP/3 front. A client that speaks it reaches HTTP/3 origins and any other UDP through a proxy setting, and the tunnel and everything inside it show up in `Sessions()`. A client that does not is reached by routing it to the transparent listener instead.
 
 Protocol upgrades, including WebSocket, are spliced through in both modes. Server-sent events and other streamed bodies are relayed as they are produced, not buffered. Trailers are forwarded.
 
@@ -233,7 +233,7 @@ Leaf certificates are minted on demand for the name the client asked for, cached
 p, _ := edge.New(edge.WithCA(ca))
 
 go p.ListenAndServeTransparent(":8443") // TCP, redirected
-go p.ListenAndServeQUIC(":8443")        // UDP, redirected
+go p.ListenAndServeTransparentUDP(":8443")        // UDP, redirected
 ```
 
 Transparent means the client is not configured, not that a particular mechanism brought its traffic here. Two get it here:
@@ -251,7 +251,7 @@ go p.ServeTransparent(edge.TransparentListener(ln))
 
 pc, _ := net.ListenPacket("udp", ":8443")
 conn, _ := edge.TransparentPacketConn(pc)
-go p.ServeQUIC(conn)
+go p.ServeTransparentUDP(conn)
 ```
 
 The connection reports where it was headed and the proxy asks it, through the `OriginalDestination` and `PacketOriginalDestination` interfaces, so a setup neither of these covers is a connection type of your own.

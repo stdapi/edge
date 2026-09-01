@@ -93,7 +93,7 @@ func serveQUIC(t *testing.T, p *Proxy, wrap func(net.PacketConn) net.PacketConn)
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	require.NoError(t, err)
 
-	go func() { _ = p.ServeQUIC(wrap(pc)) }()
+	go func() { _ = p.ServeTransparentUDP(wrap(pc)) }()
 	t.Cleanup(func() { _ = p.Close() })
 
 	addr, err := netip.ParseAddrPort(pc.LocalAddr().String())
@@ -714,7 +714,7 @@ func startTProxyQUIC(t *testing.T, p *Proxy, origin netip.AddrPort) (*tproxyOrig
 	require.NoError(t, err)
 	wrapper := newTProxyOriginPacketConn(pc, origin)
 
-	go func() { _ = p.ServeQUIC(wrapper) }()
+	go func() { _ = p.ServeTransparentUDP(wrapper) }()
 	t.Cleanup(func() { _ = p.Close() })
 
 	addr, err := netip.ParseAddrPort(pc.LocalAddr().String())
@@ -949,19 +949,20 @@ func TestQUIC_ShutdownDrainsEveryInterceptStack(t *testing.T) {
 // The eviction candidate at the stack cap is the least recently used idle stack and never
 // one with live connections.
 func TestQUICDemux_EvictInterceptPrefersIdleLRU(t *testing.T) {
-	d := &quicDemux{intercepts: map[netip.AddrPort]*quicIntercept{}}
-	busy := &quicIntercept{origin: netip.MustParseAddrPort("10.0.0.1:443"), conns: 1, lastSeen: time.Unix(1, 0)}
-	older := &quicIntercept{origin: netip.MustParseAddrPort("10.0.0.2:443"), lastSeen: time.Unix(2, 0)}
-	newer := &quicIntercept{origin: netip.MustParseAddrPort("10.0.0.3:443"), lastSeen: time.Unix(3, 0)}
+	d := &quicDemux{intercepts: map[interceptKey]*quicIntercept{}}
+	at := func(s string) interceptKey { return interceptKey{origin: netip.MustParseAddrPort(s)} }
+	busy := &quicIntercept{key: at("10.0.0.1:443"), conns: 1, lastSeen: time.Unix(1, 0)}
+	older := &quicIntercept{key: at("10.0.0.2:443"), lastSeen: time.Unix(2, 0)}
+	newer := &quicIntercept{key: at("10.0.0.3:443"), lastSeen: time.Unix(3, 0)}
 	for _, it := range []*quicIntercept{busy, older, newer} {
-		d.intercepts[it.origin] = it
+		d.intercepts[it.key] = it
 	}
 	require.Same(t, older, d.evictableLocked())
-	delete(d.intercepts, older.origin)
+	delete(d.intercepts, older.key)
 	require.Same(t, newer, d.evictableLocked())
-	delete(d.intercepts, newer.origin)
+	delete(d.intercepts, newer.key)
 	assert.Nil(t, d.evictableLocked(), "a stack with live connections is never evicted")
-	assert.Contains(t, d.intercepts, busy.origin)
+	assert.Contains(t, d.intercepts, busy.key)
 }
 
 // The read loop holds no lock between reading a datagram and publishing the relay it leads
@@ -998,7 +999,7 @@ func TestQUICDemux_CloseRefusesLatePublish(t *testing.T) {
 	require.Zerof(t, udps, "%d datagram flow(s) published into a closed demux, %d flow(s) recreated", udps, flows)
 }
 
-// Shutdown can win the race against a ServeQUIC that is tracked but has not reached run yet,
+// Shutdown can win the race against a ServeTransparentUDP that is tracked but has not reached run yet,
 // and the demux WaitGroup has to survive that ordering.
 func TestQUICDemux_ShutdownRacesServeQUICStartup(t *testing.T) {
 	for range 200 {
@@ -1007,7 +1008,7 @@ func TestQUICDemux_ShutdownRacesServeQUICStartup(t *testing.T) {
 		pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 		require.NoError(t, err)
 		served := make(chan error, 1)
-		go func() { served <- p.ServeQUIC(pc) }()
+		go func() { served <- p.ServeTransparentUDP(pc) }()
 
 		for {
 			p.srv.mu.Lock()
@@ -1027,7 +1028,7 @@ func TestQUICDemux_ShutdownRacesServeQUICStartup(t *testing.T) {
 		case err := <-served:
 			assert.ErrorIs(t, err, ErrProxyClosed)
 		case <-time.After(5 * time.Second):
-			t.Fatal("ServeQUIC did not return after Shutdown")
+			t.Fatal("ServeTransparentUDP did not return after Shutdown")
 		}
 	}
 }

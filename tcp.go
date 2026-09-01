@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"iter"
 	"net"
-	"net/netip"
 	"slices"
 	"sync"
 	"time"
@@ -33,7 +32,6 @@ type TCPCtx struct {
 	tlsState *tls.ConnectionState
 
 	target   Target
-	upstream netip.AddrPort
 	identity string
 	params   []Param
 	extra    []net.Conn
@@ -109,11 +107,11 @@ func (c *TCPCtx) Dial() (net.Conn, error) {
 }
 
 func (c *TCPCtx) dial() (net.Conn, error) {
-	addr := c.target.Authority()
-	if c.upstream.IsValid() {
-		// A transparently redirected stream goes back to the address the client had already
-		// resolved, which behind a redirect may be the only one that resolves at all.
-		addr = c.upstream.String()
+	// The destination the client fixed comes first, which behind a redirect may be the only
+	// address that resolves at all.
+	addr := c.sess.dialAddr()
+	if addr == "" {
+		addr = c.target.Authority()
 	}
 	return c.dialAddr(c.ctx, addr, c.target.Host)
 }

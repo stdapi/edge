@@ -1,0 +1,275 @@
+// Copyright 2025 Sylvain Müller. All rights reserved.
+// Mount of this source code is governed by a Apache-2.0 license that can be found
+// at https://github.com/fox-toolkit/edge/blob/master/LICENSE.txt.
+
+package edge
+
+import (
+	"context"
+	"crypto/tls"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/netip"
+	"net/url"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/net/http2"
+)
+
+// namedOrigin starts a TLS origin holding a certificate for name, signed by ca, that answers
+// with the Host it was asked for.
+func namedOrigin(t *testing.T, ca *CA, name string) *url.URL {
+	t.Helper()
+	origin := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "origin host=%s", r.Host)
+	}))
+	origin.TLS = &tls.Config{Certificates: []tls.Certificate{selfSignedFor(t, ca, name)}}
+	origin.StartTLS()
+	t.Cleanup(origin.Close)
+	u, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+	return u
+}
+
+// tunnelClient opens a CONNECT to authority through the proxy at addr and returns a client
+// speaking TLS to name inside it, trusting the certificates ca mints.
+func tunnelClient(t *testing.T, addr, authority, name string, ca *CA) *http.Client {
+	t.Helper()
+	raw := connectRaw(t, addr, authority)
+	t.Cleanup(func() { _ = raw.Close() })
+	tunnel := tls.Client(raw, &tls.Config{
+		ServerName: name,
+		RootCAs:    ca.CertPool(),
+		MinVersion: tls.VersionTLS12,
+	})
+	return &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			DialTLSContext: func(context.Context, string, string) (net.Conn, error) { return tunnel, nil },
+		},
+	}
+}
+
+// A CONNECT names where the packets go and the server name says what the client expects
+// there. The name is what the tree routes on, the CONNECT target is what the proxy dials.
+func TestConnect_NameRoutesAndTheTargetDials(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	origin := namedOrigin(t, ca, "example.test")
+
+	tr := DefaultTransport()
+	tr.RootCAs = poolOf(ca)
+	p, err := New(WithCA(ca), WithTransport(tr))
+	require.NoError(t, err)
+
+	var routed atomic.Value
+	p.MustAdd("example.test/", func(c *HTTPCtx) (*http.Response, error) {
+		routed.Store(c.Authority())
+		return c.Forward()
+	})
+	// The CONNECT is admitted on the literal it names, before any server name exists.
+	p.MustAdd[TCP]("[127.0.0.0/8]", relayStream)
+	addr := startProxy(t, p)
+
+	// The CONNECT target is the literal the client resolved itself, which no resolver of
+	// the proxy could ever produce for example.test.
+	client := tunnelClient(t, addr, origin.Host, "example.test", ca)
+	resp, err := client.Get("https://example.test/")
+	require.NoError(t, err)
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	assert.Equal(t, "origin host=example.test", string(body))
+	_, port, err := net.SplitHostPort(origin.Host)
+	require.NoError(t, err)
+	assert.Equal(t, "example.test:"+port, routed.Load())
+
+	sess := waitForSessions(t, p, 1)[0]
+	assert.Equal(t, "example.test", sess.Target().Host)
+	assert.Equal(t, netip.MustParseAddrPort(origin.Host), sess.Upstream())
+}
+
+// A CONNECT naming a hostname is dialed as that name, whatever server name the client sends
+// inside, and the name inside is still what routes.
+func TestConnect_DeclaredNameIsDialed(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	origin := namedOrigin(t, ca, "inner.test")
+
+	var dialed atomic.Value
+	tr := DefaultTransport()
+	tr.RootCAs = poolOf(ca)
+	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dialed.Store(addr)
+		return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, network, origin.Host)
+	}
+	p, err := New(WithCA(ca), WithTransport(tr))
+	require.NoError(t, err)
+	p.MustAdd("inner.test/", forwardHandler)
+	p.MustAdd[TCP]("declared.test", relayStream)
+	addr := startProxy(t, p)
+
+	_, port, err := net.SplitHostPort(origin.Host)
+	require.NoError(t, err)
+	client := tunnelClient(t, addr, "declared.test:"+port, "inner.test", ca)
+	resp, err := client.Get("https://inner.test/")
+	require.NoError(t, err)
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+
+	assert.Equal(t, "declared.test:"+port, dialed.Load())
+	sess := waitForSessions(t, p, 1)[0]
+	assert.Equal(t, "inner.test", sess.Target().Host)
+	assert.False(t, sess.Upstream().IsValid(), "a name is left to the dial to resolve")
+}
+
+// A CONNECT to a literal gives name verification the same two facts a redirect does, the
+// name the client wants and the address it chose, so the check applies to it as well.
+func TestConnect_NameVerificationAppliesToALiteralTarget(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	origin := namedOrigin(t, ca, "example.test")
+	originAddr := netip.MustParseAddrPort(origin.Host)
+
+	run := func(t *testing.T, resolved []netip.Addr) (*http.Response, error) {
+		t.Helper()
+		tr := DefaultTransport()
+		tr.RootCAs = poolOf(ca)
+		resolver := &fakeResolver{addrs: map[string][]netip.Addr{"example.test": resolved}}
+		p, err := New(WithCA(ca), WithTransport(tr),
+			WithNameVerification(VerifyReject), WithNameResolver(resolver))
+		require.NoError(t, err)
+		p.MustAdd("example.test/", forwardHandler)
+		p.MustAdd[TCP]("[127.0.0.0/8]", relayStream)
+		addr := startProxy(t, p)
+
+		client := tunnelClient(t, addr, origin.Host, "example.test", ca)
+		resp, err := client.Get("https://example.test/")
+		if err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+		}
+		assert.EqualValues(t, 1, resolver.calls.Load(), "the name is resolved once")
+		return resp, err
+	}
+
+	t.Run("confirmed", func(t *testing.T) {
+		resp, err := run(t, []netip.Addr{originAddr.Addr()})
+		require.NoError(t, err)
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+	})
+
+	t.Run("lying", func(t *testing.T) {
+		_, err := run(t, addrsOf("6.6.6.6"))
+		require.Error(t, err, "the handshake never completes, the connection is closed before it")
+	})
+}
+
+// Closing the session of a CONNECT carried on an HTTP/2 stream ends that stream and nothing
+// else. The sibling tunnel keeps echoing and the front connection still opens new ones.
+func TestConnect_CloseOnAnH2StreamEndsOnlyThatTunnel(t *testing.T) {
+	origin, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = origin.Close() })
+	go func() {
+		for {
+			c, aerr := origin.Accept()
+			if aerr != nil {
+				return
+			}
+			go func() {
+				_, _ = io.Copy(c, c)
+				_ = c.Close()
+			}()
+		}
+	}()
+
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+	p.MustAdd[TCP](origin.Addr().String(), relayStream)
+	addr := startProxy(t, p)
+
+	raw, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = raw.Close() })
+	cc, err := (&http2.Transport{AllowHTTP: true}).NewClientConn(raw)
+	require.NoError(t, err)
+
+	type tunnel struct {
+		r io.ReadCloser
+		w *io.PipeWriter
+	}
+	open := func() tunnel {
+		pr, pw := io.Pipe()
+		req, rerr := http.NewRequest(http.MethodConnect, "https://"+origin.Addr().String(), pr)
+		require.NoError(t, rerr)
+		resp, rerr := cc.RoundTrip(req)
+		require.NoError(t, rerr)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		return tunnel{r: resp.Body, w: pw}
+	}
+	echo := func(tn tunnel, line string) (string, error) {
+		if _, werr := io.WriteString(tn.w, line); werr != nil {
+			return "", werr
+		}
+		got := make(chan string, 1)
+		fail := make(chan error, 1)
+		go func() {
+			buf := make([]byte, len(line))
+			if _, rerr := io.ReadFull(tn.r, buf); rerr != nil {
+				fail <- rerr
+				return
+			}
+			got <- string(buf)
+		}()
+		select {
+		case s := <-got:
+			return s, nil
+		case rerr := <-fail:
+			return "", rerr
+		case <-time.After(3 * time.Second):
+			return "", context.DeadlineExceeded
+		}
+	}
+
+	first, second := open(), open()
+	line, err := echo(first, "one\n")
+	require.NoError(t, err)
+	require.Equal(t, "one\n", line)
+	line, err = echo(second, "two\n")
+	require.NoError(t, err)
+	require.Equal(t, "two\n", line)
+
+	sessions := waitForSessions(t, p, 2)
+	require.NoError(t, sessions[0].Close())
+	require.NoError(t, sessions[0].Close(), "closing twice is a no-op")
+
+	// One tunnel is over and the client sees it on its stream, the other is untouched.
+	_, err1 := echo(first, "again\n")
+	_, err2 := echo(second, "again\n")
+	require.True(t, (err1 == nil) != (err2 == nil), "exactly one tunnel ends: %v / %v", err1, err2)
+	ended := err1
+	if ended == nil {
+		ended = err2
+	}
+	// net/http ends the stream cleanly once the handler returned, and closes the request
+	// body with it. Which of the two the client trips on first depends on the side it was
+	// using at that moment, and either is the end.
+	assert.True(t, errors.Is(ended, io.EOF) || errors.Is(ended, io.ErrClosedPipe),
+		"the client observes the end of the stream, got %v", ended)
+
+	third := open()
+	line, err = echo(third, "three\n")
+	require.NoError(t, err)
+	assert.Equal(t, "three\n", line, "the front connection survives its tunnel")
+	waitForSessions(t, p, 2)
+}

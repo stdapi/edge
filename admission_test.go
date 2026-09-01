@@ -394,3 +394,17 @@ func TestAdmission_AddressHostIsReferenceCounted(t *testing.T) {
 	assert.False(t, p.Admits(target("10.0.0.1:443"), KindHTTP))
 	assert.Equal(t, 0, admissionsLen(p))
 }
+
+// An entry admitting a whole connection captures what its parameters matched, for the handler
+// that then serves the connection. The plain admission answer skips the captures.
+func TestAdmission_AdmitWithCapturesParameters(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p := testProxyWithCA(t, ca)
+	p.MustAdd[TCP]("{sub}.corp.test:443", relayStream)
+
+	e, params := p.admitWith(Target{Scheme: "https", Host: "mail.corp.test", Port: "443"}, KindTCP)
+	require.NotNil(t, e)
+	assert.Equal(t, []Param{{Key: "sub", Value: "mail"}}, params)
+	assert.True(t, p.Admits(Target{Scheme: "https", Host: "mail.corp.test", Port: "443"}, KindTCP))
+}

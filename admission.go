@@ -31,13 +31,15 @@ func (p *Proxy) admission(target Target, kind Kind) *entry {
 }
 
 func (t *iTree) admission(c *routeCtx, target Target, kind Kind) *entry {
-	return resolveAdmission(t.patterns, t.addrs, t.handlers+t.admissions, c, target, kind)
+	return resolveAdmission(t.patterns, t.addrs, t.handlers+t.admissions, c, target, kind, false)
 }
 
 // resolveAdmission walks the admission entries under the given roots and returns the one that
 // admits kind on target, or nil. A transaction and the published tree share the node
 // structure under different roots, so the roots are passed in rather than read off a receiver.
-func resolveAdmission(patterns, addrs *node, total int, c *routeCtx, target Target, kind Kind) *entry {
+// With capture set the walk records what the pattern's parameters matched, which only a
+// caller about to hand the entry to a handler pays for.
+func resolveAdmission(patterns, addrs *node, total int, c *routeCtx, target Target, kind Kind, capture bool) *entry {
 	if total == 0 || kind == 0 {
 		return nil
 	}
@@ -56,7 +58,7 @@ func resolveAdmission(patterns, addrs *node, total int, c *routeCtx, target Targ
 	}
 	c.resetForAdmission(nil, scheme, target.Host, port)
 
-	idx, n := lookupTarget(patterns, addrs, target.Host, "", c, true, kind)
+	idx, n := lookupTarget(patterns, addrs, target.Host, "", c, !capture, kind)
 	if n == nil {
 		return nil
 	}
@@ -67,16 +69,23 @@ func resolveAdmission(patterns, addrs *node, total int, c *routeCtx, target Targ
 // pattern captured, which a handler serving a whole connection keeps for longer than the
 // pooled state of the lookup lives.
 func (p *Proxy) admitWith(target Target, kind Kind) (*entry, []Param) {
+	return p.admitInto(target, kind, nil)
+}
+
+// admitInto is [Proxy.admitWith] writing the parameters into buf, reused across the datagrams
+// of one flow so routing one allocates nothing. The parameters it returns are only valid until
+// the next call with the same buffer.
+func (p *Proxy) admitInto(target Target, kind Kind, buf []Param) (*entry, []Param) {
 	tree := p.getTree()
 	c := tree.pool.Get().(*routeCtx)
 	defer tree.pool.Put(c)
 
-	e := tree.admission(c, target, kind)
+	e := resolveAdmission(tree.patterns, tree.addrs, tree.handlers+tree.admissions, c, target, kind, true)
 	if e == nil {
-		return nil, nil
+		return nil, buf[:0]
 	}
 	c.entry = e
-	return e, c.capturedParams()
+	return e, c.appendParams(buf)
 }
 
 // admitsAny reports whether any of the given kinds is admitted on target. It answers the

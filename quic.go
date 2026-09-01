@@ -12,7 +12,6 @@ import (
 	"io"
 	"iter"
 	"net"
-	"net/netip"
 	"slices"
 	"sync"
 
@@ -39,7 +38,6 @@ type QUICCtx struct {
 	acceptCh     chan *QUICStream
 	acceptCancel context.CancelFunc
 	target       Target
-	upstream     netip.AddrPort
 
 	identity string
 	params   []Param
@@ -135,8 +133,8 @@ func (c *QUICCtx) DialTo(ctx context.Context, addr string) (*quic.Conn, error) {
 }
 
 func (c *QUICCtx) upstreamAddr() string {
-	if c.upstream.IsValid() {
-		return c.upstream.String()
+	if addr := c.sess.dialAddr(); addr != "" {
+		return addr
 	}
 	return c.target.Authority()
 }

@@ -96,8 +96,12 @@ const requestLinePeek = 512
 // looksLikeHTTPRequestLine reports whether what is waiting on conn starts with an HTTP/1.x
 // request line, "method SP target SP HTTP/1.d". The HTTP/2 connection preface is one too, its
 // method being PRI and its version 2.0, so both are recognized by the same scan.
+//
+// What is already buffered is scanned first, and the scan waits for one more byte at a time.
+// A short first write that is not HTTP is decided on the spot.
 func looksLikeHTTPRequestLine(conn *peekConn) bool {
-	for n := 16; ; n = min(n*4, requestLinePeek) {
+	n := max(conn.r.Buffered(), 1)
+	for {
 		b, err := conn.Peek(n)
 		if len(b) > 0 {
 			switch verdict := scanRequestLine(b); verdict {
@@ -115,6 +119,7 @@ func looksLikeHTTPRequestLine(conn *peekConn) bool {
 		if n >= requestLinePeek {
 			return false
 		}
+		n = min(max(n+1, conn.r.Buffered()), requestLinePeek)
 	}
 }
 

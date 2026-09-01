@@ -100,15 +100,23 @@ func (c *routeCtx) resetForAdmission(sess *Session, scheme, host, port string) {
 // capturedParams copies the parameters captured by the last lookup, for a handler that
 // outlives the pooled state the walk used.
 func (c *routeCtx) capturedParams() []Param {
+	return c.appendParams(nil)
+}
+
+// appendParams appends the parameters captured by the last lookup to dst, reusing its storage.
+func (c *routeCtx) appendParams(dst []Param) []Param {
 	if c.entry == nil || len(*c.params) == 0 {
-		return nil
+		return dst[:0]
 	}
 	n := min(len(*c.params), len(c.entry.params))
-	out := make([]Param, 0, n)
-	for i := range n {
-		out = append(out, Param{Key: c.entry.params[i], Value: (*c.params)[i]})
+	if cap(dst) < n {
+		dst = make([]Param, 0, n)
 	}
-	return out
+	dst = dst[:0]
+	for i := range n {
+		dst = append(dst, Param{Key: c.entry.params[i], Value: (*c.params)[i]})
+	}
+	return dst
 }
 
 // routingPath returns the canonical form of the request path used for matching. The request

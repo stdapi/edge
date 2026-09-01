@@ -44,6 +44,9 @@ func (p *Proxy) terminate(ctx context.Context, conn *peekConn, sess *Session) er
 	if p.cfg.ca == nil {
 		return fmt.Errorf("%w: %w", ErrNoCertificateAuthority, errNoCA)
 	}
+	if err := p.placeTLS(ctx, conn, sess); err != nil {
+		return err
+	}
 
 	tlsConn := tls.Server(conn, p.serverTLSConfig(sess))
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
@@ -52,14 +55,6 @@ func (p *Proxy) terminate(ctx context.Context, conn *peekConn, sess *Session) er
 
 	state := tlsConn.ConnectionState()
 	sess.tlsState.Store(&state)
-	sess.target.Scheme = "https"
-	// The server name the client asked for is a better identity than the CONNECT authority,
-	// which an explicit proxy client may write as an address. A transparent target already
-	// comes from the sniffed ClientHello or the destination, and name verification may have
-	// ruled the name out.
-	if state.ServerName != "" && !sess.transparent {
-		sess.target.Host = state.ServerName
-	}
 
 	candidates := candidatesForALPN(state.NegotiatedProtocol, KindTCP)
 	if candidates == nil {
@@ -69,6 +64,55 @@ func (p *Proxy) terminate(ctx context.Context, conn *peekConn, sess *Session) er
 		return p.serveCandidates(ctx, peeked, sess, sniffStreamCandidates(peeked, p.cfg.server.sniffTimeout), &state)
 	}
 	return p.serveCandidates(ctx, tlsConn, sess, candidates, &state)
+}
+
+// placeTLS decides the authority a TLS connection is routed on, before the handshake commits
+// the proxy to a certificate. The server name routes when the client sent one, the destination
+// the connection was headed to is what the proxy dials, and name verification stands between
+// the two. Nothing is consumed, the handshake reads the same bytes after.
+func (p *Proxy) placeTLS(ctx context.Context, conn *peekConn, sess *Session) error {
+	raw, rerr := peekHandshakeRecords(conn.r)
+	if p.cfg.rejectECH {
+		if rerr != nil {
+			return errECHUnverifiable
+		}
+		if err := checkECH(raw); err != nil {
+			return err
+		}
+	}
+	var hello *ClientHello
+	if rerr == nil {
+		hello = clientHelloFromRecords(raw)
+	}
+
+	target := sess.target
+	target.Scheme = "https"
+	if target.Port == "" {
+		target.Port = "443"
+	}
+	named := hello != nil && hello.ServerName != ""
+	if named {
+		target.Host = stringsutil.ToLowerASCIIString(hello.ServerName)
+	}
+	if target.Host == "" {
+		return errors.New("edge: TLS connection with no server name and no destination")
+	}
+
+	target, admitted, verdict := p.targetForTransparent(ctx, target, sess.upstream, named, KindHTTP, KindTCP)
+	switch verdict {
+	case nameMismatch:
+		return errNameMismatch
+	case nameUnresolved:
+		return errNameUnresolved
+	}
+	if !admitted {
+		return ErrConnectionRejected
+	}
+	sess.target = target
+	if hello != nil {
+		sess.clientHello = hello
+	}
+	return nil
 }
 
 // serveCandidates serves the connection at the finest granularity its authority admits, and
@@ -135,7 +179,6 @@ func (p *Proxy) serveTerminatedStream(ctx context.Context, conn net.Conn, sess *
 		params:   params,
 		target:   sess.target,
 		identity: sess.identity,
-		upstream: sess.upstream,
 		tlsState: state,
 	}
 	defer c.close()

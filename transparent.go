@@ -15,8 +15,6 @@ import (
 	"net"
 	"net/netip"
 	"time"
-
-	"github.com/fox-toolkit/edge/internal/stringsutil"
 )
 
 // clientHelloPeekSize bounds how much of a TLS ClientHello the proxy will buffer to read the
@@ -131,59 +129,19 @@ func (p *Proxy) ServeConn(conn net.Conn) error {
 	return p.serveTransparentPlain(ctx, peeked, origin)
 }
 
-// serveTransparentTLS reads the server name out of the ClientHello without consuming it,
-// decides what to do with the connection, and either relays it untouched or terminates it.
+// serveTransparentTLS serves a redirected TLS connection. The destination is the authority
+// it starts from, and the server name in the ClientHello replaces it before the handshake, see
+// [Proxy.placeTLS].
 func (p *Proxy) serveTransparentTLS(ctx context.Context, conn *peekConn, origin netip.AddrPort) error {
-	raw, rerr := peekHandshakeRecords(conn.r)
-	if p.cfg.rejectECH {
-		if rerr != nil {
-			return errECHUnverifiable
-		}
-		if err := checkECH(raw); err != nil {
-			return err
-		}
-	}
-	var hello *ClientHello
-	if rerr == nil {
-		hello = clientHelloFromRecords(raw)
-	}
-
-	target := Target{Scheme: "https"}
-	if hello != nil && hello.ServerName != "" {
-		target.Host = stringsutil.ToLowerASCIIString(hello.ServerName)
-	}
+	target := Target{Scheme: "https", Port: "443"}
 	if origin.IsValid() {
 		target.Port = fmt.Sprint(origin.Port())
-		if target.Host == "" {
-			target.Host = origin.Addr().Unmap().String()
-		}
-	}
-	if target.Port == "" {
-		target.Port = "443"
-	}
-	if target.Host == "" {
-		return errors.New("edge: transparent TLS connection with no server name and no original destination")
-	}
-
-	named := hello != nil && hello.ServerName != ""
-	target, admitted, verdict := p.targetForTransparent(ctx, target, origin, named, KindHTTP, KindTCP)
-	switch verdict {
-	case nameMismatch:
-		return errNameMismatch
-	case nameUnresolved:
-		return errNameUnresolved
-	}
-	if !admitted {
-		return ErrConnectionRejected
+		target.Host = origin.Addr().Unmap().String()
 	}
 
 	sess := newSession(ctx, conn, target, 0, 0)
 	sess.transparent = true
 	sess.upstream = origin
-	if hello != nil {
-		sess.clientHello = hello
-	}
-
 	return p.terminate(ctx, conn, sess)
 }
 

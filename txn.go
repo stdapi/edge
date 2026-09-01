@@ -193,7 +193,7 @@ func (txn *Txn) Admits(target Target, kind Kind) bool {
 	c := pool.Get().(*routeCtx)
 	defer pool.Put(c)
 
-	return resolveAdmission(t.patterns, t.addrs, t.handlers+t.admissions, c, target, kind) != nil
+	return resolveAdmission(t.patterns, t.addrs, t.handlers+t.admissions, c, target, kind, false) != nil
 }
 
 // Commit finalizes the transaction. This is a noop for read transactions, already aborted or

@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/netip"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -106,11 +107,14 @@ func (t Target) normalized() Target {
 
 var sessionSeq atomic.Uint64
 
-// Session is a client connection handled by the proxy. Every unit carried on that connection
-// belongs to the same session, so an HTTP/2 or HTTP/3 connection has a single session and
-// many requests. This does not apply to a protocol upgrade, which gets a session of its own.
+// Session is a unit the proxy decided once, when it arrived: a client connection, a CONNECT,
+// a terminated QUIC connection, a datagram flow. Every request or stream multiplexed on it
+// belongs to it, so an HTTP/2 or HTTP/3 connection has one session and many requests. A
+// protocol upgrade gets a session of its own.
 //
-// The proxy decides a session once, when the connection arrives.
+// Every request and every datagram is routed on the entries as they stand when it arrives.
+// What was decided when the session arrived does not change when entries do, and
+// [Session.Close] ends the session so the client comes back and is decided again.
 //
 // A Session is safe for concurrent use by the goroutines serving its requests.
 type Session struct {
@@ -130,11 +134,16 @@ type Session struct {
 	// so TLS() can read the state once it exists.
 	tlsConn     *tls.Conn
 	clientHello *ClientHello
-	target      Target
-	// upstream is the address a transparently redirected connection was headed to. It is
-	// preferred over resolving the authority again, which may not even resolve outside the
-	// client's own network.
+	// via is the CONNECT-UDP tunnel this session arrived through, nil off a socket.
+	via    *Session
+	target Target
+	// upstream is the destination of a redirected connection or the literal a CONNECT
+	// named, preferred over resolving the authority again, which may not even resolve
+	// outside the client's network.
 	upstream netip.AddrPort
+	// dial is the hostname authority a CONNECT named, resolved by the dial. It is empty when
+	// upstream is set.
+	dial     string
 	identity string
 	// servableAs holds the kinds the traffic allows, most specific first, and stays empty
 	// where only the decided kind was ever possible.
@@ -150,6 +159,8 @@ type Session struct {
 	// request rather than once at the connection. It is not reported by [Proxy.Sessions].
 	perRequest  bool
 	transparent bool
+	// tunnel marks a CONNECT-UDP tunnel, a session that serves nothing itself.
+	tunnel bool
 }
 
 func newSession(ctx context.Context, c net.Conn, target Target, kind Kind, proto Protocol) *Session {
@@ -195,8 +206,9 @@ func (s *Session) RemoteAddr() netip.AddrPort { return addrPort(s.remoteAddr) }
 // none.
 func (s *Session) LocalAddr() netip.AddrPort { return addrPort(s.localAddr) }
 
-// Target returns the authority the client asked for. For a CONNECT it is the request target,
-// and in transparent mode it comes from the TLS server name or the Host header.
+// Target returns the authority the session is routed on. It is the TLS server name when the
+// client sent one, and otherwise the CONNECT target, the Host header or the destination the
+// connection was headed to.
 //
 // A client sending plain requests through the proxy can ask for a different authority on each
 // one, so a session shared by several of them reports none. A handler reads the authority it is
@@ -235,9 +247,30 @@ func (s *Session) TLS() *tls.ConnectionState {
 // session. It is the ground truth for mirroring a client's capabilities upstream.
 func (s *Session) ClientHello() *ClientHello { return s.clientHello }
 
-// Upstream returns the address a transparently redirected connection was headed to before
-// the redirect, or the zero value when the proxy was reached explicitly.
+// Upstream returns the address the proxy sends to, the destination a redirected connection was
+// headed to, the address literal a CONNECT named, or the address a CONNECT-UDP target
+// resolved to. It is the zero value when the proxy resolves the authority itself.
 func (s *Session) Upstream() netip.AddrPort { return s.upstream }
+
+// setDestination records where a CONNECT asked the proxy to send.
+func (s *Session) setDestination(t Target) {
+	if addr, err := netip.ParseAddr(t.Host); err == nil {
+		if port, perr := strconv.ParseUint(t.Port, 10, 16); perr == nil {
+			s.upstream = netip.AddrPortFrom(addr.Unmap(), uint16(port))
+			return
+		}
+	}
+	s.dial = t.Authority()
+}
+
+// dialAddr returns the authority the proxy dials, or an empty string when it is the one the
+// session is routed on.
+func (s *Session) dialAddr() string {
+	if s.upstream.IsValid() {
+		return s.upstream.String()
+	}
+	return s.dial
+}
 
 // Transparent reports whether the client reached the proxy without being configured to use
 // it, its traffic having been redirected by the network.
@@ -246,7 +279,20 @@ func (s *Session) Transparent() bool { return s.transparent }
 // Kind returns the kind serving this connection. The proxy picks the most specific of
 // [Session.ServableAs] admitted by an entry when the connection arrives, and keeps it for
 // the life of the connection.
+//
+// A CONNECT-UDP tunnel reports the most specific kind an entry admitted it for, HTTP, QUIC or
+// UDP in that order. The tunnel serves nothing itself. Each connection and datagram flow
+// inside it is a session of its own, see [Session.Via].
 func (s *Session) Kind() Kind { return s.kind }
+
+// Tunnel reports whether the session is a CONNECT-UDP tunnel. Closing one ends every session
+// inside it, and the client has to ask for a new tunnel, which is authenticated and admitted
+// again.
+func (s *Session) Tunnel() bool { return s.tunnel }
+
+// Via returns the CONNECT-UDP tunnel the session arrived through, or nil when its datagrams
+// arrived off a socket. A session reports the identity of its tunnel.
+func (s *Session) Via() *Session { return s.via }
 
 // ServableAs returns the kinds that can serve this connection, from the most specific to the
 // least. The negotiated ALPN or the first bytes fix the list when the connection arrives,
@@ -289,10 +335,12 @@ func (s *Session) ALPN() string {
 	return ""
 }
 
-// Close ends the connection immediately, without draining it, and drops the requests or
-// streams in flight. Closing a connection that already ended is a no-op. The client is free
-// to reconnect, and the proxy decides the new connection again. Revoking an identity uses
-// the same call, see [Session.Identity].
+// Close ends the session at once, without draining, and the requests or streams in flight
+// fail. It ends this session and nothing else. The client sees the end in its own protocol, a
+// FIN, a CONNECTION_CLOSE or a stream reset, and is free to come back, to be authenticated and
+// admitted again on the entries as they stand then. A datagram flow has no such signal and
+// the client sees its replies stop. Closing a session that already ended is a no-op.
+// Revoking an identity uses the same call, see [Session.Identity].
 func (s *Session) Close() error {
 	if s.closer == nil {
 		return nil

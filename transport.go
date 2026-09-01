@@ -8,13 +8,13 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/http3"
 	"net"
 	"net/http"
-	"net/netip"
 	"net/url"
 	"time"
+
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 )
 
 // Transport configures how the proxy reaches upstream servers. The zero value is not usable;
@@ -79,16 +79,17 @@ func DefaultTransport() *Transport {
 	}
 }
 
-// withUpstreamOverride lets a transparently redirected request reach the exact address the
-// client had resolved, instead of whatever resolving the authority again would produce.
+// withUpstreamOverride lets a request reach the destination its connection fixed, the address
+// a redirect was headed to or the CONNECT target, instead of whatever resolving the authority
+// again would produce.
 //
 // Connections are still pooled per authority, so two redirects to different members of the
 // same pool may share one upstream connection. Both are legitimate origins for that
 // authority, which makes the sharing harmless.
 func withUpstreamOverride(dial func(context.Context, string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		if ap, ok := ctx.Value(upstreamAddrKey{}).(netip.AddrPort); ok && ap.IsValid() {
-			addr = ap.String()
+		if fixed, ok := ctx.Value(upstreamAddrKey{}).(string); ok && fixed != "" {
+			addr = fixed
 		}
 		return dial(ctx, network, addr)
 	}
@@ -182,11 +183,11 @@ func newHTTP3Transport(t *Transport) (http.RoundTripper, error) {
 		},
 		DisableCompression: true,
 		Dial: func(ctx context.Context, addr string, cfg *tls.Config, qcfg *quic.Config) (*quic.Conn, error) {
-			// A transparently redirected request goes back to the address the client had
-			// resolved. The server name stays the one in the request, so the certificate is
-			// still checked against the authority the client asked for.
-			if ap, ok := ctx.Value(upstreamAddrKey{}).(netip.AddrPort); ok && ap.IsValid() {
-				addr = ap.String()
+			// The request goes where its connection fixed. The server name stays the one in
+			// the request, so the certificate is still checked against the authority the
+			// client asked for.
+			if fixed, ok := ctx.Value(upstreamAddrKey{}).(string); ok && fixed != "" {
+				addr = fixed
 			}
 			udpAddr, err := net.ResolveUDPAddr("udp", addr)
 			if err != nil {

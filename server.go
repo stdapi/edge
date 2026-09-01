@@ -24,6 +24,8 @@ import (
 	"time"
 
 	"github.com/fox-toolkit/edge/internal/stringsutil"
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 )
 
 type sessionKey struct{}
@@ -56,9 +58,10 @@ type server struct {
 	p   *Proxy
 	fwd *forwarder
 
-	// h1 serves the explicit proxy port; mitm serves the connections the proxy terminated
-	// itself, which speak origin semantics rather than proxy semantics.
+	// h1 and h3 serve the explicit proxy port, over TCP and over QUIC. mitm serves the
+	// connections the proxy terminated itself, which speak origin semantics.
 	h1   *http.Server
+	h3   *http3.Server
 	mitm *http.Server
 
 	listeners map[*net.Listener]struct{}
@@ -72,7 +75,10 @@ type server struct {
 	// quics tracks the QUIC demultiplexers. Their connections own their sessions under a
 	// separate lock, merged when the sessions are read rather than mirrored here, so no
 	// invariant spans the two locks.
-	quics    map[*quicDemux]struct{}
+	quics map[*quicDemux]struct{}
+	// tunnels is the demultiplexer the CONNECT-UDP tunnels feed, brought up on the first
+	// tunnel. It has no socket, so one serves the whole proxy.
+	tunnels  *quicDemux
 	closed   chan struct{}
 	wg       sync.WaitGroup
 	closeOne sync.Once
@@ -132,6 +138,23 @@ func newServer(p *Proxy) (*server, error) {
 				cc.arm(cancel)
 			}
 			return context.WithValue(ctx, sessionKey{}, newSession(ctx, c, Target{}, KindHTTP, HTTP11))
+		},
+	}
+
+	s.h3 = &http3.Server{
+		Handler:         http.HandlerFunc(p.serveProxyRequest),
+		EnableDatagrams: true,
+		MaxHeaderBytes:  p.cfg.server.maxHeaderBytes,
+		IdleTimeout:     p.cfg.server.idleTimeout,
+		Logger:          p.cfg.logger,
+		ConnContext: func(ctx context.Context, c *quic.Conn) context.Context {
+			// The handshake is over by the time a connection is handed here, so the session
+			// has its TLS state from the start.
+			sess := newSession(ctx, nil, Target{}, KindHTTP, HTTP3)
+			sess.remoteAddr, sess.localAddr = c.RemoteAddr(), c.LocalAddr()
+			state := c.ConnectionState().TLS
+			sess.tlsState.Store(&state)
+			return context.WithValue(ctx, sessionKey{}, sess)
 		},
 	}
 
@@ -217,6 +240,54 @@ func (p *Proxy) ServeTLS(ln net.Listener, cert tls.Certificate) error {
 	return p.serveFront(tls.NewListener(cancelListener{ln}, cfg))
 }
 
+// ListenAndServeQUIC listens for UDP on addr and serves as an explicit forward proxy reached
+// over HTTP/3. Like [Proxy.ListenAndServeTLS], the certificate authenticates the proxy itself.
+//
+// A client configured with it sends plain requests with an absolute target, CONNECT for a TCP
+// origin, and CONNECT-UDP (RFC 9298) for a UDP origin, HTTP/3 origins included.
+func (p *Proxy) ListenAndServeQUIC(addr string, cert tls.Certificate) error {
+	pc, err := net.ListenPacket("udp", addr)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = pc.Close() }()
+	return p.ServeQUIC(pc, cert)
+}
+
+// ServeQUIC serves as an explicit forward proxy on the QUIC connections arriving on pc, see
+// [Proxy.ListenAndServeQUIC]. It always returns a non-nil error, [ErrProxyClosed] after
+// [Proxy.Shutdown] or [Proxy.Close].
+func (p *Proxy) ServeQUIC(pc net.PacketConn, cert tls.Certificate) error {
+	if p.srv.closing.Load() {
+		return ErrProxyClosed
+	}
+	tr := &quic.Transport{Conn: pc}
+	ln, err := tr.Listen(http3.ConfigureTLSConfig(&tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS13,
+	}), &quic.Config{
+		MaxIdleTimeout:     p.cfg.server.idleTimeout,
+		EnableDatagrams:    true,
+		MaxIncomingStreams: int64(p.cfg.server.maxConcurrentStreams),
+	})
+	if err != nil {
+		_ = tr.Close()
+		return err
+	}
+	// The server leaves a listener it was handed alone, so both are closed here once it is
+	// done with them.
+	defer func() {
+		_ = ln.Close()
+		_ = tr.Close()
+	}()
+
+	err = p.srv.h3.ServeListener(ln)
+	if errors.Is(err, http.ErrServerClosed) {
+		return ErrProxyClosed
+	}
+	return err
+}
+
 // Shutdown stops accepting new connections, then waits for the requests in flight to finish.
 // The servers drain together: idle HTTP/1.1 connections are closed, HTTP/2 and HTTP/3
 // connections are told with a GOAWAY, and every request already started runs to completion.
@@ -240,12 +311,13 @@ func (p *Proxy) Shutdown(ctx context.Context) error {
 	// The planes drain together. An intercepted connection carried on a CONNECT stream of
 	// the front server only ends once the mitm server drains it, so draining one server
 	// after the other would hold the first open until the deadline.
-	errs := make([]error, 2+len(demuxes))
+	errs := make([]error, 3+len(demuxes))
 	var drains sync.WaitGroup
 	drains.Go(func() { errs[0] = p.srv.h1.Shutdown(ctx) })
-	drains.Go(func() { errs[1] = p.srv.mitm.Shutdown(ctx) })
+	drains.Go(func() { errs[1] = p.srv.h3.Shutdown(ctx) })
+	drains.Go(func() { errs[2] = p.srv.mitm.Shutdown(ctx) })
 	for i, d := range demuxes {
-		drains.Go(func() { errs[2+i] = d.shutdown(ctx) })
+		drains.Go(func() { errs[3+i] = d.shutdown(ctx) })
 	}
 
 	// Each drain bounds itself by ctx, but the cut only closes sockets and no close can
@@ -287,18 +359,20 @@ func (p *Proxy) Shutdown(ctx context.Context) error {
 // Close stops the proxy at once, dropping every connection including the traffic in flight.
 func (p *Proxy) Close() error {
 	p.srv.beginClose()
-	err := errors.Join(p.srv.closeListeners(), p.srv.h1.Close(), p.srv.mitm.Close())
+	err := errors.Join(p.srv.closeListeners(), p.srv.h1.Close(), p.srv.h3.Close(), p.srv.mitm.Close())
 	p.srv.closeActive()
 	p.srv.fwd.close()
 	return err
 }
 
 // Sessions returns an iterator over a point-in-time snapshot of the connections the proxy is
-// serving. Each [Session] is one client connection, a CONNECT tunnel, a redirected TLS or
-// QUIC connection, or a datagram flow, and covers every request or stream multiplexed on it.
-// A protocol upgrade is reported as a session of its own, under the authority its request
-// was routed on. Connections addressed to the proxy itself are not reported, and neither is
-// a redirected plaintext connection decided on the Host header of each request.
+// serving. Each [Session] is one client connection, a connection opened by CONNECT, a
+// redirected TLS or QUIC connection, or a datagram flow, and covers every request or stream
+// multiplexed on it. A protocol upgrade is reported as a session of its own, under the
+// authority its request was routed on, and so is a CONNECT-UDP tunnel, beside the
+// connections and datagram flows inside it. Connections addressed to the proxy itself are
+// not reported, and neither is a redirected plaintext connection decided on the Host header
+// of each request.
 //
 // Deleting an entry does not close the connections already open. Use Sessions with
 // [Session.Close] to end them.
@@ -357,12 +431,15 @@ func (p *Proxy) serveProxyRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.Method == http.MethodConnect {
-		if isExtendedConnect(r) {
+		switch extendedConnectProtocol(r) {
+		case "":
+			p.serveConnect(w, r, identity)
+		case "connect-udp":
+			p.serveConnectUDP(w, r, identity)
+		default:
 			http.Error(w, "edge: extended CONNECT is not served, WebSocket goes over HTTP/1.1",
 				http.StatusNotImplemented)
-			return
 		}
-		p.serveConnect(w, r, identity)
 		return
 	}
 
@@ -494,6 +571,27 @@ func (s *server) tryTrackDemux(d *quicDemux) bool {
 	s.active[d] = struct{}{}
 	s.quics[d] = struct{}{}
 	return true
+}
+
+// tunnelDemux returns the demultiplexer the tunnels feed, brought up on first use inside the
+// closing critical section. It has no shutdown token, since the drain or the cut at the
+// deadline closes it synchronously.
+func (s *server) tunnelDemux() (*quicDemux, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closing.Load() {
+		return nil, ErrProxyClosed
+	}
+	if s.tunnels == nil {
+		d, err := newQUICDemux(s.p, newTunnelPacketConn())
+		if err != nil {
+			return nil, err
+		}
+		s.active[d] = struct{}{}
+		s.quics[d] = struct{}{}
+		s.tunnels = d
+	}
+	return s.tunnels, nil
 }
 
 func (s *server) untrackDemux(d *quicDemux) {

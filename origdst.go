@@ -29,7 +29,7 @@ type OriginalDestination interface {
 }
 
 // PacketOriginalDestination is a packet connection that reports where the datagram it last
-// returned was headed. [TransparentPacketConn] returns one, and [Proxy.ServeQUIC] asks a
+// returned was headed. [TransparentPacketConn] returns one, and [Proxy.ServeTransparentUDP] asks a
 // connection that implements it.
 type PacketOriginalDestination interface {
 	net.PacketConn
@@ -113,7 +113,7 @@ func divertedOrigin(local, listener netip.AddrPort) (netip.AddrPort, bool) {
 func (c transparentConn) CloseWrite() error { return closeWrite(c.Conn) }
 
 // TransparentPacketConn returns pc with the socket options a redirected datagram needs, so
-// [Proxy.ServeQUIC] can place each datagram by the address it was headed to. A Linux
+// [Proxy.ServeTransparentUDP] can place each datagram by the address it was headed to. A Linux
 // redirect does not preserve that address, so there connections are placed by their server
 // name and [Session.Upstream] reports nothing.
 //

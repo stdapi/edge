@@ -245,11 +245,26 @@ func bodyAllowed(method string, status int) bool {
 	return true
 }
 
-// isExtendedConnect reports whether the request is an RFC 8441 CONNECT, which carries a
-// :protocol pseudo header. Go's HTTP/2 server advertises the setting and surfaces the pseudo
-// header as an ordinary one.
+// isExtendedConnect reports whether the request is an RFC 8441 or RFC 9220 CONNECT, one
+// carrying a :protocol pseudo header.
 func isExtendedConnect(r *http.Request) bool {
-	return r != nil && r.Method == http.MethodConnect && r.Header.Get(":protocol") != ""
+	return extendedConnectProtocol(r) != ""
+}
+
+// extendedConnectProtocol returns the :protocol of an extended CONNECT, or an empty string
+// for a plain one. Go's HTTP/2 server surfaces the pseudo header as an ordinary one, and
+// quic-go's HTTP/3 server puts it where the version normally is.
+func extendedConnectProtocol(r *http.Request) string {
+	if r == nil || r.Method != http.MethodConnect {
+		return ""
+	}
+	if v := r.Header.Get(":protocol"); v != "" {
+		return v
+	}
+	if r.ProtoMajor == 3 && !strings.HasPrefix(r.Proto, "HTTP/") {
+		return r.Proto
+	}
+	return ""
 }
 
 func isClientGone(err error) bool {

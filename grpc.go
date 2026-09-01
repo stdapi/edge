@@ -14,7 +14,14 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
+
+// errCallRefused ends a call whose method no entry matches any more. The message that
+// arrived is refused before it is delivered, and the client is answered with Unavailable.
+var errCallRefused = errors.New("edge: no entry matches this call any more")
+
+const callRefusedMessage = "no entry matches this call any more"
 
 // maxGRPCMessage bounds one message the proxy will buffer to hand a handler. The gRPC
 // protocol puts a 4 byte length on the wire, so a peer can announce 4 GiB.
@@ -82,7 +89,8 @@ type MessageReader struct {
 }
 
 // ReadMessage returns the next message and blocks until one arrives. It returns an error once
-// no message will arrive.
+// no message will arrive, and once no entry matches the call any more, in which case the
+// message that arrived is refused and the call is answered with [Unavailable].
 func (r *MessageReader) ReadMessage() (*MessageCtx, error) { return r.read() }
 
 // MergeMessages returns a reader over the messages of a and b. When one of them ends with
@@ -132,12 +140,14 @@ func (m *MessageCtx) Reply(b []byte) error {
 // Drop discards the message. It is equivalent to returning without sending.
 func (m *MessageCtx) Drop() error { return nil }
 
-// msgSource reads length-prefixed messages into a reusable buffer. The error is sticky.
+// msgSource reads length-prefixed messages into a reusable buffer, the error sticky. admit,
+// when set, is asked once a header has arrived and refuses the message when it answers false.
 type msgSource struct {
-	r   io.Reader
-	err error
-	msg []byte
-	hdr [5]byte
+	r     io.Reader
+	admit func() bool
+	err   error
+	msg   []byte
+	hdr   [5]byte
 }
 
 func (s *msgSource) next() (payload []byte, compressed bool, err error) {
@@ -154,6 +164,9 @@ func (s *msgSource) step() ([]byte, bool, error) {
 		// truncated header must not be turned into a clean end, since the far side would then
 		// read a complete call that was cut short.
 		return nil, false, err
+	}
+	if s.admit != nil && !s.admit() {
+		return nil, false, errCallRefused
 	}
 	length := binary.BigEndian.Uint32(s.hdr[1:])
 	if length > maxGRPCMessage {
@@ -174,6 +187,10 @@ func (s *msgSource) step() ([]byte, bool, error) {
 //
 // A gRPC entry and an HTTP entry can share a path. A request whose content type is gRPC is
 // served by the gRPC entry, any other request by the HTTP entry.
+//
+// The call keeps its handler, and every message is checked against the entries as they stand
+// when it arrives. Once no entry matches the method any more, the message is refused, the
+// call is answered with [Unavailable] and closed toward the origin.
 //
 // It is not safe for concurrent use and is returned to a pool once the handler returns, so
 // anything kept past that must be copied.
@@ -198,10 +215,113 @@ func (c *GRPCCtx) reset() {
 	c.call = nil
 }
 
+// grpcRoute is what a call needs to ask the tree again whether an entry still matches it. It
+// is copied out of the pooled routing state, since the question outlives the handler.
+type grpcRoute struct {
+	p      *Proxy
+	sess   *Session
+	req    *http.Request
+	scheme string
+	host   string
+	port   string
+}
+
+func (r *grpcRoute) admitted() bool {
+	tree := r.p.getTree()
+	c := tree.pool.Get().(*routeCtx)
+	c.reset(r.sess, r.req, r.scheme, r.host, r.port)
+	_, n := tree.lookup(r.host, routingPath(r.req), c, false)
+	tree.pool.Put(c)
+	return n != nil
+}
+
+// markRefused puts the status of a refused call in the trailers of a response being relayed,
+// where the client reads it once the body ends.
+func markRefused(resp *http.Response) {
+	if resp.Trailer == nil {
+		resp.Trailer = make(http.Header, 2)
+	}
+	resp.Trailer.Set("Grpc-Status", strconv.FormatUint(uint64(Unavailable), 10))
+	resp.Trailer.Set("Grpc-Message", grpcPercentEncode(callRefusedMessage))
+}
+
+// messageGate passes a stream of length-prefixed messages through and asks, once the header
+// of each has arrived, whether the tree still matches the call. Reads never cross a message
+// boundary, so nothing is buffered beyond the five header bytes held back for the question.
+type messageGate struct {
+	r      io.ReadCloser
+	admit  func() bool
+	refuse func()
+	err    error
+	left   int64
+	hdr    [5]byte
+	hdrN   int
+	hdrOut int
+}
+
+func (g *messageGate) Read(b []byte) (int, error) {
+	if g.err != nil {
+		return 0, g.err
+	}
+	if len(b) == 0 {
+		return 0, nil
+	}
+	if g.left > 0 {
+		n, err := g.r.Read(b[:min(int64(len(b)), g.left)])
+		g.left -= int64(n)
+		if g.left == 0 {
+			g.hdrN, g.hdrOut = 0, 0
+		}
+		return n, err
+	}
+	if g.hdrOut < g.hdrN {
+		return g.handOut(b), nil
+	}
+	for g.hdrN < len(g.hdr) {
+		n, err := g.r.Read(g.hdr[g.hdrN:])
+		g.hdrN += n
+		if err != nil {
+			// What was read is handed out first, so the far side sees the same truncated
+			// header a direct read would have produced.
+			g.err = err
+			if g.hdrN > 0 && g.hdrN < len(g.hdr) {
+				n := g.hdrN
+				g.hdrN = 0
+				return copy(b, g.hdr[:n]), nil
+			}
+			if g.hdrN == 0 {
+				return 0, err
+			}
+			break
+		}
+	}
+	if !g.admit() {
+		g.refuse()
+		g.err = errCallRefused
+		return 0, g.err
+	}
+	g.left = int64(binary.BigEndian.Uint32(g.hdr[1:]))
+	return g.handOut(b), nil
+}
+
+// handOut delivers the header bytes not yet delivered, and steps to the next message when
+// the message carried no body.
+func (g *messageGate) handOut(b []byte) int {
+	n := copy(b, g.hdr[g.hdrOut:g.hdrN])
+	g.hdrOut += n
+	if g.hdrOut == len(g.hdr) && g.left == 0 {
+		g.hdrN, g.hdrOut = 0, 0
+	}
+	return n
+}
+
+func (g *messageGate) Close() error { return g.r.Close() }
+
 // grpcCall is the state of a call the handler owns. It is allocated per call, since a pump
 // still blocked in a body read when the handler returns must find a dead call and never the
 // pooled context serving the next one.
 type grpcCall struct {
+	route        grpcRoute
 	ctx          context.Context
 	w            http.ResponseWriter
 	req          *http.Request
@@ -225,6 +345,14 @@ type grpcCall struct {
 	opened       bool
 	outClosed    bool
 	inDone       bool
+	// refused records that a message was refused, so the response ends on a status the
+	// client can read.
+	refused bool
+}
+
+func (c *GRPCCtx) routeOf() grpcRoute {
+	r := c.http.r
+	return grpcRoute{p: r.p, sess: r.sess, req: r.req, scheme: r.scheme, host: r.host, port: r.port}
 }
 
 // get returns the call state, creating it on first use.
@@ -232,7 +360,7 @@ func (c *GRPCCtx) get() *grpcCall {
 	c.initMu.Lock()
 	defer c.initMu.Unlock()
 	if c.call == nil {
-		c.call = &grpcCall{ctx: c.ctx}
+		c.call = &grpcCall{ctx: c.ctx, route: c.routeOf()}
 	}
 	return c.call
 }
@@ -317,19 +445,59 @@ func (c *GRPCCtx) Param(name string) string { return c.http.Param(name) }
 // Proxy returns the [Proxy] serving this call.
 func (c *GRPCCtx) Proxy() *Proxy { return c.http.Proxy() }
 
-// Forward sends the call to the origin and streams the response back unchanged.
+// Forward sends the call to the origin and streams the response back unchanged, every message
+// still checked against the entries as it arrives.
 func (c *GRPCCtx) Forward() error {
 	if c.isOpen() {
 		return errors.New("edge: call already opened")
 	}
+	route := c.routeOf()
+	var refused atomic.Bool
+	refuse := func() { refused.Store(true) }
+
+	req := c.http.r.req
+	if req != nil && req.Body != nil && req.Body != http.NoBody {
+		// The transport keeps reading the body after Forward returns, so the gate is its
+		// own allocation and the request is handed back as it was.
+		body := req.Body
+		req.Body = &messageGate{r: body, admit: route.admitted, refuse: refuse}
+		defer func() { req.Body = body }()
+	}
+
 	resp, err := c.http.Forward()
 	if err != nil {
 		c.err = err
 		return err
 	}
+	if resp.Body != nil && resp.Body != http.NoBody {
+		gate := &messageGate{r: resp.Body, admit: route.admitted}
+		gate.refuse = func() {
+			refused.Store(true)
+			markRefused(resp)
+		}
+		resp.Body = &refusedBody{gate: gate, resp: resp, refused: &refused}
+	}
 	c.setResponse(resp)
 	return nil
 }
+
+// refusedBody is the response body of a forwarded call. A refusal in either direction ends
+// it, and the status the client reads is put in the trailers as it ends.
+type refusedBody struct {
+	gate    *messageGate
+	resp    *http.Response
+	refused *atomic.Bool
+}
+
+func (b *refusedBody) Read(p []byte) (int, error) {
+	n, err := b.gate.Read(p)
+	if err != nil && b.refused.Load() {
+		markRefused(b.resp)
+	}
+	return n, err
+}
+
+func (b *refusedBody) Close() error { return b.gate.Close() }
 
 // Open sends the request headers to the origin and gives the handler the call. The handler
 // then reads [GRPCCtx.Outbound] and [GRPCCtx.Inbound] and decides each message. A forwarded
@@ -460,13 +628,16 @@ func (k *grpcCall) outbound(body io.Reader) *MessageReader {
 		return k.outR
 	}
 
-	src := &msgSource{r: body}
+	src := &msgSource{r: body, admit: k.route.admitted}
 	mc := &MessageCtx{call: k, inbound: false}
 	k.outR = &MessageReader{ctx: k.ctx, read: func() (*MessageCtx, error) {
 		payload, compressed, err := src.next()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				_ = k.closeSend()
+			}
+			if errors.Is(err, errCallRefused) {
+				k.refuse()
 			}
 			return nil, err
 		}
@@ -490,7 +661,7 @@ func (k *grpcCall) inbound() *MessageReader {
 			if err := k.waitResponse(); err != nil {
 				return nil, err
 			}
-			src = &msgSource{r: k.upResp.Body}
+			src = &msgSource{r: k.upResp.Body, admit: k.route.admitted}
 		}
 		k.bodyMu.Lock()
 		payload, compressed, err := src.next()
@@ -499,12 +670,27 @@ func (k *grpcCall) inbound() *MessageReader {
 		}
 		k.bodyMu.Unlock()
 		if err != nil {
+			if errors.Is(err, errCallRefused) {
+				k.refuse()
+			}
 			return nil, err
 		}
 		mc.payload, mc.compressed = payload, compressed
 		return mc, nil
 	}}
 	return k.inR
+}
+
+func (k *grpcCall) refuse() {
+	k.mu.Lock()
+	k.refused = true
+	k.mu.Unlock()
+}
+
+func (k *grpcCall) isRefused() bool {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	return k.refused
 }
 
 // waitResponse blocks until the origin answered the open call, and returns the error when it
@@ -562,6 +748,9 @@ func (k *grpcCall) serveResponse() {
 
 	if k.upErr != nil {
 		resp := grpcStatusResponse(statusOf(k.upErr), k.upErr.Error())
+		if k.isRefused() {
+			resp = grpcStatusResponse(Unavailable, callRefusedMessage)
+		}
 		_ = writeResponse(k.w, k.req, resp)
 		// Drain the pipe, so a handler still sending toward the client does not block.
 		_, _ = io.Copy(io.Discard, k.inPr)
@@ -587,6 +776,13 @@ func (k *grpcCall) serveResponse() {
 
 	k.bodyMu.Lock()
 	defer k.bodyMu.Unlock()
+	if k.isRefused() {
+		// The origin's trailers never arrived or no longer apply, and the client reads the
+		// refusal instead.
+		dst.Set(http.TrailerPrefix+"Grpc-Status", strconv.FormatUint(uint64(Unavailable), 10))
+		dst.Set(http.TrailerPrefix+"Grpc-Message", grpcPercentEncode(callRefusedMessage))
+		return
+	}
 	if !k.inDone {
 		return
 	}
