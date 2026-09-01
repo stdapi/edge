@@ -90,8 +90,8 @@ type grpcConfig struct {
 // and returning without either drops it from the stream.
 //
 // The two directions run on their own goroutines, so on a bidirectional call fn is called from
-// both at once. The answering direction also runs while the response is written, which is after
-// the handler returned.
+// both at once, and either can still be running after the handler returned. fn must not touch
+// the [GRPCCtx] and must read everything it needs from the message alone.
 func OnMessage(fn func(*GRPCMessage) error) GRPCOption {
 	return grpcOptionFunc(func(c *grpcConfig) { c.onMessage = fn })
 }
@@ -133,6 +133,9 @@ func (m *GRPCMessage) Drop() error { return nil }
 //
 // A gRPC entry and an HTTP entry can name the same path. The request tells them apart: a call
 // whose content type says gRPC takes the gRPC entry, anything else takes the HTTP one.
+//
+// It is not safe for concurrent use and must not outlive the handler: it is returned to a pool
+// as soon as the call is served. Read out of it whatever has to outlive it.
 type GRPCCtx struct {
 	http *HTTPCtx
 	ctx  context.Context

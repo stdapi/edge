@@ -74,6 +74,7 @@ func (t *iTree) allocateContext() *routeCtx {
 		p: t.p,
 	}
 	c.http.r = c
+	c.grpc.http = &c.http
 	return c
 }
 

@@ -94,7 +94,8 @@ func (p *Proxy) serveGRPC(c *routeCtx, w http.ResponseWriter, r *http.Request, s
 		return
 	}
 
-	gc := &GRPCCtx{http: &c.http, ctx: r.Context()}
+	gc := &c.grpc
+	gc.ctx = r.Context()
 	err := runKindHandler(p, sess, func() error { return handler(gc) })
 	if err == nil {
 		var resp *http.Response

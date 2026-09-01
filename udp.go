@@ -31,6 +31,9 @@ type datagramSink interface {
 // The unit here is the datagram, which is what makes loss and reordering expressible: dropping
 // one is something the network does anyway, so a handler may do it too. Every datagram is
 // routed on its own, so removing the entry stops the flow at the next one.
+//
+// A context is not safe for concurrent use and may be reused as soon as the handler
+// returns, so anything kept must be copied.
 type DatagramCtx struct {
 	ctx      context.Context
 	sink     datagramSink
@@ -114,24 +117,23 @@ func (c *DatagramCtx) Send(b []byte, opts ...DatagramOption) error {
 		o.applyDatagram(cfg)
 	}
 	if cfg.delay > 0 {
-		// The copy is what lets the write outlive the handler, whose payload buffer is
-		// reused by the next read.
 		kept := slices.Clone(b)
+		ctx, sink, inbound := c.ctx, c.sink, c.inbound
 		go func() {
-			if sleepCtx(c.ctx, cfg.delay) {
-				_ = c.write(kept)
+			if sleepCtx(ctx, cfg.delay) {
+				_ = writeDatagram(sink, inbound, kept)
 			}
 		}()
 		return nil
 	}
-	return c.write(b)
+	return writeDatagram(c.sink, c.inbound, b)
 }
 
-func (c *DatagramCtx) write(b []byte) error {
-	if c.inbound {
-		return c.sink.toClient(b)
+func writeDatagram(sink datagramSink, inbound bool, b []byte) error {
+	if inbound {
+		return sink.toClient(b)
 	}
-	return c.sink.toOrigin(b)
+	return sink.toOrigin(b)
 }
 
 // Drop discards the datagram. It is what not forwarding already does, spelled out so a

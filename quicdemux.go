@@ -266,6 +266,10 @@ type udpFlow struct {
 	cancel context.CancelFunc
 	target Target
 	key    netip.AddrPort
+	// out and in are the per direction contexts. A single goroutine serves each direction,
+	// so at most one datagram is ever in flight on a context.
+	out DatagramCtx
+	in  DatagramCtx
 	// lastSeenNano is when a datagram last travelled, either way. Both directions write it,
 	// from their own goroutine, so it is read and written atomically.
 	lastSeenNano atomic.Int64
@@ -1019,6 +1023,16 @@ func (d *quicDemux) openUDPFlow(client net.Addr, from netip.AddrPort, origin net
 	}
 	sess.closer = &udpFlowCloser{d: d, flow: from, key: origin}
 	u.sink = &udpSink{d: d, u: u}
+	u.out = DatagramCtx{
+		ctx:    sess.Context(),
+		sink:   u.sink,
+		p:      d.p,
+		sess:   sess,
+		target: target,
+		client: addrPort(client),
+	}
+	u.in = u.out
+	u.in.inbound = true
 	u.touch(time.Now())
 
 	d.mu.Lock()
@@ -1074,6 +1088,11 @@ func (d *quicDemux) serveDatagram(u *udpFlow, payload []byte, inbound bool) {
 	}
 	u.touch(time.Now())
 
+	c, seq := &u.out, &u.outSeq
+	if inbound {
+		c, seq = &u.in, &u.inSeq
+	}
+
 	// Routed on the tree as it stands, per datagram. Nothing is remembered between two of
 	// them: a datagram is its own unit, and what serves it is whatever the tree says now.
 	e, params := d.p.admitWith(u.target, KindUDP)
@@ -1085,25 +1104,11 @@ func (d *quicDemux) serveDatagram(u *udpFlow, payload []byte, inbound bool) {
 		return
 	}
 
-	seq := &u.outSeq
-	if inbound {
-		seq = &u.inSeq
-	}
-
-	c := &DatagramCtx{
-		ctx:      u.sess.Context(),
-		p:        d.p,
-		sess:     u.sess,
-		entry:    e,
-		sink:     u.sink,
-		payload:  payload,
-		params:   params,
-		target:   u.target,
-		identity: u.sess.identity,
-		client:   addrPort(u.client),
-		seq:      seq.Add(1) - 1,
-		inbound:  inbound,
-	}
+	c.entry = e
+	c.payload = payload
+	c.params = params
+	c.identity = u.sess.identity
+	c.seq = seq.Add(1) - 1
 
 	if err := runKindHandler(d.p, u.sess, func() error { return handler(c) }); err != nil {
 		d.p.cfg.logger.Debug("edge: datagram handler",

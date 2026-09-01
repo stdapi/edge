@@ -76,6 +76,9 @@ type routeCtx struct {
 	// http points back at this state, so a handler is handed &c.http and nothing is
 	// allocated to serve a request.
 	http HTTPCtx
+	// grpc borrows the same state through http, a call being a request underneath, so
+	// serving one allocates nothing either.
+	grpc GRPCCtx
 
 	scheme   string
 	host     string
@@ -92,6 +95,9 @@ func (c *routeCtx) reset(sess *Session, r *http.Request, scheme, host, port stri
 	c.cachedQueries = nil
 	c.entry = nil
 	c.identity = ""
+	c.grpc.ctx = nil
+	c.grpc.resp = nil
+	c.grpc.err = nil
 	*c.params = (*c.params)[:0]
 }
 
@@ -99,8 +105,8 @@ func (c *routeCtx) resetForAdmission(sess *Session, scheme, host, port string) {
 	c.reset(sess, nil, scheme, host, port)
 }
 
-// params copies the parameters captured by the last lookup, for a handler that outlives the
-// pooled state the walk used.
+// capturedParams copies the parameters captured by the last lookup, for a handler that
+// outlives the pooled state the walk used.
 func (c *routeCtx) capturedParams() []Param {
 	if c.entry == nil || len(*c.params) == 0 {
 		return nil
