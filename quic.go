@@ -168,7 +168,7 @@ func (c *QUICCtx) dial() (*quic.Conn, error) {
 // context calls it once the handler returns.
 func (c *QUICCtx) close() {
 	if c.dialed != nil {
-		_ = c.dialed.CloseWithError(0, "")
+		_ = closeNoError(c.dialed)
 	}
 	if c.tr != nil {
 		_ = c.tr.Close()
@@ -290,7 +290,7 @@ func closePeer(to *quic.Conn, err error) {
 		_ = to.CloseWithError(appErr.ErrorCode, appErr.ErrorMessage)
 		return
 	}
-	_ = to.CloseWithError(0, "")
+	_ = closeNoError(to)
 }
 
 // QUICStream is one stream of a relayed connection. Its content is opaque: what the peers put

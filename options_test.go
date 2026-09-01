@@ -206,9 +206,6 @@ func TestTarget_String(t *testing.T) {
 	assert.Equal(t, "https://api.test:443", Target{Scheme: "https", Host: "api.test", Port: "443"}.String())
 	assert.Equal(t, "api.test:443", Target{Host: "api.test", Port: "443"}.String())
 	assert.Equal(t, "[::1]:8080", Target{Host: "::1", Port: "8080"}.Authority())
-	assert.True(t, Target{Scheme: "https", Host: "a.test", Port: "443"}.IsDefaultPort())
-	assert.True(t, Target{Scheme: "http", Host: "a.test", Port: "80"}.IsDefaultPort())
-	assert.False(t, Target{Scheme: "https", Host: "a.test", Port: "8443"}.IsDefaultPort())
 }
 
 func TestKind_String(t *testing.T) {

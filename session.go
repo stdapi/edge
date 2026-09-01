@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -103,11 +104,6 @@ func (t Target) normalized() Target {
 	return t
 }
 
-// IsDefaultPort reports whether the port is the default for the scheme.
-func (t Target) IsDefaultPort() bool {
-	return (t.Scheme == "https" && t.Port == "443") || (t.Scheme == "http" && t.Port == "80")
-}
-
 var sessionSeq atomic.Uint64
 
 // Session is a client connection handled by the proxy. Every unit carried on that connection
@@ -141,11 +137,13 @@ type Session struct {
 	// upstream is the address a transparently redirected connection was headed to. It is
 	// preferred over resolving the authority again, which may not even resolve outside the
 	// client's own network.
-	upstream  netip.AddrPort
-	identity  string
-	alpn      string
-	id        uint64
-	closeOnce sync.Once
+	upstream netip.AddrPort
+	identity string
+	// servableAs holds the kinds the traffic allows, most specific first, and stays empty
+	// where only the decided kind was ever possible.
+	servableAs []Kind
+	id         uint64
+	closeOnce  sync.Once
 	// proto is the protocol of the connection. The front listener builds its session from
 	// ConnContext, before the protocol is known, so unlike every other field it is written
 	// once a request has been read, from a goroutine serving one of them.
@@ -243,13 +241,46 @@ func (s *Session) Upstream() netip.AddrPort { return s.upstream }
 // it, its traffic having been redirected by the network.
 func (s *Session) Transparent() bool { return s.transparent }
 
-// Kind returns the kind of traffic this connection was admitted as. The traffic itself fixes
-// it, from the negotiated ALPN or from what the first bytes are, never the tree.
+// Kind returns the kind serving this connection. The proxy picks the most specific of
+// [Session.ServableAs] admitted by an entry when the connection arrives, and keeps it for
+// the life of the connection.
 func (s *Session) Kind() Kind { return s.kind }
 
+// ServableAs returns the kinds that can serve this connection, from the most specific to the
+// least. The negotiated ALPN or the first bytes fix the list when the connection arrives,
+// and [Session.Kind] is always one of them. For example, an h3 connection reports KindHTTP
+// then KindQUIC even when only a QUIC entry admits it.
+//
+// Use ServableAs with [Proxy.Admits] to close the connections that a newly added entry would
+// serve at a more specific kind, so the clients reconnect onto it.
+//
+//	for s := range p.Sessions() {
+//		for _, kind := range s.ServableAs() {
+//			if kind == s.Kind() {
+//				break
+//			}
+//			if p.Admits(s.Target(), kind) {
+//				s.Close()
+//				break
+//			}
+//		}
+//	}
+func (s *Session) ServableAs() []Kind {
+	if len(s.servableAs) == 0 {
+		return []Kind{s.kind}
+	}
+	return slices.Clone(s.servableAs)
+}
+
 // ALPN returns the application protocol negotiated with the client, or an empty string when
-// the connection carries no TLS or the client offered none.
-func (s *Session) ALPN() string { return s.alpn }
+// the connection carries no TLS or the client offered none. The value appears once the
+// handshake completes.
+func (s *Session) ALPN() string {
+	if state := s.TLS(); state != nil {
+		return state.NegotiatedProtocol
+	}
+	return ""
+}
 
 // Close ends the connection immediately, without draining it: it is dropped along with the
 // units in flight on it. Closing a connection that already ended is a no-op.

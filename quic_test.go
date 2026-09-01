@@ -18,6 +18,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -210,6 +211,101 @@ func TestQUIC_RejectDropsTheConnection(t *testing.T) {
 		&quic.Config{HandshakeIdleTimeout: 2 * time.Second},
 	)
 	require.Error(t, err, "a rejected authority must never complete a handshake")
+}
+
+// The application error space belongs to the protocol a connection negotiated, so a close
+// with nothing to report says H3_NO_ERROR where h3 was negotiated and 0 everywhere else,
+// KindQUIC either way.
+func TestQUIC_CloseCarriesTheProtocolsNoErrorCode(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		alpn       string
+		code       quic.ApplicationErrorCode
+		servableAs []Kind
+	}{
+		{name: "h3 served stream by stream", alpn: "h3", code: h3NoError, servableAs: []Kind{KindHTTP, KindQUIC}},
+		{name: "doq", alpn: "doq", code: 0, servableAs: []Kind{KindQUIC}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			proxyCA, err := GenerateCA()
+			require.NoError(t, err)
+			p, err := New(WithCA(proxyCA))
+			require.NoError(t, err)
+			p.MustAdd[QUIC](h3Authority, func(c *QUICCtx) error {
+				<-c.Context().Done()
+				return nil
+			})
+
+			proxyAddr := startQUIC(t, p)
+
+			pc, err := net.ListenUDP("udp", nil)
+			require.NoError(t, err)
+			defer func() { _ = pc.Close() }()
+			conn, err := quic.Dial(t.Context(), pc, net.UDPAddrFromAddrPort(proxyAddr),
+				&tls.Config{ServerName: h3Authority, RootCAs: poolOf(proxyCA), NextProtos: []string{tc.alpn}, MinVersion: tls.VersionTLS13},
+				&quic.Config{MaxIdleTimeout: 10 * time.Second, HandshakeIdleTimeout: 3 * time.Second},
+			)
+			require.NoError(t, err)
+			defer func() { _ = conn.CloseWithError(0, "") }()
+
+			sess := waitForSessions(t, p, 1)[0]
+			require.Equal(t, KindQUIC, sess.Kind())
+			assert.Equal(t, tc.servableAs, sess.ServableAs())
+			require.NoError(t, sess.Close())
+
+			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+			defer cancel()
+			_, err = conn.AcceptStream(ctx)
+			var appErr *quic.ApplicationError
+			require.ErrorAs(t, err, &appErr, "the close must reach the client as an application close")
+			assert.True(t, appErr.Remote)
+			assert.Equal(t, tc.code, appErr.ErrorCode)
+		})
+	}
+}
+
+// A QUIC session is listed while its handshake still runs, so a handshake fact written to a
+// plain field after publication races this loop under the race detector.
+func TestQUIC_SessionALPNDuringHandshake(t *testing.T) {
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(proxyCA))
+	require.NoError(t, err)
+	p.MustAdd[QUIC](h3Authority, func(c *QUICCtx) error {
+		<-c.Context().Done()
+		return nil
+	})
+	proxyAddr := startQUIC(t, p)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	defer wg.Wait()
+	defer close(stop)
+	wg.Go(func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			for s := range p.Sessions() {
+				_ = s.ALPN()
+			}
+			runtime.Gosched()
+		}
+	})
+
+	for range 5 {
+		pc, err := net.ListenUDP("udp", nil)
+		require.NoError(t, err)
+		conn, err := quic.Dial(t.Context(), pc, net.UDPAddrFromAddrPort(proxyAddr),
+			&tls.Config{ServerName: h3Authority, RootCAs: poolOf(proxyCA), NextProtos: []string{"doq"}, MinVersion: tls.VersionTLS13},
+			&quic.Config{MaxIdleTimeout: 5 * time.Second, HandshakeIdleTimeout: 3 * time.Second},
+		)
+		require.NoError(t, err)
+		_ = conn.CloseWithError(0, "")
+		_ = pc.Close()
+	}
 }
 
 // dialQUICTo returns an HTTP/3 transport reaching addr whatever the URL says, so a test can

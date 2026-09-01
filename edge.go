@@ -196,6 +196,10 @@ func (p *Proxy) MustAdd[H Handler](pattern string, handler H, opts ...EntryOptio
 // Registering an entry admits its authority for the traffic its kind rides on, and nothing
 // else. An authority no entry names is refused, and so is a unit no entry matches.
 //
+// The entry takes effect on the next unit routed, so a connection already open keeps the
+// kind it was decided as. See [Session.ServableAs] to close the connections a new entry
+// would serve at a more specific kind.
+//
 // If an error occurs, it returns one of the following:
 //   - [*PatternError]: the pattern syntax is invalid.
 //   - [*EntryConflictError]: it conflicts with an existing entry.

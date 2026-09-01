@@ -53,7 +53,6 @@ func (p *Proxy) terminate(ctx context.Context, conn *peekConn, sess *Session) er
 
 	state := tlsConn.ConnectionState()
 	sess.tlsState.Store(&state)
-	sess.alpn = state.NegotiatedProtocol
 	sess.target.Scheme = "https"
 	// The server name the client asked for is a better identity than the CONNECT authority,
 	// which an explicit proxy client may write as an address. A transparent target already
@@ -76,6 +75,7 @@ func (p *Proxy) terminate(ctx context.Context, conn *peekConn, sess *Session) er
 // serveCandidates serves the connection at the finest granularity its authority admits, and
 // closes it when none is admitted.
 func (p *Proxy) serveCandidates(ctx context.Context, conn net.Conn, sess *Session, candidates []Kind, state *tls.ConnectionState) error {
+	sess.servableAs = candidates
 	for _, kind := range candidates {
 		e, params := p.admitWith(sess.target, kind)
 		if e == nil {
@@ -116,17 +116,16 @@ func (p *Proxy) serveTerminatedStream(ctx context.Context, conn net.Conn, sess *
 	state *tls.ConnectionState, e *entry, params []Param,
 ) error {
 	sess.closer = conn
-	if !p.srv.admitSession(sess) {
-		return ErrConnectionRejected
-	}
-	defer p.srv.trackSession(sess, false)
-
 	if sess.remoteAddr == nil {
 		sess.remoteAddr = conn.RemoteAddr()
 	}
 	if sess.localAddr == nil {
 		sess.localAddr = conn.LocalAddr()
 	}
+	if !p.srv.admitSession(sess) {
+		return ErrConnectionRejected
+	}
+	defer p.srv.trackSession(sess, false)
 
 	c := &TCPCtx{
 		ctx:      ctx,

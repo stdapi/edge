@@ -105,7 +105,7 @@ func BenchmarkLookupDeepTree(b *testing.B) {
 	}
 }
 
-func BenchmarkActionFor(b *testing.B) {
+func BenchmarkAdmits(b *testing.B) {
 	cases := []struct {
 		name        string
 		authorities []string

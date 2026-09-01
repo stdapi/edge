@@ -115,6 +115,50 @@ func TestSession_SweepAfterDeleteStream(t *testing.T) {
 	require.Error(t, err)
 }
 
+// Registering a more specific entry never moves a connection already open. ServableAs records
+// what the traffic allows, so the sweep can find the connections such an entry would serve
+// and end them.
+func TestSession_ServableAsSweepsRefinableStream(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p := testProxyWithCA(t, ca)
+	client, originURL, _ := streamedOrigin(t, p, ca)
+
+	resp, gerr := client.Get(originURL.String())
+	require.NoError(t, gerr)
+	_, _ = io.Copy(io.Discard, resp.Body)
+	require.NoError(t, resp.Body.Close())
+
+	sess := waitForSessions(t, p, 1)[0]
+	require.Equal(t, KindTCP, sess.Kind())
+	assert.Equal(t, []Kind{KindHTTP, KindTCP}, sess.ServableAs(),
+		"the traffic said HTTP, the tree had no entry for it")
+
+	sweep := func() int {
+		closed := 0
+		for s := range p.Sessions() {
+			for _, kind := range s.ServableAs() {
+				if kind == s.Kind() {
+					break
+				}
+				if p.Admits(s.Target(), kind) {
+					_ = s.Close()
+					closed++
+					break
+				}
+			}
+		}
+		return closed
+	}
+	assert.Zero(t, sweep(), "nothing finer is admitted yet")
+
+	p.MustAdd(originHost(originURL)+"/*{rest}", func(c *HTTPCtx) (*http.Response, error) {
+		return c.Forward()
+	})
+	assert.Equal(t, 1, sweep(), "an HTTP entry now serves what this connection carries")
+	waitForSessions(t, p, 0)
+}
+
 func TestSession_InterceptedIsListedAndClosed(t *testing.T) {
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprint(w, "origin")

@@ -306,6 +306,17 @@ func (d *quicDemux) closeIntercept(it *quicIntercept) {
 // nothing to report.
 const h3NoError quic.ApplicationErrorCode = 0x100
 
+// closeNoError closes qc with the no-error code of the protocol it negotiated, since the
+// application error space belongs to that protocol. An h3 connection served stream by stream
+// still gets H3_NO_ERROR.
+func closeNoError(qc *quic.Conn) error {
+	var code quic.ApplicationErrorCode
+	if qc.ConnectionState().TLS.NegotiatedProtocol == "h3" {
+		code = h3NoError
+	}
+	return qc.CloseWithError(code, "")
+}
+
 var (
 	errNoReplyDestination = errors.New("no destination to source the replies from")
 	errInterceptsBusy     = errors.New("every terminating stack has live connections")
@@ -349,7 +360,7 @@ func (c *quicConnCloser) Close() error {
 		return nil
 	}
 	// Outside the lock, quic-go writes a CONNECTION_CLOSE from here.
-	return qc.CloseWithError(h3NoError, "")
+	return closeNoError(qc)
 }
 
 // udpFlowCloser ends one datagram flow. The flow is the whole of what its session covers, so
@@ -601,14 +612,14 @@ func (d *quicDemux) serveRawQUIC(qc *quic.Conn, sess *Session) {
 	}
 	d.mu.Unlock()
 	if draining {
-		_ = qc.CloseWithError(h3NoError, "")
+		_ = closeNoError(qc)
 		return
 	}
 	defer func() {
 		d.mu.Lock()
 		delete(d.raw, qc)
 		d.mu.Unlock()
-		_ = qc.CloseWithError(h3NoError, "")
+		_ = closeNoError(qc)
 	}()
 
 	e, params := d.p.admitWith(sess.target, KindQUIC)
@@ -689,7 +700,7 @@ func (d *quicDemux) endTerminated(from netip.AddrPort, odcid string) {
 func (d *quicDemux) accept(c *quic.Conn) *Session {
 	carrier, _ := c.Context().Value(quicCarrierKey{}).(*quicCarrier)
 	if carrier == nil {
-		_ = c.CloseWithError(h3NoError, "")
+		_ = closeNoError(c)
 		return nil
 	}
 
@@ -704,7 +715,7 @@ func (d *quicDemux) accept(c *quic.Conn) *Session {
 	}
 	if conn == nil || conn.doomed || conn.state != connTerminated {
 		d.mu.Unlock()
-		_ = c.CloseWithError(h3NoError, "")
+		_ = closeNoError(c)
 		return nil
 	}
 	conn.qc = c
@@ -716,7 +727,6 @@ func (d *quicDemux) accept(c *quic.Conn) *Session {
 		// its TLS state exists.
 		state := c.ConnectionState().TLS
 		sess.tlsState.Store(&state)
-		sess.alpn = state.NegotiatedProtocol
 		carrier.sess = sess
 	}
 	return sess
@@ -1336,7 +1346,7 @@ func (d *quicDemux) sniff(from netip.AddrPort, conn *quicConn, datagram []byte) 
 		return
 	}
 
-	d.beginTermination(from, client, conn, target, ch, kind, pending)
+	d.beginTermination(from, client, conn, target, ch, kind, candidates, pending)
 }
 
 // targetFor works out where a QUIC connection was headed, from the server name it offered and,
@@ -1371,7 +1381,7 @@ func (d *quicDemux) originalDst(client net.Addr) netip.AddrPort {
 }
 
 func (d *quicDemux) beginTermination(from netip.AddrPort, client net.Addr, conn *quicConn,
-	target Target, hello *ClientHello, kind Kind, pending [][]byte,
+	target Target, hello *ClientHello, kind Kind, candidates []Kind, pending [][]byte,
 ) {
 	if err := d.startTermination(); err != nil {
 		if !errors.Is(err, ErrProxyClosed) {
@@ -1388,6 +1398,7 @@ func (d *quicDemux) beginTermination(from netip.AddrPort, client net.Addr, conn 
 	sess.transparent = true
 	sess.upstream = conn.origin
 	sess.clientHello = hello
+	sess.servableAs = candidates
 	sess.closer = &quicConnCloser{d: d, flow: from, odcid: conn.odcid}
 
 	d.mu.Lock()
@@ -1645,7 +1656,7 @@ func (d *quicDemux) close() {
 		// http3.Server.Close leaves the connections handed to ServeQUICConn alone, and a raw
 		// one is not its at all, so both kinds are ended here.
 		for _, qc := range raw {
-			_ = qc.CloseWithError(h3NoError, "")
+			_ = closeNoError(qc)
 		}
 		if h3 != nil {
 			_ = h3.Close()

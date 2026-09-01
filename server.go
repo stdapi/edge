@@ -45,7 +45,7 @@ type server struct {
 	// it as soon as it is accepted, before anything has decided it.
 	active map[io.Closer]struct{}
 	// sessions is what [Proxy.Sessions] reports. A session enters it only once its target is
-	// resolved, so a caller never sees one it cannot pass to [Proxy.ActionFor].
+	// resolved, so a caller never sees one it cannot pass to [Proxy.Admits].
 	sessions map[*Session]struct{}
 	// quics tracks the QUIC demultiplexers. Their connections own their sessions under a
 	// separate lock, merged when the sessions are read rather than mirrored here, so no
@@ -382,27 +382,22 @@ func (s *server) admitSession(sess *Session) bool {
 	return false
 }
 
-// Sessions returns an iterator over a point-in-time snapshot of the connections the proxy
-// decides on. A protocol upgrade is reported on its own, under the authority its request was
-// routed on.
+// Sessions returns an iterator over a point-in-time snapshot of the connections the proxy is
+// serving. Each [Session] is one client connection, a CONNECT tunnel, a redirected TLS or
+// QUIC connection, or a datagram flow, and covers every request or stream multiplexed on it.
+// A protocol upgrade is reported as a session of its own, under the authority its request
+// was routed on. Connections addressed to the proxy itself and redirected plaintext
+// connections are not reported, the latter being decided on the Host header of each request.
 //
-// Removing an entry governs the next unit on the connections already open, so this is not how
-// a change is applied. It is how a connection is ended on its own terms, and how one the tree
-// no longer admits at all is swept.
+// Deleting an entry refuses new traffic but does not close the connections already open. Use
+// Sessions with [Session.Close] to end them.
 //
 //	p.Delete[edge.TCP]("example.com")
 //	for s := range p.Sessions() {
-//		if p.ActionFor(s.Target()) == Reject {
+//		if !p.Admits(s.Target(), s.Kind()) {
 //			s.Close()
 //		}
 //	}
-//
-// A connection opening while the loop runs does not slip through, it refuses itself when the
-// tree no longer accepts it, though it may still be open when the loop returns.
-//
-// Two kinds are never reported. A connection a client opens to the proxy itself addresses the
-// proxy rather than an authority, and a redirected plaintext connection is decided on the Host
-// header of each request.
 func (p *Proxy) Sessions() iter.Seq[*Session] {
 	p.srv.mu.Lock()
 	out := make([]*Session, 0, len(p.srv.sessions))

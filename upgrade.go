@@ -270,7 +270,6 @@ func pipeSession(c *routeCtx, r *http.Request, kind Kind, pipe io.Closer) *Sessi
 	sess.clientHello = front.clientHello
 	sess.upstream = front.upstream
 	sess.transparent = front.transparent
-	sess.alpn = front.alpn
 	if state := front.tlsState.Load(); state != nil {
 		sess.tlsState.Store(state)
 	} else {
