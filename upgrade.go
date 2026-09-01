@@ -186,6 +186,7 @@ func (p *Proxy) serveUpgradedStream(c *routeCtx, w http.ResponseWriter, r *http.
 	// dial done is what makes Relay carry this one instead of opening another.
 	sc.dialed = pipeConn{ReadWriteCloser: backend}
 	sc.dialOnce.Do(func() {})
+	defer sc.close()
 
 	return runKindHandler(p, upSess, func() error { return handler(sc) })
 }

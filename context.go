@@ -76,14 +76,14 @@ type routeCtx struct {
 	// http points back at this state, so a handler is handed &c.http and nothing is
 	// allocated to serve a request.
 	http HTTPCtx
-	// grpc borrows the same state through http, a call being a request underneath, so
-	// serving one allocates nothing either.
-	grpc GRPCCtx
 
 	scheme   string
 	host     string
 	port     string
 	identity string
+	// grpc borrows the same state through http, a call being a request underneath, so
+	// serving one allocates nothing either.
+	grpc GRPCCtx
 }
 
 func (c *routeCtx) reset(sess *Session, r *http.Request, scheme, host, port string) {
@@ -95,9 +95,7 @@ func (c *routeCtx) reset(sess *Session, r *http.Request, scheme, host, port stri
 	c.cachedQueries = nil
 	c.entry = nil
 	c.identity = ""
-	c.grpc.ctx = nil
-	c.grpc.resp = nil
-	c.grpc.err = nil
+	c.grpc.reset()
 	*c.params = (*c.params)[:0]
 }
 

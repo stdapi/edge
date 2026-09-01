@@ -12,12 +12,20 @@ import (
 	"time"
 )
 
-// DatagramOption shapes what forwarding one datagram does.
+// DatagramOption configures how a datagram is sent.
 type DatagramOption interface{ applyDatagram(*datagramConfig) }
 
 type datagramConfig struct {
 	delay time.Duration
 }
+
+// Delay holds the datagram for d before it is sent. The payload is copied, so the handler may
+// return before the send. Datagrams delayed by different amounts may be reordered.
+func Delay(d time.Duration) DatagramOption { return delayOption(d) }
+
+type delayOption time.Duration
+
+func (d delayOption) applyDatagram(c *datagramConfig) { c.delay = time.Duration(d) }
 
 // datagramSink is what a datagram context writes through. The demultiplexer owning the flow
 // implements it.
@@ -26,14 +34,11 @@ type datagramSink interface {
 	toClient(b []byte) error
 }
 
-// DatagramCtx is one datagram, handed to a [UDP] handler in the direction it was travelling.
+// DatagramCtx is one datagram, handed to a [UDP] handler. A handler receives the datagrams of
+// both directions of a flow, and each datagram is routed on its own.
 //
-// The unit here is the datagram, which is what makes loss and reordering expressible: dropping
-// one is something the network does anyway, so a handler may do it too. Every datagram is
-// routed on its own, so removing the entry stops the flow at the next one.
-//
-// A context is not safe for concurrent use and may be reused as soon as the handler
-// returns, so anything kept must be copied.
+// A context is not safe for concurrent use and is reused once the handler returns, so
+// anything kept past that must be copied.
 type DatagramCtx struct {
 	ctx      context.Context
 	sink     datagramSink
@@ -52,12 +57,10 @@ type DatagramCtx struct {
 // Context returns a context canceled when the flow ends.
 func (c *DatagramCtx) Context() context.Context { return c.ctx }
 
-// Bytes returns the payload of the datagram. It is only valid until the handler returns, so
-// anything kept must be copied.
+// Bytes returns the payload. It is valid until the handler returns.
 func (c *DatagramCtx) Bytes() []byte { return c.payload }
 
-// Inbound reports whether the datagram is travelling from the origin toward the client. A
-// handler sees both directions of its flow.
+// Inbound reports whether the origin sent the datagram toward the client.
 func (c *DatagramCtx) Inbound() bool { return c.inbound }
 
 // Seq returns the index of this datagram in its flow, counted per direction and starting at
@@ -104,21 +107,30 @@ func (c *DatagramCtx) Param(name string) string {
 // Proxy returns the [Proxy] serving this flow.
 func (c *DatagramCtx) Proxy() *Proxy { return c.p }
 
-// Forward sends the datagram on, unchanged, in the direction it was travelling.
+// Forward sends the datagram unchanged, in its direction.
 func (c *DatagramCtx) Forward(opts ...DatagramOption) error {
 	return c.Send(c.payload, opts...)
 }
 
-// Send forwards b in place of the datagram the handler was given, in the direction it was
-// travelling. A handler that calls neither Send nor Forward drops the datagram.
+// Send sends b in place of the datagram, in its direction. A handler that calls none of
+// Send, Reply and Forward drops the datagram.
 func (c *DatagramCtx) Send(b []byte, opts ...DatagramOption) error {
+	return c.write(c.inbound, b, opts)
+}
+
+// Reply sends b to the peer the datagram came from. The other peer receives nothing.
+func (c *DatagramCtx) Reply(b []byte, opts ...DatagramOption) error {
+	return c.write(!c.inbound, b, opts)
+}
+
+func (c *DatagramCtx) write(inbound bool, b []byte, opts []DatagramOption) error {
 	cfg := &datagramConfig{}
 	for _, o := range opts {
 		o.applyDatagram(cfg)
 	}
 	if cfg.delay > 0 {
 		kept := slices.Clone(b)
-		ctx, sink, inbound := c.ctx, c.sink, c.inbound
+		ctx, sink := c.ctx, c.sink
 		go func() {
 			if sleepCtx(ctx, cfg.delay) {
 				_ = writeDatagram(sink, inbound, kept)
@@ -126,7 +138,7 @@ func (c *DatagramCtx) Send(b []byte, opts ...DatagramOption) error {
 		}()
 		return nil
 	}
-	return writeDatagram(c.sink, c.inbound, b)
+	return writeDatagram(c.sink, inbound, b)
 }
 
 func writeDatagram(sink datagramSink, inbound bool, b []byte) error {
@@ -136,6 +148,5 @@ func writeDatagram(sink datagramSink, inbound bool, b []byte) error {
 	return sink.toOrigin(b)
 }
 
-// Drop discards the datagram. It is what not forwarding already does, spelled out so a
-// handler reads as a decision rather than as a missing branch.
+// Drop discards the datagram. It is equivalent to returning without sending.
 func (c *DatagramCtx) Drop() error { return nil }

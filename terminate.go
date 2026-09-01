@@ -138,11 +138,7 @@ func (p *Proxy) serveTerminatedStream(ctx context.Context, conn net.Conn, sess *
 		upstream: sess.upstream,
 		tlsState: state,
 	}
-	defer func() {
-		if c.dialed != nil {
-			_ = c.dialed.Close()
-		}
-	}()
+	defer c.close()
 
 	handler, _ := e.serve.(TCP)
 	if handler == nil {

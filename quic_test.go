@@ -1031,3 +1031,63 @@ func TestQUICDemux_ShutdownRacesServeQUICStartup(t *testing.T) {
 		}
 	}
 }
+
+// The accept loop replaces relaying blind: a handler sees each stream, reads its first bytes,
+// and Relay carries the rest after what was consumed went over by hand.
+func TestQUIC_AcceptInspectsAndRelaysStreams(t *testing.T) {
+	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
+	require.NoError(t, err)
+	origin := h3Origin(t, originCA)
+
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	tr2 := DefaultTransport()
+	tr2.RootCAs = poolOf(originCA)
+	p, err := New(WithCA(proxyCA), WithTransport(tr2))
+	require.NoError(t, err)
+
+	var streams atomic.Int64
+	p.MustAdd[QUIC](h3Authority, func(c *QUICCtx) error {
+		var wg sync.WaitGroup
+		defer wg.Wait()
+		for {
+			st, aerr := c.Accept()
+			if aerr != nil {
+				return nil
+			}
+			streams.Add(1)
+			wg.Go(func() {
+				buf := make([]byte, 64)
+				n, rerr := st.Reader().Read(buf)
+				if n == 0 && rerr != nil {
+					return
+				}
+				w, _, oerr := st.Open()
+				if oerr != nil {
+					return
+				}
+				if _, werr := w.Write(buf[:n]); werr != nil {
+					return
+				}
+				_ = st.Relay()
+			})
+		}
+	})
+
+	proxyAddr := startQUICRedirected(t, p, origin)
+	tr := dialQUICTo(proxyAddr, poolOf(proxyCA))
+	defer func() { _ = tr.Close() }()
+
+	req, err := http.NewRequest(http.MethodGet,
+		fmt.Sprintf("https://%s:%d/inspected", h3Authority, proxyAddr.Port()), nil)
+	require.NoError(t, err)
+	resp, err := tr.RoundTrip(req)
+	require.NoError(t, err)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Contains(t, string(body), "path=/inspected", "the inspected bytes were not lost")
+	assert.Greater(t, streams.Load(), int64(0), "the handler saw the streams it carried")
+}

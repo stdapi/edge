@@ -47,7 +47,13 @@ func ExampleProxy_Add_stream() {
 		// TLS is already terminated, so the bytes are in the clear and the upstream
 		// handshake mirrors what the client asked for.
 		log.Printf("smtp over %q", c.ALPN())
-		return c.Relay(edge.Throttle(256<<10), edge.Delay(50*time.Millisecond))
+		up, err := c.Dial()
+		if err != nil {
+			return err
+		}
+		// Shaping is a wrapper on one side, so it applies to one direction alone.
+		_, _, err = edge.Relay(c.Client(), edge.Throttled(up, 256<<10))
+		return err
 	})
 
 	fmt.Println(p.Admits(edge.Target{Scheme: "https", Host: "smtp.test", Port: "465"}, edge.KindTCP))
@@ -93,11 +99,21 @@ func ExampleProxy_Add_webSocket() {
 	p := edge.Must(edge.WithCA(ca))
 
 	p.MustAdd("chat.test/ws", func(c *edge.WebSocketCtx) error {
-		// The ping is swallowed rather than relayed, to see how the client's keepalive
-		// reacts.
-		return c.Relay(edge.DropFrame(func(f edge.Frame) bool {
-			return f.Opcode() == edge.OpPing
-		}))
+		src := edge.MergeFrames(c.Outbound(), c.Inbound())
+		for {
+			f, err := src.ReadFrame()
+			if err != nil {
+				return nil
+			}
+			// The ping is swallowed rather than relayed, to see how the client's
+			// keepalive reacts.
+			if !f.Inbound() && f.Opcode() == edge.OpPing {
+				continue
+			}
+			if err := f.Forward(); err != nil {
+				return err
+			}
+		}
 	})
 
 	fmt.Println(p.Len())

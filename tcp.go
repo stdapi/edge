@@ -7,7 +7,6 @@ package edge
 import (
 	"context"
 	"crypto/tls"
-	"errors"
 	"fmt"
 	"iter"
 	"net"
@@ -17,12 +16,10 @@ import (
 	"time"
 )
 
-// TCPCtx is one byte stream, handed to a [TCP] handler in the clear. When the client spoke
-// TLS the proxy terminated it, so what the handler reads and writes is the plaintext, and
-// what [TCPCtx.Dial] opens upstream carries the same TLS the client asked for.
-//
-// The unit here is the whole stream. A stream has nothing to drop, and an entry removed while
-// it runs governs the next connection rather than this one.
+// TCPCtx is one byte stream, handed to a [TCP] handler. When the client used TLS, the proxy
+// terminated it, so the handler reads and writes plaintext and [TCPCtx.Dial] opens the
+// upstream connection with the same TLS parameters. An entry removed while the stream is open
+// applies to the next connection.
 type TCPCtx struct {
 	ctx     context.Context
 	conn    net.Conn
@@ -39,6 +36,7 @@ type TCPCtx struct {
 	upstream netip.AddrPort
 	identity string
 	params   []Param
+	extra    []net.Conn
 
 	dialOnce sync.Once
 }
@@ -56,8 +54,8 @@ func (c *TCPCtx) Target() Target { return c.target }
 // string when none did.
 func (c *TCPCtx) Identity() string { return c.identity }
 
-// ALPN returns the application protocol negotiated with the client, or an empty string when
-// the stream carries no TLS or the client offered none.
+// ALPN returns the application protocol negotiated with the client, or an empty string
+// without TLS or when the client offered none.
 func (c *TCPCtx) ALPN() string {
 	if c.tlsState == nil {
 		return ""
@@ -69,8 +67,8 @@ func (c *TCPCtx) ALPN() string {
 // arrived in the clear.
 func (c *TCPCtx) TLS() *tls.ConnectionState { return c.tlsState }
 
-// Client returns the client side of the stream, in the clear. Reading it consumes the bytes,
-// so a handler either drives both sides itself or calls [TCPCtx.Relay].
+// Client returns the client side of the stream, in plaintext. A read consumes the bytes,
+// which are then not relayed.
 func (c *TCPCtx) Client() net.Conn { return c.conn }
 
 // Pattern returns the pattern of the matched entry.
@@ -100,17 +98,11 @@ func (c *TCPCtx) Param(name string) string {
 // Proxy returns the [Proxy] serving this stream.
 func (c *TCPCtx) Proxy() *Proxy { return c.p }
 
-// Dial opens the upstream side of the stream and returns it, opening it once however many
-// times it is called. When the client spoke TLS the connection is wrapped in a handshake
-// carrying the same server name and the same protocol the proxy negotiated with the client.
-//
-// That commits both sides to one protocol before the origin has been asked. A client offering
-// several and an origin speaking only the second connect directly but fail here, because a
-// relay whose two ends speak different protocols carries nothing. The alternative, dialing the
-// origin before answering the client, would let the origin's failures and its latency show
-// through the handshake instead.
-//
-// The caller does not own the returned connection: it is closed when the handler returns.
+// Dial opens the upstream connection and returns it. It dials once, and every later call
+// returns the same connection. When the client used TLS, the upstream handshake uses the same
+// server name and the same application protocol the proxy negotiated with the client, and an
+// origin that rejects that protocol fails the dial. The connection is closed when the handler
+// returns.
 func (c *TCPCtx) Dial() (net.Conn, error) {
 	c.dialOnce.Do(func() { c.dialed, c.dialErr = c.dial() })
 	return c.dialed, c.dialErr
@@ -123,12 +115,32 @@ func (c *TCPCtx) dial() (net.Conn, error) {
 		// resolved, which behind a redirect may be the only one that resolves at all.
 		addr = c.upstream.String()
 	}
+	return c.dialAddr(c.ctx, addr, c.target.Host)
+}
 
+// DialTo opens a connection to addr, given as host:port, with the transport the proxy is
+// configured with and the TLS parameters of [TCPCtx.Dial], the server name taken from addr.
+// Set a dial timeout through ctx. Every call opens a new connection, closed when the handler
+// returns.
+func (c *TCPCtx) DialTo(ctx context.Context, addr string) (net.Conn, error) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, fmt.Errorf("edge: dial %q: %w", addr, err)
+	}
+	conn, err := c.dialAddr(ctx, addr, host)
+	if err != nil {
+		return nil, err
+	}
+	c.extra = append(c.extra, conn)
+	return conn, nil
+}
+
+func (c *TCPCtx) dialAddr(ctx context.Context, addr, serverName string) (net.Conn, error) {
 	dial := c.p.cfg.transport.DialContext
 	if dial == nil {
 		dial = (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext
 	}
-	conn, err := dial(c.ctx, "tcp", addr)
+	conn, err := dial(ctx, "tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", addr, err)
 	}
@@ -138,57 +150,42 @@ func (c *TCPCtx) dial() (net.Conn, error) {
 	}
 
 	cfg := c.p.cfg.transport.upstreamTLSConfig()
-	cfg.ServerName = c.target.Host
+	cfg.ServerName = serverName
 	if c.tlsState.NegotiatedProtocol != "" {
 		cfg.NextProtos = []string{c.tlsState.NegotiatedProtocol}
 	}
 	tc := tls.Client(conn, cfg)
-	if err := tc.HandshakeContext(c.ctx); err != nil {
+	if err := tc.HandshakeContext(ctx); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("tls handshake with %s: %w", addr, err)
 	}
 	return tc, nil
 }
 
-// Relay opens the upstream side and copies bytes both ways until either end is done. It
-// returns when both directions have finished.
+// close releases the connections the handler opened, once the handler has returned.
+func (c *TCPCtx) close() {
+	if c.dialed != nil {
+		_ = c.dialed.Close()
+	}
+	for _, conn := range c.extra {
+		_ = conn.Close()
+	}
+}
+
+// Relay dials the upstream connection and relays the stream in both directions until both
+// have ended. Shaping, byte counts and an idle timeout are available through [Relay],
+// [Relayer], [Throttled] and [Delayed].
 //
-//	return c.Relay(edge.Throttle(256<<10), edge.Delay(50*time.Millisecond))
-func (c *TCPCtx) Relay(opts ...RelayOption) error {
+//	up, err := c.Dial()
+//	if err != nil {
+//		return err
+//	}
+//	_, _, err = edge.Relay(c.Client(), edge.Throttled(up, 256<<10))
+func (c *TCPCtx) Relay() error {
 	upstream, err := c.Dial()
 	if err != nil {
 		return err
 	}
-	cfg := newRelayConfig(opts)
-
-	var (
-		wg      sync.WaitGroup
-		toUp    int64
-		toDown  int64
-		upErr   error
-		downErr error
-	)
-
-	idle := newIdleTracker(cfg.idle, c.conn, upstream)
-	defer idle.stop()
-
-	up := relayWriter{w: upstream, ctx: c.ctx, rate: cfg.rate, delay: cfg.delay}
-	down := relayWriter{w: c.conn, ctx: c.ctx, rate: cfg.rate, delay: cfg.delay}
-
-	wg.Go(func() {
-		toUp, upErr = copyStream(up, c.conn, idle)
-		halfClose(upstream)
-		idle.arm(halfClosedIdleTimeout)
-	})
-	wg.Go(func() {
-		toDown, downErr = copyStream(down, upstream, idle)
-		halfClose(c.conn)
-		idle.arm(halfClosedIdleTimeout)
-	})
-	wg.Wait()
-
-	if cfg.onBytes != nil {
-		cfg.onBytes(toUp, toDown)
-	}
-	return errors.Join(filterCopyErr(upErr), filterCopyErr(downErr))
+	_, _, err = Relay(c.conn, upstream)
+	return err
 }

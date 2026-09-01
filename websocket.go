@@ -60,12 +60,12 @@ func (o Opcode) String() string {
 // 125 payload bytes and forbids fragmenting.
 func (o Opcode) Control() bool { return o&0x8 != 0 }
 
-// closeTooBig is RFC 6455's 1009, what a peer sends when a frame is larger than it will
-// process.
+// closeTooBig is the RFC 6455 status code 1009, sent for a frame larger than the receiver
+// accepts.
 const closeTooBig = 1009
 
-// Frame is one WebSocket frame as it arrived, unmasked. The payload is only valid while the
-// callback that received it runs.
+// Frame is one WebSocket frame, unmasked. The payload is valid until the next read on the
+// reader that returned it.
 type Frame struct {
 	payload []byte
 	opcode  Opcode
@@ -84,14 +84,15 @@ func (f Frame) Fin() bool { return f.fin }
 // meaning to.
 func (f Frame) RSV() uint8 { return f.rsv }
 
-// Payload returns the frame payload, unmasked. It is only valid until the callback returns.
+// Payload returns the unmasked payload. It is valid until the next read on the reader that
+// returned the frame.
 func (f Frame) Payload() []byte { return f.payload }
 
-// Inbound reports whether the frame is travelling from the origin toward the client.
+// Inbound reports whether the origin sent the frame toward the client.
 func (f Frame) Inbound() bool { return f.inbound }
 
 // CloseCode returns the status code of a close frame, or zero when the frame is not a close
-// or carries no code.
+// frame or has no code.
 func (f Frame) CloseCode() uint16 {
 	if f.opcode != OpClose || len(f.payload) < 2 {
 		return 0
@@ -99,68 +100,61 @@ func (f Frame) CloseCode() uint16 {
 	return binary.BigEndian.Uint16(f.payload)
 }
 
-// WebSocketOption shapes what relaying a WebSocket connection does.
-type WebSocketOption interface{ applyWebSocket(*wsConfig) }
-
-type wsOptionFunc func(*wsConfig)
-
-func (f wsOptionFunc) applyWebSocket(c *wsConfig) { f(c) }
-
-type wsConfig struct {
-	drop    func(Frame) bool
-	onFrame func(*FrameCtx) error
+// FrameReader returns frames one at a time, from one direction or from both when built by
+// [MergeFrames]. It is not safe for concurrent use. The frame it returns is valid until the
+// next ReadFrame on the same reader.
+type FrameReader struct {
+	ctx  context.Context
+	read func() (*FrameCtx, error)
 }
 
-// DropFrame swallows every frame fn accepts instead of relaying it. Dropping a Ping is how a
-// client's keepalive is tested; dropping a Close leaves the peers to time out.
-func DropFrame(fn func(Frame) bool) WebSocketOption {
-	return wsOptionFunc(func(c *wsConfig) { c.drop = fn })
+// ReadFrame returns the next frame and blocks until one arrives. It returns an error once no
+// frame will arrive.
+func (r *FrameReader) ReadFrame() (*FrameCtx, error) { return r.read() }
+
+// MergeFrames returns a reader over the frames of a and b. When one of them ends with io.EOF
+// the other is still read, and the merged reader ends with io.EOF once both have ended. Any
+// other error ends it immediately. a and b must not be read elsewhere afterwards.
+func MergeFrames(a, b *FrameReader) *FrameReader {
+	m := &merged[*FrameCtx]{ctx: a.ctx, a: a.read, b: b.read}
+	return &FrameReader{ctx: a.ctx, read: m.read}
 }
 
-// OnFrame runs fn for every frame, in both directions. fn decides what happens to it:
-// [FrameCtx.Forward] relays it, [FrameCtx.Send] relays something else, and returning without
-// either drops it.
-func OnFrame(fn func(*FrameCtx) error) WebSocketOption {
-	return wsOptionFunc(func(c *wsConfig) { c.onFrame = fn })
-}
-
-// FrameCtx is one frame being relayed, and the decision about it.
+// FrameCtx is one frame and the decision about it. A frame reaches the far side only through
+// [FrameCtx.Forward] or [FrameCtx.Send].
 type FrameCtx struct {
-	ctx context.Context
-	w   *wsWriter
+	w    *wsWriter
+	back *wsWriter
 	Frame
 }
 
 // Forward relays the frame unchanged.
 func (f *FrameCtx) Forward() error { return f.w.write(f.Frame) }
 
-// Send relays frame in place of the one the callback was given, in the same direction.
+// Send writes frame in the direction of this one.
 func (f *FrameCtx) Send(frame Frame) error {
 	frame.inbound = f.inbound
 	return f.w.write(frame)
 }
 
-// Inject writes an extra frame in the same direction, on top of forwarding.
-func (f *FrameCtx) Inject(frame Frame) error {
-	frame.inbound = f.inbound
-	return f.w.write(frame)
+// Reply writes frame to the peer this one came from. The other peer receives nothing.
+func (f *FrameCtx) Reply(frame Frame) error {
+	frame.inbound = !f.inbound
+	return f.back.write(frame)
 }
 
-// Drop discards the frame. It is what not forwarding already does, spelled out so a handler
-// reads as a decision rather than as a missing branch.
+// Drop discards the frame. It is equivalent to returning without forwarding.
 func (f *FrameCtx) Drop() error { return nil }
 
-// NewFrame returns a frame carrying payload, marked as completing its message.
+// NewFrame returns a frame with payload and the FIN bit set.
 func NewFrame(op Opcode, payload []byte) Frame {
 	return Frame{opcode: op, payload: payload, fin: true}
 }
 
 // WebSocketCtx is one WebSocket connection, handed to a [WebSocket] handler once the 101 has
-// been exchanged. Past that point the connection is no longer HTTP, so the unit is the frame.
-//
-// The handshake itself is an HTTP request and is routed as one. A connection whose upgrade
-// matches no WebSocket entry is not relayed blind: the request is served by whatever HTTP
-// entry matched it, and with none it is refused.
+// been exchanged. The handshake is routed as an HTTP request. A connection whose upgrade
+// matches no WebSocket entry is served by the HTTP entry that matched, and refused when none
+// did.
 type WebSocketCtx struct {
 	ctx      context.Context
 	client   io.ReadWriteCloser
@@ -170,17 +164,21 @@ type WebSocketCtx struct {
 	entry    *entry
 	req      *http.Request
 	resp     *http.Response
+	wOrigin  *wsWriter
+	wClient  *wsWriter
+	outR     *FrameReader
+	inR      *FrameReader
 	target   Target
 	identity string
 	params   []Param
 	maxFrame int
+	initOnce sync.Once
 }
 
 // Context returns a context canceled when the connection ends.
 func (c *WebSocketCtx) Context() context.Context { return c.ctx }
 
-// Session returns the session of this connection. An upgrade gets a session of its own, since
-// it routes on the request that established it rather than on the connection's authority.
+// Session returns the session of this connection. An upgrade has a session of its own.
 func (c *WebSocketCtx) Session() *Session { return c.sess }
 
 // Target returns the authority the connection was established with.
@@ -231,27 +229,61 @@ func (c *WebSocketCtx) Param(name string) string {
 // Proxy returns the [Proxy] serving this connection.
 func (c *WebSocketCtx) Proxy() *Proxy { return c.p }
 
-// Relay carries the frames both ways until either peer closes. Without options every frame is
-// forwarded unchanged, which is what an origin would have seen without the proxy.
-func (c *WebSocketCtx) Relay(opts ...WebSocketOption) error {
-	cfg := &wsConfig{}
-	for _, o := range opts {
-		o.applyWebSocket(cfg)
-	}
+// Outbound returns the reader of the frames sent by the client toward the origin.
+func (c *WebSocketCtx) Outbound() *FrameReader {
+	c.init()
+	return c.outR
+}
 
-	// The proxy is the server toward the client and the client toward the origin, so the
-	// masking rule of RFC 6455 section 5.3 runs one way on each side.
-	toOrigin := &wsWriter{w: c.backend, mask: true}
-	toClient := &wsWriter{w: c.client, mask: false}
+// Inbound returns the reader of the frames sent by the origin toward the client.
+func (c *WebSocketCtx) Inbound() *FrameReader {
+	c.init()
+	return c.inR
+}
+
+func (c *WebSocketCtx) init() {
+	c.initOnce.Do(func() {
+		// The proxy is the server toward the client and the client toward the origin, so the
+		// masking rule of RFC 6455 section 5.3 runs one way on each side.
+		c.wOrigin = &wsWriter{w: c.backend, mask: true}
+		c.wClient = &wsWriter{w: c.client, mask: false}
+		c.outR = c.newFrameReader(c.client, c.wOrigin, c.wClient, false)
+		c.inR = c.newFrameReader(c.backend, c.wClient, c.wOrigin, true)
+	})
+}
+
+func (c *WebSocketCtx) newFrameReader(src io.Reader, dst, back *wsWriter, inbound bool) *FrameReader {
+	r := &wsReader{r: src, max: c.maxFrame}
+	fc := &FrameCtx{w: dst, back: back}
+	return &FrameReader{ctx: c.ctx, read: func() (*FrameCtx, error) {
+		f, err := r.read()
+		if err != nil {
+			if errors.Is(err, errFrameTooBig) {
+				// Under RFC 6455 section 7.4.1 the peer that refuses the frame sends the
+				// close, to the sender of the frame.
+				_ = back.write(closeFrame(closeTooBig, "frame too big"))
+			}
+			return nil, err
+		}
+		f.inbound = inbound
+		fc.Frame = f
+		return fc, nil
+	}}
+}
+
+// Relay relays every frame in both directions until either peer closes. A connection is
+// driven either by Relay or by its readers.
+func (c *WebSocketCtx) Relay() error {
+	c.init()
 
 	var wg sync.WaitGroup
 	var upErr, downErr error
 	wg.Go(func() {
-		upErr = c.pump(cfg, c.client, toOrigin, toClient, false)
+		upErr = pumpFrames(c.outR)
 		_ = c.backend.Close()
 	})
 	wg.Go(func() {
-		downErr = c.pump(cfg, c.backend, toClient, toOrigin, true)
+		downErr = pumpFrames(c.inR)
 		_ = c.client.Close()
 	})
 	wg.Wait()
@@ -259,33 +291,13 @@ func (c *WebSocketCtx) Relay(opts ...WebSocketOption) error {
 	return errors.Join(filterCopyErr(upErr), filterCopyErr(downErr))
 }
 
-// pump reads frames off src and hands each to the configured callbacks, which decide what
-// reaches dst. back is the writer answering the peer src reads from.
-func (c *WebSocketCtx) pump(cfg *wsConfig, src io.Reader, dst, back *wsWriter, inbound bool) error {
-	r := &wsReader{r: src, max: c.maxFrame}
+func pumpFrames(r *FrameReader) error {
 	for {
-		f, err := r.read()
+		f, err := r.ReadFrame()
 		if err != nil {
-			if errors.Is(err, errFrameTooBig) {
-				// RFC 6455 section 7.4.1: the peer that will not process the frame is the
-				// one that says so, and it says it to whoever sent it.
-				_ = back.write(closeFrame(closeTooBig, "frame too big"))
-			}
 			return err
 		}
-		f.inbound = inbound
-
-		if cfg.drop != nil && cfg.drop(f) {
-			continue
-		}
-		if cfg.onFrame != nil {
-			fc := &FrameCtx{Frame: f, w: dst, ctx: c.ctx}
-			if herr := cfg.onFrame(fc); herr != nil {
-				return herr
-			}
-			continue
-		}
-		if werr := dst.write(f); werr != nil {
+		if werr := f.Forward(); werr != nil {
 			return werr
 		}
 	}
@@ -337,8 +349,8 @@ func (r *wsReader) read() (Frame, error) {
 	}
 
 	if f.opcode.Control() {
-		// RFC 6455 section 5.5: a control frame carries at most 125 bytes and is never
-		// fragmented. A peer breaking that is not speaking WebSocket.
+		// RFC 6455 section 5.5 limits a control frame to 125 bytes and forbids fragmenting
+		// it. A peer that breaks that does not implement WebSocket.
 		if length > 125 || !f.fin {
 			return Frame{}, fmt.Errorf("edge: malformed websocket control frame")
 		}
@@ -370,8 +382,8 @@ func (r *wsReader) read() (Frame, error) {
 	return f, nil
 }
 
-// wsWriter writes RFC 6455 frames, masking them when it speaks as a client. Writes are
-// serialized: both directions of a relay may inject into the same side.
+// wsWriter writes RFC 6455 frames, masked when the proxy writes as a client. Writes are
+// serialized, since both directions of a relay may write to the same side.
 type wsWriter struct {
 	w    io.Writer
 	mu   sync.Mutex
@@ -434,11 +446,9 @@ func (w *wsWriter) write(f Frame) error {
 	return err
 }
 
-// isWebSocketUpgrade reports whether the request is a WebSocket handshake. It is the
-// precondition of [KindWebSocket]: the traffic says so, never the tree.
-//
-// Only the HTTP/1.1 handshake is recognized. RFC 8441 carries WebSocket over an extended
-// CONNECT stream instead, which the proxy refuses with 501 rather than serve half way.
+// isWebSocketUpgrade reports whether the request is a WebSocket handshake, the precondition
+// of [KindWebSocket]. Only the HTTP/1.1 handshake is recognized. The RFC 8441 extended
+// CONNECT is refused with 501.
 func isWebSocketUpgrade(r *http.Request) bool {
 	return r != nil && r.ProtoMajor == 1 && r.Method == http.MethodGet &&
 		strings.EqualFold(upgradeType(r.Header), "websocket")

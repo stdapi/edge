@@ -6,105 +6,102 @@ package edge
 
 import (
 	"context"
-	"io"
+	"errors"
+	"net"
+	"sync"
 	"time"
 )
 
-// RelayOption shapes what a relay does with the bytes it carries. The options apply to both
-// directions unless one names a direction itself.
-type RelayOption interface{ applyRelay(*relayConfig) }
-
-type relayOptionFunc func(*relayConfig)
-
-func (f relayOptionFunc) applyRelay(c *relayConfig) { f(c) }
-
-type relayConfig struct {
-	onBytes func(sent, received int64)
-	rate    int
-	delay   time.Duration
-	idle    time.Duration
+// Relayer relays byte streams between two connections. The zero value sets no idle timeout.
+type Relayer struct {
+	// IdleTimeout closes both connections once neither direction has transferred a byte for
+	// this long. Zero disables it.
+	IdleTimeout time.Duration
 }
 
-// Throttle caps a relay at n bytes per second in each direction. Zero leaves it uncapped.
-func Throttle(n int) RelayOption {
-	return relayOptionFunc(func(c *relayConfig) { c.rate = n })
+// Relay copies bytes in both directions between a and b and returns once both directions have
+// ended. When one direction ends, the connection it was writing to is half-closed. aToB and
+// bToA count the bytes written to b and to a.
+func (r *Relayer) Relay(a, b net.Conn) (aToB, bToA int64, err error) {
+	var (
+		wg   sync.WaitGroup
+		aErr error
+		bErr error
+	)
+
+	idle := newIdleTracker(r.IdleTimeout, a, b)
+	defer idle.stop()
+
+	wg.Go(func() {
+		aToB, aErr = copyStream(b, a, idle)
+		halfClose(b)
+		idle.arm(halfClosedIdleTimeout)
+	})
+	wg.Go(func() {
+		bToA, bErr = copyStream(a, b, idle)
+		halfClose(a)
+		idle.arm(halfClosedIdleTimeout)
+	})
+	wg.Wait()
+
+	return aToB, bToA, errors.Join(filterCopyErr(aErr), filterCopyErr(bErr))
 }
 
-// Delay holds what it applies to for d before writing it: every chunk of a relay, in each
-// direction, or the datagram being forwarded. It adds latency without reordering a stream,
-// which has no unit to reorder, while datagrams delayed by different amounts do reorder.
-func Delay(d time.Duration) interface {
-	RelayOption
-	DatagramOption
-} {
-	return delayOption(d)
+// Relay copies bytes in both directions between a and b with a zero [Relayer].
+func Relay(a, b net.Conn) (aToB, bToA int64, err error) {
+	return (&Relayer{}).Relay(a, b)
 }
 
-type delayOption time.Duration
-
-func (d delayOption) applyRelay(c *relayConfig)       { c.delay = time.Duration(d) }
-func (d delayOption) applyDatagram(c *datagramConfig) { c.delay = time.Duration(d) }
-
-// IdleTimeout closes a relay once neither direction has moved a byte for d. Zero, the
-// default, leaves it open: a stream can legitimately stay silent for a long time.
-func IdleTimeout(d time.Duration) RelayOption {
-	return relayOptionFunc(func(c *relayConfig) { c.idle = d })
+// Throttled returns c with its writes limited to bytesPerSecond. Wrapping one connection of a
+// relay limits one direction. Zero or negative disables the limit. A write in progress
+// completes its pacing before a close of c takes effect, for at most one second.
+func Throttled(c net.Conn, bytesPerSecond int) net.Conn {
+	return &shapedConn{Conn: c, rate: bytesPerSecond}
 }
 
-// OnClose reports how many bytes a relay carried once it ends, sent counting the bytes that
-// went upstream.
-func OnClose(fn func(sent, received int64)) RelayOption {
-	return relayOptionFunc(func(c *relayConfig) { c.onBytes = fn })
+// Delayed returns c with every write held for d before it reaches c. A write in progress
+// completes its delay before a close of c takes effect.
+func Delayed(c net.Conn, d time.Duration) net.Conn {
+	return &shapedConn{Conn: c, delay: d}
 }
 
-func newRelayConfig(opts []RelayOption) *relayConfig {
-	cfg := &relayConfig{}
-	for _, o := range opts {
-		o.applyRelay(cfg)
-	}
-	return cfg
-}
-
-// relayWriter applies the shaping of a relay to one direction: it holds each chunk for the
-// configured delay, then releases it at no more than the configured rate.
-//
-// The rate is enforced by sleeping for the time the bytes just written are worth, which keeps
-// a single reader goroutine per direction and needs no timer. A burst larger than one second
-// of budget is split, so a large read cannot pay for itself in one sleep and then run free.
-type relayWriter struct {
-	w     io.Writer
-	ctx   context.Context
+// shapedConn holds each write for the delay, then paces it at the rate. A write is split into
+// chunks of at most one second of rate, so a single sleep never pays for more than that.
+type shapedConn struct {
+	net.Conn
 	rate  int
 	delay time.Duration
 }
 
-func (s relayWriter) Write(b []byte) (int, error) {
-	if s.delay > 0 && !sleepCtx(s.ctx, s.delay) {
-		return 0, s.ctx.Err()
+func (s *shapedConn) Write(b []byte) (int, error) {
+	if s.delay > 0 {
+		time.Sleep(s.delay)
 	}
 	if s.rate <= 0 {
-		return s.w.Write(b)
+		return s.Conn.Write(b)
 	}
 
 	written := 0
 	for len(b) > 0 {
 		chunk := min(len(b), s.rate)
-		n, err := s.w.Write(b[:chunk])
+		n, err := s.Conn.Write(b[:chunk])
 		written += n
 		if err != nil {
 			return written, err
 		}
 		b = b[n:]
 		wait := time.Duration(float64(n) / float64(s.rate) * float64(time.Second))
-		if wait > 0 && !sleepCtx(s.ctx, wait) {
-			return written, s.ctx.Err()
+		if wait > 0 {
+			time.Sleep(wait)
 		}
 	}
 	return written, nil
 }
 
-// sleepCtx waits for d and reports whether it ran to completion rather than being cut short
-// by ctx.
+// CloseWrite half-closes the wrapped connection.
+func (s *shapedConn) CloseWrite() error { return closeWrite(s.Conn) }
+
+// sleepCtx sleeps for d and reports false when ctx ended first.
 func sleepCtx(ctx context.Context, d time.Duration) bool {
 	if ctx == nil {
 		time.Sleep(d)

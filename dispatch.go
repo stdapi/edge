@@ -96,7 +96,15 @@ func (p *Proxy) serveGRPC(c *routeCtx, w http.ResponseWriter, r *http.Request, s
 
 	gc := &c.grpc
 	gc.ctx = r.Context()
+	gc.w = w
 	err := runKindHandler(p, sess, func() error { return handler(gc) })
+	if gc.finishOpenCall() {
+		// The response of an open call was written while the handler ran.
+		if err != nil {
+			p.logf(r.Context(), slog.LevelDebug, "grpc handler", sess, err)
+		}
+		return
+	}
 	if err == nil {
 		var resp *http.Response
 		if resp, err = gc.response(); err == nil {
@@ -112,7 +120,7 @@ func (p *Proxy) serveGRPC(c *routeCtx, w http.ResponseWriter, r *http.Request, s
 
 	// A failed call is still a 200 carrying a status, which is how a gRPC client reads an
 	// error at all.
-	resp := grpcStatusResponse(Unavailable, err.Error())
+	resp := grpcStatusResponse(statusOf(err), err.Error())
 	if werr := writeResponse(w, r, resp); werr != nil {
 		p.logf(r.Context(), slog.LevelDebug, "write gRPC status", sess, werr)
 	}
