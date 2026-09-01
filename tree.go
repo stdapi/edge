@@ -113,11 +113,15 @@ func (t *iTree) byName(name string) *entry {
 }
 
 type tXn struct {
-	tree       *iTree
-	writable   *simplelru.LRU[*node, struct{}]
-	patterns   *node
-	addrs      *node
-	names      *node
+	tree     *iTree
+	writable *simplelru.LRU[*node, struct{}]
+	patterns *node
+	addrs    *node
+	names    *node
+	// pending is the admission implied by the entry being inserted or deleted, claimed by
+	// the descent at the host node and settled on the unwind.
+	pending    *entry
+	pathTokens int
 	handlers   int
 	admissions int
 	maxParams  int
@@ -312,10 +316,13 @@ func (t *tXn) deleteNameIn(root, n *node, search string) *node {
 }
 
 // insert performs a recursive copy-on-write insertion.
-func (t *tXn) insert(ic *entry, mode insertMode) error {
+func (t *tXn) insert(ic *entry, mode insertMode, adm *entry) error {
 	t.mode = mode
+	t.pending = adm
+	t.pathTokens = len(ic.pattern.tokens) - ic.pattern.pathStart
 
 	newRoot, err := t.insertTokens(nil, t.rootFor(ic), ic.pattern.tokens, ic)
+	t.pending = nil
 	if err != nil {
 		return err
 	}
@@ -324,17 +331,26 @@ func (t *tXn) insert(ic *entry, mode insertMode) error {
 		t.maxDepth = max(t.maxDepth, t.computePathDepth(newRoot, ic.pattern.tokens))
 		t.maxParams = max(t.maxParams, len(ic.params))
 		if t.mode == modeInsert {
-			if ic.handler == nil {
-				t.admissions++
-			} else {
-				t.handlers++
-			}
+			t.handlers++
 		}
 	}
 	return nil
 }
 
 func (t *tXn) insertTokens(p, n *node, tokens []token, ic *entry) (*node, error) {
+	// len(tokens) first drops to pathTokens on the node ending the host tokens. Applying
+	// the admission on the unwind keeps every failure ahead of the first mutation.
+	if t.pending != nil && len(tokens) == t.pathTokens {
+		adm := t.pending
+		t.pending = nil
+		nc, err := t.insertTokens(p, n, tokens, ic)
+		if err != nil {
+			return nil, err
+		}
+		t.applyAdmission(nc, adm)
+		return nc, nil
+	}
+
 	// Base case: no tokens left, attach the interceptor
 	if len(tokens) == 0 {
 		switch t.mode {
@@ -661,35 +677,55 @@ func (t *tXn) insertWildcard(n *node, tk token, remaining []token, ic *entry) (*
 	return nc, nil
 }
 
-// searchAdmission returns the entry admitting the same authority and kind as ic, declared or
-// implied, or nil. An admission carries no matcher, so a pattern and a kind identify at most
-// one.
-func (t *tXn) searchAdmission(ic *entry) *entry {
-	matched := t.rootFor(ic).searchPattern(ic.pattern.key)
-	if matched == nil || !matched.isLeaf() {
-		return nil
-	}
-	for _, r := range matched.entries {
-		if r.kind == ic.kind && r.admits() && r.pattern.str == ic.pattern.str {
-			return r
+// applyAdmission inserts adm on the cloned host node, or bumps the count of the one already
+// there through a copy, entries being immutable once published. Kind and port are the whole
+// identity, a node is one host structure and parameter names are no part of it.
+func (t *tXn) applyAdmission(nc *node, adm *entry) {
+	for i, r := range nc.entries {
+		if r.admits() && r.kind == adm.kind && r.samePort(adm) {
+			next := *r
+			next.refs++
+			nc.entries[i] = &next
+			return
 		}
 	}
-	return nil
+	adm.refs = 1
+	nc.addEntry(adm)
+	t.admissions++
 }
 
-func (t *tXn) delete(ic *entry) (*entry, bool) {
+// releaseAdmission drops one reference on the admission the deleted entry implied, removing
+// it once the last entry that needed it is gone.
+func (t *tXn) releaseAdmission(nc *node, adm *entry) {
+	for i, r := range nc.entries {
+		if r.admits() && r.kind == adm.kind && r.samePort(adm) {
+			if r.refs > 1 {
+				next := *r
+				next.refs--
+				nc.entries[i] = &next
+				return
+			}
+			nc.delIC(i)
+			t.admissions--
+			return
+		}
+	}
+	panic("internal error: no admission on host node")
+}
+
+func (t *tXn) delete(ic *entry, adm *entry) (*entry, bool) {
+	t.pending = adm
+	t.pathTokens = len(ic.pattern.tokens) - ic.pattern.pathStart
+
 	root := t.rootFor(ic)
 	newRoot, oldIC := t.deleteTokens(root, root, ic.pattern.tokens, ic)
+	t.pending = nil
 	if newRoot != nil {
 		t.setRootFor(ic, newRoot)
 	}
 
 	if oldIC != nil {
-		if oldIC.handler == nil {
-			t.admissions--
-		} else {
-			t.handlers--
-		}
+		t.handlers--
 		return oldIC, true
 	}
 
@@ -697,6 +733,26 @@ func (t *tXn) delete(ic *entry) (*entry, bool) {
 }
 
 func (t *tXn) deleteTokens(root, n *node, tokens []token, ic *entry) (*node, *entry) {
+	// Counterpart of the insert claim, releasing once the deeper delete has succeeded and
+	// retrying the merge the admission blocked.
+	if t.pending != nil && len(tokens) == t.pathTokens {
+		adm := t.pending
+		t.pending = nil
+		nc, deleted := t.deleteTokens(root, n, tokens, ic)
+		if deleted == nil {
+			return nil, nil
+		}
+		t.releaseAdmission(nc, adm)
+		if n != root &&
+			!nc.isLeaf() &&
+			len(nc.statics) == 1 &&
+			len(nc.params) == 0 &&
+			len(nc.wildcards) == 0 {
+			t.mergeChild(nc)
+		}
+		return nc, deleted
+	}
+
 	if len(tokens) == 0 {
 		if !n.isLeaf() {
 			return nil, nil

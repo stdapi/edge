@@ -271,6 +271,36 @@ func BenchmarkLookupUnnarrowed(b *testing.B) {
 	}
 }
 
+func BenchmarkAddDelete(b *testing.B) {
+	cases := []struct {
+		name string
+		base string
+	}{
+		{name: "fresh authority"},
+		{name: "admitted authority", base: "api.stripe.com/v1/other"},
+	}
+
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			var patterns []string
+			if tc.base != "" {
+				patterns = append(patterns, tc.base)
+			}
+			p := benchProxy(b, patterns...)
+
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, err := p.Add("api.stripe.com/v1/charges", noopHandler); err != nil {
+					b.Fatal(err)
+				}
+				if _, err := p.Delete[HTTP]("api.stripe.com/v1/charges"); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}
+
 // BenchmarkDatagramAdmission measures what routing one datagram costs. It is walked per
 // datagram, like every other unit, so this is the price of the model rather than of a cache.
 func BenchmarkDatagramAdmission(b *testing.B) {

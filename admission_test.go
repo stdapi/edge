@@ -299,3 +299,98 @@ func TestAdmission_MatchersAreRefusedOnConnectionKinds(t *testing.T) {
 	_, err = p.Add("api.test/v1", noopHandler, WithMatcher(beta))
 	require.NoError(t, err)
 }
+
+// Releasing the last admission of a host node retries the merge its presence blocked.
+func TestAdmission_ReleaseRestoresTheMerge(t *testing.T) {
+	p := testProxy(t)
+	p.MustAdd("api.test/x", noopHandler)
+	p.MustAdd("api.testers/y", noopHandler)
+
+	_, err := p.Delete[HTTP]("api.test/x")
+	require.NoError(t, err)
+	assert.False(t, p.Admits(target("api.test:443"), KindHTTP))
+	assert.True(t, p.Admits(target("api.testers:443"), KindHTTP))
+	assert.NotZero(t, lookupHTTP(p, "api.testers/y"))
+
+	p.MustAdd("api.test/x", noopHandler)
+	assert.True(t, p.Admits(target("api.test:443"), KindHTTP))
+	assert.Equal(t, 2, admissionsLen(p))
+}
+
+// Two ports on one authority are two admissions on one node, and deleting the entries of one
+// must not release the other's.
+func TestAdmission_PortsAreCountedApart(t *testing.T) {
+	p := testProxy(t)
+	p.MustAdd("api.test:8443/x", noopHandler)
+	p.MustAdd("api.test:9443/x", noopHandler)
+	assert.Equal(t, 2, admissionsLen(p))
+
+	_, err := p.Delete[HTTP]("api.test:8443/x")
+	require.NoError(t, err)
+	assert.False(t, p.Admits(target("api.test:8443"), KindHTTP))
+	assert.True(t, p.Admits(target("api.test:9443"), KindHTTP))
+}
+
+// The admission of a wildcard host lives on the wildcard node.
+func TestAdmission_WildcardHostIsReferenceCounted(t *testing.T) {
+	p := testProxy(t)
+	p.MustAdd("+{any}/a", noopHandler)
+	p.MustAdd("+{any}/b", noopHandler)
+	assert.Equal(t, 1, admissionsLen(p))
+
+	_, err := p.Delete[HTTP]("+{any}/a")
+	require.NoError(t, err)
+	assert.True(t, p.Admits(target("whatever.test:443"), KindHTTP))
+
+	_, err = p.Delete[HTTP]("+{any}/b")
+	require.NoError(t, err)
+	assert.False(t, p.Admits(target("whatever.test:443"), KindHTTP))
+	assert.Equal(t, 0, admissionsLen(p))
+}
+
+// Parameter names are no part of identity, here as in the rest of the router. Two hosts of
+// one structure conflict only where their entries do, and share the one admission.
+func TestAdmission_ParamNamesShareOneAdmission(t *testing.T) {
+	p := testProxy(t)
+	p.MustAdd("{sub}.api.test/a", noopHandler)
+	p.MustAdd("{other}.api.test/b", noopHandler)
+	assert.Equal(t, 1, admissionsLen(p))
+	assert.True(t, p.Admits(target("eu.api.test:443"), KindHTTP))
+
+	_, err := p.Add("{third}.api.test/a", noopHandler)
+	var ce *EntryConflictError
+	require.ErrorAs(t, err, &ce)
+
+	_, err = p.Delete[HTTP]("{sub}.api.test/a")
+	require.NoError(t, err)
+	assert.True(t, p.Admits(target("eu.api.test:443"), KindHTTP))
+
+	_, err = p.Delete[HTTP]("{other}.api.test/b")
+	require.NoError(t, err)
+	assert.False(t, p.Admits(target("eu.api.test:443"), KindHTTP))
+	assert.Equal(t, 0, admissionsLen(p))
+}
+
+// The same accounting through the address root, where the host key is encoded prefix bits.
+func TestAdmission_AddressHostIsReferenceCounted(t *testing.T) {
+	p := testProxy(t)
+	p.MustAdd("10.0.0.1/a", noopHandler)
+	p.MustAdd("10.0.0.1/b", noopHandler)
+	p.MustAdd("[10.0.0.0/8]/c", noopHandler)
+	assert.Equal(t, 2, admissionsLen(p))
+
+	_, err := p.Delete[HTTP]("10.0.0.1/a")
+	require.NoError(t, err)
+	assert.True(t, p.Admits(target("10.0.0.1:443"), KindHTTP))
+
+	_, err = p.Delete[HTTP]("10.0.0.1/b")
+	require.NoError(t, err)
+	// The exact address is gone, the range admission still covers it.
+	assert.True(t, p.Admits(target("10.0.0.1:443"), KindHTTP))
+	assert.Zero(t, lookupHTTP(p, "10.0.0.1/a"))
+
+	_, err = p.Delete[HTTP]("[10.0.0.0/8]/c")
+	require.NoError(t, err)
+	assert.False(t, p.Admits(target("10.0.0.1:443"), KindHTTP))
+	assert.Equal(t, 0, admissionsLen(p))
+}

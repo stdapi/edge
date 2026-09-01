@@ -7,7 +7,6 @@ package edge
 import (
 	"fmt"
 	"slices"
-	"strings"
 )
 
 // Txn is a read or write transaction on the routing tree.
@@ -38,17 +37,12 @@ func (txn *Txn) Add[H Handler](pattern string, handler H, opts ...EntryOption) (
 		return Entry[H]{}, err
 	}
 
-	// The entry goes in first. Admitting an authority for an entry that then fails to insert
-	// leaves an admission nothing needs and nothing can withdraw, since a delete has no entry
-	// to release it from.
-	if err = txn.rootTxn.insert(e, modeInsert); err != nil {
+	adm, err := txn.admissionFor(e)
+	if err != nil {
 		return Entry[H]{}, err
 	}
-	if err = txn.admit(e); err != nil {
-		if _, ok := txn.rootTxn.delete(e); !ok {
-			return Entry[H]{}, fmt.Errorf("internal error: entry %s vanished while unwinding: %w",
-				e.pattern.str, err)
-		}
+	// One descent lands the entry and its admission, so a failed Add leaves neither.
+	if err = txn.rootTxn.insert(e, modeInsert, adm); err != nil {
 		return Entry[H]{}, err
 	}
 	return Entry[H]{e: e}, nil
@@ -68,7 +62,7 @@ func (txn *Txn) Update[H Handler](pattern string, handler H, opts ...EntryOption
 	if err != nil {
 		return Entry[H]{}, err
 	}
-	if err = txn.rootTxn.insert(e, modeUpdate); err != nil {
+	if err = txn.rootTxn.insert(e, modeUpdate, nil); err != nil {
 		return Entry[H]{}, err
 	}
 	return Entry[H]{e: e}, nil
@@ -100,11 +94,14 @@ func (txn *Txn) Delete[H Handler](pattern string, opts ...MatcherOption) (Entry[
 		return Entry[H]{}, fmt.Errorf("%w: %w", ErrInvalidEntry, ErrTooManyMatchers)
 	}
 
-	deleted, ok := txn.rootTxn.delete(e)
+	var adm *entry
+	if kind.perMessage() {
+		adm = impliedAdmission(e)
+	}
+	deleted, ok := txn.rootTxn.delete(e, adm)
 	if !ok {
 		return Entry[H]{}, newEntryNotFoundError(e)
 	}
-	txn.release(deleted)
 
 	return Entry[H]{e: deleted}, nil
 }
@@ -246,53 +243,17 @@ func (txn *Txn) Snapshot() *Txn {
 	}
 }
 
-// admit registers the admission a per-message entry implies, or bumps the reference count of
-// the one already there. An entry that routes whole connections is its own admission and
-// needs none.
-func (txn *Txn) admit(e *entry) error {
+// admissionFor returns the admission e implies, nil for a kind that is its own. Running
+// requireCA here keeps every refusal ahead of the first mutation.
+func (txn *Txn) admissionFor(e *entry) (*entry, error) {
 	if !e.kind.perMessage() {
-		return txn.requireCA(e)
+		return nil, txn.requireCA(e)
 	}
-
-	adm, err := txn.p.newAdmission(admissionPattern(e.pattern), e.kind.admittedAs())
-	if err != nil {
-		return err
+	adm := impliedAdmission(e)
+	if err := txn.requireCA(adm); err != nil {
+		return nil, err
 	}
-	if err = txn.requireCA(adm); err != nil {
-		return err
-	}
-
-	t := txn.rootTxn
-	existing := t.searchAdmission(adm)
-	if existing == nil {
-		adm.refs = 1
-		return t.insert(adm, modeInsert)
-	}
-	return replaceRefs(t, existing, existing.refs+1)
-}
-
-// release drops one reference on the admission a deleted entry implied, removing it once the
-// last entry that needed it is gone.
-func (txn *Txn) release(e *entry) {
-	if !e.kind.perMessage() {
-		return
-	}
-
-	adm, err := txn.p.newAdmission(admissionPattern(e.pattern), e.kind.admittedAs())
-	if err != nil {
-		return
-	}
-
-	t := txn.rootTxn
-	existing := t.searchAdmission(adm)
-	if existing == nil {
-		return
-	}
-	if existing.refs > 1 {
-		_ = replaceRefs(t, existing, existing.refs-1)
-		return
-	}
-	t.delete(existing)
+	return adm, nil
 }
 
 // requireCA refuses a registration the proxy could not serve. QUIC is always TLS, and the HTTP
@@ -309,50 +270,29 @@ func (txn *Txn) requireCA(e *entry) error {
 		ErrNoCertificateAuthority, e.kind, e.pattern.str)
 }
 
-// replaceRefs swaps an entry for a copy holding a different reference count. Entries are
-// immutable once published, so the count cannot be bumped in place.
-func replaceRefs(t *tXn, existing *entry, refs uint32) error {
-	next := *existing
-	next.refs = refs
-	if _, ok := t.delete(existing); !ok {
-		return fmt.Errorf("internal error: admission %s vanished during refcount update", existing.pattern.str)
+// impliedAdmission slices the admission out of the parsed pattern, so nothing is reparsed
+// and nothing can fail. An entry restricted to one port implies an admission restricted to
+// the same one, terminating TLS on a port no entry serves would be visible for nothing.
+func impliedAdmission(e *entry) *entry {
+	pat := e.pattern
+	hostTokens := pat.tokens[:pat.pathStart:pat.pathStart]
+	adm := &entry{
+		pattern: pattern{
+			str:       pat.str[:len(pat.str)-len(pat.path)],
+			key:       pat.key[:len(pat.key)-len(pat.path)],
+			host:      pat.host,
+			port:      pat.port,
+			prefix:    pat.prefix,
+			tokens:    hostTokens,
+			pathStart: len(hostTokens),
+		},
+		kind:    e.kind.admittedAs(),
+		implied: true,
 	}
-	return t.insert(&next, modeInsert)
-}
-
-// newAdmission builds the entry admitting one authority for one kind. It carries no
-// handler and no matcher: nothing has been read off the connection at the point it is
-// consulted.
-func (p *Proxy) newAdmission(pattern string, kind Kind) (*entry, error) {
-	pat, paramsCnt, err := p.parseAuthorityPattern(pattern)
-	if err != nil {
-		return nil, err
-	}
-
-	e := &entry{pattern: pat, kind: kind, implied: true}
-	e.params = make([]string, 0, paramsCnt)
-	for _, tk := range pat.tokens {
+	for _, tk := range hostTokens {
 		if tk.typ != nodeStatic {
-			e.params = append(e.params, tk.value)
+			adm.params = append(adm.params, tk.value)
 		}
 	}
-	return e, nil
-}
-
-// admissionPattern spells the authority pattern naming pat's host and port. Only an address
-// host is ever bracketed, a range for its '/' as an IPv6 literal is for its colons. A name is
-// left alone, the colon of a regexp constraint lives inside braces and the parser reads it
-// back there.
-//
-// An entry restricted to one port implies an admission restricted to the same one:
-// terminating TLS on a port no entry can serve would be visible to the client for nothing.
-func admissionPattern(pat pattern) string {
-	host := pat.host
-	if pat.prefix.IsValid() && strings.ContainsAny(host, ":/") {
-		host = "[" + host + "]"
-	}
-	if pat.port == "" {
-		return host
-	}
-	return host + ":" + pat.port
+	return adm
 }

@@ -37,8 +37,11 @@ type pattern struct {
 	path string
 	// prefix is set when the host is an address, an exact one being full length. It routes
 	// the pattern to the address root, where key holds the encoded form, not the host text.
-	prefix           netip.Prefix
-	tokens           []token
+	prefix netip.Prefix
+	tokens []token
+	// pathStart is the index in tokens where the path begins, len(tokens) for an authority
+	// pattern. The host tokens end on the node carrying the admission.
+	pathStart        int
 	optionalCatchAll bool
 	catchAll         bool
 }
@@ -146,6 +149,7 @@ func (p *Proxy) parsePattern(raw string, kind Kind) (pattern, int, error) {
 		path:             path,
 		prefix:           ah.prefix,
 		tokens:           tokens,
+		pathStart:        len(ah.tokens),
 		optionalCatchAll: optCatchAll,
 		catchAll:         pathTokens[len(pathTokens)-1].typ == nodeWildcard,
 	}, paramCount, nil
@@ -360,12 +364,13 @@ func (p *Proxy) parseAuthorityPattern(raw string) (pattern, int, error) {
 	}
 
 	return pattern{
-		str:    raw,
-		key:    ah.key,
-		host:   ah.host,
-		port:   ah.port,
-		prefix: ah.prefix,
-		tokens: ah.tokens,
+		str:       raw,
+		key:       ah.key,
+		host:      ah.host,
+		port:      ah.port,
+		prefix:    ah.prefix,
+		tokens:    ah.tokens,
+		pathStart: len(ah.tokens),
 	}, ah.params, nil
 }
 
