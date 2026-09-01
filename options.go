@@ -7,15 +7,16 @@ package edge
 import (
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 )
 
-// TrailingSlashOption controls whether an interceptor matches a path whose trailing slash differs
+// TrailingSlashOption controls whether an entry matches a path whose trailing slash differs
 // from the one it was registered with.
 type TrailingSlashOption uint8
 
 const (
-	// ExactSlash matches the path exactly as registered. /foo and /foo/ are distinct interceptors.
+	// ExactSlash matches the path exactly as registered. /foo and /foo/ are distinct entries.
 	ExactSlash TrailingSlashOption = iota
 	// RelaxedSlash matches the path with or without its trailing slash. An exactly registered
 	// variant always wins over a relaxed match.
@@ -24,67 +25,67 @@ const (
 	slashOptionSentinel
 )
 
-// HandlerScope selects which handlers a middleware wraps.
-type HandlerScope uint8
-
-const (
-	// InterceptorHandler wraps handlers registered for an interceptor.
-	InterceptorHandler HandlerScope = 1 << iota
-	// NoInterceptorHandler wraps the handler used when an intercepted request matches no interceptor.
-	NoInterceptorHandler
-	// AllHandlers wraps every handler.
-	AllHandlers = InterceptorHandler | NoInterceptorHandler
-)
-
 // ProxyOption configures a [Proxy].
 type ProxyOption interface {
 	applyProxy(sealedOption) error
 }
 
-// InterceptorOption configures a [Interceptor].
-type InterceptorOption interface {
-	applyInterceptor(sealedOption) error
+// EntryOption configures one entry. An option that only makes sense for some kinds is refused
+// on the others, at registration, with [ErrInvalidConfig].
+type EntryOption interface {
+	applyEntry(sealedOption) error
 }
 
-// MatcherOption identifies an interceptor by its matchers, for lookup and deletion.
+// MatcherOption identifies an entry by its matchers, for lookup and deletion.
 type MatcherOption interface {
 	applyMatcher(sealedOption) error
 }
 
-// sealedOption carries what an option may reach. interceptor is non-nil exactly when the
-// option is being applied to one, which is how an option usable in both places tells them
-// apart. proxy is always set, so the configuration is always reachable through it.
+// sealedOption carries what an option may reach. entry is non-nil exactly when the option is
+// being applied to one, which is how an option usable in both places tells them apart. proxy
+// is always set, so the configuration is always reachable through it.
 type sealedOption struct {
-	proxy       *Proxy
-	interceptor *Interceptor
+	proxy *Proxy
+	entry *entry
 }
 
 type optionFunc func(sealedOption) error
 
-func (o optionFunc) applyProxy(s sealedOption) error       { return o(s) }
-func (o optionFunc) applyInterceptor(s sealedOption) error { return o(s) }
-func (o optionFunc) applyMatcher(s sealedOption) error     { return o(s) }
+func (o optionFunc) applyProxy(s sealedOption) error   { return o(s) }
+func (o optionFunc) applyEntry(s sealedOption) error   { return o(s) }
+func (o optionFunc) applyMatcher(s sealedOption) error { return o(s) }
 
-// WithCA sets the certificate authority used to mint leaf certificates for intercepted
-// authorities. Without it the proxy can only tunnel.
+// onlyKinds refuses an option on an entry whose kind it does not describe. The handler
+// signature is what fixes the kind, so an option that cannot apply is a mistake worth
+// reporting rather than a setting that quietly does nothing.
+func onlyKinds(s sealedOption, name string, kinds ...Kind) error {
+	if s.entry == nil || slices.Contains(kinds, s.entry.kind) {
+		return nil
+	}
+	return fmt.Errorf("%w: %s does not apply to a %s entry", ErrInvalidConfig, name, s.entry.kind)
+}
+
+// onlyPerMessage refuses a matcher on an entry keyed on an authority alone. Admission selects
+// on the kind and the port, before anything has been read that a matcher could look at, so a
+// matcher there would be a written policy narrower than the one enforced. A [Matcher] also
+// reads a request, which an admission does not have.
+func onlyPerMessage(s sealedOption, name string) error {
+	if s.entry == nil || s.entry.kind.perMessage() {
+		return nil
+	}
+	return fmt.Errorf("%w: %s narrows a request, and a %s entry admits a connection before any request exists",
+		ErrInvalidConfig, name, s.entry.kind)
+}
+
+// WithCA sets the certificate authority used to mint leaf certificates for the authorities the
+// proxy terminates. Every admitted connection is terminated, so anything carried over TLS
+// needs one.
 func WithCA(ca *CA) ProxyOption {
 	return optionFunc(func(s sealedOption) error {
 		if ca == nil {
 			return fmt.Errorf("%w: certificate authority cannot be nil", ErrInvalidConfig)
 		}
 		s.proxy.cfg.ca = ca
-		return nil
-	})
-}
-
-// WithNoInterceptorHandler sets the handler called for an intercepted request that matches no
-// interceptor. It defaults to [DefaultNoInterceptorHandler], which forwards the request unchanged.
-func WithNoInterceptorHandler(handler HandlerFunc) ProxyOption {
-	return optionFunc(func(s sealedOption) error {
-		if handler == nil {
-			return fmt.Errorf("%w: no interceptor handler cannot be nil", ErrInvalidConfig)
-		}
-		s.proxy.noInterceptor = handler
 		return nil
 	})
 }
@@ -106,8 +107,9 @@ func WithProxyAuth(a ProxyAuthenticator) ProxyOption {
 	})
 }
 
-// WithErrorHandler sets the handler that turns a handler error into a response. It defaults
-// to [DefaultErrorHandler], which answers 502 Bad Gateway.
+// WithErrorHandler sets the handler that turns an [HTTP] handler error into a response. It
+// defaults to [DefaultErrorHandler], which answers 502 Bad Gateway. A handler of another kind
+// has no response to write, so its error is logged instead.
 func WithErrorHandler(handler ErrorHandler) ProxyOption {
 	return optionFunc(func(s sealedOption) error {
 		if handler == nil {
@@ -118,89 +120,102 @@ func WithErrorHandler(handler ErrorHandler) ProxyOption {
 	})
 }
 
-// WithMiddleware registers middleware, proxy-wide or on a single interceptor depending on
-// where it is passed. Middleware runs in registration order, outermost first, and the
-// proxy-wide ones wrap the interceptor's.
+// WithMiddleware registers middleware, proxy-wide or on a single entry depending on where it
+// is passed. Middleware runs in registration order, outermost first, and the proxy-wide ones
+// wrap the entry's.
 //
-//	edge.New(edge.WithCA(ca), edge.WithMiddleware(log))                  // every handler
-//	p.AddInterceptor(nil, "api.test/v1", h, edge.WithMiddleware(retry))  // this one only
-func WithMiddleware(m ...MiddlewareFunc) interface {
+// The kind a middleware wraps is its own signature, so a proxy-wide registration only reaches
+// the entries of that kind, and one passed to an entry of another kind is refused.
+//
+//	edge.New(edge.WithCA(ca), edge.WithMiddleware(logHTTP))          // every HTTP entry
+//	p.Add("api.test/v1", h, edge.WithMiddleware(retry))              // this one only
+func WithMiddleware(m ...any) interface {
 	ProxyOption
-	InterceptorOption
+	EntryOption
 } {
 	return optionFunc(func(s sealedOption) error {
 		for i, fn := range m {
-			if fn == nil {
-				return fmt.Errorf("%w: middleware at index %d is nil", ErrInvalidConfig, i)
+			kind, ok := middlewareKind(fn)
+			if !ok {
+				return fmt.Errorf("%w: middleware at index %d is not a func(edge.T) edge.T for any handler kind",
+					ErrInvalidConfig, i)
 			}
-		}
-		// interceptor is set exactly when the option is applied to one, which is what tells
-		// the two placements apart.
-		if s.interceptor != nil {
-			for _, fn := range m {
-				s.interceptor.mws = append(s.interceptor.mws, middleware{m: fn, scope: InterceptorHandler})
+			// entry is set exactly when the option is applied to one, which is what tells
+			// the two placements apart.
+			if s.entry != nil {
+				if kind != s.entry.kind {
+					return fmt.Errorf("%w: middleware at index %d wraps a %s handler, not a %s one",
+						ErrInvalidConfig, i, kind, s.entry.kind)
+				}
+				s.entry.mws = append(s.entry.mws, middleware{m: fn, kind: kind})
+				continue
 			}
-			return nil
-		}
-		for _, fn := range m {
-			s.proxy.mws = append(s.proxy.mws, middleware{m: fn, scope: AllHandlers, g: true})
+			s.proxy.mws = append(s.proxy.mws, middleware{m: fn, kind: kind})
 		}
 		return nil
 	})
 }
 
-// WithMiddlewareFor registers proxy-wide middleware for the given scopes only.
-func WithMiddlewareFor(scope HandlerScope, m ...MiddlewareFunc) ProxyOption {
-	return optionFunc(func(s sealedOption) error {
-		// A scope naming nothing, or naming something no handler runs in, would register
-		// middleware that silently never fires.
-		if scope == 0 || scope&^AllHandlers != 0 {
-			return fmt.Errorf("%w: handler scope %d wraps no handler", ErrInvalidConfig, scope)
-		}
-		for i, fn := range m {
-			if fn == nil {
-				return fmt.Errorf("%w: middleware at index %d is nil", ErrInvalidConfig, i)
-			}
-			s.proxy.mws = append(s.proxy.mws, middleware{m: fn, scope: scope, g: true})
-		}
-		return nil
-	})
+// middlewareKind reports which kind of handler m wraps. A middleware is a function from a
+// handler signature to itself, so the signature names the kind.
+func middlewareKind(m any) (Kind, bool) {
+	switch m.(type) {
+	case Middleware[HTTP]:
+		return KindHTTP, true
+	case Middleware[GRPC]:
+		return KindGRPC, true
+	case Middleware[WebSocket]:
+		return KindWebSocket, true
+	case Middleware[TCP]:
+		return KindTCP, true
+	case Middleware[QUIC]:
+		return KindQUIC, true
+	case Middleware[UDP]:
+		return KindUDP, true
+	default:
+		return 0, false
+	}
 }
 
-// WithName names an interceptor so it can be looked up with [Proxy.Name]. Names are unique.
-func WithName(name string) InterceptorOption {
+// WithName names an entry so it can be looked up with [Proxy.Named]. Names are unique across
+// every kind.
+func WithName(name string) EntryOption {
 	return optionFunc(func(s sealedOption) error {
 		if name == "" {
-			return fmt.Errorf("%w: interceptor name cannot be empty", ErrInvalidConfig)
+			return fmt.Errorf("%w: entry name cannot be empty", ErrInvalidConfig)
 		}
-		s.interceptor.name = name
+		s.entry.name = name
 		return nil
 	})
 }
 
-// WithAnnotation attaches an arbitrary value to an interceptor, readable with [Interceptor.Annotation].
-func WithAnnotation(key, value any) InterceptorOption {
+// WithAnnotation attaches an arbitrary value to an entry, readable with [Entry.Annotation].
+func WithAnnotation(key, value any) EntryOption {
 	return optionFunc(func(s sealedOption) error {
-		if s.interceptor.annots == nil {
-			s.interceptor.annots = make(map[any]any, 1)
+		if s.entry.annots == nil {
+			s.entry.annots = make(map[any]any, 1)
 		}
-		s.interceptor.annots[key] = value
+		s.entry.annots[key] = value
 		return nil
 	})
 }
 
-// WithTrailingSlash configures trailing slash handling, proxy-wide or for a single interceptor.
-// An interceptor setting overrides the proxy default.
+// WithTrailingSlash configures trailing slash handling, proxy-wide or for a single entry. An
+// entry setting overrides the proxy default. Only a kind carrying a path has a trailing slash
+// to handle.
 func WithTrailingSlash(opt TrailingSlashOption) interface {
 	ProxyOption
-	InterceptorOption
+	EntryOption
 } {
 	return optionFunc(func(s sealedOption) error {
 		if opt >= slashOptionSentinel {
 			return fmt.Errorf("%w: unknown trailing slash option", ErrInvalidConfig)
 		}
-		if s.interceptor != nil {
-			s.interceptor.handleSlash = opt
+		if s.entry != nil {
+			if err := onlyKinds(s, "WithTrailingSlash", KindHTTP, KindGRPC, KindWebSocket); err != nil {
+				return err
+			}
+			s.entry.handleSlash = opt
 			return nil
 		}
 		s.proxy.cfg.handleSlash = opt
@@ -218,12 +233,12 @@ func WithRegexpParam(enable bool) ProxyOption {
 	})
 }
 
-// WithRejectECH refuses every connection offering the TLS Encrypted Client Hello
-// extension, tunneled and intercepted alike, and every TLS connection whose ClientHello
-// the proxy cannot read. ECH hides the real server name from the proxy, so the visible
-// name no longer says where the connection goes. Chrome offers the extension on most
-// connections by default, as a decoy, so enabling this refuses a stock Chrome client.
-// It is off by default.
+// WithRejectECH refuses every connection offering the TLS Encrypted Client Hello extension,
+// and every TLS connection whose ClientHello the proxy cannot read. ECH hides the real server
+// name, so the visible name no longer says where the connection goes, and a connection the
+// proxy cannot place is one it cannot terminate correctly. Chrome offers the extension on most
+// connections by default, as a decoy, so enabling this refuses a stock Chrome client. It is
+// off by default.
 func WithRejectECH(enable bool) ProxyOption {
 	return optionFunc(func(s sealedOption) error {
 		s.proxy.cfg.rejectECH = enable
@@ -231,19 +246,18 @@ func WithRejectECH(enable bool) ProxyOption {
 	})
 }
 
-// WithNameVerification checks the server name of a transparent connection against the
-// proxy's own resolution of it. The name is confirmed when the client's destination is
-// among the resolved addresses. [VerifyLoose] matches an unconfirmed connection on its
-// destination alone and [VerifyReject] refuses it. The default is [VerifyOff], the name
-// is trusted as sent, and a client can then reach any address under a permitted name.
+// WithNameVerification checks the server name of a transparent connection against the proxy's
+// own resolution of it. The name is confirmed when the client's destination is among the
+// resolved addresses. [VerifyLoose] matches an unconfirmed connection on its destination alone
+// and [VerifyReject] refuses it. The default is [VerifyOff], the name is trusted as sent, and
+// a client can then reach any address under a permitted name.
 //
 // The proxy's resolver and the client's can answer differently, and the name then fails
 // confirmation. Under [VerifyLoose] a rule on the address admits the connection, and
 // [WithNameResolver] can point the check at the resolver the clients use.
 //
-// The name is resolved at most once per connection. Only the transparent listeners
-// verify. An explicit proxy resolves the authority itself, so the name and the
-// destination cannot diverge.
+// The name is resolved at most once per connection. Only the transparent listeners verify. An
+// explicit proxy resolves the authority itself, so the name and the destination cannot diverge.
 func WithNameVerification(mode NameVerification) ProxyOption {
 	return optionFunc(func(s sealedOption) error {
 		if mode >= verifySentinel {
@@ -288,7 +302,7 @@ func WithMaxPatternParamKeyBytes(n uint8) ProxyOption {
 	})
 }
 
-// WithMaxMatchers bounds how many matchers an interceptor may carry, implicit scheme and port
+// WithMaxMatchers bounds how many matchers an entry may carry, the implicit scheme and method
 // matchers included. It defaults to 255.
 func WithMaxMatchers(n uint8) ProxyOption {
 	return optionFunc(func(s sealedOption) error {
@@ -344,15 +358,16 @@ func WithIdleTimeout(d time.Duration) ProxyOption {
 	})
 }
 
-// WithTunnelIdleTimeout bounds how long a tunneled connection may stay silent in both
-// directions before it is closed. Zero disables the timeout, which is the default: a tunnel
-// can legitimately carry a long-lived stream the proxy knows nothing about.
-func WithTunnelIdleTimeout(d time.Duration) ProxyOption {
+// WithSniffTimeout bounds how long the proxy waits for a redirected plaintext connection to
+// say what it is before serving it as a byte stream. A protocol whose server speaks first
+// sends nothing until then, so the wait is what tells it apart from a slow HTTP client. It
+// defaults to 1s.
+func WithSniffTimeout(d time.Duration) ProxyOption {
 	return optionFunc(func(s sealedOption) error {
 		if d < 0 {
-			return fmt.Errorf("%w: tunnel idle timeout cannot be negative", ErrInvalidConfig)
+			return fmt.Errorf("%w: sniff timeout cannot be negative", ErrInvalidConfig)
 		}
-		s.proxy.cfg.server.tunnelIdleTimeout = d
+		s.proxy.cfg.server.sniffTimeout = d
 		return nil
 	})
 }
@@ -368,61 +383,105 @@ func WithMaxHeaderBytes(n int) ProxyOption {
 	})
 }
 
-// WithMatcher attaches a [Matcher] to an interceptor, narrowing it beyond its pattern and method.
-// An interceptor with matchers is evaluated before one without at the same pattern.
-func WithMatcher(m Matcher) interface {
-	InterceptorOption
-	MatcherOption
-} {
+// WithMaxFrameBytes bounds one WebSocket frame the proxy will buffer to hand a handler. A peer
+// sending a larger one is closed with 1009, the status RFC 6455 reserves for it. It defaults
+// to 1 MiB.
+func WithMaxFrameBytes(n int) ProxyOption {
 	return optionFunc(func(s sealedOption) error {
-		if m == nil {
-			return fmt.Errorf("%w: matcher cannot be nil", ErrInvalidMatcher)
+		if n <= 0 {
+			return fmt.Errorf("%w: max frame bytes must be greater than zero", ErrInvalidConfig)
 		}
-		s.interceptor.matchers = append(s.interceptor.matchers, m)
+		s.proxy.cfg.server.maxFrameBytes = n
 		return nil
 	})
 }
 
-// WithMatchers attaches several matchers to an interceptor. All must match.
-func WithMatchers(matchers ...Matcher) interface {
-	InterceptorOption
+// WithMatcher attaches a [Matcher] to an entry, narrowing it beyond its pattern. An entry with
+// matchers is evaluated before one without at the same pattern.
+func WithMatcher(m Matcher) interface {
+	EntryOption
 	MatcherOption
 } {
 	return optionFunc(func(s sealedOption) error {
+		if err := onlyPerMessage(s, "WithMatcher"); err != nil {
+			return err
+		}
+		if m == nil {
+			return fmt.Errorf("%w: matcher cannot be nil", ErrInvalidMatcher)
+		}
+		s.entry.matchers = append(s.entry.matchers, m)
+		return nil
+	})
+}
+
+// WithMatchers attaches several matchers to an entry. All must match.
+func WithMatchers(matchers ...Matcher) interface {
+	EntryOption
+	MatcherOption
+} {
+	return optionFunc(func(s sealedOption) error {
+		if err := onlyPerMessage(s, "WithMatchers"); err != nil {
+			return err
+		}
 		for i, m := range matchers {
 			if m == nil {
 				return fmt.Errorf("%w: matcher at index %d is nil", ErrInvalidMatcher, i)
 			}
-			s.interceptor.matchers = append(s.interceptor.matchers, m)
+			s.entry.matchers = append(s.entry.matchers, m)
 		}
 		return nil
 	})
 }
 
-// WithScheme narrows an interceptor to one scheme, http or https. An interceptor pattern carries a
-// hostname and a path and nothing else, so this is how the scheme is expressed.
+// WithMethods narrows an entry to the given request methods. It is a matcher like any other,
+// which is what lets several handlers share one path and differ only by method: the methods
+// are part of what identifies the entry.
 //
-// An interceptor with no scheme matches both, which is almost always what a proxy wants: the
-// authority and the path say what the traffic is, the scheme only says how it was carried.
-func WithScheme(scheme string) interface {
-	InterceptorOption
+// An entry with no method matcher answers every method.
+func WithMethods(methods ...string) interface {
+	EntryOption
 	MatcherOption
 } {
 	return optionFunc(func(s sealedOption) error {
+		if err := onlyKinds(s, "WithMethods", KindHTTP, KindGRPC, KindWebSocket); err != nil {
+			return err
+		}
+		m, err := MatchMethods(methods...)
+		if err != nil {
+			return err
+		}
+		s.entry.matchers = append(s.entry.matchers, m)
+		return nil
+	})
+}
+
+// WithScheme narrows an entry to one scheme, http or https. A pattern carries a hostname and
+// a path and nothing else, so this is how the scheme is expressed.
+//
+// An entry with no scheme matches both, which is almost always what a proxy wants: the
+// authority and the path say what the traffic is, the scheme only says how it was carried.
+func WithScheme(scheme string) interface {
+	EntryOption
+	MatcherOption
+} {
+	return optionFunc(func(s sealedOption) error {
+		if err := onlyKinds(s, "WithScheme", KindHTTP, KindGRPC, KindWebSocket); err != nil {
+			return err
+		}
 		m, err := MatchScheme(scheme)
 		if err != nil {
 			return err
 		}
-		s.interceptor.matchers = append(s.interceptor.matchers, m)
+		s.entry.matchers = append(s.entry.matchers, m)
 		return nil
 	})
 }
 
-// WithMatchersPriority orders interceptors that share a pattern. Higher runs first. It defaults
-// to the number of matchers on it, so the most constrained one is tried first.
-func WithMatchersPriority(priority uint) InterceptorOption {
+// WithMatchersPriority orders entries that share a pattern. Higher runs first. It defaults to
+// the number of matchers on it, so the most constrained one is tried first.
+func WithMatchersPriority(priority uint) EntryOption {
 	return optionFunc(func(s sealedOption) error {
-		s.interceptor.priority = priority
+		s.entry.priority = priority
 		return nil
 	})
 }
@@ -432,8 +491,9 @@ type serverConfig struct {
 	readTimeout          time.Duration
 	writeTimeout         time.Duration
 	idleTimeout          time.Duration
-	tunnelIdleTimeout    time.Duration
+	sniffTimeout         time.Duration
 	maxHeaderBytes       int
+	maxFrameBytes        int
 	maxConcurrentStreams int
 }
 
@@ -441,7 +501,9 @@ func defaultServerConfig() serverConfig {
 	return serverConfig{
 		readHeaderTimeout:    10 * time.Second,
 		idleTimeout:          90 * time.Second,
+		sniffTimeout:         time.Second,
 		maxHeaderBytes:       1 << 20,
+		maxFrameBytes:        1 << 20,
 		maxConcurrentStreams: 250,
 	}
 }

@@ -13,7 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func patternsOf(seq func(func(*Interceptor) bool)) []string {
+func patternsOf(seq func(func(EntryView) bool)) []string {
 	var out []string
 	for ic := range seq {
 		out = append(out, ic.Pattern())
@@ -24,9 +24,9 @@ func patternsOf(seq func(func(*Interceptor) bool)) []string {
 
 func TestIter_All(t *testing.T) {
 	p := testProxy(t)
-	p.MustAddInterceptor([]string{http.MethodGet}, "api.test/v1/charges", noopHandler)
-	p.MustAddInterceptor([]string{http.MethodPost}, "api.test/v1/refunds", noopHandler)
-	p.MustAddInterceptor([]string{http.MethodGet}, "files.test/v1/files/{id}", noopHandler)
+	p.MustAdd("api.test/v1/charges", noopHandler, WithMethods(http.MethodGet))
+	p.MustAdd("api.test/v1/refunds", noopHandler, WithMethods(http.MethodPost))
+	p.MustAdd("files.test/v1/files/{id}", noopHandler, WithMethods(http.MethodGet))
 
 	assert.Equal(t, []string{
 		"api.test/v1/charges",
@@ -35,41 +35,30 @@ func TestIter_All(t *testing.T) {
 	}, patternsOf(p.Iter().All()))
 }
 
-func TestIter_Methods(t *testing.T) {
-	p := testProxy(t)
-	p.MustAddInterceptor([]string{http.MethodGet}, "api.test/v1/charges", noopHandler)
-	p.MustAddInterceptor([]string{http.MethodPost}, "api.test/v1/refunds", noopHandler)
-	p.MustAddInterceptor(nil, "api.test/v1/any", noopHandler)
-
-	methods := slices.Sorted(p.Iter().Methods())
-	assert.Equal(t, []string{http.MethodGet, http.MethodPost}, methods,
-		"an interceptor with no method constraint contributes none")
-}
-
 func TestIter_Interceptors(t *testing.T) {
 	p := testProxy(t)
-	p.MustAddInterceptor([]string{http.MethodGet}, "api.test/v1/charges", noopHandler)
-	p.MustAddInterceptor([]string{http.MethodPost}, "api.test/v1/charges", noopHandler)
-	p.MustAddInterceptor([]string{http.MethodGet}, "api.test/v1/refunds", noopHandler)
+	p.MustAdd("api.test/v1/charges", noopHandler, WithMethods(http.MethodGet))
+	p.MustAdd("api.test/v1/charges", noopHandler, WithMethods(http.MethodPost))
+	p.MustAdd("api.test/v1/refunds", noopHandler, WithMethods(http.MethodGet))
 
-	assert.Len(t, patternsOf(p.Iter().Interceptors("api.test/v1/charges")), 2)
-	assert.Empty(t, patternsOf(p.Iter().Interceptors("api.test/v1/missing")))
+	assert.Len(t, patternsOf(p.Iter().Entries("api.test/v1/charges")), 2)
+	assert.Empty(t, patternsOf(p.Iter().Entries("api.test/v1/missing")))
 }
 
 func TestIter_InterceptorsReturnsEveryOneOnAPattern(t *testing.T) {
 	p := testProxy(t)
-	p.MustAddInterceptor([]string{http.MethodGet}, "api.test/v1/charges", noopHandler, WithScheme("https"))
-	p.MustAddInterceptor([]string{http.MethodGet}, "api.test/v1/charges", noopHandler)
+	p.MustAdd("api.test/v1/charges", noopHandler, WithScheme("https"), WithMethods(http.MethodGet))
+	p.MustAdd("api.test/v1/charges", noopHandler, WithMethods(http.MethodGet))
 
 	// Two interceptors on one pattern, told apart by their matchers rather than by their key.
-	assert.Len(t, patternsOf(p.Iter().Interceptors("api.test/v1/charges")), 2)
+	assert.Len(t, patternsOf(p.Iter().Entries("api.test/v1/charges")), 2)
 }
 
 func TestIter_PatternPrefix(t *testing.T) {
 	p := testProxy(t)
-	p.MustAddInterceptor([]string{http.MethodGet}, "api.test/v1/charges", noopHandler)
-	p.MustAddInterceptor([]string{http.MethodGet}, "api.test/v1/refunds", noopHandler)
-	p.MustAddInterceptor([]string{http.MethodGet}, "files.test/v1/files", noopHandler)
+	p.MustAdd("api.test/v1/charges", noopHandler, WithMethods(http.MethodGet))
+	p.MustAdd("api.test/v1/refunds", noopHandler, WithMethods(http.MethodGet))
+	p.MustAdd("files.test/v1/files", noopHandler, WithMethods(http.MethodGet))
 
 	assert.Equal(t, []string{
 		"api.test/v1/charges",
@@ -79,9 +68,9 @@ func TestIter_PatternPrefix(t *testing.T) {
 
 func TestIter_NamePrefix(t *testing.T) {
 	p := testProxy(t)
-	p.MustAddInterceptor([]string{http.MethodGet}, "api.test/v1/charges", noopHandler, WithName("stripe.charges"))
-	p.MustAddInterceptor([]string{http.MethodGet}, "api.test/v1/refunds", noopHandler, WithName("stripe.refunds"))
-	p.MustAddInterceptor([]string{http.MethodGet}, "files.test/v1/files", noopHandler, WithName("files.list"))
+	p.MustAdd("api.test/v1/charges", noopHandler, WithName("stripe.charges"), WithMethods(http.MethodGet))
+	p.MustAdd("api.test/v1/refunds", noopHandler, WithName("stripe.refunds"), WithMethods(http.MethodGet))
+	p.MustAdd("files.test/v1/files", noopHandler, WithName("files.list"), WithMethods(http.MethodGet))
 
 	var names []string
 	for ic := range p.Iter().NamePrefix("stripe.") {
@@ -93,10 +82,10 @@ func TestIter_NamePrefix(t *testing.T) {
 
 func TestIter_SnapshotIsStable(t *testing.T) {
 	p := testProxy(t)
-	p.MustAddInterceptor([]string{http.MethodGet}, "api.test/v1/charges", noopHandler)
+	p.MustAdd("api.test/v1/charges", noopHandler, WithMethods(http.MethodGet))
 
 	it := p.Iter()
-	p.MustAddInterceptor([]string{http.MethodGet}, "api.test/v1/refunds", noopHandler)
+	p.MustAdd("api.test/v1/refunds", noopHandler, WithMethods(http.MethodGet))
 
 	assert.Len(t, patternsOf(it.All()), 1, "an iterator must not observe writes made after it was taken")
 	assert.Len(t, patternsOf(p.Iter().All()), 2)
@@ -104,8 +93,8 @@ func TestIter_SnapshotIsStable(t *testing.T) {
 
 func TestIter_Names(t *testing.T) {
 	p := testProxy(t)
-	p.MustAddInterceptor([]string{http.MethodGet}, "api.test/v1/charges", noopHandler, WithName("charges"))
-	p.MustAddInterceptor([]string{http.MethodGet}, "api.test/v1/refunds", noopHandler)
+	p.MustAdd("api.test/v1/charges", noopHandler, WithName("charges"), WithMethods(http.MethodGet))
+	p.MustAdd("api.test/v1/refunds", noopHandler, WithMethods(http.MethodGet))
 
 	var named []string
 	for ic := range p.Iter().Names() {

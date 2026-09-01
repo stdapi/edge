@@ -44,7 +44,7 @@ var (
 )
 
 // nameVerdict is what verification concluded about the server name. Refusals are already
-// folded into the action.
+// folded into the admission answer.
 type nameVerdict uint8
 
 const (
@@ -55,41 +55,45 @@ const (
 	nameUnresolved
 )
 
-// actionForTransparent answers the action of a transparent connection and the target it
-// was matched on. named reports that the host came from the ClientHello rather than the
-// destination.
-func (p *Proxy) actionForTransparent(ctx context.Context, target Target, origin netip.AddrPort, named bool) (Action, Target, nameVerdict) {
+// targetForTransparent answers which target a transparent connection is matched on, and
+// whether anything admits it at all. named reports that the host came from the ClientHello
+// rather than the destination.
+//
+// The kinds are the kinds the connection could still turn out to be. Nothing has been
+// negotiated yet, so admission here only asks whether the authority is known at all; the
+// kind is checked again once the traffic has named it.
+func (p *Proxy) targetForTransparent(ctx context.Context, target Target, origin netip.AddrPort, named bool, kinds ...Kind) (Target, bool, nameVerdict) {
 	mode := p.cfg.verifyNames
 	if mode == VerifyOff || !named || !origin.IsValid() {
 		// Without a destination on record the upstream dial resolves the name itself, so
 		// there is no client-chosen address the name could disagree with.
-		return p.ActionFor(target), target, nameTrusted
+		return target, p.admitsAny(target, kinds...), nameTrusted
 	}
 
 	// The target the same connection without a server name would have produced.
 	nameless := target
 	nameless.Host = origin.Addr().Unmap().String()
 
-	// One snapshot for both lookups, so a rule committing in between cannot split them
+	// One snapshot for both lookups, so an entry committing in between cannot split them
 	// across two trees.
 	tree := p.getTree()
-	c := tree.pool.Get().(*Context)
-	action := tree.actionFor(c, target)
-	fallback := Reject
+	c := tree.pool.Get().(*routeCtx)
+	admitted := tree.admitsAny(c, target, kinds)
+	fallback := false
 	if mode == VerifyLoose {
-		fallback = tree.actionFor(c, nameless)
+		fallback = tree.admitsAny(c, nameless, kinds)
 	}
 	tree.pool.Put(c)
 
-	if action == Reject {
-		if fallback == Reject {
+	if !admitted {
+		if !fallback {
 			// Refused confirmed or not, so the name is not resolved. A client spraying
 			// names gets no lookups of its choosing out of the proxy.
-			return Reject, target, nameTrusted
+			return target, false, nameTrusted
 		}
-		// A name no rule matches is dropped unresolved, since resolution could not make
+		// A name no entry matches is dropped unresolved, since resolution could not make
 		// it match one.
-		return fallback, nameless, nameDropped
+		return nameless, true, nameDropped
 	}
 
 	rctx, cancel := context.WithTimeout(ctx, nameVerifyTimeout)
@@ -99,19 +103,19 @@ func (p *Proxy) actionForTransparent(ctx context.Context, target Target, origin 
 		p.cfg.logger.Debug("edge: server name cannot be resolved",
 			slog.String("name", target.Host), slog.String("error", err.Error()))
 		if mode == VerifyReject {
-			return Reject, target, nameUnresolved
+			return target, false, nameUnresolved
 		}
-		return fallback, nameless, nameDropped
+		return nameless, fallback, nameDropped
 	}
 
 	want := origin.Addr().Unmap()
 	if slices.ContainsFunc(addrs, func(a netip.Addr) bool { return a.Unmap() == want }) {
-		return action, target, nameTrusted
+		return target, true, nameTrusted
 	}
 	if mode == VerifyReject {
-		return Reject, target, nameMismatch
+		return target, false, nameMismatch
 	}
 	p.cfg.logger.Debug("edge: server name does not resolve to the destination",
 		slog.String("name", target.Host), slog.String("destination", origin.String()))
-	return fallback, nameless, nameDropped
+	return nameless, fallback, nameDropped
 }

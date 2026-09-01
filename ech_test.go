@@ -17,6 +17,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -188,7 +190,7 @@ func TestTransparent_RejectECHRefusesBeforeDialing(t *testing.T) {
 
 	p, err := New(WithRejectECH(true), WithTransport(tr))
 	require.NoError(t, err)
-	p.MustAddTunnel("allowed.test")
+	p.MustAdd[TCP]("allowed.test", relayStream)
 
 	addr := startTransparent(t, p)
 
@@ -228,9 +230,11 @@ func TestTransparent_WithoutRejectECHTheOuterNameDecides(t *testing.T) {
 	tr := DefaultTransport()
 	tr.DialContext = pinnedDialer(origin.Addr().String())
 
-	p, err := New(WithTransport(tr))
+	ca, err := GenerateCA()
 	require.NoError(t, err)
-	p.MustAddTunnel("allowed.test")
+	p, err := New(WithCA(ca), WithTransport(tr))
+	require.NoError(t, err)
+	p.MustAdd[TCP]("allowed.test", relayStream)
 
 	addr := startTransparent(t, p)
 
@@ -242,11 +246,20 @@ func TestTransparent_WithoutRejectECHTheOuterNameDecides(t *testing.T) {
 	_, err = conn.Write(hello)
 	require.NoError(t, err)
 
+	// Without the refusal the outer name is what the connection is placed on, so the proxy
+	// admits it and answers the handshake, with a record of its own or an alert. A refusal
+	// closes the connection without a word, which is what tells the two apart.
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+	answer := make([]byte, 1)
+	n, rerr := conn.Read(answer)
+	require.NoError(t, rerr, "the connection was closed without an answer, so the outer name did not decide")
+	require.Equal(t, 1, n)
+	assert.Contains(t, []byte{0x16, 0x15}, answer[0], "the proxy should answer the handshake")
+
 	select {
 	case got := <-received:
-		assert.True(t, bytes.HasPrefix(hello, got), "the tunnel should relay the ClientHello untouched")
-	case <-time.After(5 * time.Second):
-		t.Fatal("the origin never received the ClientHello")
+		t.Fatalf("the origin was reached with %d byte(s); a terminated connection re-originates its own handshake", len(got))
+	case <-time.After(200 * time.Millisecond):
 	}
 }
 
@@ -299,7 +312,7 @@ func TestConnect_RejectECHClosesTheTunnel(t *testing.T) {
 
 	p, err := New(WithRejectECH(true))
 	require.NoError(t, err)
-	p.MustAddTunnel(origin.Addr().String())
+	p.MustAdd[TCP](origin.Addr().String(), relayStream)
 
 	addr := startProxy(t, p)
 	conn := connectRaw(t, addr, origin.Addr().String())
@@ -309,50 +322,46 @@ func TestConnect_RejectECHClosesTheTunnel(t *testing.T) {
 
 	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
 	_, err = conn.Read(make([]byte, 1))
-	assert.ErrorIs(t, err, io.EOF, "the tunnel should be closed without an answer")
+	assert.ErrorIs(t, err, io.EOF, "the connection should be closed without an answer")
 
+	// The refusal lands before anything upstream is opened, so the origin sees no connection
+	// at all rather than one that carried nothing.
 	select {
 	case n := <-received:
-		assert.Zero(t, n, "no client byte should reach the origin")
-	case <-time.After(5 * time.Second):
-		t.Fatal("the origin connection never ended")
+		t.Fatalf("the origin was reached, and read %d byte(s)", n)
+	case <-time.After(500 * time.Millisecond):
 	}
 }
 
+// A ClientHello that offers no ECH is let through, and so is traffic that is not TLS at all.
+// The check refuses what it cannot read, not everything it inspects.
 func TestConnect_RejectECHLeavesOtherTrafficAlone(t *testing.T) {
-	origin, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	defer func() { _ = origin.Close() }()
+	t.Run("plaintext", func(t *testing.T) {
+		origin, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		defer func() { _ = origin.Close() }()
 
-	received := make(chan []byte, 4)
-	go func() {
-		for {
+		received := make(chan []byte, 1)
+		go func() {
 			c, aerr := origin.Accept()
 			if aerr != nil {
 				return
 			}
-			go func() {
-				defer func() { _ = c.Close() }()
-				_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
-				buf := make([]byte, clientHelloPeekSize)
-				n, _ := io.ReadAtLeast(c, buf, 1)
-				if _, werr := c.Write([]byte("pong")); werr != nil {
-					return
-				}
-				received <- buf[:n]
-			}()
-		}
-	}()
+			defer func() { _ = c.Close() }()
+			buf := make([]byte, 4)
+			n, _ := io.ReadFull(c, buf)
+			received <- buf[:n]
+			_, _ = c.Write([]byte("pong"))
+			time.Sleep(200 * time.Millisecond)
+		}()
 
-	p, err := New(WithRejectECH(true))
-	require.NoError(t, err)
-	p.MustAddTunnel(origin.Addr().String())
+		p, err := New(WithRejectECH(true))
+		require.NoError(t, err)
+		p.MustAdd[TCP](origin.Addr().String(), relayStream)
+		addr := startProxy(t, p)
 
-	addr := startProxy(t, p)
-
-	t.Run("plaintext", func(t *testing.T) {
 		conn := connectRaw(t, addr, origin.Addr().String())
-		_, err := conn.Write([]byte("ping"))
+		_, err = conn.Write([]byte("ping"))
 		require.NoError(t, err)
 
 		require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
@@ -364,17 +373,28 @@ func TestConnect_RejectECHLeavesOtherTrafficAlone(t *testing.T) {
 	})
 
 	t.Run("tls without ech", func(t *testing.T) {
-		conn := connectRaw(t, addr, origin.Addr().String())
-		hello := plainClientHello(t, "allowed.test")
-		_, err := conn.Write(hello)
+		origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			fmt.Fprint(w, "origin")
+		}))
+		defer origin.Close()
+		originURL, err := url.Parse(origin.URL)
 		require.NoError(t, err)
 
-		select {
-		case got := <-received:
-			assert.True(t, bytes.HasPrefix(hello, got), "the ClientHello should be relayed byte for byte")
-		case <-time.After(5 * time.Second):
-			t.Fatal("the origin never received the ClientHello")
-		}
+		ca, err := GenerateCA()
+		require.NoError(t, err)
+		tr := DefaultTransport()
+		tr.RootCAs = originPool(t, origin)
+		p := Must(WithCA(ca), WithTransport(tr), WithRejectECH(true))
+		p.MustAdd[TCP](originHost(originURL), relayStream)
+		addr := startProxy(t, p)
+
+		// A real client, so the ClientHello is a real one: the check reads it, finds no ECH
+		// and lets the handshake through.
+		resp, err := proxyClient(addr, ca.CertPool()).Get(origin.URL)
+		require.NoError(t, err)
+		defer func() { _ = resp.Body.Close() }()
+		body, _ := io.ReadAll(resp.Body)
+		assert.Equal(t, "origin", string(body))
 	})
 }
 
@@ -384,7 +404,7 @@ func TestConnect_RejectECHRefusesAnInterceptedHandshake(t *testing.T) {
 
 	p, err := New(WithCA(ca), WithRejectECH(true))
 	require.NoError(t, err)
-	p.MustAddInterceptor(nil, "secret.test/+{any}", func(c *Context) (*http.Response, error) {
+	p.MustAdd("secret.test/+{any}", func(c *HTTPCtx) (*http.Response, error) {
 		return c.Forward()
 	})
 
@@ -420,7 +440,7 @@ func TestConnect_RejectECHClosesAnH2Stream(t *testing.T) {
 
 	p, err := New(WithRejectECH(true))
 	require.NoError(t, err)
-	p.MustAddTunnel(origin.Addr().String())
+	p.MustAdd[TCP](origin.Addr().String(), relayStream)
 
 	addr := startProxy(t, p)
 
@@ -446,11 +466,12 @@ func TestConnect_RejectECHClosesAnH2Stream(t *testing.T) {
 	_, err = resp.Body.Read(buf)
 	assert.Error(t, err, "the stream should end without an answer")
 
+	// Nothing upstream is opened until a handler asks for it, so a refused stream leaves the
+	// origin untouched rather than reached and then dropped.
 	select {
 	case n := <-received:
-		assert.Zero(t, n, "no client byte should reach the origin")
-	case <-time.After(5 * time.Second):
-		t.Fatal("the origin connection never ended")
+		t.Fatalf("the origin was reached, and read %d byte(s)", n)
+	case <-time.After(500 * time.Millisecond):
 	}
 }
 
@@ -479,7 +500,7 @@ func TestQUIC_RejectECHDropsTheConnection(t *testing.T) {
 		WithLogger(slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))),
 	)
 	require.NoError(t, err)
-	p.MustAddTunnel("allowed.test")
+	p.MustAdd[TCP]("allowed.test", relayStream)
 
 	addr := startQUIC(t, p)
 

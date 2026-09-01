@@ -27,43 +27,35 @@ const (
 	plusDelim    byte = '+'
 )
 
-// HandlerFunc handles an intercepted request. It receives the request through c and returns
-// the response to send back to the client.
+// Middleware wraps a handler of one kind. Middleware runs in registration order, outermost
+// first, and the proxy-wide ones wrap the ones registered on an entry.
 //
-// A handler forwards the request upstream with [Context.Forward], which returns the live
-// upstream response. Returning that response streams it to the client untouched. Returning
-// a response built locally, with [Text] or [JSON] for example, short circuits the upstream
-// entirely and the request never leaves the proxy.
-//
-// A non-nil error is reported to the configured [ErrorHandler], which is responsible for
-// the response sent to the client. A handler that returns a nil response and a nil error
-// sends a bare 502 Bad Gateway.
-type HandlerFunc func(c *Context) (*http.Response, error)
-
-// MiddlewareFunc wraps a [HandlerFunc]. Middleware runs in registration order, outermost first.
-type MiddlewareFunc func(next HandlerFunc) HandlerFunc
+//	func log(next edge.HTTP) edge.HTTP {
+//		return func(c *edge.HTTPCtx) (*http.Response, error) { ...; return next(c) }
+//	}
+type Middleware[H Handler] = func(next H) H
 
 // ErrorHandler writes a response for a request that failed. err is never nil.
-type ErrorHandler func(c *Context, err error) *http.Response
+type ErrorHandler func(c *HTTPCtx, err error) *http.Response
 
+// middleware is one registered wrapper, kept with the kind it wraps so an entry only picks
+// up the ones written for its own handler signature.
 type middleware struct {
-	m     MiddlewareFunc
-	scope HandlerScope
-	g     bool
+	m    any
+	kind Kind
 }
 
-// Proxy is a forward HTTP proxy. It tunnels connections it was not asked to look at and
-// intercepts the rest, terminating TLS with its certificate authority so registered
-// handlers can inspect and rewrite traffic.
+// Proxy is a forward proxy that terminates what it admits. TLS is terminated when there is
+// TLS, so every handler sees the traffic in the clear, and nothing is relayed encrypted.
 //
-// A Proxy is safe for concurrent use. Interceptors and tunnels can be changed while
-// traffic is flowing: lookups are lock-free and never observe a partially applied write.
+// A Proxy is safe for concurrent use. Entries can be added and removed while traffic flows:
+// lookups are lock-free and never observe a partially applied write, and every unit, request,
+// stream or datagram, is routed on the tree as it stands when it arrives.
 type Proxy struct {
 	cfg  *config
 	tree atomic.Pointer[iTree]
 
-	noInterceptor HandlerFunc
-	onError       ErrorHandler
+	onError ErrorHandler
 
 	// srv owns the accepted connections and the upstream transports.
 	srv *server
@@ -108,8 +100,8 @@ func newConfig() *config {
 	}
 }
 
-// Must returns a ready to use [Proxy] and panics on error. It is a convenience wrapper
-// for [New].
+// Must returns a ready to use [Proxy] and panics on error. It is a convenience wrapper for
+// [New].
 func Must(opts ...ProxyOption) *Proxy {
 	p, err := New(opts...)
 	if err != nil {
@@ -120,14 +112,18 @@ func Must(opts ...ProxyOption) *Proxy {
 
 // New returns a ready to use [Proxy].
 //
-// A proxy with no certificate authority can still tunnel and observe connections, but it
-// cannot intercept: anything that would require minting a leaf certificate, an intercept
-// an interceptor, is reported as [ErrNoCertificateAuthority]. Use [NewCA], [LoadCA] or
-// [GenerateCA] with [WithCA] to provide one.
+// Every admitted connection is terminated, so a proxy needs a certificate authority to serve
+// anything carried over TLS. An [HTTP] or [QUIC] entry is refused without one, with
+// [ErrNoCertificateAuthority]: QUIC is always TLS, and HTTP is in practice, so a registration
+// that could not be served is reported at once rather than at the first handshake. That holds
+// even for a deployment that only ever sees cleartext.
+//
+// A [TCP] or [UDP] entry needs none, a stream being often in the clear and a datagram carrying
+// no handshake at all; a stream that turns out to carry TLS fails at that handshake instead.
+// Use [NewCA], [LoadCA] or [GenerateCA] with [WithCA].
 func New(opts ...ProxyOption) (*Proxy, error) {
 	cfg := newConfig()
 	p := &Proxy{cfg: cfg}
-	p.noInterceptor = DefaultNoInterceptorHandler
 	p.onError = DefaultErrorHandler
 
 	for _, opt := range opts {
@@ -136,9 +132,8 @@ func New(opts ...ProxyOption) (*Proxy, error) {
 		}
 	}
 
-	// Clip so newInterceptor's append(p.mws, ic.mws...) can never write into the shared backing array.
+	// Clip so newEntry's append(p.mws, e.mws...) can never write into the shared backing array.
 	p.mws = slices.Clip(p.mws)
-	p.noInterceptor = applyMiddleware(NoInterceptorHandler, p.mws, p.noInterceptor)
 
 	p.tree.Store(p.newTree())
 
@@ -157,7 +152,6 @@ func (p *Proxy) newTree() *iTree {
 	tree.patterns = new(node)
 	tree.addrs = new(node)
 	tree.names = new(node)
-	tree.methods = make(map[string]uint)
 	tree.pool = sync.Pool{
 		New: func() any {
 			return tree.allocateContext()
@@ -168,21 +162,25 @@ func (p *Proxy) newTree() *iTree {
 
 func (p *Proxy) getTree() *iTree { return p.tree.Load() }
 
-// MustAddInterceptor registers handler for the given methods and pattern and panics on error. It is
-// a convenience wrapper for [Proxy.AddInterceptor].
-func (p *Proxy) MustAddInterceptor(methods []string, pattern string, handler HandlerFunc, opts ...InterceptorOption) *Interceptor {
-	ic, err := p.AddInterceptor(methods, pattern, handler, opts...)
+// MustAdd registers handler for pattern and panics on error. It is a convenience wrapper for
+// [Proxy.Add].
+func (p *Proxy) MustAdd[H Handler](pattern string, handler H, opts ...EntryOption) Entry[H] {
+	e, err := p.Add(pattern, handler, opts...)
 	if err != nil {
 		panic(err)
 	}
-	return ic
+	return e
 }
 
-// AddInterceptor registers handler for the given methods and pattern. An empty or nil set of
-// methods matches every method. On success it returns the newly registered [Interceptor].
+// Add registers handler for pattern. The handler signature is what selects the kind of
+// traffic it serves, so no type argument is needed unless one is wanted for clarity.
 //
-// A pattern is an authority and a path. The authority is required: it is the one the
-// interceptor arms, and interception is what makes the handler reachable at all.
+//	p.Add("api.test/v1/charges/{id}", func(c *edge.HTTPCtx) (*http.Response, error) { ... })
+//	p.Add[edge.TCP]("smtp.test:465", relay)
+//
+// A pattern is an authority, and a path for the kinds that route each message of a
+// connection: [KindHTTP], [KindGRPC] and [KindWebSocket] take one, the others take none.
+// The authority is required either way, it is the one the entry admits.
 //
 //	api.stripe.com/v1/charges       one host
 //	+{sub}.corp.internal/health     every subdomain
@@ -190,106 +188,112 @@ func (p *Proxy) MustAddInterceptor(methods []string, pattern string, handler Han
 //	api.stripe.com/*{any}           every path on one host, which is how to just watch it
 //	[10.0.0.0/8]/health             every address in a range
 //	[::/0]/health                   every IPv6 address
+//	smtp.test:465                   one authority, for a kind that routes connections
 //
-// The port belongs to the pattern, as "host:port/path". The scheme is a matcher: see [WithScheme].
+// The port belongs to the pattern, as "host:port/path". The scheme is a matcher, see
+// [WithScheme], and so is the method, see [WithMethods].
 //
-// Registering an interceptor marks its authority for interception, so nothing else has to be
-// declared. An authority already tunneled is a conflict rather than a silent no-op, since the
-// handler could never run.
+// Registering an entry admits its authority for the traffic its kind rides on, and nothing
+// else. An authority no entry names is refused, and so is a unit no entry matches.
 //
 // If an error occurs, it returns one of the following:
 //   - [*PatternError]: the pattern syntax is invalid.
-//   - [*InterceptorConflictError]: it conflicts with an existing interceptor.
-//   - [*InterceptorNameConflictError]: the name is already registered.
-//   - [ErrInvalidInterceptor]: a method is invalid, the handler is nil or the pattern is empty.
-//   - [ErrInvalidConfig]: an option is invalid.
+//   - [*EntryConflictError]: it conflicts with an existing entry.
+//   - [*EntryNameConflictError]: the name is already registered.
+//   - [ErrInvalidEntry]: the handler is nil or the pattern is empty.
+//   - [ErrInvalidConfig]: an option is invalid, or does not apply to this kind.
 //   - [ErrInvalidMatcher]: a matcher option is invalid.
-//   - [ErrAuthorityConflict]: the authority is tunneled, so the handler could never run.
-//   - [ErrNoCertificateAuthority]: interception needs a CA and none is configured.
-func (p *Proxy) AddInterceptor(methods []string, pattern string, handler HandlerFunc, opts ...InterceptorOption) (*Interceptor, error) {
+//   - [ErrNoCertificateAuthority]: termination needs a CA and none is configured.
+func (p *Proxy) Add[H Handler](pattern string, handler H, opts ...EntryOption) (Entry[H], error) {
 	txn := p.Txn(true)
 	defer txn.Abort()
-	ic, err := txn.AddInterceptor(methods, pattern, handler, opts...)
+	e, err := txn.Add(pattern, handler, opts...)
 	if err != nil {
-		return nil, err
+		return Entry[H]{}, err
 	}
 	txn.Commit()
-	return ic, nil
+	return e, nil
 }
 
-// UpdateInterceptor overrides the handler and options of an existing interceptor. Options and middleware
-// must be reapplied: anything not provided falls back to the proxy default.
-func (p *Proxy) UpdateInterceptor(methods []string, pattern string, handler HandlerFunc, opts ...InterceptorOption) (*Interceptor, error) {
-	txn := p.Txn(true)
-	defer txn.Abort()
-	ic, err := txn.UpdateInterceptor(methods, pattern, handler, opts...)
-	if err != nil {
-		return nil, err
-	}
-	txn.Commit()
-	return ic, nil
-}
-
-// DeleteInterceptor removes the interceptor registered for the given methods, pattern and matchers, and
-// returns it.
+// Update overrides the handler and options of an existing entry. Options and middleware must
+// be reapplied: anything not provided falls back to the proxy default.
 //
-// The connections already open are left untouched, though the requests on them are routed
-// again. See [Proxy.Sessions] to close them.
-func (p *Proxy) DeleteInterceptor(methods []string, pattern string, opts ...MatcherOption) (*Interceptor, error) {
+// The change takes effect on the next unit routed, on connections already open included.
+func (p *Proxy) Update[H Handler](pattern string, handler H, opts ...EntryOption) (Entry[H], error) {
 	txn := p.Txn(true)
 	defer txn.Abort()
-	ic, err := txn.DeleteInterceptor(methods, pattern, opts...)
+	e, err := txn.Update(pattern, handler, opts...)
 	if err != nil {
-		return nil, err
+		return Entry[H]{}, err
 	}
 	txn.Commit()
-	return ic, nil
+	return e, nil
 }
 
-// removeInterceptor removes the provided [Interceptor] and returns the deleted interceptor.
-func (p *Proxy) removeInterceptor(ic *Interceptor) (*Interceptor, error) {
+// Delete removes the entry registered for the given kind, pattern and matchers, and returns
+// it. The kind has no handler to infer it from, so it is always written out.
+//
+//	p.Delete[edge.HTTP]("api.test/v1/charges/{id}")
+//
+// The connections already open are left untouched, though the units on them are routed again
+// and refused when nothing matches any more. See [Proxy.Sessions] to close them instead.
+func (p *Proxy) Delete[H Handler](pattern string, opts ...MatcherOption) (Entry[H], error) {
 	txn := p.Txn(true)
 	defer txn.Abort()
-	ic, err := txn.removeInterceptor(ic)
+	e, err := txn.Delete[H](pattern, opts...)
 	if err != nil {
-		return nil, err
+		return Entry[H]{}, err
 	}
 	txn.Commit()
-	return ic, nil
+	return e, nil
 }
 
-// Has reports whether an interceptor is registered for the given methods, pattern and matchers.
-func (p *Proxy) Has(methods []string, pattern string, matchers ...Matcher) bool {
-	return p.Interceptor(methods, pattern, matchers...) != nil
+// Has reports whether an entry is registered for the given kind, pattern and matchers.
+func (p *Proxy) Has[H Handler](pattern string, matchers ...Matcher) bool {
+	_, ok := p.Lookup[H](pattern, matchers...)
+	return ok
 }
 
-// Interceptor returns the [Interceptor] registered for the given methods, pattern and matchers, or nil.
-func (p *Proxy) Interceptor(methods []string, pattern string, matchers ...Matcher) *Interceptor {
-	return p.getTree().interceptor(methods, pattern, matchers)
+// Lookup returns the entry registered for the given kind, pattern and matchers.
+func (p *Proxy) Lookup[H Handler](pattern string, matchers ...Matcher) (Entry[H], bool) {
+	e := p.getTree().entryFor(kindOf[H](), pattern, matchers)
+	if e == nil {
+		return Entry[H]{}, false
+	}
+	return Entry[H]{e: e}, true
 }
 
-// Name returns the [Interceptor] registered under the given name, or nil.
-func (p *Proxy) Name(name string) *Interceptor {
-	tree := p.getTree()
-	return tree.byName(name)
+// Named returns the entry registered under name for the given kind. An entry registered
+// under another kind is not reported, so the lookup can hand back a typed handler.
+func (p *Proxy) Named[H Handler](name string) (Entry[H], bool) {
+	e := p.getTree().byName(name)
+	if e == nil || e.kind != kindOf[H]() {
+		return Entry[H]{}, false
+	}
+	return Entry[H]{e: e}, true
 }
 
-// AuthoritiesLen returns the number of registered authority entries, the ones declared with
-// [Proxy.AddTunnel] and the ones implied by interceptors alike.
-func (p *Proxy) AuthoritiesLen() int { return p.getTree().authorities }
-
-// InterceptorsLen returns the number of registered interceptors.
-func (p *Proxy) InterceptorsLen() int { return p.getTree().interceptors }
+// Len returns the number of registered entries. The admissions implied by the per-message
+// ones are internal bookkeeping and are not counted.
+func (p *Proxy) Len() int { return p.getTree().handlers }
 
 // Iter returns a set of range iterators over a point-in-time snapshot of the routing tree.
 func (p *Proxy) Iter() Iter {
 	tree := p.getTree()
-	return Iter{patterns: tree.patterns, addrs: tree.addrs, names: tree.names, methods: tree.methods, maxDepth: tree.maxDepth}
+	return Iter{patterns: tree.patterns, addrs: tree.addrs, names: tree.names, maxDepth: tree.maxDepth}
 }
 
 // Updates runs fn in a write transaction on the routing tree. The transaction is committed
 // when fn returns nil and aborted otherwise. Only one write transaction runs at a time;
 // lookups never block.
+//
+//	p.Updates(func(txn *edge.Txn) error {
+//		if _, err := txn.Delete[edge.HTTP]("api.test/v1/charges/{id}"); err != nil {
+//			return err
+//		}
+//		_, err := txn.Add("api.test/v1/charges/{id}", handler)
+//		return err
+//	})
 func (p *Proxy) Updates(fn func(txn *Txn) error) error {
 	txn := p.Txn(true)
 	defer txn.Abort()
@@ -317,89 +321,99 @@ func (p *Proxy) Txn(write bool) *Txn {
 	return &Txn{p: p, rootTxn: p.getTree().txn()}
 }
 
-// newInterceptor creates a [Interceptor] without registering it. If an error occurs, it returns one of:
+// newEntry builds an entry without registering it. If an error occurs, it returns one of:
 //   - [*PatternError]: the pattern syntax is invalid.
-//   - [ErrInvalidInterceptor]: the method is invalid, the handler is nil or the pattern is empty.
-//   - [ErrInvalidConfig]: an interceptor option is invalid.
+//   - [ErrInvalidEntry]: the handler is nil or the pattern is empty.
+//   - [ErrInvalidConfig]: an option is invalid or does not apply to this kind.
 //   - [ErrInvalidMatcher]: a matcher option is invalid.
-func (p *Proxy) newInterceptor(methods []string, pattern string, handler HandlerFunc, opts ...InterceptorOption) (*Interceptor, error) {
-	if handler == nil {
-		return nil, fmt.Errorf("%w: nil handler", ErrInvalidInterceptor)
+func newEntry[H Handler](p *Proxy, pattern string, handler H, opts ...EntryOption) (*entry, error) {
+	kind := kindOf[H]()
+	if isNilHandler(handler) {
+		return nil, fmt.Errorf("%w: nil handler", ErrInvalidEntry)
 	}
 
-	for _, method := range methods {
-		if !validMethod(method) {
-			return nil, fmt.Errorf("%w: invalid method %q", ErrInvalidInterceptor, method)
-		}
-		if method == http.MethodConnect {
-			return nil, fmt.Errorf("%w: CONNECT is handled by the tunnel layer, not by an interceptor", ErrInvalidInterceptor)
-		}
-	}
-
-	pat, paramsCnt, err := p.parsePattern(pattern)
+	pat, paramsCnt, err := p.parsePattern(pattern, kind)
 	if err != nil {
 		return nil, err
 	}
 
-	ic := &Interceptor{
-		hbase:       handler,
+	e := &entry{
+		handler:     handler,
 		pattern:     pat,
+		kind:        kind,
 		handleSlash: p.cfg.handleSlash,
-		methodFast:  noFastMethod,
 	}
 
-	ic.params = make([]string, 0, paramsCnt)
+	e.params = make([]string, 0, paramsCnt)
 	for _, tk := range pat.tokens {
 		if tk.typ != nodeStatic {
-			ic.params = append(ic.params, tk.value)
+			e.params = append(e.params, tk.value)
 		}
 	}
 
 	for _, opt := range opts {
-		if err = opt.applyInterceptor(sealedOption{proxy: p, interceptor: ic}); err != nil {
+		if err = opt.applyEntry(sealedOption{proxy: p, entry: e}); err != nil {
 			return nil, err
 		}
 	}
 
-	if len(ic.matchers) > p.cfg.maxMatchers {
-		return nil, fmt.Errorf("%w: %w", ErrInvalidInterceptor, ErrTooManyMatchers)
+	if len(e.matchers) > p.cfg.maxMatchers {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidEntry, ErrTooManyMatchers)
 	}
-	if len(ic.matchers) == 0 && ic.priority > 0 {
-		return nil, fmt.Errorf("%w: priority requires matchers", ErrInvalidInterceptor)
-	}
-
-	ic.priority = cmp.Or(ic.priority, uint(len(ic.matchers)))
-	ic.hself, ic.hall = applyInterceptorMiddleware(append(p.mws, ic.mws...), handler)
-
-	if len(methods) > 0 {
-		// Defensive copy: the caller keeps ownership of the slice it passed.
-		ic.methods = slices.Clone(methods)
-		slices.Sort(ic.methods)
-		ic.methods = slices.Compact(ic.methods)
+	if len(e.matchers) == 0 && e.priority > 0 {
+		return nil, fmt.Errorf("%w: priority requires matchers", ErrInvalidEntry)
 	}
 
-	if len(ic.methods) == 1 && len(ic.matchers) == 0 && ic.pattern.port == "" {
-		// A port is compared in matchSlow, so an interceptor naming one cannot take the fast
-		// path any more than one carrying a matcher can.
-		ic.methodFast = ic.methods[0]
-	}
+	e.priority = cmp.Or(e.priority, uint(len(e.matchers)))
+	e.serve = chain(append(p.mws, e.mws...), handler)
 
-	return ic, nil
+	return e, nil
 }
 
-// DefaultNoInterceptorHandler forwards the request upstream unchanged. It is the handler used for
-// intercepted requests that match no interceptor, which makes interception without a matching interceptor
-// observable but not disruptive.
-func DefaultNoInterceptorHandler(c *Context) (*http.Response, error) {
-	return c.Forward()
+// isNilHandler reports whether a handler value is nil. A nil func boxed in an interface makes
+// the interface itself non-nil, so the comparison has to happen at the concrete type.
+func isNilHandler[H Handler](h H) bool {
+	switch v := any(h).(type) {
+	case HTTP:
+		return v == nil
+	case GRPC:
+		return v == nil
+	case WebSocket:
+		return v == nil
+	case TCP:
+		return v == nil
+	case QUIC:
+		return v == nil
+	case UDP:
+		return v == nil
+	default:
+		return true
+	}
+}
+
+// chain wraps base with every middleware registered for its kind, outermost first. A
+// middleware of another kind cannot have the right signature, and the option that accepted it
+// already refused it, so the assertion here is the second half of one check.
+func chain[H Handler](mws []middleware, base H) H {
+	kind := kindOf[H]()
+	h := base
+	for _, mw := range slices.Backward(mws) {
+		if mw.kind != kind {
+			continue
+		}
+		if f, ok := mw.m.(Middleware[H]); ok {
+			h = f(h)
+		}
+	}
+	return h
 }
 
 // DefaultErrorHandler answers 502 Bad Gateway with the error text, and 500 for a
 // [PanicError], which it logs with its stack. A replacement takes over that logging.
-func DefaultErrorHandler(c *Context, err error) *http.Response {
+func DefaultErrorHandler(c *HTTPCtx, err error) *http.Response {
 	if pe, ok := errors.AsType[*PanicError](err); ok {
-		if c != nil && c.p != nil {
-			c.p.cfg.logger.Error("edge: handler panic",
+		if c != nil && c.r != nil && c.r.p != nil {
+			c.r.p.cfg.logger.Error("edge: handler panic",
 				slog.String("pattern", c.Pattern()),
 				slog.Any("panic", pe.Value),
 				slog.String("stack", pe.Stack),
@@ -408,29 +422,6 @@ func DefaultErrorHandler(c *Context, err error) *http.Response {
 		return Text(http.StatusInternalServerError, pe.Error())
 	}
 	return Text(http.StatusBadGateway, err.Error())
-}
-
-func applyMiddleware(scope HandlerScope, mws []middleware, h HandlerFunc) HandlerFunc {
-	m := h
-	for _, mw := range slices.Backward(mws) {
-		if mw.scope&scope != 0 {
-			m = mw.m(m)
-		}
-	}
-	return m
-}
-
-func applyInterceptorMiddleware(mws []middleware, base HandlerFunc) (self, all HandlerFunc) {
-	self, all = base, base
-	for _, mw := range slices.Backward(mws) {
-		if mw.scope&InterceptorHandler != 0 {
-			all = mw.m(all)
-			if !mw.g {
-				self = mw.m(self)
-			}
-		}
-	}
-	return self, all
 }
 
 func firstHeader(headers http.Header, k string) (string, bool) {

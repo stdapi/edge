@@ -41,8 +41,8 @@ type server struct {
 
 	listeners map[*net.Listener]struct{}
 	// active tracks connections the proxy owns outside of http.Server, which is every
-	// tunnel and every intercepted connection. It answers what a shutdown must close, so a
-	// connection enters it as soon as it is accepted, before anything has decided it.
+	// connection it terminated. It answers what a shutdown must close, so a connection enters
+	// it as soon as it is accepted, before anything has decided it.
 	active map[io.Closer]struct{}
 	// sessions is what [Proxy.Sessions] reports. A session enters it only once its target is
 	// resolved, so a caller never sees one it cannot pass to [Proxy.ActionFor].
@@ -109,12 +109,12 @@ func newServer(p *Proxy) (*server, error) {
 				ctx, cancel = context.WithCancel(ctx)
 				cc.arm(cancel)
 			}
-			return context.WithValue(ctx, sessionKey{}, newSession(ctx, c, Target{}, Intercept, HTTP11))
+			return context.WithValue(ctx, sessionKey{}, newSession(ctx, c, Target{}, KindHTTP, HTTP11))
 		},
 	}
 
 	s.mitm = &http.Server{
-		Handler:           http.HandlerFunc(p.serveInterceptedRequest),
+		Handler:           http.HandlerFunc(p.serveTerminatedRequest),
 		Protocols:         protocols,
 		HTTP2:             http2Cfg,
 		ReadHeaderTimeout: p.cfg.server.readHeaderTimeout,
@@ -198,16 +198,16 @@ func (p *Proxy) ServeTLS(ln net.Listener, cert tls.Certificate) error {
 // Shutdown stops accepting new connections, then waits for the requests in flight to finish.
 // The servers drain together: idle HTTP/1.1 connections are closed, HTTP/2 and HTTP/3
 // connections are told with a GOAWAY, and every request already started runs to completion.
-// Tunneled connections carry traffic the proxy cannot see the end of, so they are relayed
-// until they end on their own and cut when ctx is done, along with anything else still open.
-// Without a deadline on ctx, Shutdown waits indefinitely, on tunnels and on handlers alike.
+// A handler serving a whole connection, a stream or a datagram flow, ends when its peers do,
+// so it is waited on until ctx is done and cut then, along with anything else still open.
+// Without a deadline on ctx, Shutdown waits indefinitely.
 func (p *Proxy) Shutdown(ctx context.Context) error {
 	p.srv.beginClose()
 
 	err := p.srv.closeListeners()
 
-	// Past the deadline, whatever draining could not end is cut: tunnels, upgraded pipes,
-	// and connections still handshaking. Cutting them is what unblocks the waits below.
+	// Past the deadline, whatever draining could not end is cut: streams, upgraded pipes, and
+	// connections still handshaking. Cutting them is what unblocks the waits below.
 	stop := context.AfterFunc(ctx, p.srv.closeActive)
 	defer stop()
 
@@ -262,7 +262,7 @@ func (p *Proxy) Shutdown(ctx context.Context) error {
 	return err
 }
 
-// Close stops the proxy at once, dropping every connection including tunnels in flight.
+// Close stops the proxy at once, dropping every connection including the traffic in flight.
 func (p *Proxy) Close() error {
 	p.srv.beginClose()
 	err := errors.Join(p.srv.closeListeners(), p.srv.h1.Close(), p.srv.mitm.Close())
@@ -367,12 +367,15 @@ func (s *server) trackSession(sess *Session, add bool) {
 // the snapshot, so it also came after the delete, and this read sees that delete. Registering
 // after the read would reopen the window.
 func (s *server) admitSession(sess *Session) bool {
-	if sess.perRequest {
+	// A connection served request by request is not decided as a connection at all, so there
+	// is nothing to register and nothing a sweep could act on. Only the kind actually serving
+	// it says whether that is what happened.
+	if sess.perRequest && sess.kind == KindHTTP {
 		return true
 	}
 
 	s.trackSession(sess, true)
-	if s.p.ActionFor(sess.target) != Reject {
+	if s.p.Admits(sess.target, sess.kind) {
 		return true
 	}
 	s.trackSession(sess, false)
@@ -380,13 +383,14 @@ func (s *server) admitSession(sess *Session) bool {
 }
 
 // Sessions returns an iterator over a point-in-time snapshot of the connections the proxy
-// decides on, the tunnels it relays and the connections it terminated. A protocol upgrade is
-// reported on its own, under the authority its request was routed on.
+// decides on. A protocol upgrade is reported on its own, under the authority its request was
+// routed on.
 //
-// Removing a tunnel or an interceptor leaves the connections already open untouched. This is
-// how a caller applies the change to them.
+// Removing an entry governs the next unit on the connections already open, so this is not how
+// a change is applied. It is how a connection is ended on its own terms, and how one the tree
+// no longer admits at all is swept.
 //
-//	p.DeleteTunnel("example.com")
+//	p.Delete[edge.TCP]("example.com")
 //	for s := range p.Sessions() {
 //		if p.ActionFor(s.Target()) == Reject {
 //			s.Close()
@@ -456,7 +460,7 @@ func (s *server) closeActive() {
 }
 
 // ServeHTTP serves one request with explicit forward proxy semantics: a CONNECT opens a
-// tunnel, anything else is a plain HTTP request carrying an absolute target.
+// connection, anything else is a plain HTTP request carrying an absolute target.
 //
 // It makes a Proxy an [http.Handler], so it can be mounted in a server you already own
 // rather than given a listener of its own. The server must leave hijacking available, which
@@ -467,7 +471,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 var _ http.Handler = (*Proxy)(nil)
 
-// serveProxyRequest is the explicit forward proxy entry point: a CONNECT opens a tunnel,
+// serveProxyRequest is the explicit forward proxy entry point: a CONNECT opens a connection,
 // anything else is a plain HTTP request carrying an absolute target.
 func (p *Proxy) serveProxyRequest(w http.ResponseWriter, r *http.Request) {
 	// Before anything else, including the origin-form refusal below, so that an
@@ -483,6 +487,11 @@ func (p *Proxy) serveProxyRequest(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.Method == http.MethodConnect {
+		if isExtendedConnect(r) {
+			http.Error(w, "edge: extended CONNECT is not served, WebSocket goes over HTTP/1.1",
+				http.StatusNotImplemented)
+			return
+		}
 		p.serveConnect(w, r, identity)
 		return
 	}
@@ -497,7 +506,7 @@ func (p *Proxy) serveProxyRequest(w http.ResponseWriter, r *http.Request) {
 
 	sess := sessionFromRequest(r)
 	if sess == nil {
-		sess = newSession(r.Context(), nil, target, Intercept, protoOfRequest(r))
+		sess = newSession(r.Context(), nil, target, KindHTTP, protoOfRequest(r))
 	}
 
 	p.dispatchRequest(w, r, sess, target, identity)
@@ -579,11 +588,11 @@ func sessionFromRequest(r *http.Request) *Session {
 	return sess
 }
 
-func newSession(ctx context.Context, c net.Conn, target Target, action Action, proto Protocol) *Session {
+func newSession(ctx context.Context, c net.Conn, target Target, kind Kind, proto Protocol) *Session {
 	s := &Session{
 		id:        sessionSeq.Add(1),
 		target:    target,
-		action:    action,
+		kind:      kind,
 		createdAt: time.Now(),
 		ctx:       ctx,
 	}

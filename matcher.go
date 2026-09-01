@@ -6,13 +6,17 @@ package edge
 
 import (
 	"fmt"
+	"iter"
+	"net/http"
 	"net/netip"
 	"net/textproto"
 	"regexp"
 	"regexp/syntax"
+	"slices"
 	"strings"
 
 	"github.com/fox-toolkit/edge/internal/netutil"
+	"golang.org/x/net/http/httpguts"
 )
 
 // Matcher narrows an interceptor beyond its pattern and method. Every matcher on an interceptor must
@@ -289,4 +293,62 @@ var (
 	_ Matcher = RemoteIPMatcher{}
 	_ Matcher = ProtocolMatcher{}
 	_ Matcher = MatcherFunc(nil)
+)
+
+// MethodMatcher matches the request method against a set. Attach one with [WithMethods].
+type MethodMatcher struct {
+	methods []string
+}
+
+// MatchMethods returns a [MethodMatcher] for the given methods. An empty set is refused: an
+// entry answering no method could never be selected, and answering every method is spelled by
+// attaching no matcher at all.
+func MatchMethods(methods ...string) (MethodMatcher, error) {
+	if len(methods) == 0 {
+		return MethodMatcher{}, fmt.Errorf("%w: no method, an entry with no method matcher already answers every method", ErrInvalidMatcher)
+	}
+	out := make([]string, 0, len(methods))
+	for _, m := range methods {
+		if !validMethod(m) {
+			return MethodMatcher{}, fmt.Errorf("%w: invalid method %q", ErrInvalidMatcher, m)
+		}
+		if m == http.MethodConnect {
+			return MethodMatcher{}, fmt.Errorf("%w: CONNECT establishes a connection, it never reaches an entry", ErrInvalidMatcher)
+		}
+		out = append(out, m)
+	}
+	slices.Sort(out)
+	return MethodMatcher{methods: slices.Compact(out)}, nil
+}
+
+// Methods returns an iterator over the methods this matcher accepts, in lexicographical order.
+func (m MethodMatcher) Methods() iter.Seq[string] { return slices.Values(m.methods) }
+
+func (m MethodMatcher) Match(c RequestContext) bool {
+	method := c.Method()
+	switch len(m.methods) {
+	case 1:
+		// The common case, and the one worth keeping off slices.Contains.
+		return m.methods[0] == method
+	default:
+		return slices.Contains(m.methods, method)
+	}
+}
+
+func (m MethodMatcher) Equal(matcher Matcher) bool {
+	other, ok := matcher.(MethodMatcher)
+	return ok && slices.Equal(other.methods, m.methods)
+}
+
+func (m MethodMatcher) String() string { return "method=" + strings.Join(m.methods, ",") }
+
+// validMethod reports whether s is a valid HTTP method token (RFC 9110 section 9).
+func validMethod(method string) bool {
+	return len(method) > 0 && strings.IndexFunc(method, isNotToken) == -1
+}
+
+func isNotToken(r rune) bool { return !httpguts.IsTokenRune(r) }
+
+var (
+	_ Matcher = MethodMatcher{}
 )

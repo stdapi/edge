@@ -95,10 +95,10 @@ func TestTransparent_TLSInterceptRoutesOnServerName(t *testing.T) {
 	require.NoError(t, err)
 
 	var seenTarget Target
-	p.MustAddInterceptor([]string{http.MethodGet}, "api.example.test/v1/charges", func(c *Context) (*http.Response, error) {
+	p.MustAdd("api.example.test/v1/charges", func(c *HTTPCtx) (*http.Response, error) {
 		seenTarget = Target{Scheme: c.Scheme(), Host: c.Host(), Port: c.Port()}
 		return c.Forward()
-	})
+	}, WithMethods(http.MethodGet))
 
 	addr := startTransparent(t, p)
 
@@ -125,7 +125,7 @@ func TestTransparent_TLSInterceptRoutesOnServerName(t *testing.T) {
 	assert.Equal(t, "443", seenTarget.Port)
 }
 
-func TestTransparent_TLSTunnelLeavesTheHandshakeAlone(t *testing.T) {
+func TestTransparent_TLSStreamIsPlacedByItsServerName(t *testing.T) {
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "tunneled")
 	}))
@@ -136,22 +136,23 @@ func TestTransparent_TLSTunnelLeavesTheHandshakeAlone(t *testing.T) {
 
 	tr := DefaultTransport()
 	tr.DialContext = pinnedDialer(originURL.Host)
+	tr.RootCAs = originPool(t, origin)
 
 	p, err := New(WithCA(ca), WithTransport(tr))
 	require.NoError(t, err)
 	// The authority comes from the ClientHello, so it is the name the client asked for,
 	// not the address the upstream transport is pinned to.
-	p.MustAddTunnel("example.com")
+	p.MustAdd[TCP]("example.com", relayStream)
 
 	addr := startTransparent(t, p)
 
-	// Trusting only the origin: an interception here would present the proxy CA and fail.
+	// Terminated like everything else, so the certificate the client checks is the proxy's.
 	client := &http.Client{
 		Timeout: 10 * time.Second,
 		Transport: &http.Transport{
 			DialContext: pinnedDialer(addr),
 			TLSClientConfig: &tls.Config{
-				RootCAs:    originPool(t, origin),
+				RootCAs:    ca.CertPool(),
 				MinVersion: tls.VersionTLS12,
 			},
 		},
@@ -165,8 +166,8 @@ func TestTransparent_TLSTunnelLeavesTheHandshakeAlone(t *testing.T) {
 	assert.Equal(t, "tunneled", string(body))
 
 	sessions := waitForSessions(t, p, 1)
-	assert.Equal(t, Tunnel, sessions[0].Action())
-	assert.Equal(t, TLS, sessions[0].Protocol(), "a tunneled handshake stays opaque, no HTTP version is established")
+	assert.Equal(t, KindTCP, sessions[0].Kind())
+	assert.Zero(t, sessions[0].Protocol(), "a stream carries no HTTP version")
 }
 
 func TestTransparent_PlaintextRoutesOnHostHeader(t *testing.T) {
@@ -185,10 +186,10 @@ func TestTransparent_PlaintextRoutesOnHostHeader(t *testing.T) {
 	require.NoError(t, err)
 
 	var seen Target
-	p.MustAddInterceptor([]string{http.MethodGet}, "api.example.test/ping", func(c *Context) (*http.Response, error) {
+	p.MustAdd("api.example.test/ping", func(c *HTTPCtx) (*http.Response, error) {
 		seen = Target{Scheme: c.Scheme(), Host: c.Host(), Port: c.Port()}
 		return c.Forward()
-	})
+	}, WithMethods(http.MethodGet))
 
 	addr := startTransparent(t, p)
 
@@ -212,7 +213,7 @@ func TestTransparent_PeekClientHelloDoesNotConsume(t *testing.T) {
 	p, err := New(WithCA(ca))
 	require.NoError(t, err)
 
-	p.MustAddInterceptor(nil, "peek.example.test/", func(c *Context) (*http.Response, error) {
+	p.MustAdd("peek.example.test/", func(c *HTTPCtx) (*http.Response, error) {
 		hello := c.Session().ClientHello()
 		require.NotNil(t, hello)
 		return Text(http.StatusOK, "sni="+hello.ServerName), nil
@@ -294,7 +295,7 @@ func TestTransparent_OriginalDestinationPlacesTheConnection(t *testing.T) {
 
 	p, err := New(WithCA(ca), WithTransport(tr))
 	require.NoError(t, err)
-	p.MustAddTunnel(originURL.Host)
+	p.MustAdd[TCP](originURL.Host, relayStream)
 
 	addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) {
 		return originAddr, nil
@@ -334,7 +335,7 @@ func TestTransparent_PlaintextRejectsAnUnnamedAuthority(t *testing.T) {
 
 	p, err := New(WithCA(ca))
 	require.NoError(t, err)
-	require.Equal(t, Reject, p.ActionFor(Target{Scheme: "http", Host: "127.0.0.1", Port: originURL.Port()}))
+	require.Equal(t, false, p.Admits(Target{Scheme: "http", Host: "127.0.0.1", Port: originURL.Port()}, KindHTTP))
 
 	addr := startTransparent(t, p)
 	client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{DialContext: pinnedDialer(addr)}}
@@ -347,7 +348,10 @@ func TestTransparent_PlaintextRejectsAnUnnamedAuthority(t *testing.T) {
 	assert.False(t, reached.Load(), "a rejected authority must not be forwarded to")
 }
 
-func TestTransparent_PlaintextRelaysATunneledAuthority(t *testing.T) {
+// A redirected plaintext connection the platform reports no destination for has no authority
+// of its own: each request names one, and each is routed on its own. Nothing can serve it as a
+// stream, since by the time an authority is known the bytes have been parsed.
+func TestTransparent_PlaintextWithoutADestinationRoutesPerRequest(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprint(w, "origin reached")
 	}))
@@ -358,12 +362,9 @@ func TestTransparent_PlaintextRelaysATunneledAuthority(t *testing.T) {
 
 	p, err := New(WithCA(ca))
 	require.NoError(t, err)
-	p.MustAddTunnel(originURL.Host)
 
-	// A tunneled authority stays unobserved even when it arrives as a plain request the
-	// proxy had to parse to place it at all.
 	observed := new(atomic.Bool)
-	p.MustAddInterceptor(nil, "+{any}/+{rest}", func(c *Context) (*http.Response, error) {
+	p.MustAdd("[0.0.0.0/0]/+{rest}", func(c *HTTPCtx) (*http.Response, error) {
 		observed.Store(true)
 		return c.Forward()
 	})
@@ -377,7 +378,13 @@ func TestTransparent_PlaintextRelaysATunneledAuthority(t *testing.T) {
 
 	body, _ := io.ReadAll(resp.Body)
 	assert.Equal(t, "origin reached", string(body))
-	assert.False(t, observed.Load(), "no handler may observe a tunneled authority")
+	assert.True(t, observed.Load(), "the request is routed on the authority its Host names")
+
+	// An authority nothing names is refused on the request rather than on the connection.
+	resp2, err := client.Get("http://never-named.test/probe")
+	require.NoError(t, err)
+	defer func() { _ = resp2.Body.Close() }()
+	assert.Equal(t, http.StatusForbidden, resp2.StatusCode)
 }
 
 func TestTransparent_PlaintextServesH2C(t *testing.T) {
@@ -394,7 +401,7 @@ func TestTransparent_PlaintextServesH2C(t *testing.T) {
 
 	var seen, session atomic.Value
 	// The redirected target is an address, which the name wildcard does not cover.
-	p.MustAddInterceptor(nil, "[0.0.0.0/0]/+{rest}", func(c *Context) (*http.Response, error) {
+	p.MustAdd("[0.0.0.0/0]/+{rest}", func(c *HTTPCtx) (*http.Response, error) {
 		seen.Store(c.Protocol())
 		session.Store(c.Session().Protocol())
 		return c.Forward()
@@ -438,7 +445,7 @@ func TestTransparent_SessionReportsTheRedirect(t *testing.T) {
 	require.NoError(t, err)
 
 	transparent := new(atomic.Bool)
-	p.MustAddInterceptor(nil, "api.example.test/+{rest}", func(c *Context) (*http.Response, error) {
+	p.MustAdd("api.example.test/+{rest}", func(c *HTTPCtx) (*http.Response, error) {
 		transparent.Store(c.Session().Transparent())
 		return c.Forward()
 	})
@@ -537,9 +544,9 @@ func TestTransparent_PlaintextWithOriginalDestination(t *testing.T) {
 	tr.DialContext = pinnedDialer(originURL.Host)
 
 	p := testProxy(t, WithTransport(tr))
-	p.MustAddInterceptor([]string{http.MethodGet}, "api.example.test/ping", func(c *Context) (*http.Response, error) {
+	p.MustAdd("api.example.test/ping", func(c *HTTPCtx) (*http.Response, error) {
 		return c.Forward()
-	})
+	}, WithMethods(http.MethodGet))
 
 	addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) {
 		return originAddr, nil
@@ -592,7 +599,7 @@ func TestTransparent_RawTCPTunnelByDestination(t *testing.T) {
 	require.NoError(t, err)
 	p, err := New(WithCA(ca))
 	require.NoError(t, err)
-	p.MustAddTunnel(origin.String())
+	p.MustAdd[TCP](origin.String(), relayStream)
 
 	addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) {
 		return origin, nil
@@ -613,8 +620,8 @@ func TestTransparent_RawTCPTunnelByDestination(t *testing.T) {
 
 	sessions := waitForSessions(t, p, 1)
 	sess := sessions[0]
-	assert.Equal(t, Tunnel, sess.Action())
-	assert.Equal(t, TCP, sess.Protocol())
+	assert.Equal(t, KindTCP, sess.Kind())
+	assert.Equal(t, KindTCP, sess.Kind())
 	assert.Equal(t, origin.Addr().String(), sess.Target().Host)
 	assert.Equal(t, fmt.Sprint(origin.Port()), sess.Target().Port)
 	assert.Equal(t, origin, sess.Upstream())
@@ -660,14 +667,14 @@ func TestTransparent_RawTCPRejectedWithoutTunnel(t *testing.T) {
 
 // A tunnel entry says to leave the connection alone, so bytes that would parse as HTTP go
 // through untouched rather than being intercepted on their Host header.
-func TestTransparent_RawTCPTunnelWinsOverHTTPParsing(t *testing.T) {
+func TestTransparent_StreamEntryWinsOverHTTPParsing(t *testing.T) {
 	origin := tcpEchoOrigin(t)
 
 	ca, err := GenerateCA()
 	require.NoError(t, err)
 	p, err := New(WithCA(ca))
 	require.NoError(t, err)
-	p.MustAddTunnel(origin.String())
+	p.MustAdd[TCP](origin.String(), relayStream)
 
 	addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) {
 		return origin, nil
@@ -746,7 +753,7 @@ func TestTransparent_TProxyTCPPlacesByTheSocketAddress(t *testing.T) {
 	require.NoError(t, err)
 	p, err := New(WithCA(ca))
 	require.NoError(t, err)
-	p.MustAddTunnel(origin.String())
+	p.MustAdd[TCP](origin.String(), relayStream)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -767,7 +774,42 @@ func TestTransparent_TProxyTCPPlacesByTheSocketAddress(t *testing.T) {
 	assert.Equal(t, payload, buf[:n])
 
 	sessions := waitForSessions(t, p, 1)
-	assert.Equal(t, Tunnel, sessions[0].Action())
-	assert.Equal(t, TCP, sessions[0].Protocol())
+	assert.Equal(t, KindTCP, sessions[0].Kind())
+	assert.Equal(t, KindTCP, sessions[0].Kind())
 	assert.Equal(t, origin, sessions[0].Upstream())
+}
+
+// A stream entry naming a destination serves it even when a request entry admits the same
+// destination for HTTP. What the connection is comes from its bytes, and the kinds are tried
+// most refined first against the destination, not one against the other by hand.
+func TestTransparent_StreamAndHTTPOnOneDestination(t *testing.T) {
+	origin := tcpEchoOrigin(t)
+
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+	// Portless, so it admits every port of that address, including the stream entry's.
+	p.MustAdd(origin.Addr().String()+"/*{any}", noopHandler)
+	p.MustAdd[TCP](origin.String(), relayStream)
+
+	addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) {
+		return origin, nil
+	})
+
+	client, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+
+	payload := []byte{0x00, 0x2a, 'n', 'o', 't', '-', 'h', 't', 't', 'p'}
+	_, err = client.Write(payload)
+	require.NoError(t, err)
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
+	buf := make([]byte, 64)
+	n, err := client.Read(buf)
+	require.NoError(t, err)
+	assert.Equal(t, payload, buf[:n], "the stream entry serves it, HTTP being admitted changes nothing")
+
+	sessions := waitForSessions(t, p, 1)
+	assert.Equal(t, KindTCP, sessions[0].Kind())
 }

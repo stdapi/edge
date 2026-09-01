@@ -44,7 +44,7 @@ func interceptingProxy(t *testing.T, origin *httptest.Server, opts ...ProxyOptio
 
 	// Observing an authority without changing anything is a catch-all that forwards. It is
 	// what arms the interception: nothing crosses a proxy that was not asked for it.
-	p.MustAddInterceptor(nil, host+"/*{any}", DefaultNoInterceptorHandler)
+	p.MustAdd(host+"/*{any}", forwardHandler)
 
 	addr := startProxy(t, p)
 	return p, host, proxyClient(addr, ca.CertPool())
@@ -233,12 +233,12 @@ func TestSemantics_HandlerPanicBecomesAnError(t *testing.T) {
 	defer origin.Close()
 
 	p, authority, client := interceptingProxy(t, origin)
-	p.MustAddInterceptor([]string{http.MethodGet}, authority+"/boom", func(c *Context) (*http.Response, error) {
+	p.MustAdd(authority+"/boom", func(c *HTTPCtx) (*http.Response, error) {
 		panic("handler exploded")
-	})
-	p.MustAddInterceptor([]string{http.MethodGet}, authority+"/fine", func(c *Context) (*http.Response, error) {
+	}, WithMethods(http.MethodGet))
+	p.MustAdd(authority+"/fine", func(c *HTTPCtx) (*http.Response, error) {
 		return Text(http.StatusOK, "still alive"), nil
-	})
+	}, WithMethods(http.MethodGet))
 
 	resp, err := client.Get(origin.URL + "/boom")
 	require.NoError(t, err)
@@ -266,20 +266,20 @@ func TestSemantics_PanicReachesTheErrorHandler(t *testing.T) {
 	sentinel := errors.New("boom")
 
 	var got *PanicError
-	p, authority, client := interceptingProxy(t, origin, WithErrorHandler(func(c *Context, err error) *http.Response {
+	p, authority, client := interceptingProxy(t, origin, WithErrorHandler(func(c *HTTPCtx, err error) *http.Response {
 		got, _ = errors.AsType[*PanicError](err)
 		return Status(http.StatusTeapot)
 	}))
-	p.MustAddInterceptor([]string{http.MethodGet}, authority+"/boom", func(c *Context) (*http.Response, error) {
+	p.MustAdd(authority+"/boom", func(c *HTTPCtx) (*http.Response, error) {
 		panic(sentinel)
-	})
+	}, WithMethods(http.MethodGet))
 
 	resp, err := client.Get(origin.URL + "/boom")
 	require.NoError(t, err)
 	_ = resp.Body.Close()
 
 	assert.Equal(t, http.StatusTeapot, resp.StatusCode)
-	require.NotNil(t, got)
+	require.NotZero(t, got)
 	assert.Equal(t, sentinel, got.Value)
 	assert.ErrorIs(t, got, sentinel, "a panic carrying an error stays reachable through Unwrap")
 	assert.Contains(t, got.Stack, "TestSemantics_PanicReachesTheErrorHandler",
@@ -292,15 +292,15 @@ func TestSemantics_ErrorHandler(t *testing.T) {
 
 	sentinel := errors.New("upstream refused")
 
-	p, authority, client := interceptingProxy(t, origin, WithErrorHandler(func(c *Context, err error) *http.Response {
+	p, authority, client := interceptingProxy(t, origin, WithErrorHandler(func(c *HTTPCtx, err error) *http.Response {
 		if errors.Is(err, sentinel) {
 			return Text(http.StatusServiceUnavailable, "handled: "+err.Error())
 		}
 		return Status(http.StatusBadGateway)
 	}))
-	p.MustAddInterceptor([]string{http.MethodGet}, authority+"/fail", func(c *Context) (*http.Response, error) {
+	p.MustAdd(authority+"/fail", func(c *HTTPCtx) (*http.Response, error) {
 		return nil, sentinel
-	})
+	}, WithMethods(http.MethodGet))
 
 	resp, err := client.Get(origin.URL + "/fail")
 	require.NoError(t, err)
@@ -316,9 +316,9 @@ func TestSemantics_MiddlewareOrder(t *testing.T) {
 	defer origin.Close()
 
 	var order []string
-	record := func(name string) MiddlewareFunc {
-		return func(next HandlerFunc) HandlerFunc {
-			return func(c *Context) (*http.Response, error) {
+	record := func(name string) Middleware[HTTP] {
+		return func(next HTTP) HTTP {
+			return func(c *HTTPCtx) (*http.Response, error) {
 				order = append(order, "→"+name)
 				resp, err := next(c)
 				order = append(order, "←"+name)
@@ -328,10 +328,10 @@ func TestSemantics_MiddlewareOrder(t *testing.T) {
 	}
 
 	p, authority, client := interceptingProxy(t, origin, WithMiddleware(record("outer"), record("inner")))
-	p.MustAddInterceptor([]string{http.MethodGet}, authority+"/x", func(c *Context) (*http.Response, error) {
+	p.MustAdd(authority+"/x", func(c *HTTPCtx) (*http.Response, error) {
 		order = append(order, "handler")
 		return Status(http.StatusOK), nil
-	}, WithMiddleware(record("interceptor")))
+	}, WithMiddleware(record("interceptor")), WithMethods(http.MethodGet))
 
 	resp, err := client.Get(origin.URL + "/x")
 	require.NoError(t, err)
@@ -347,9 +347,9 @@ func TestSemantics_NoInterceptorForwardsUnchanged(t *testing.T) {
 	defer origin.Close()
 
 	p, authority, client := interceptingProxy(t, origin)
-	p.MustAddInterceptor([]string{http.MethodGet}, authority+"/known", func(c *Context) (*http.Response, error) {
+	p.MustAdd(authority+"/known", func(c *HTTPCtx) (*http.Response, error) {
 		return Text(http.StatusOK, "handled"), nil
-	})
+	}, WithMethods(http.MethodGet))
 
 	resp, err := client.Get(origin.URL + "/unknown")
 	require.NoError(t, err)
@@ -382,10 +382,10 @@ func TestSemantics_RawPathIsPreserved(t *testing.T) {
 	require.NoError(t, err)
 
 	var routed string
-	p.MustAddInterceptor([]string{http.MethodGet}, originHost(originURL)+"/*{any}", func(c *Context) (*http.Response, error) {
+	p.MustAdd(originHost(originURL)+"/*{any}", func(c *HTTPCtx) (*http.Response, error) {
 		routed = c.RoutingPath()
 		return c.Forward()
-	})
+	}, WithMethods(http.MethodGet))
 	client := proxyClient(startProxy(t, p), ca.CertPool())
 
 	cases := []struct{ wire, wantRouted string }{
@@ -427,10 +427,10 @@ func TestSemantics_HostHeaderCannotReachAnUnnamedAuthority(t *testing.T) {
 	require.NoError(t, err)
 	p, err := New(WithCA(ca))
 	require.NoError(t, err)
-	p.MustAddInterceptor(nil, "allowed.example.test/+{rest}", func(c *Context) (*http.Response, error) {
+	p.MustAdd("allowed.example.test/+{rest}", func(c *HTTPCtx) (*http.Response, error) {
 		return c.Forward()
 	})
-	require.Equal(t, Reject, p.ActionFor(Target{Scheme: "http", Host: "127.0.0.1", Port: otherURL.Port()}))
+	require.Equal(t, false, p.Admits(Target{Scheme: "http", Host: "127.0.0.1", Port: otherURL.Port()}, KindHTTP))
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)

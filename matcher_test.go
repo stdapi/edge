@@ -28,7 +28,7 @@ func matchCtx(t *testing.T, method, target, path string, headers http.Header) Re
 	req.Proto, req.ProtoMajor, req.ProtoMinor = "HTTP/2.0", 2, 0
 
 	host, port := splitHostPort(target)
-	c := &Context{
+	c := &routeCtx{
 		req:    req,
 		scheme: "https",
 		host:   host,
@@ -123,12 +123,10 @@ func TestMatcher_Protocol(t *testing.T) {
 	_, err = MatchProtocol(Protocol(99))
 	assert.ErrorIs(t, err, ErrInvalidMatcher)
 
-	// A matcher runs on requests the proxy parsed, which the opaque and raw protocols
-	// never produce.
-	for _, proto := range []Protocol{TLS, QUIC, TCP, UDP} {
-		_, err = MatchProtocol(proto)
-		assert.ErrorIs(t, err, ErrInvalidMatcher, proto.String())
-	}
+	// A matcher runs on requests the proxy parsed, so the zero protocol, what a connection
+	// carrying no HTTP reports, is not one to match on.
+	_, err = MatchProtocol(0)
+	assert.ErrorIs(t, err, ErrInvalidMatcher)
 }
 
 func TestMatcher_Func(t *testing.T) {
@@ -146,21 +144,21 @@ func TestMatcher_NarrowsAnInterceptor(t *testing.T) {
 	beta, err := MatchHeader("X-Channel", "beta")
 	require.NoError(t, err)
 
-	special := p.MustAddInterceptor([]string{http.MethodGet}, "api.test/v1/charges", noopHandler, WithMatcher(beta))
-	fallback := p.MustAddInterceptor([]string{http.MethodGet}, "api.test/v1/charges", noopHandler)
+	special := p.MustAdd("api.test/v1/charges", noopHandler, WithMatcher(beta), WithMethods(http.MethodGet))
+	fallback := p.MustAdd("api.test/v1/charges", noopHandler, WithMethods(http.MethodGet))
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/charges", nil)
 	req.Header.Set("X-Channel", "beta")
 	got := matchRequest(t, p, "https", joinHostPort("api.test", "443"), req)
-	assert.Same(t, special, got, "the matched interceptor must win over the fallback")
+	assert.Equal(t, special, got, "the matched interceptor must win over the fallback")
 
 	plain := httptest.NewRequest(http.MethodGet, "/v1/charges", nil)
 	got = matchRequest(t, p, "https", joinHostPort("api.test", "443"), plain)
-	assert.Same(t, fallback, got)
+	assert.Equal(t, fallback, got)
 
 	// An interceptor carrying matchers is identified by them.
-	assert.Same(t, special, p.Interceptor([]string{http.MethodGet}, "api.test/v1/charges", beta))
-	assert.Same(t, fallback, p.Interceptor([]string{http.MethodGet}, "api.test/v1/charges"))
+	assert.Equal(t, special, lookupHTTP(p, "api.test/v1/charges", beta, mustMethods(http.MethodGet)))
+	assert.Equal(t, fallback, lookupHTTP(p, "api.test/v1/charges", mustMethods(http.MethodGet)))
 }
 
 // The protocol and the client address are read off the request, so a matcher on either
@@ -173,15 +171,15 @@ func TestMatcher_ProtocolAndRemoteIPComeFromTheRequest(t *testing.T) {
 	lan, err := MatchRemoteIP("192.0.2.0/24")
 	require.NoError(t, err)
 
-	narrow := p.MustAddInterceptor([]string{http.MethodGet}, "api.test/v1/charges", noopHandler, WithMatchers(h3, lan))
-	fallback := p.MustAddInterceptor([]string{http.MethodGet}, "api.test/v1/charges", noopHandler)
+	narrow := p.MustAdd("api.test/v1/charges", noopHandler, WithMatchers(h3, lan), WithMethods(http.MethodGet))
+	fallback := p.MustAdd("api.test/v1/charges", noopHandler, WithMethods(http.MethodGet))
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/charges", nil)
 	req.Proto, req.ProtoMajor, req.ProtoMinor = "HTTP/3.0", 3, 0
 	req.RemoteAddr = "192.0.2.10:4242"
-	assert.Same(t, narrow, matchRequest(t, p, "https", "api.test:443", req))
+	assert.Equal(t, narrow, matchRequest(t, p, "https", "api.test:443", req))
 
 	off := httptest.NewRequest(http.MethodGet, "/v1/charges", nil)
 	off.RemoteAddr = "198.51.100.10:4242"
-	assert.Same(t, fallback, matchRequest(t, p, "https", "api.test:443", off))
+	assert.Equal(t, fallback, matchRequest(t, p, "https", "api.test:443", off))
 }

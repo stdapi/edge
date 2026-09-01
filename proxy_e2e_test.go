@@ -86,7 +86,7 @@ func TestProxy_InterceptHTTPS(t *testing.T) {
 	}
 
 	var seenPattern string
-	p.MustAddInterceptor([]string{http.MethodGet}, originHost(originURL)+"/v1/charges", func(c *Context) (*http.Response, error) {
+	p.MustAdd(originHost(originURL)+"/v1/charges", func(c *HTTPCtx) (*http.Response, error) {
 		seenPattern = c.Pattern()
 		c.Request().Header.Set("Idempotency-Key", "abc-123")
 
@@ -99,7 +99,7 @@ func TestProxy_InterceptHTTPS(t *testing.T) {
 			return nil, err
 		}
 		return Rewrite(resp, []byte(string(body)+" | patched")), nil
-	})
+	}, WithMethods(http.MethodGet))
 
 	addr := startProxy(t, p)
 	client := proxyClient(addr, ca.CertPool())
@@ -147,12 +147,12 @@ func TestProxy_ShortCircuit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new proxy: %v", err)
 	}
-	p.MustAddInterceptor([]string{http.MethodPost}, originHost(originURL)+"/v1/charges", func(c *Context) (*http.Response, error) {
+	p.MustAdd(originHost(originURL)+"/v1/charges", func(c *HTTPCtx) (*http.Response, error) {
 		if c.Request().Header.Get("Idempotency-Key") == "" {
 			return Text(http.StatusBadRequest, "missing idempotency key"), nil
 		}
 		return c.Forward()
-	})
+	}, WithMethods(http.MethodPost))
 
 	addr := startProxy(t, p)
 	client := proxyClient(addr, ca.CertPool())
@@ -175,50 +175,52 @@ func TestProxy_ShortCircuit(t *testing.T) {
 	}
 }
 
-func TestProxy_TunnelKeepsOriginCertificate(t *testing.T) {
+func TestProxy_StreamEntryTerminatesAndReoriginates(t *testing.T) {
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, "tunneled")
+		fmt.Fprint(w, "streamed")
 	}))
 	defer origin.Close()
 
 	originURL, _ := url.Parse(origin.URL)
 	ca, _ := GenerateCA()
 
-	p, err := New(WithCA(ca))
+	tr := DefaultTransport()
+	tr.RootCAs = originPool(t, origin)
+	p, err := New(WithCA(ca), WithTransport(tr))
 	if err != nil {
 		t.Fatalf("new proxy: %v", err)
 	}
-	if _, err := p.AddTunnel(originHost(originURL)); err != nil {
-		t.Fatalf("tunnel %s: %v", originHost(originURL), err)
+	if _, err := p.Add[TCP](originHost(originURL), relayStream); err != nil {
+		t.Fatalf("stream entry %s: %v", originHost(originURL), err)
 	}
 
-	// Registered on every other authority: the tunnel names a static host, so it is the
-	// more precise of the two and wins. Putting this interceptor on the tunneled authority is
-	// refused outright, since it could never run.
+	// A request-level catch-all on every other authority. The stream entry names a static
+	// host, so on that host the HTTP kind has nothing registered and the connection is
+	// served as the byte stream the entry asked for.
 	var handlerRan bool
-	p.MustAddInterceptor([]string{http.MethodGet}, "+{any}/", func(c *Context) (*http.Response, error) {
+	p.MustAdd("+{any}/", func(c *HTTPCtx) (*http.Response, error) {
 		handlerRan = true
 		return c.Forward()
-	})
+	}, WithMethods(http.MethodGet))
 
 	addr := startProxy(t, p)
 
-	// The client trusts only the origin, not the proxy CA: if the proxy had intercepted,
-	// the handshake would fail on an unknown authority.
-	client := proxyClient(addr, originPool(t, origin))
+	// Everything admitted is terminated, so the certificate the client checks is the proxy's
+	// and the proxy is the one that has to trust the origin.
+	client := proxyClient(addr, ca.CertPool())
 
 	resp, err := client.Get(origin.URL + "/")
 	if err != nil {
-		t.Fatalf("get through tunnel: %v", err)
+		t.Fatalf("get through the stream entry: %v", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	body, _ := io.ReadAll(resp.Body)
-	if string(body) != "tunneled" {
-		t.Fatalf("body = %q, want tunneled", body)
+	if string(body) != "streamed" {
+		t.Fatalf("body = %q, want streamed", body)
 	}
 	if handlerRan {
-		t.Fatal("handler ran on a tunneled connection")
+		t.Fatal("a request handler ran on a connection served as a stream")
 	}
 }
 
@@ -236,7 +238,7 @@ func TestProxy_PlainHTTPAbsoluteTarget(t *testing.T) {
 		t.Fatalf("new proxy: %v", err)
 	}
 
-	p.MustAddInterceptor([]string{http.MethodGet}, originHost(originURL)+"/hello", func(c *Context) (*http.Response, error) {
+	p.MustAdd(originHost(originURL)+"/hello", func(c *HTTPCtx) (*http.Response, error) {
 		if c.Scheme() != "http" {
 			return nil, fmt.Errorf("scheme = %q, want http", c.Scheme())
 		}
@@ -246,7 +248,7 @@ func TestProxy_PlainHTTPAbsoluteTarget(t *testing.T) {
 		}
 		body, _ := ReadBody(resp, 0)
 		return Rewrite(resp, []byte(strings.ToUpper(string(body)))), nil
-	})
+	}, WithMethods(http.MethodGet))
 
 	addr := startProxy(t, p)
 	client := proxyClient(addr, nil)
@@ -302,7 +304,7 @@ func TestProxy_TunnelRelaysTheHalfClose(t *testing.T) {
 	require.NoError(t, err)
 	p, err := New(WithCA(ca))
 	require.NoError(t, err)
-	p.MustAddTunnel(originLn.Addr().String())
+	p.MustAdd[TCP](originLn.Addr().String(), relayStream)
 
 	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)

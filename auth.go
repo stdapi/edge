@@ -11,7 +11,7 @@ import (
 )
 
 // ProxyAuthenticator authenticates the clients of an explicit forward proxy. It is consulted
-// once per request addressed to the proxy, so the CONNECT that opens a tunnel authenticates
+// once per request addressed to the proxy, so the CONNECT that opens a connection authenticates
 // everything carried on it. Implementations must be safe for concurrent use.
 type ProxyAuthenticator interface {
 	// Authenticate reports the client's identity. It must not read the body. An empty

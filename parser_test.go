@@ -22,7 +22,7 @@ func TestParser_KeyIsThePatternWithoutItsPort(t *testing.T) {
 		"+{any}/v1/charges",
 		"+{sub}.stripe.com/v1/{id}",
 	} {
-		pat, _, err := p.parsePattern(raw)
+		pat, _, err := p.parsePattern(raw, KindHTTP)
 		require.NoError(t, err, raw)
 		assert.Equal(t, raw, pat.key, raw)
 	}
@@ -39,7 +39,7 @@ func TestParser_KeyIsThePatternWithoutItsPort(t *testing.T) {
 		{"[::1]:8080/health", v6Key + "/health", "8080"},
 		{"[::1]/health", v6Key + "/health", ""},
 	} {
-		pat, _, err := p.parsePattern(tc.raw)
+		pat, _, err := p.parsePattern(tc.raw, KindHTTP)
 		require.NoError(t, err, tc.raw)
 		assert.Equal(t, tc.key, pat.key, tc.raw)
 		assert.Equal(t, tc.port, pat.port, tc.raw)
@@ -52,7 +52,7 @@ func TestParser_SchemeIsRefusedInAnInterceptorPattern(t *testing.T) {
 	p := testProxy(t)
 
 	for _, pattern := range []string{"https://api.test/v1", "http://api.test/v1"} {
-		_, err := p.AddInterceptor([]string{http.MethodGet}, pattern, noopHandler)
+		_, err := p.Add(pattern, noopHandler, WithMethods(http.MethodGet))
 		var pe *PatternError
 		require.ErrorAs(t, err, &pe, pattern)
 		assert.Contains(t, pe.Error(), "it carries no scheme",
@@ -61,7 +61,7 @@ func TestParser_SchemeIsRefusedInAnInterceptorPattern(t *testing.T) {
 
 	// A port, on the other hand, is part of the pattern.
 	for _, pattern := range []string{"api.test:8443/v1", "localhost:8080/api"} {
-		_, err := p.AddInterceptor([]string{http.MethodGet}, pattern, noopHandler)
+		_, err := p.Add(pattern, noopHandler, WithMethods(http.MethodGet))
 		require.NoError(t, err, pattern)
 	}
 }
@@ -74,7 +74,7 @@ func TestParser_RegexpConstraintMayHoldAColon(t *testing.T) {
 		`{sub:[a-z]+}.example.com/health`,
 		`+{any:[a-z.]+}/health`,
 	} {
-		_, err := p.AddInterceptor(nil, pattern, noopHandler)
+		_, err := p.Add(pattern, noopHandler)
 		require.NoError(t, err, pattern)
 	}
 	// Tunnels go on authorities no interceptor claims, since an interceptor and a tunnel cannot disagree
@@ -83,33 +83,33 @@ func TestParser_RegexpConstraintMayHoldAColon(t *testing.T) {
 		`{sub:[a-z]+}.tunnelled.test`,
 		`+{any:[a-z.]+}.also-tunnelled.test`,
 	} {
-		_, err := p.AddTunnel(pattern)
+		_, err := p.Add[TCP](pattern, noopStream)
 		require.NoError(t, err, pattern)
 	}
 
 	// Past the last brace the colon is a port again, and both patterns split on it.
-	p.MustAddTunnel(`{sub:[a-z]+}.other.com:8080`)
+	p.MustAdd[TCP](`{sub:[a-z]+}.other.com:8080`, noopStream)
 	pat, _, err := p.parseAuthorityPattern(`{sub:[a-z]+}.other.com:8080`)
 	require.NoError(t, err)
 	assert.Equal(t, `{sub:[a-z]+}.other.com`, pat.host)
 	assert.Equal(t, "8080", pat.port)
 
-	pat, _, err = p.parsePattern(`{sub:[a-z]+}.other.com:8080/health`)
+	pat, _, err = p.parsePattern(`{sub:[a-z]+}.other.com:8080/health`, KindHTTP)
 	require.NoError(t, err)
 	assert.Equal(t, `{sub:[a-z]+}.other.com`, pat.host)
 	assert.Equal(t, "8080", pat.port)
 
-	// That authority is tunnelled, so an interceptor on it is refused as a conflict rather
-	// than as a syntax error: the pattern is well formed, the authority is spoken for.
-	_, err = p.AddInterceptor(nil, `{sub:[a-z]+}.other.com:8080/health`, noopHandler)
-	assert.ErrorIs(t, err, ErrAuthorityConflict)
+	// The same authority carries a stream entry, which is another kind and no conflict: the
+	// pattern is well formed and the two never compete for one connection.
+	_, err = p.Add(`{sub:[a-z]+}.other.com:8080/health`, noopHandler)
+	require.NoError(t, err)
 }
 func TestParser_AddressLiteralMustBeCanonical(t *testing.T) {
 	p := testProxy(t)
 
 	// An address has exactly one spelling, bracketed as an authority carries it. Anything
 	// else is refused with the form to use, so no two patterns reach one key.
-	pat, _, err := p.parsePattern("[::1]/health")
+	pat, _, err := p.parsePattern("[::1]/health", KindHTTP)
 	require.NoError(t, err)
 	assert.Equal(t, "::1", pat.host)
 	assert.Equal(t, prefixKey(netip.PrefixFrom(netip.MustParseAddr("::1"), 128))+"/health", pat.key)
@@ -121,7 +121,7 @@ func TestParser_AddressLiteralMustBeCanonical(t *testing.T) {
 		{"[0:0:0:0:0:0:0:1]/health", "non-canonical address literal, write [::1]"},
 		{"[::ffff:127.0.0.1]/health", "non-canonical address literal, write 127.0.0.1"},
 	} {
-		_, _, err := p.parsePattern(tc.pattern)
+		_, _, err := p.parsePattern(tc.pattern, KindHTTP)
 		var pe *PatternError
 		require.ErrorAs(t, err, &pe, tc.pattern)
 		assert.Contains(t, pe.Error(), tc.hint, tc.pattern)

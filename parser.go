@@ -43,14 +43,21 @@ type pattern struct {
 	catchAll         bool
 }
 
-// parsePattern parses an interceptor pattern of the form host[:port]/path. The hostname is
-// required. An interceptor arms the interception of the authority it matches, so one without a
-// hostname would arm nothing and leave a handler registered that no connection can reach.
-// Matching every hostname is spelled with a wildcard, and every address with a zero-length
-// range, so both say so.
-func (p *Proxy) parsePattern(raw string) (pattern, int, error) {
+// parsePattern parses the pattern of one kind. A kind that routes each message of a
+// connection is written host[:port]/path, one that routes whole connections or datagrams is
+// written host[:port] alone, so a pattern always says which of the two key spaces it lands in.
+//
+// The hostname is required either way. An entry admits the authority it matches, so one
+// without a hostname would admit nothing and leave a handler no traffic can reach. Matching
+// every hostname is spelled with a wildcard, and every address with a zero-length range, so
+// both say so.
+func (p *Proxy) parsePattern(raw string, kind Kind) (pattern, int, error) {
+	if !kind.requiresPath() {
+		return p.parseAuthorityPattern(raw)
+	}
+
 	if len(raw) == 0 {
-		return pattern{}, 0, fmt.Errorf("%w: empty pattern", ErrInvalidInterceptor)
+		return pattern{}, 0, fmt.Errorf("%w: empty pattern", ErrInvalidEntry)
 	}
 
 	if i := strings.Index(raw, "://"); i >= 0 {
@@ -58,7 +65,7 @@ func (p *Proxy) parsePattern(raw string) (pattern, int, error) {
 			Pattern: raw,
 			Type:    "hostname",
 			Reason:  "syntax",
-			Hint:    "an interceptor pattern is a hostname and a path, it carries no scheme",
+			Hint:    "a pattern is a hostname and a path, it carries no scheme",
 			Start:   0,
 			End:     i + 3,
 		}
@@ -84,7 +91,7 @@ func (p *Proxy) parsePattern(raw string) (pattern, int, error) {
 			Pattern: raw,
 			Type:    "hostname",
 			Reason:  "syntax",
-			Hint:    "an interceptor pattern starts with the authority it intercepts, write +{any} to match every hostname",
+			Hint:    "a pattern starts with the authority it admits, write +{any} to match every hostname",
 			Start:   0,
 			End:     1,
 		}

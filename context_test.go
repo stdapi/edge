@@ -37,11 +37,11 @@ func TestContext_Accessors(t *testing.T) {
 		proto                                              Protocol
 		hasTLS                                             bool
 		remoteAddr                                         string
-		scope                                              HandlerScope
+		kind                                               Kind
 	}
 	var got observed
 
-	p.MustAddInterceptor([]string{http.MethodPost}, host+"/v1/{id}/refunds", func(c *Context) (*http.Response, error) {
+	p.MustAdd(host+"/v1/{id}/refunds", func(c *HTTPCtx) (*http.Response, error) {
 		got = observed{
 			method:      c.Method(),
 			scheme:      c.Scheme(),
@@ -56,20 +56,20 @@ func TestContext_Accessors(t *testing.T) {
 			proto:       c.Protocol(),
 			hasTLS:      c.Request().TLS != nil,
 			remoteAddr:  c.RemoteAddr().Addr().String(),
-			scope:       c.Scope(),
+			kind:        c.Entry().Kind(),
 		}
 
 		require.Same(t, p, c.Proxy())
 		require.NotNil(t, c.Session())
 		require.Equal(t, "ch_1", c.Param("id"))
 		require.Empty(t, c.Param("missing"))
-		require.NotNil(t, c.Interceptor())
+		require.NotZero(t, c.Entry())
 
 		// The connection reports the same client as the request it carries.
 		require.Equal(t, c.Session().RemoteAddr(), c.RemoteAddr())
 
 		return Text(http.StatusOK, "done"), nil
-	})
+	}, WithMethods(http.MethodPost))
 
 	req, err := http.NewRequest(http.MethodPost, origin.URL+"/v1/ch_1/refunds?limit=10", nil)
 	require.NoError(t, err)
@@ -94,43 +94,42 @@ func TestContext_Accessors(t *testing.T) {
 	assert.Equal(t, HTTP11, got.proto)
 	assert.True(t, got.hasTLS, "an intercepted TLS connection must report its state")
 	assert.Equal(t, "127.0.0.1", got.remoteAddr)
-	assert.Equal(t, InterceptorHandler, got.scope)
+	assert.Equal(t, KindHTTP, got.kind)
 }
 
-func TestContext_NoInterceptorScope(t *testing.T) {
+// A request no entry matches is refused. The permissive default is gone: what passes through
+// is a route the caller wrote, so an authority armed by a narrow entry does not quietly open
+// every path under it.
+func TestContext_UnmatchedRequestIsRefused(t *testing.T) {
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "origin")
 	}))
 	defer origin.Close()
 
-	var scope HandlerScope
-	var pattern string
-	var ic *Interceptor
-
 	originURL := origin.URL
-	p, host, client := interceptingProxy(t, origin, WithNoInterceptorHandler(func(c *Context) (*http.Response, error) {
-		scope = c.Scope()
-		pattern = c.Pattern()
-		ic = c.Interceptor()
-		return Text(http.StatusOK, "no interceptor"), nil
-	}))
+	p, host, client := interceptingProxy(t, origin)
 
-	// The helper arms the authority with a catch-all, which would match here and leave the
-	// no-interceptor handler unreachable. A narrow interceptor keeps the authority armed while
-	// letting an unregistered path fall through, which is what this test is about.
-	_, err := p.DeleteInterceptor(nil, host+"/*{any}")
+	// The helper arms the authority with a catch-all. A narrow entry keeps the authority
+	// armed while leaving every other path uncovered, which is what this test is about.
+	_, err := p.Delete[HTTP](host + "/*{any}")
 	require.NoError(t, err)
-	p.MustAddInterceptor(nil, host+"/registered", noopHandler)
+	p.MustAdd(host+"/registered", noopHandler)
 
 	resp, err := client.Get(originURL + "/anything")
 	require.NoError(t, err)
 	body, _ := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
 
-	assert.Equal(t, "no interceptor", string(body))
-	assert.Equal(t, NoInterceptorHandler, scope)
-	assert.Empty(t, pattern, "there is no pattern outside of an interceptor")
-	assert.Nil(t, ic)
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+	assert.Contains(t, string(body), "no entry matches this request")
+
+	// The catch-all is a route like any other, and writing it restores the old behavior.
+	p.MustAdd(host+"/*{any}", forwardHandler)
+	resp, err = client.Get(originURL + "/anything")
+	require.NoError(t, err)
+	body, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	assert.Equal(t, "origin", string(body))
 }
 
 func TestContext_SetRequest(t *testing.T) {
@@ -142,12 +141,12 @@ func TestContext_SetRequest(t *testing.T) {
 	defer origin.Close()
 
 	p, authority, client := interceptingProxy(t, origin)
-	p.MustAddInterceptor([]string{http.MethodGet}, authority+"/old", func(c *Context) (*http.Response, error) {
+	p.MustAdd(authority+"/old", func(c *HTTPCtx) (*http.Response, error) {
 		req := c.Request().Clone(c.Request().Context())
 		req.URL.Path = "/new"
 		c.SetRequest(req)
 		return c.Forward()
-	})
+	}, WithMethods(http.MethodGet))
 
 	resp, err := client.Get(origin.URL + "/old")
 	require.NoError(t, err)
@@ -157,11 +156,13 @@ func TestContext_SetRequest(t *testing.T) {
 }
 
 func TestContext_RemoteAddrOfAnAddresslessRequest(t *testing.T) {
-	c := &Context{params: new([]string)}
+	rc := &routeCtx{params: new([]string)}
+	rc.http.r = rc
+	c := &rc.http
 	assert.False(t, c.RemoteAddr().IsValid(), "a context with no request has no client address")
 
-	c.req = httptest.NewRequest(http.MethodGet, "/v1/charges", nil)
-	c.req.RemoteAddr = "/tmp/sock"
+	rc.req = httptest.NewRequest(http.MethodGet, "/v1/charges", nil)
+	rc.req.RemoteAddr = "/tmp/sock"
 	assert.False(t, c.RemoteAddr().IsValid(), "a unix socket has no IP")
 
 	sess := &Session{remoteAddr: &net.UnixAddr{Name: "/tmp/sock", Net: "unix"}}

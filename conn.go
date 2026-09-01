@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,8 +20,8 @@ import (
 
 const (
 	copyBufSize = 32 * 1024
-	// halfClosedIdleTimeout bounds how long the remaining direction of a tunnel may sit
-	// silent once the other one is done.
+	// halfClosedIdleTimeout bounds how long the remaining direction of a relay may sit silent
+	// once the other one is done.
 	halfClosedIdleTimeout = 30 * time.Second
 	// defaultPeekSize covers a protocol discriminator and the buffering http.Server would
 	// have done anyway on the connection it is handed.
@@ -60,7 +61,7 @@ func (c *peekConn) CloseWrite() error { return closeWrite(c.Conn) }
 // Peek returns the next n bytes without consuming them.
 func (c *peekConn) Peek(n int) ([]byte, error) { return c.r.Peek(n) }
 
-// closeWriter is implemented by connections that can be half-closed, which is how a tunnel
+// closeWriter is implemented by connections that can be half-closed, which is how a relay
 // tells the far end that one direction is done without tearing down the other.
 type closeWriter interface {
 	CloseWrite() error
@@ -227,39 +228,6 @@ func cancelConnOf(c net.Conn) *cancelConn {
 	return nil
 }
 
-// tunnel relays bytes between client and upstream until both directions are done. It
-// returns the number of bytes sent in each direction.
-//
-// Each direction is closed for writing as soon as its source is exhausted, so a peer that
-// half-closes gets a half-close on the other side instead of a connection that stays open
-// waiting for data that will never come.
-func tunnel(client, upstream net.Conn, idleTimeout time.Duration) (sent, received int64, err error) {
-	var (
-		wg      sync.WaitGroup
-		toUp    int64
-		toDown  int64
-		upErr   error
-		downErr error
-	)
-
-	idle := newIdleTracker(idleTimeout, client, upstream)
-	defer idle.stop()
-
-	wg.Go(func() {
-		toUp, upErr = copyStream(upstream, client, idle)
-		halfClose(upstream)
-		idle.arm(halfClosedIdleTimeout)
-	})
-	wg.Go(func() {
-		toDown, downErr = copyStream(client, upstream, idle)
-		halfClose(client)
-		idle.arm(halfClosedIdleTimeout)
-	})
-	wg.Wait()
-
-	return toUp, toDown, errors.Join(filterCopyErr(upErr), filterCopyErr(downErr))
-}
-
 func copyStream(dst io.Writer, src io.Reader, idle *idleTracker) (int64, error) {
 	buf := getCopyBuf()
 	defer putCopyBuf(buf)
@@ -297,7 +265,7 @@ func closeWrite(c net.Conn) error {
 	return c.Close()
 }
 
-// filterCopyErr drops the errors that are the normal end of a tunnel rather than a fault.
+// filterCopyErr drops the errors that are the normal end of a relay rather than a fault.
 func filterCopyErr(err error) error {
 	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
 		return nil
@@ -308,9 +276,9 @@ func filterCopyErr(err error) error {
 	return err
 }
 
-// idleTracker closes both ends of a tunnel once neither direction has moved a byte for the
+// idleTracker closes both ends of a relay once neither direction has moved a byte for the
 // configured duration. A zero duration leaves it disarmed until a half-close arms it, since a
-// tunnel open in both directions can legitimately carry a long-lived silent stream.
+// relay open in both directions can legitimately carry a long-lived silent stream.
 type idleTracker struct {
 	timer   *time.Timer
 	conns   []net.Conn
@@ -349,8 +317,9 @@ func (t *idleTracker) start(d time.Duration) {
 	t.armed.Store(true)
 }
 
+// touch is a no-op on a nil tracker, which is what a copy with no idleness to track passes.
 func (t *idleTracker) touch() {
-	if !t.armed.Load() {
+	if t == nil || !t.armed.Load() {
 		return
 	}
 	t.mu.Lock()
@@ -369,15 +338,16 @@ func (t *idleTracker) stop() {
 	}
 }
 
-// h2Stream adapts an HTTP/2 or HTTP/3 CONNECT stream to a net.Conn, so the same tunneling
-// and interception code serves it as an HTTP/1.1 hijacked connection.
+// h2Stream adapts an HTTP/2 or HTTP/3 CONNECT stream to a net.Conn, so the same termination
+// code serves it as an HTTP/1.1 hijacked connection.
 //
 // Writes are serialized and refused once the stream is closed. A response writer is only
 // valid while its handler runs, and the HTTP/2 server writes some frames from goroutines it
 // does not wait for: without the guard, one of those could reach the writer after the
 // CONNECT handler returned.
 type h2Stream struct {
-	r       io.ReadCloser
+	r       *deadlineReader
+	body    io.ReadCloser
 	w       io.Writer
 	flusher http.Flusher
 	local   net.Addr
@@ -388,7 +358,7 @@ type h2Stream struct {
 }
 
 func newH2Stream(w http.ResponseWriter, r *http.Request, local, remote net.Addr) *h2Stream {
-	s := &h2Stream{r: r.Body, w: w, local: local, remote: remote}
+	s := &h2Stream{r: newDeadlineReader(r.Body), body: r.Body, w: w, local: local, remote: remote}
 	if f, ok := w.(http.Flusher); ok {
 		s.flusher = f
 	}
@@ -426,7 +396,7 @@ func (s *h2Stream) Close() error {
 	// being idle once Close returns.
 	s.wmu.Lock()
 	s.wmu.Unlock() //nolint:staticcheck // acquire and release, this is a barrier not a critical section
-	return s.r.Close()
+	return s.body.Close()
 }
 
 // CloseWrite ends the proxy-to-client direction. An HTTP/2 stream has no way to do that
@@ -436,8 +406,100 @@ func (s *h2Stream) CloseWrite() error { return nil }
 func (s *h2Stream) LocalAddr() net.Addr  { return s.local }
 func (s *h2Stream) RemoteAddr() net.Addr { return s.remote }
 
-func (s *h2Stream) SetDeadline(time.Time) error      { return nil }
-func (s *h2Stream) SetReadDeadline(time.Time) error  { return nil }
+func (s *h2Stream) SetDeadline(t time.Time) error { return s.SetReadDeadline(t) }
+
+// SetReadDeadline bounds a read the way a socket would. An HTTP/2 request body has no
+// deadline of its own, and the protocol sniff needs one: without it a stream carrying a
+// server-first protocol parks the read forever instead of being served as the byte stream it
+// is.
+func (s *h2Stream) SetReadDeadline(t time.Time) error {
+	s.r.setDeadline(t)
+	return nil
+}
+
 func (s *h2Stream) SetWriteDeadline(time.Time) error { return nil }
+
+// deadlineReader gives a reader that has no deadline of its own one, by keeping at most one
+// read outstanding and handing back what it produced on the next call. A read the deadline cut
+// short is not lost: it is still running, and its result is the first thing the next read
+// sees.
+type deadlineReader struct {
+	r        io.Reader
+	err      error
+	res      chan readResult
+	deadline atomic.Pointer[time.Time]
+	// buf is the one buffer the reading goroutine fills. It is handed out again only once
+	// that goroutine has delivered and rest is drained, so a read never writes into bytes a
+	// caller is still holding.
+	buf  []byte
+	rest []byte
+	mu   sync.Mutex
+	// pending is set while a read goroutine is still running for this reader.
+	pending bool
+}
+
+type readResult struct {
+	err error
+	b   []byte
+}
+
+func newDeadlineReader(r io.Reader) *deadlineReader {
+	return &deadlineReader{r: r, res: make(chan readResult, 1)}
+}
+
+func (d *deadlineReader) setDeadline(t time.Time) { d.deadline.Store(&t) }
+
+func (d *deadlineReader) Read(b []byte) (int, error) {
+	d.mu.Lock()
+	if len(d.rest) > 0 {
+		n := copy(b, d.rest)
+		d.rest = d.rest[n:]
+		d.mu.Unlock()
+		return n, nil
+	}
+	if d.err != nil {
+		err := d.err
+		d.mu.Unlock()
+		return 0, err
+	}
+	if !d.pending {
+		d.pending = true
+		if cap(d.buf) < len(b) {
+			d.buf = make([]byte, max(len(b), copyBufSize))
+		}
+		buf := d.buf[:cap(d.buf)]
+		go func() {
+			n, err := d.r.Read(buf)
+			d.res <- readResult{b: buf[:n], err: err}
+		}()
+	}
+	d.mu.Unlock()
+
+	var timeout <-chan time.Time
+	if dl := d.deadline.Load(); dl != nil && !dl.IsZero() {
+		timer := time.NewTimer(time.Until(*dl))
+		defer timer.Stop()
+		timeout = timer.C
+	}
+
+	select {
+	case res := <-d.res:
+		d.mu.Lock()
+		d.pending = false
+		d.err = res.err
+		n := copy(b, res.b)
+		d.rest = res.b[n:]
+		err := d.err
+		if n > 0 {
+			// The bytes come first; the error is reported on the read that finds nothing
+			// left, which is what a socket does.
+			err = nil
+		}
+		d.mu.Unlock()
+		return n, err
+	case <-timeout:
+		return 0, os.ErrDeadlineExceeded
+	}
+}
 
 var _ net.Conn = (*h2Stream)(nil)

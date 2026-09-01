@@ -140,7 +140,7 @@ func TestQUIC_InterceptWithCurl(t *testing.T) {
 	require.NoError(t, err)
 
 	seen := new(recorder)
-	p.MustAddInterceptor(nil, h3Authority+"/+{any}", func(c *Context) (*http.Response, error) {
+	p.MustAdd(h3Authority+"/+{any}", func(c *HTTPCtx) (*http.Response, error) {
 		seen.add(c.Protocol().String() + " " + c.Request().URL.Path)
 		return c.Forward()
 	})
@@ -161,47 +161,6 @@ func TestQUIC_InterceptWithCurl(t *testing.T) {
 	assert.Contains(t, res.body, "path=/echo")
 	require.Equal(t, []string{"HTTP/3.0 /echo"}, seen.all())
 }
-
-func TestQUIC_TunnelWithCurl(t *testing.T) {
-	requireCurl(t)
-
-	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
-	require.NoError(t, err)
-	origin := h3Origin(t, originCA)
-
-	proxyCA, err := GenerateCA()
-	require.NoError(t, err)
-
-	p, err := New(WithCA(proxyCA))
-	require.NoError(t, err)
-	p.MustAddTunnel(h3Authority)
-
-	// On every other authority: the tunnel is the more precise entry and decides first.
-	// An interceptor on the tunneled authority itself is refused, since it could never run.
-	handlerRan := new(atomic.Bool)
-	p.MustAddInterceptor(nil, "+{any}/+{rest}", func(c *Context) (*http.Response, error) {
-		handlerRan.Store(true)
-		return c.Forward()
-	})
-
-	proxyAddr := startQUICRedirected(t, p, origin)
-	port := fmt.Sprint(proxyAddr.Port())
-
-	// Only the origin CA is trusted. A relayed handshake reaches the origin certificate, an
-	// intercepted one would present the proxy's and fail.
-	res := runCurl(t,
-		"--http3-only",
-		"--resolve", h3Authority+":"+port+":127.0.0.1",
-		"--cacert", caFileOf(t, originCA, "origin.pem"),
-		fmt.Sprintf("https://%s:%s/echo", h3Authority, port),
-	)
-
-	require.Equal(t, "200", res.status, "body %q", res.body)
-	assert.Equal(t, "3", res.version)
-	assert.Contains(t, res.body, "proto=HTTP/3.0")
-	assert.False(t, handlerRan.Load(), "no handler may run on a relayed connection")
-}
-
 func TestQUIC_HandlerCanShortCircuit(t *testing.T) {
 	requireCurl(t)
 
@@ -211,9 +170,9 @@ func TestQUIC_HandlerCanShortCircuit(t *testing.T) {
 	p, err := New(WithCA(proxyCA))
 	require.NoError(t, err)
 
-	p.MustAddInterceptor([]string{http.MethodGet}, h3Authority+"/blocked", func(c *Context) (*http.Response, error) {
+	p.MustAdd(h3Authority+"/blocked", func(c *HTTPCtx) (*http.Response, error) {
 		return Text(http.StatusForbidden, "blocked by edge over "+c.Protocol().String()), nil
-	})
+	}, WithMethods(http.MethodGet))
 
 	proxyAddr := startQUIC(t, p)
 	port := fmt.Sprint(proxyAddr.Port())
@@ -274,53 +233,6 @@ func dialQUICTo(addr netip.AddrPort, roots *x509.CertPool) *http3.Transport {
 		},
 	}
 }
-
-// A tunneled QUIC connection is decided once, when its ClientHello is read, and never again,
-// so it needs a session of its own for a sweep to reach it.
-func TestQUIC_TunnelSessionIsListedAndClosed(t *testing.T) {
-	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
-	require.NoError(t, err)
-	origin := h3Origin(t, originCA)
-
-	proxyCA, err := GenerateCA()
-	require.NoError(t, err)
-	p, err := New(WithCA(proxyCA))
-	require.NoError(t, err)
-	p.MustAddTunnel(h3Authority)
-
-	proxyAddr := startQUICRedirected(t, p, origin)
-
-	tr := dialQUICTo(proxyAddr, poolOf(originCA))
-	defer func() { _ = tr.Close() }()
-
-	req, err := http.NewRequest(http.MethodGet,
-		fmt.Sprintf("https://%s:%d/echo", h3Authority, proxyAddr.Port()), nil)
-	require.NoError(t, err)
-
-	resp, err := tr.RoundTrip(req)
-	require.NoError(t, err)
-	body, err := io.ReadAll(resp.Body)
-	require.NoError(t, err)
-	require.NoError(t, resp.Body.Close())
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-	// End to end, the origin answered its own certificate and the proxy only moved datagrams.
-	assert.Contains(t, string(body), "path=/echo")
-
-	sessions := waitForSessions(t, p, 1)
-	assert.Equal(t, Tunnel, sessions[0].Action())
-	assert.Equal(t, h3Authority, sessions[0].Target().Host)
-	assert.Equal(t, QUIC, sessions[0].Protocol(), "a tunneled handshake stays opaque, HTTP/3 is never established")
-	require.NotNil(t, sessions[0].ClientHello(), "the sniffed ClientHello belongs to the session")
-	assert.Equal(t, h3Authority, sessions[0].ClientHello().ServerName)
-	assert.Contains(t, sessions[0].ClientHello().ALPN, "h3")
-
-	require.NoError(t, sessions[0].Close())
-	assert.Empty(t, slices.Collect(p.Sessions()), "closing removes the peer under the demux lock")
-}
-
-// The proxy terminated an intercepted QUIC connection itself, so closing its session goes
-// through CloseWithError rather than leaving the client to time out. What the client
-// then observes is not asserted, an http3.Transport is free to redial on its own.
 func TestQUIC_InterceptedSessionIsListedAndClosed(t *testing.T) {
 	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
 	require.NoError(t, err)
@@ -335,7 +247,7 @@ func TestQUIC_InterceptedSessionIsListedAndClosed(t *testing.T) {
 
 	p, err := New(WithCA(proxyCA), WithTransport(upstream))
 	require.NoError(t, err)
-	p.MustAddInterceptor(nil, h3Authority+"/+{any}", func(c *Context) (*http.Response, error) {
+	p.MustAdd(h3Authority+"/+{any}", func(c *HTTPCtx) (*http.Response, error) {
 		return c.Forward()
 	})
 
@@ -357,7 +269,7 @@ func TestQUIC_InterceptedSessionIsListedAndClosed(t *testing.T) {
 	assert.Contains(t, string(body), "path=/echo")
 
 	sessions := waitForSessions(t, p, 1)
-	assert.Equal(t, Intercept, sessions[0].Action())
+	assert.Equal(t, KindHTTP, sessions[0].Kind())
 	assert.Equal(t, h3Authority, sessions[0].Target().Host)
 	assert.Equal(t, HTTP3, sessions[0].Protocol(), "established once the server adopts the connection")
 	assert.NotNil(t, sessions[0].TLS(), "the handshake the proxy terminated is recorded")
@@ -377,12 +289,17 @@ func TestQUIC_SessionContextEndsWithTheSession(t *testing.T) {
 
 	proxyCA, err := GenerateCA()
 	require.NoError(t, err)
-	p, err := New(WithCA(proxyCA))
+	tr2 := DefaultTransport()
+	tr2.RootCAs = poolOf(originCA)
+	p, err := New(WithCA(proxyCA), WithTransport(tr2))
 	require.NoError(t, err)
-	p.MustAddTunnel(h3Authority)
+	// Served stream by stream: the client offers h3 and nothing admits HTTP here, so the
+	// connection falls to the QUIC entry, which carries its streams opaque.
+	p.MustAdd[QUIC](h3Authority, relayQUIC)
 
 	proxyAddr := startQUICRedirected(t, p, origin)
-	tr := dialQUICTo(proxyAddr, poolOf(originCA))
+	// Terminated either way, so the certificate the client checks is the proxy's.
+	tr := dialQUICTo(proxyAddr, poolOf(proxyCA))
 	defer func() { _ = tr.Close() }()
 
 	req, err := http.NewRequest(http.MethodGet,
@@ -447,12 +364,12 @@ func TestQUIC_TwoInterceptedConnectionsOnOneSocket(t *testing.T) {
 	require.NoError(t, err)
 	p, err := New(WithCA(proxyCA))
 	require.NoError(t, err)
-	handler := func(c *Context) (*http.Response, error) {
+	handler := func(c *HTTPCtx) (*http.Response, error) {
 		// A request served under its sibling's session would echo the wrong authority.
 		return Text(http.StatusOK, c.Session().Target().Host), nil
 	}
-	p.MustAddInterceptor(nil, "a.example.test/", handler)
-	p.MustAddInterceptor(nil, "b.example.test/", handler)
+	p.MustAdd("a.example.test/", handler)
+	p.MustAdd("b.example.test/", handler)
 
 	proxyAddr := startQUIC(t, p)
 
@@ -497,65 +414,12 @@ func TestQUIC_TwoInterceptedConnectionsOnOneSocket(t *testing.T) {
 	remaining := waitForSessions(t, p, 1)
 	assert.Equal(t, "b.example.test", remaining[0].Target().Host)
 }
-
-// A second tunneled connection from the same client socket used to be fed into the first
-// one's tunnel and could never establish. Each is now decided on its own server name, and
-// closing either cuts the relay they share, so a survivor would re-handshake.
-func TestQUIC_TunnelSiblingsShareOneRelayAndCloseTogether(t *testing.T) {
-	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
-	require.NoError(t, err)
-	origin := h3Origin(t, originCA, "a.example.test", "b.example.test")
-
-	proxyCA, err := GenerateCA()
-	require.NoError(t, err)
-	p, err := New(WithCA(proxyCA))
-	require.NoError(t, err)
-	p.MustAddTunnel("a.example.test")
-	p.MustAddTunnel("b.example.test")
-
-	proxyAddr := startQUICRedirected(t, p, origin)
-
-	clientPC, err := net.ListenUDP("udp", nil)
-	require.NoError(t, err)
-	ctr := &quic.Transport{Conn: clientPC}
-	defer func() { _ = ctr.Close(); _ = clientPC.Close() }()
-
-	connA := dialSharedQUIC(t, ctr, proxyAddr, "a.example.test", poolOf(originCA))
-	connB := dialSharedQUIC(t, ctr, proxyAddr, "b.example.test", poolOf(originCA))
-
-	h3tr := &http3.Transport{}
-	defer func() { _ = h3tr.Close() }()
-	ccA, ccB := h3tr.NewClientConn(connA), h3tr.NewClientConn(connB)
-	assert.Contains(t, h3Get(t, ccA, "a.example.test", proxyAddr.Port()), "host=a.example.test")
-	assert.Contains(t, h3Get(t, ccB, "b.example.test", proxyAddr.Port()), "host=b.example.test")
-
-	sessions := waitForSessions(t, p, 2)
-	slices.SortFunc(sessions, func(x, y *Session) int { return strings.Compare(x.Target().Host, y.Target().Host) })
-	assert.Equal(t, "a.example.test", sessions[0].Target().Host)
-	assert.Equal(t, "b.example.test", sessions[1].Target().Host)
-	assert.Equal(t, Tunnel, sessions[0].Action())
-	assert.Equal(t, Tunnel, sessions[1].Action())
-
-	require.NoError(t, sessions[0].Close())
-	for _, sess := range sessions {
-		select {
-		case <-sess.Context().Done():
-		case <-time.After(3 * time.Second):
-			t.Fatal("cutting the relay did not end every session riding it")
-		}
-	}
-	assert.Empty(t, slices.Collect(p.Sessions()))
-}
-
-// Closing an intercepted session before the HTTP/3 server has adopted the connection must
-// still end it. The tag keeps delivering its packets with no state to drop, so the demux
-// dooms the connection and the adoption is where it dies.
 func TestQUIC_CloseBeforeAdoptionEndsTheConnection(t *testing.T) {
 	proxyCA, err := GenerateCA()
 	require.NoError(t, err)
 	p, err := New(WithCA(proxyCA))
 	require.NoError(t, err)
-	p.MustAddInterceptor(nil, h3Authority+"/", func(c *Context) (*http.Response, error) {
+	p.MustAdd(h3Authority+"/", func(c *HTTPCtx) (*http.Response, error) {
 		return Text(http.StatusOK, "ok"), nil
 	})
 	proxyAddr := startQUIC(t, p)
@@ -625,7 +489,7 @@ func TestQUIC_SessionContextEndsWhenTheClientLeaves(t *testing.T) {
 	require.NoError(t, err)
 	p, err := New(WithCA(proxyCA))
 	require.NoError(t, err)
-	p.MustAddInterceptor(nil, h3Authority+"/", func(c *Context) (*http.Response, error) {
+	p.MustAdd(h3Authority+"/", func(c *HTTPCtx) (*http.Response, error) {
 		return Text(http.StatusOK, "ok"), nil
 	})
 
@@ -703,466 +567,8 @@ func (c *payloadOriginPacketConn) OriginalDestination(net.Addr) (netip.AddrPort,
 
 func (c *payloadOriginPacketConn) exactOriginalDestination() bool { return true }
 
-// rawPayloadFor spells a datagram whose first two bytes name the origin's port, for
-// payloadOriginPacketConn to read back.
-func rawPayloadFor(origin netip.AddrPort) []byte {
-	return []byte{byte(origin.Port() >> 8), byte(origin.Port()), 'p', 'i', 'n', 'g'}
-}
-
-func TestQUIC_RawUDPTunnelByDestination(t *testing.T) {
-	origin := udpEchoOrigin(t)
-
-	proxyCA, err := GenerateCA()
-	require.NoError(t, err)
-	p, err := New(WithCA(proxyCA))
-	require.NoError(t, err)
-	p.MustAddTunnel(origin.String())
-
-	proxyAddr := startQUICRedirected(t, p, origin)
-
-	client, err := net.Dial("udp", proxyAddr.String())
-	require.NoError(t, err)
-	defer func() { _ = client.Close() }()
-
-	buf := make([]byte, 128)
-	for _, payload := range [][]byte{
-		[]byte("raw-low-bit"),
-		{0x81, 0xde, 0xad, 0xbe, 0xef, 0x78, 0x01, 0x02}, // the high bit set, but not QUIC
-	} {
-		_, err = client.Write(payload)
-		require.NoError(t, err)
-		require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
-		n, rerr := client.Read(buf)
-		require.NoError(t, rerr)
-		assert.Equal(t, payload, buf[:n])
-	}
-
-	sessions := waitForSessions(t, p, 1)
-	sess := sessions[0]
-	assert.Equal(t, Tunnel, sess.Action())
-	assert.Equal(t, UDP, sess.Protocol())
-	assert.Equal(t, origin.Addr().String(), sess.Target().Host)
-	assert.Equal(t, fmt.Sprint(origin.Port()), sess.Target().Port)
-	assert.Equal(t, origin, sess.Upstream())
-	assert.True(t, sess.Transparent())
-	assert.Nil(t, sess.ClientHello())
-
-	_, err = p.DeleteTunnel(origin.String())
-	require.NoError(t, err)
-	require.NoError(t, sess.Close())
-	assert.Empty(t, slices.Collect(p.Sessions()))
-	select {
-	case <-sess.Context().Done():
-	default:
-		t.Fatal("closing the session must end its context")
-	}
-
-	_, err = client.Write([]byte("after-close"))
-	require.NoError(t, err)
-	require.NoError(t, client.SetReadDeadline(time.Now().Add(300*time.Millisecond)))
-	_, err = client.Read(buf)
-	require.Error(t, err, "a withdrawn destination must not be relayed")
-}
-
-func TestQUIC_RawUDPRejectedByDefault(t *testing.T) {
-	origin := udpEchoOrigin(t)
-
-	proxyCA, err := GenerateCA()
-	require.NoError(t, err)
-	p, err := New(WithCA(proxyCA))
-	require.NoError(t, err)
-
-	proxyAddr := startQUICRedirected(t, p, origin)
-
-	client, err := net.Dial("udp", proxyAddr.String())
-	require.NoError(t, err)
-	defer func() { _ = client.Close() }()
-
-	_, err = client.Write([]byte("nobody-said-yes"))
-	require.NoError(t, err)
-	require.NoError(t, client.SetReadDeadline(time.Now().Add(300*time.Millisecond)))
-	_, err = client.Read(make([]byte, 64))
-	require.Error(t, err)
-	assert.Empty(t, slices.Collect(p.Sessions()))
-}
-
-// An authority held by an interceptor names traffic the operator chose to inspect, and raw
-// bytes offer nothing to terminate, so they drop rather than slipping through as a tunnel.
-func TestQUIC_RawUDPInterceptedAuthorityDrops(t *testing.T) {
-	origin := udpEchoOrigin(t)
-
-	proxyCA, err := GenerateCA()
-	require.NoError(t, err)
-	p, err := New(WithCA(proxyCA))
-	require.NoError(t, err)
-	p.MustAddInterceptor(nil, fmt.Sprintf("%s/+{any}", origin.String()), func(c *Context) (*http.Response, error) {
-		return c.Forward()
-	})
-
-	proxyAddr := startQUICRedirected(t, p, origin)
-
-	client, err := net.Dial("udp", proxyAddr.String())
-	require.NoError(t, err)
-	defer func() { _ = client.Close() }()
-
-	_, err = client.Write([]byte("raw-to-an-intercepted-ip"))
-	require.NoError(t, err)
-	require.NoError(t, client.SetReadDeadline(time.Now().Add(300*time.Millisecond)))
-	_, err = client.Read(make([]byte, 64))
-	require.Error(t, err)
-	assert.Empty(t, slices.Collect(p.Sessions()))
-}
-
-func TestQUIC_RawUDPWildcardTunnel(t *testing.T) {
-	origin := udpEchoOrigin(t)
-
-	proxyCA, err := GenerateCA()
-	require.NoError(t, err)
-	p, err := New(WithCA(proxyCA))
-	require.NoError(t, err)
-	p.MustAddTunnel("[0.0.0.0/0]")
-
-	proxyAddr := startQUICRedirected(t, p, origin)
-
-	client, err := net.Dial("udp", proxyAddr.String())
-	require.NoError(t, err)
-	defer func() { _ = client.Close() }()
-
-	_, err = client.Write([]byte("anything-goes"))
-	require.NoError(t, err)
-	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
-	buf := make([]byte, 64)
-	n, err := client.Read(buf)
-	require.NoError(t, err)
-	assert.Equal(t, "anything-goes", string(buf[:n]))
-}
-
-func TestQUIC_RawUDPRelayCapPerFlow(t *testing.T) {
-	proxyCA, err := GenerateCA()
-	require.NoError(t, err)
-	p, err := New(WithCA(proxyCA))
-	require.NoError(t, err)
-	p.MustAddTunnel("[0.0.0.0/0]")
-
-	origins := make([]netip.AddrPort, maxRelaysPerFlow+1)
-	for i := range origins {
-		origins[i] = udpEchoOrigin(t)
-	}
-
-	proxyAddr := serveQUIC(t, p, func(pc net.PacketConn) net.PacketConn {
-		return &payloadOriginPacketConn{PacketConn: pc}
-	})
-
-	client, err := net.Dial("udp", proxyAddr.String())
-	require.NoError(t, err)
-	defer func() { _ = client.Close() }()
-
-	buf := make([]byte, 64)
-	for i, origin := range origins[:maxRelaysPerFlow] {
-		payload := rawPayloadFor(origin)
-		_, err = client.Write(payload)
-		require.NoError(t, err)
-		require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
-		n, rerr := client.Read(buf)
-		require.NoError(t, rerr, "origin %d must be relayed", i)
-		assert.Equal(t, payload, buf[:n])
-	}
-
-	_, err = client.Write(rawPayloadFor(origins[maxRelaysPerFlow]))
-	require.NoError(t, err)
-	require.NoError(t, client.SetReadDeadline(time.Now().Add(300*time.Millisecond)))
-	_, err = client.Read(buf)
-	require.Error(t, err, "the relay cap refuses the next origin")
-	assert.Len(t, slices.Collect(p.Sessions()), maxRelaysPerFlow)
-}
-
-func TestQUIC_RawUDPSessionEndsOnProxyClose(t *testing.T) {
-	origin := udpEchoOrigin(t)
-
-	proxyCA, err := GenerateCA()
-	require.NoError(t, err)
-	p, err := New(WithCA(proxyCA))
-	require.NoError(t, err)
-	p.MustAddTunnel(origin.String())
-
-	proxyAddr := startQUICRedirected(t, p, origin)
-
-	client, err := net.Dial("udp", proxyAddr.String())
-	require.NoError(t, err)
-	defer func() { _ = client.Close() }()
-
-	_, err = client.Write([]byte("warm-up"))
-	require.NoError(t, err)
-	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
-	_, err = client.Read(make([]byte, 64))
-	require.NoError(t, err)
-
-	sessions := waitForSessions(t, p, 1)
-	require.NoError(t, p.Close())
-	select {
-	case <-sessions[0].Context().Done():
-	case <-time.After(3 * time.Second):
-		t.Fatal("closing the proxy must end the raw session")
-	}
-}
-
-// Closing a raw UDP session bars its destination, or the client's next datagram would
-// re-open a relay under the tunnel that still matches, undoing the close. Once the bar
-// expires the destination is decided afresh.
-func TestQUIC_RawUDPSessionCloseBarsReadmission(t *testing.T) {
-	origin := udpEchoOrigin(t)
-
-	proxyCA, err := GenerateCA()
-	require.NoError(t, err)
-	p, err := New(WithCA(proxyCA))
-	require.NoError(t, err)
-	p.MustAddTunnel("[0.0.0.0/0]")
-
-	proxyAddr := startQUICRedirected(t, p, origin)
-
-	client, err := net.Dial("udp", proxyAddr.String())
-	require.NoError(t, err)
-	defer func() { _ = client.Close() }()
-
-	buf := make([]byte, 64)
-	_, err = client.Write([]byte("ping"))
-	require.NoError(t, err)
-	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
-	n, err := client.Read(buf)
-	require.NoError(t, err)
-	require.Equal(t, "ping", string(buf[:n]))
-
-	sess := waitForSessions(t, p, 1)[0]
-	require.NoError(t, sess.Close())
-
-	_, err = client.Write([]byte("zombie"))
-	require.NoError(t, err)
-	require.NoError(t, client.SetReadDeadline(time.Now().Add(300*time.Millisecond)))
-	_, err = client.Read(buf)
-	require.Error(t, err, "the tunnel still matches, only the bar can refuse this datagram")
-	assert.Empty(t, slices.Collect(p.Sessions()))
-
-	var d *quicDemux
-	p.srv.mu.Lock()
-	for dd := range p.srv.quics {
-		d = dd
-	}
-	p.srv.mu.Unlock()
-	require.NotNil(t, d)
-
-	// Backdating the deadline stands in for its expiry.
-	from := netip.MustParseAddrPort(client.LocalAddr().String())
-	revoked := 0
-	d.mu.Lock()
-	flow := d.flows[from]
-	if flow != nil {
-		revoked = len(flow.revoked)
-		for o := range flow.revoked {
-			flow.revoked[o] = time.Now().Add(-time.Second)
-		}
-	}
-	d.mu.Unlock()
-	require.NotNil(t, flow)
-	require.Equal(t, 1, revoked)
-
-	_, err = client.Write([]byte("fresh"))
-	require.NoError(t, err)
-	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
-	n, err = client.Read(buf)
-	require.NoError(t, err)
-	require.Equal(t, "fresh", string(buf[:n]))
-	waitForSessions(t, p, 1)
-}
-
-// With exact per datagram destinations, closing one origin's session refuses that origin
-// alone and the flow's other relay keeps going.
-func TestQUIC_RawUDPSessionClosePerOrigin(t *testing.T) {
-	originA := udpEchoOrigin(t)
-	originB := udpEchoOrigin(t)
-
-	proxyCA, err := GenerateCA()
-	require.NoError(t, err)
-	p, err := New(WithCA(proxyCA))
-	require.NoError(t, err)
-	p.MustAddTunnel("[0.0.0.0/0]")
-
-	proxyAddr := serveQUIC(t, p, func(pc net.PacketConn) net.PacketConn {
-		return &payloadOriginPacketConn{PacketConn: pc}
-	})
-
-	client, err := net.Dial("udp", proxyAddr.String())
-	require.NoError(t, err)
-	defer func() { _ = client.Close() }()
-
-	buf := make([]byte, 64)
-	for _, origin := range []netip.AddrPort{originA, originB} {
-		payload := rawPayloadFor(origin)
-		_, err = client.Write(payload)
-		require.NoError(t, err)
-		require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
-		n, rerr := client.Read(buf)
-		require.NoError(t, rerr)
-		assert.Equal(t, payload, buf[:n])
-	}
-
-	var sessA *Session
-	for _, sess := range waitForSessions(t, p, 2) {
-		if sess.Upstream() == originA {
-			sessA = sess
-		}
-	}
-	require.NotNil(t, sessA)
-	require.NoError(t, sessA.Close())
-
-	_, err = client.Write(rawPayloadFor(originA))
-	require.NoError(t, err)
-	require.NoError(t, client.SetReadDeadline(time.Now().Add(300*time.Millisecond)))
-	_, err = client.Read(buf)
-	require.Error(t, err, "the closed origin must be refused")
-
-	payload := rawPayloadFor(originB)
-	_, err = client.Write(payload)
-	require.NoError(t, err)
-	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
-	n, err := client.Read(buf)
-	require.NoError(t, err, "the other origin's relay must keep going")
-	assert.Equal(t, payload, buf[:n])
-	assert.Len(t, slices.Collect(p.Sessions()), 1)
-
-	// A revocation scoped to the flow instead of the pair would refuse this too.
-	originC := udpEchoOrigin(t)
-	payload = rawPayloadFor(originC)
-	_, err = client.Write(payload)
-	require.NoError(t, err)
-	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
-	n, err = client.Read(buf)
-	require.NoError(t, err, "a fresh origin must still be admitted")
-	assert.Equal(t, payload, buf[:n])
-	assert.Len(t, slices.Collect(p.Sessions()), 2)
-}
-
-// A close of a session already ended by a transport failure stays a no-op. The relay
-// re-admitted since then keeps going and no revocation is posted.
-func TestQUIC_RawUDPStaleSessionCloseIsNoOp(t *testing.T) {
-	origin := udpEchoOrigin(t)
-
-	proxyCA, err := GenerateCA()
-	require.NoError(t, err)
-	p, err := New(WithCA(proxyCA))
-	require.NoError(t, err)
-	p.MustAddTunnel("[0.0.0.0/0]")
-
-	proxyAddr := startQUICRedirected(t, p, origin)
-
-	client, err := net.Dial("udp", proxyAddr.String())
-	require.NoError(t, err)
-	defer func() { _ = client.Close() }()
-
-	buf := make([]byte, 64)
-	_, err = client.Write([]byte("ping"))
-	require.NoError(t, err)
-	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
-	_, err = client.Read(buf)
-	require.NoError(t, err)
-
-	stale := waitForSessions(t, p, 1)[0]
-
-	var d *quicDemux
-	p.srv.mu.Lock()
-	for dd := range p.srv.quics {
-		d = dd
-	}
-	p.srv.mu.Unlock()
-	require.NotNil(t, d)
-
-	from := netip.MustParseAddrPort(client.LocalAddr().String())
-	d.mu.Lock()
-	flow := d.flows[from]
-	var relay *quicRelay
-	if flow != nil {
-		relay = flow.relays[origin]
-	}
-	d.mu.Unlock()
-	require.NotNil(t, relay)
-
-	// The transport failure path, then the client is re-admitted onto a fresh relay.
-	d.closeRelay(from, relay)
-	_, err = client.Write([]byte("again"))
-	require.NoError(t, err)
-	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
-	_, err = client.Read(buf)
-	require.NoError(t, err, "a transport failure must allow the redial")
-	waitForSessions(t, p, 1)
-
-	require.NoError(t, stale.Close())
-
-	_, err = client.Write([]byte("still"))
-	require.NoError(t, err)
-	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
-	_, err = client.Read(buf)
-	require.NoError(t, err, "the stale close must not touch the fresh relay")
-	assert.Len(t, slices.Collect(p.Sessions()), 1)
-
-	d.mu.Lock()
-	revoked := len(flow.revoked)
-	d.mu.Unlock()
-	assert.Zero(t, revoked, "a stale close must not post a revocation")
-}
-
-// Closing a tunneled QUIC session leaves the client's connection sending datagrams no
-// header can attribute, which land in raw admission. With a catch-all tunnel still
-// matching the destination they would re-open a relay and the connection would survive
-// its own close, never re-handshaking, never re-decided.
-func TestQUIC_TunnelSessionCloseBarsOrphanedDatagrams(t *testing.T) {
-	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
-	require.NoError(t, err)
-	origin := h3Origin(t, originCA)
-
-	proxyCA, err := GenerateCA()
-	require.NoError(t, err)
-	p, err := New(WithCA(proxyCA))
-	require.NoError(t, err)
-	p.MustAddTunnel("+{any}")
-
-	proxyAddr := startQUICRedirected(t, p, origin)
-
-	pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
-	require.NoError(t, err)
-	defer func() { _ = pc.Close() }()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	conn, err := quic.Dial(ctx, pc, net.UDPAddrFromAddrPort(proxyAddr), &tls.Config{
-		ServerName: h3Authority,
-		RootCAs:    poolOf(originCA),
-		NextProtos: []string{"h3"},
-		MinVersion: tls.VersionTLS13,
-	}, &quic.Config{MaxIdleTimeout: time.Second})
-	require.NoError(t, err)
-	defer func() { _ = conn.CloseWithError(0, "") }()
-
-	sess := waitForSessions(t, p, 1)[0]
-	require.Equal(t, Tunnel, sess.Action())
-	require.NoError(t, sess.Close())
-	require.Empty(t, slices.Collect(p.Sessions()))
-
-	// A short header from the closed connection, past its handshake, reaches raw admission.
-	orphan := make([]byte, 48)
-	_, err = rand.Read(orphan)
-	require.NoError(t, err)
-	orphan[0] = orphan[0]&0x3f | 0x40
-	_, err = pc.WriteToUDP(orphan, net.UDPAddrFromAddrPort(proxyAddr))
-	require.NoError(t, err)
-
-	time.Sleep(300 * time.Millisecond)
-	assert.Empty(t, slices.Collect(p.Sessions()), "an orphaned datagram must not become a session")
-}
-
-// tproxyOriginPacketConn stands in for a TPROXY socket: exact per datagram origins, reply
-// sockets that are plain loopback ones, and a shared socket that black-holes every direct
-// client write so a reply sneaking around the reply sockets fails the test. perClient is
-// keyed by the client address as the proxy reads it off its socket, and a client not in it
-// reports the shared origin, so a test may hold one origin live per client socket.
+// tproxyOriginPacketConn is a socket that reports an original destination for every datagram
+// and sources its replies from that destination, the TPROXY contract.
 type tproxyOriginPacketConn struct {
 	net.PacketConn
 	origin    atomic.Value
@@ -1219,37 +625,6 @@ func startTProxyQUIC(t *testing.T, p *Proxy, origin netip.AddrPort) (*tproxyOrig
 	require.NoError(t, err)
 	return wrapper, addr
 }
-
-func TestQUIC_TProxyRawRelayRepliesFromTheOrigin(t *testing.T) {
-	origin := udpEchoOrigin(t)
-
-	proxyCA, err := GenerateCA()
-	require.NoError(t, err)
-	p, err := New(WithCA(proxyCA))
-	require.NoError(t, err)
-	p.MustAddTunnel(origin.String())
-
-	wrapper, proxyAddr := startTProxyQUIC(t, p, origin)
-
-	client, err := net.ListenPacket("udp", "127.0.0.1:0")
-	require.NoError(t, err)
-	defer func() { _ = client.Close() }()
-
-	payload := []byte("spoofed-return-path")
-	_, err = client.WriteTo(payload, net.UDPAddrFromAddrPort(proxyAddr))
-	require.NoError(t, err)
-	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
-	buf := make([]byte, 64)
-	n, from, err := client.ReadFrom(buf)
-	require.NoError(t, err)
-	assert.Equal(t, payload, buf[:n])
-
-	replyAddr := <-wrapper.replies
-	assert.Equal(t, replyAddr.String(), from.String(), "the reply must leave from the origin's socket")
-	assert.NotEqual(t, proxyAddr.String(), from.String())
-	assert.Zero(t, wrapper.direct.Load(), "nothing may write to a client through the shared socket")
-}
-
 func TestQUIC_TProxyInterceptRepliesFromTheOrigin(t *testing.T) {
 	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
 	require.NoError(t, err)
@@ -1264,7 +639,7 @@ func TestQUIC_TProxyInterceptRepliesFromTheOrigin(t *testing.T) {
 
 	p, err := New(WithCA(proxyCA), WithTransport(upstream))
 	require.NoError(t, err)
-	p.MustAddInterceptor(nil, h3Authority+"/+{any}", func(c *Context) (*http.Response, error) {
+	p.MustAdd(h3Authority+"/+{any}", func(c *HTTPCtx) (*http.Response, error) {
 		return c.Forward()
 	})
 
@@ -1299,11 +674,11 @@ func TestQUIC_TProxyTwoInterceptedOriginsOnOneSocket(t *testing.T) {
 	require.NoError(t, err)
 	p, err := New(WithCA(proxyCA))
 	require.NoError(t, err)
-	handler := func(c *Context) (*http.Response, error) {
+	handler := func(c *HTTPCtx) (*http.Response, error) {
 		return Text(http.StatusOK, c.Session().Target().Host), nil
 	}
-	p.MustAddInterceptor(nil, "first.test/", handler)
-	p.MustAddInterceptor(nil, "second.test/", handler)
+	p.MustAdd("first.test/", handler)
+	p.MustAdd("second.test/", handler)
 
 	wrapper, proxyAddr := startTProxyQUIC(t, p, first)
 
@@ -1339,10 +714,10 @@ func TestQUIC_StatelessResetForOrphanedTag(t *testing.T) {
 	require.NoError(t, err)
 	p, err := New(WithCA(proxyCA))
 	require.NoError(t, err)
-	p.MustAddInterceptor(nil, "first.test/", func(c *Context) (*http.Response, error) {
+	p.MustAdd("first.test/", func(c *HTTPCtx) (*http.Response, error) {
 		return Text(http.StatusOK, "ok"), nil
 	})
-	p.MustAddTunnel(orphanOrigin.String())
+	p.MustAdd[UDP](orphanOrigin.String(), forwardDatagram)
 
 	wrapper, proxyAddr := startTProxyQUIC(t, p, first)
 
@@ -1401,13 +776,13 @@ func TestQUIC_ShutdownDrainsEveryInterceptStack(t *testing.T) {
 	require.NoError(t, err)
 	release := make(chan struct{})
 	inflight := make(chan struct{}, 2)
-	handler := func(c *Context) (*http.Response, error) {
+	handler := func(c *HTTPCtx) (*http.Response, error) {
 		inflight <- struct{}{}
 		<-release
 		return Text(http.StatusOK, c.Session().Target().Host), nil
 	}
-	p.MustAddInterceptor(nil, "first.test/", handler)
-	p.MustAddInterceptor(nil, "second.test/", handler)
+	p.MustAdd("first.test/", handler)
+	p.MustAdd("second.test/", handler)
 
 	wrapper, proxyAddr := startTProxyQUIC(t, p, first)
 
@@ -1499,7 +874,7 @@ func TestQUICDemux_EvictInterceptPrefersIdleLRU(t *testing.T) {
 func TestQUICDemux_CloseRefusesLatePublish(t *testing.T) {
 	p, err := New()
 	require.NoError(t, err)
-	p.MustAddTunnel("+{any}")
+	p.MustAdd[TCP]("+{any}", relayStream)
 
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -1522,7 +897,7 @@ func TestQUICDemux_CloseRefusesLatePublish(t *testing.T) {
 
 	d.mu.Lock()
 	flows := len(d.flows)
-	relays := d.relays
+	udps := d.udps
 	d.mu.Unlock()
-	require.Zerof(t, relays, "%d relay(s) published into a closed demux, %d flow(s) recreated", relays, flows)
+	require.Zerof(t, udps, "%d datagram flow(s) published into a closed demux, %d flow(s) recreated", udps, flows)
 }

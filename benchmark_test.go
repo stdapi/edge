@@ -22,7 +22,7 @@ func benchProxy(b *testing.B, patterns ...string) *Proxy {
 		b.Fatal(err)
 	}
 	for _, pattern := range patterns {
-		if _, err := p.AddInterceptor([]string{http.MethodGet}, pattern, noopHandler); err != nil {
+		if _, err := p.Add(pattern, noopHandler, WithMethods(http.MethodGet)); err != nil {
 			b.Fatalf("register %s: %v", pattern, err)
 		}
 	}
@@ -52,14 +52,14 @@ func BenchmarkLookup(b *testing.B) {
 			tree := p.getTree()
 			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
 
-			c := tree.pool.Get().(*Context)
+			c := tree.pool.Get().(*routeCtx)
 			defer tree.pool.Put(c)
 			c.reset(nil, req, "https", tc.host, "443")
 
 			b.ReportAllocs()
 			for b.Loop() {
 				*c.params = (*c.params)[:0]
-				if _, n := tree.lookup(http.MethodGet, tc.host, tc.path, c, false); n == nil {
+				if _, n := tree.lookup(tc.host, tc.path, c, false); n == nil {
 					b.Fatal("no match")
 				}
 			}
@@ -92,14 +92,14 @@ func BenchmarkLookupDeepTree(b *testing.B) {
 	const path = "/v1/subscriptions/sub_123/items/si_456"
 	req := httptest.NewRequest(http.MethodGet, path, nil)
 
-	c := tree.pool.Get().(*Context)
+	c := tree.pool.Get().(*routeCtx)
 	defer tree.pool.Put(c)
 	c.reset(nil, req, "https", host, "443")
 
 	b.ReportAllocs()
 	for b.Loop() {
 		*c.params = (*c.params)[:0]
-		if _, n := tree.lookup(http.MethodGet, host, path, c, false); n == nil {
+		if _, n := tree.lookup(host, path, c, false); n == nil {
 			b.Fatal("no match")
 		}
 	}
@@ -130,7 +130,7 @@ func BenchmarkActionFor(b *testing.B) {
 				b.Fatal(err)
 			}
 			for _, authority := range tc.authorities {
-				if _, err := p.AddInterceptor(nil, authority+"/*{any}", noopHandler); err != nil {
+				if _, err := p.Add(authority+"/*{any}", noopHandler); err != nil {
 					b.Fatalf("intercept %s: %v", authority, err)
 				}
 			}
@@ -138,7 +138,7 @@ func BenchmarkActionFor(b *testing.B) {
 
 			b.ReportAllocs()
 			for b.Loop() {
-				p.ActionFor(t)
+				p.Admits(t, KindHTTP)
 			}
 		})
 	}
@@ -220,6 +220,73 @@ func BenchmarkRoutingPath(b *testing.B) {
 	for b.Loop() {
 		if routingPath(req) == "" {
 			b.Fatal("empty routing path")
+		}
+	}
+}
+
+// BenchmarkLookupUnnarrowed is BenchmarkLookup on entries nothing narrows, the shape the fast
+// path in match answers. Comparing the two says what a matcher costs, and what skipping the
+// matcher loop entirely buys.
+func BenchmarkLookupUnnarrowed(b *testing.B) {
+	cases := []struct {
+		name    string
+		pattern string
+		host    string
+		path    string
+	}{
+		{name: "static", pattern: "api.stripe.com/v1/charges", host: "api.stripe.com", path: "/v1/charges"},
+		{name: "param", pattern: "api.stripe.com/v1/{id}/refunds", host: "api.stripe.com", path: "/v1/ch_1234567890/refunds"},
+		{name: "any authority", pattern: "+{any}/v1/charges", host: "anything.example.test", path: "/v1/charges"},
+		{name: "range", pattern: "[10.0.0.0/8]/v1/charges", host: "10.1.2.3", path: "/v1/charges"},
+	}
+
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			ca, err := GenerateCA()
+			if err != nil {
+				b.Fatal(err)
+			}
+			p, err := New(WithCA(ca))
+			if err != nil {
+				b.Fatal(err)
+			}
+			if _, err := p.Add(tc.pattern, noopHandler); err != nil {
+				b.Fatalf("register %s: %v", tc.pattern, err)
+			}
+
+			tree := p.getTree()
+			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+
+			c := tree.pool.Get().(*routeCtx)
+			defer tree.pool.Put(c)
+			c.reset(nil, req, "https", tc.host, "443")
+
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, n := tree.lookup(tc.host, tc.path, c, false); n == nil {
+					b.Fatal("no match")
+				}
+			}
+		})
+	}
+}
+
+// BenchmarkDatagramAdmission measures what routing one datagram costs. It is walked per
+// datagram, like every other unit, so this is the price of the model rather than of a cache.
+func BenchmarkDatagramAdmission(b *testing.B) {
+	p, err := New()
+	if err != nil {
+		b.Fatal(err)
+	}
+	if _, err := p.Add("[0.0.0.0/0]:53", func(*DatagramCtx) error { return nil }); err != nil {
+		b.Fatal(err)
+	}
+	target := Target{Scheme: "http", Host: "10.1.2.3", Port: "53"}
+
+	b.ReportAllocs()
+	for b.Loop() {
+		if e, _ := p.admitWith(target, KindUDP); e == nil {
+			b.Fatal("no entry")
 		}
 	}
 }

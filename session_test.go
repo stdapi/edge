@@ -42,7 +42,10 @@ func waitForSessions(t *testing.T, p *Proxy, want int) []*Session {
 
 // tunneledOrigin starts a TLS origin the proxy is told to tunnel, and returns a client
 // reaching it through the proxy along with the origin URL.
-func tunneledOrigin(t *testing.T, p *Proxy) (*http.Client, *url.URL, *x509.CertPool) {
+// streamedOrigin arms p with a stream entry for a TLS origin and returns a client that trusts
+// the proxy. The connection is terminated like every other, so the certificate the client
+// checks is the one the proxy minted, and the proxy is the one that has to trust the origin.
+func streamedOrigin(t *testing.T, p *Proxy, ca *CA) (*http.Client, *url.URL, *x509.CertPool) {
 	t.Helper()
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprint(w, "origin")
@@ -51,25 +54,28 @@ func tunneledOrigin(t *testing.T, p *Proxy) (*http.Client, *url.URL, *x509.CertP
 
 	u, err := url.Parse(origin.URL)
 	require.NoError(t, err)
-	p.MustAddTunnel(originHost(u))
+	p.cfg.transport.RootCAs = originPool(t, origin)
+	p.MustAdd[TCP](originHost(u), relayStream)
 
-	pool := originPool(t, origin)
+	pool := ca.CertPool()
 	return proxyClient(startProxy(t, p), pool), u, pool
 }
 
-func TestSession_TunnelIsListedAndClosed(t *testing.T) {
-	p := testProxy(t)
-	client, originURL, _ := tunneledOrigin(t, p)
-
-	resp, err := client.Get(originURL.String())
+func TestSession_StreamIsListedAndClosed(t *testing.T) {
+	ca, err := GenerateCA()
 	require.NoError(t, err)
+	p := testProxyWithCA(t, ca)
+	client, originURL, _ := streamedOrigin(t, p, ca)
+
+	resp, gerr := client.Get(originURL.String())
+	require.NoError(t, gerr)
 	_, _ = io.Copy(io.Discard, resp.Body)
 	require.NoError(t, resp.Body.Close())
 
-	// The transport keeps the CONNECT tunnel open, so the session outlives the request.
+	// The transport keeps the connection open, so the session outlives the request.
 	sessions := waitForSessions(t, p, 1)
 	sess := sessions[0]
-	assert.Equal(t, Tunnel, sess.Action())
+	assert.Equal(t, KindTCP, sess.Kind())
 	assert.Equal(t, originHost(originURL), sess.Target().Host)
 	assert.NotZero(t, sess.ID())
 
@@ -80,27 +86,29 @@ func TestSession_TunnelIsListedAndClosed(t *testing.T) {
 	waitForSessions(t, p, 0)
 }
 
-func TestSession_SweepAfterDeleteTunnel(t *testing.T) {
-	p := testProxy(t)
-	client, originURL, _ := tunneledOrigin(t, p)
-
-	resp, err := client.Get(originURL.String())
+func TestSession_SweepAfterDeleteStream(t *testing.T) {
+	ca, err := GenerateCA()
 	require.NoError(t, err)
+	p := testProxyWithCA(t, ca)
+	client, originURL, _ := streamedOrigin(t, p, ca)
+
+	resp, gerr := client.Get(originURL.String())
+	require.NoError(t, gerr)
 	_, _ = io.Copy(io.Discard, resp.Body)
 	require.NoError(t, resp.Body.Close())
 	waitForSessions(t, p, 1)
 
-	_, err = p.DeleteTunnel(originHost(originURL))
+	_, err = p.Delete[TCP](originHost(originURL))
 	require.NoError(t, err)
 
 	var closed int
 	for s := range p.Sessions() {
-		if p.ActionFor(s.Target()) == Reject {
+		if !p.Admits(s.Target(), s.Kind()) {
 			require.NoError(t, s.Close())
 			closed++
 		}
 	}
-	assert.Equal(t, 1, closed, "the orphaned tunnel is swept")
+	assert.Equal(t, 1, closed, "the orphaned stream is swept")
 
 	// The client reconnects and is refused at the CONNECT, which is what the delete asked for.
 	_, err = client.Get(originURL.String())
@@ -119,7 +127,7 @@ func TestSession_InterceptedIsListedAndClosed(t *testing.T) {
 	tr := DefaultTransport()
 	tr.RootCAs = originPool(t, origin)
 	p := testProxy(t, WithTransport(tr))
-	p.MustAddInterceptor(nil, originHost(originURL)+"/*{rest}", func(c *Context) (*http.Response, error) {
+	p.MustAdd(originHost(originURL)+"/*{rest}", func(c *HTTPCtx) (*http.Response, error) {
 		return c.Forward()
 	})
 
@@ -130,7 +138,7 @@ func TestSession_InterceptedIsListedAndClosed(t *testing.T) {
 	require.NoError(t, resp.Body.Close())
 
 	sessions := waitForSessions(t, p, 1)
-	assert.Equal(t, Intercept, sessions[0].Action())
+	assert.Equal(t, KindHTTP, sessions[0].Kind())
 	assert.Equal(t, originHost(originURL), sessions[0].Target().Host)
 	assert.NotNil(t, sessions[0].TLS(), "the handshake with the client is recorded")
 
@@ -150,7 +158,7 @@ func TestSession_FrontConnectionsAreNotListed(t *testing.T) {
 	require.NoError(t, err)
 
 	p := testProxy(t)
-	p.MustAddInterceptor(nil, originHost(originURL)+"/*{rest}", func(c *Context) (*http.Response, error) {
+	p.MustAdd(originHost(originURL)+"/*{rest}", func(c *HTTPCtx) (*http.Response, error) {
 		return c.Forward()
 	})
 
@@ -167,8 +175,10 @@ func TestSession_FrontConnectionsAreNotListed(t *testing.T) {
 
 // Closing while traffic flows must not race the goroutines serving it.
 func TestSession_CloseUnderTraffic(t *testing.T) {
-	p := testProxy(t)
-	client, originURL, _ := tunneledOrigin(t, p)
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p := testProxyWithCA(t, ca)
+	client, originURL, _ := streamedOrigin(t, p, ca)
 
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
@@ -211,18 +221,18 @@ func TestSession_CloseUnderTraffic(t *testing.T) {
 // after the delete committed reads the tree again and refuses itself.
 func TestSession_AdmitAfterDelete(t *testing.T) {
 	p := testProxy(t)
-	p.MustAddTunnel("example.test")
+	p.MustAdd[TCP]("example.test", relayStream)
 	target := Target{Scheme: "https", Host: "example.test", Port: "443"}
 
-	admitted := newSession(context.Background(), nil, target, Tunnel, HTTP11)
+	admitted := newSession(context.Background(), nil, target, KindTCP, 0)
 	require.True(t, p.srv.admitSession(admitted))
 	require.Len(t, slices.Collect(p.Sessions()), 1)
 	p.srv.trackSession(admitted, false)
 
-	_, err := p.DeleteTunnel("example.test")
+	_, err := p.Delete[TCP]("example.test")
 	require.NoError(t, err)
 
-	refused := newSession(context.Background(), nil, target, Tunnel, HTTP11)
+	refused := newSession(context.Background(), nil, target, KindTCP, 0)
 	assert.False(t, p.srv.admitSession(refused))
 	assert.Empty(t, slices.Collect(p.Sessions()), "a refused connection is not reported")
 }
@@ -233,7 +243,7 @@ func frontSessionContext(t *testing.T, p *Proxy, client *http.Client) {
 	t.Helper()
 
 	ctxCh := make(chan context.Context, 1)
-	p.MustAddInterceptor(nil, "example.test/", func(c *Context) (*http.Response, error) {
+	p.MustAdd("example.test/", func(c *HTTPCtx) (*http.Response, error) {
 		select {
 		case ctxCh <- c.Session().Context():
 		default:

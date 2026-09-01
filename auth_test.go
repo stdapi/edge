@@ -67,7 +67,7 @@ func rawConnect(t *testing.T, addr, authority, credentials string) *http.Respons
 
 func TestProxyAuth_ChallengesAnUnauthenticatedConnect(t *testing.T) {
 	p := Must(WithProxyAuth(testBasic()))
-	p.MustAddTunnel("example.com")
+	p.MustAdd[TCP]("example.com", relayStream)
 	addr := startProxy(t, p)
 
 	resp := rawConnect(t, addr, "example.com:443", "")
@@ -78,7 +78,7 @@ func TestProxyAuth_ChallengesAnUnauthenticatedConnect(t *testing.T) {
 
 func TestProxyAuth_RefusesWrongCredentials(t *testing.T) {
 	p := Must(WithProxyAuth(testBasic()))
-	p.MustAddTunnel("example.com")
+	p.MustAdd[TCP]("example.com", relayStream)
 	addr := startProxy(t, p)
 
 	resp := rawConnect(t, addr, "example.com:443", "Basic YWxpY2U6d3Jvbmc=") // alice:wrong
@@ -108,7 +108,7 @@ func (noChallengeAuth) Challenges(*http.Request) []string         { return nil }
 
 func TestProxyAuth_NoChallengeAnswers403(t *testing.T) {
 	p := Must(WithProxyAuth(noChallengeAuth{}))
-	p.MustAddTunnel("example.com")
+	p.MustAdd[TCP]("example.com", relayStream)
 	addr := startProxy(t, p)
 
 	resp := rawConnect(t, addr, "example.com:443", "")
@@ -129,7 +129,7 @@ func TestProxyAuth_IdentityReachesTheHandler(t *testing.T) {
 	require.NoError(t, err)
 
 	p := Must(WithCA(ca), WithProxyAuth(testBasic()))
-	p.MustAddInterceptor(nil, originHost(originURL)+"/*{any}", func(c *Context) (*http.Response, error) {
+	p.MustAdd(originHost(originURL)+"/*{any}", func(c *HTTPCtx) (*http.Response, error) {
 		return Text(http.StatusOK, c.Identity()), nil
 	})
 	addr := startProxy(t, p)
@@ -157,7 +157,7 @@ func TestProxyAuth_IdentityIsPerRequest(t *testing.T) {
 	require.NoError(t, err)
 
 	p := Must(WithCA(ca), WithProxyAuth(testBasic()))
-	p.MustAddInterceptor(nil, originHost(originURL)+"/*{any}", func(c *Context) (*http.Response, error) {
+	p.MustAdd(originHost(originURL)+"/*{any}", func(c *HTTPCtx) (*http.Response, error) {
 		return Text(http.StatusOK, c.Identity()), nil
 	})
 	addr := startProxy(t, p)
@@ -191,7 +191,7 @@ func TestProxyAuth_SessionCarriesTheIdentityOfItsConnect(t *testing.T) {
 	tr.RootCAs = originPool(t, origin)
 
 	p := Must(WithCA(ca), WithTransport(tr), WithProxyAuth(testBasic()))
-	p.MustAddInterceptor(nil, originHost(originURL)+"/*{any}", func(c *Context) (*http.Response, error) {
+	p.MustAdd(originHost(originURL)+"/*{any}", func(c *HTTPCtx) (*http.Response, error) {
 		// Nothing on an intercepted connection is challenged, so both must report the
 		// identity the CONNECT that opened it carried.
 		return Text(http.StatusOK, c.Session().Identity()+"/"+c.Identity()), nil
@@ -209,7 +209,7 @@ func TestProxyAuth_SessionCarriesTheIdentityOfItsConnect(t *testing.T) {
 
 func TestProxyAuth_NoAuthenticatorLeavesEveryoneIn(t *testing.T) {
 	p := Must()
-	p.MustAddTunnel("example.com")
+	p.MustAdd[TCP]("example.com", relayStream)
 	addr := startProxy(t, p)
 
 	// No authenticator, so the authority decision is what answers, and it admits this one.
@@ -267,8 +267,7 @@ func TestParseBasicCredentials(t *testing.T) {
 }
 
 // Proxy-Authorization is hop-by-hop and holds a credential, so it must never reach an origin.
-// The client sends it on every request of the plain path, and both the routed and the relayed
-// path build the outbound request.
+// The client sends it on every request, and the outbound request is built from it.
 func TestProxyAuth_CredentialsNeverReachTheOrigin(t *testing.T) {
 	seen := make(chan string, 1)
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -279,40 +278,50 @@ func TestProxyAuth_CredentialsNeverReachTheOrigin(t *testing.T) {
 	originURL, err := url.Parse(origin.URL)
 	require.NoError(t, err)
 
-	cases := []struct {
-		name  string
-		setup func(p *Proxy)
-	}{
-		{"intercepted", func(p *Proxy) {
-			p.MustAddInterceptor(nil, originHost(originURL)+"/*{any}", func(c *Context) (*http.Response, error) {
-				return c.Forward()
-			})
-		}},
-		{"tunneled", func(p *Proxy) {
-			p.MustAddTunnel(originHost(originURL))
-		}},
-	}
+	ca, cerr := GenerateCA()
+	require.NoError(t, cerr)
+	p := Must(WithCA(ca), WithProxyAuth(testBasic()))
+	p.MustAdd(originHost(originURL)+"/*{any}", func(c *HTTPCtx) (*http.Response, error) {
+		return c.Forward()
+	})
+	addr := startProxy(t, p)
 
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			ca, cerr := GenerateCA()
-			require.NoError(t, cerr)
-			p := Must(WithCA(ca), WithProxyAuth(testBasic()))
-			tc.setup(p)
-			addr := startProxy(t, p)
+	resp, gerr := authProxyClient(addr, "alice", "secret", nil).Get(origin.URL)
+	require.NoError(t, gerr)
+	_ = resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
 
-			resp, gerr := authProxyClient(addr, "alice", "secret", nil).Get(origin.URL)
-			require.NoError(t, gerr)
-			_ = resp.Body.Close()
-			require.Equal(t, http.StatusOK, resp.StatusCode)
-
-			assert.Empty(t, <-seen, "the origin was handed the client's proxy credentials")
-		})
-	}
+	assert.Empty(t, <-seen, "the origin was handed the client's proxy credentials")
 }
 
-// The revocation sweep the identity exists for: a credential is withdrawn, and the
-// connections already open are found through Sessions and closed.
+// The same on a stream entry, which re-originates the TLS the client asked for rather than
+// carrying its bytes: the credential belongs to the hop and stops at the proxy either way.
+func TestProxyAuth_CredentialsNeverReachAStreamOrigin(t *testing.T) {
+	seen := make(chan string, 1)
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen <- r.Header.Get(HeaderProxyAuthorization)
+		fmt.Fprint(w, "origin")
+	}))
+	defer origin.Close()
+	originURL, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+
+	ca, cerr := GenerateCA()
+	require.NoError(t, cerr)
+	tr := DefaultTransport()
+	tr.RootCAs = originPool(t, origin)
+	p := Must(WithCA(ca), WithTransport(tr), WithProxyAuth(testBasic()))
+	p.MustAdd[TCP](originHost(originURL), relayStream)
+	addr := startProxy(t, p)
+
+	resp, gerr := authProxyClient(addr, "alice", "secret", ca.CertPool()).Get(origin.URL)
+	require.NoError(t, gerr)
+	_ = resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	assert.Empty(t, <-seen, "the origin was handed the client's proxy credentials")
+}
+
 func TestProxyAuth_SessionsReportTheIdentity(t *testing.T) {
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprint(w, "origin")
@@ -327,7 +336,7 @@ func TestProxyAuth_SessionsReportTheIdentity(t *testing.T) {
 	p := Must(WithCA(ca), WithProxyAuth(testBasic()))
 	// The session is registered by the time a handler runs on it, so reading the sweep from
 	// inside one needs no synchronisation with the connection being established.
-	p.MustAddInterceptor(nil, originHost(originURL)+"/*{any}", func(c *Context) (*http.Response, error) {
+	p.MustAdd(originHost(originURL)+"/*{any}", func(c *HTTPCtx) (*http.Response, error) {
 		var found []string
 		for s := range c.Proxy().Sessions() {
 			if id := s.Identity(); id != "" {
@@ -347,19 +356,25 @@ func TestProxyAuth_SessionsReportTheIdentity(t *testing.T) {
 	assert.Equal(t, "alice", string(body))
 }
 
-// A CONNECT carried on an HTTP/2 stream reaches its session through connectStream rather
-// than through the hijack, and the identity has to reach both. The tunnel branch registers
-// the session before it answers, so the sweep below cannot race the connection.
+// The identity of a CONNECT carried on an HTTP/2 stream reaches the session serving it. A
+// stream session exists once the traffic has said what it is, so the client writes before the
+// sweep looks.
 func TestProxyAuth_IdentityOnAnHTTP2Connect(t *testing.T) {
-	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprint(w, "origin")
-	}))
-	defer origin.Close()
-	originURL, err := url.Parse(origin.URL)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
+	defer func() { _ = ln.Close() }()
+	go func() {
+		for {
+			c, aerr := ln.Accept()
+			if aerr != nil {
+				return
+			}
+			go func() { _, _ = io.Copy(c, c); _ = c.Close() }()
+		}
+	}()
 
 	p := Must(WithProxyAuth(testBasic()))
-	p.MustAddTunnel(originHost(originURL))
+	p.MustAdd[TCP](ln.Addr().String(), relayStream)
 	addr := startProxy(t, p)
 
 	// h2c to the proxy, opened by hand since http2.Transport has no proxy support.
@@ -372,7 +387,7 @@ func TestProxyAuth_IdentityOnAnHTTP2Connect(t *testing.T) {
 
 	pr, pw := io.Pipe()
 	defer func() { _ = pw.Close() }()
-	req, err := http.NewRequest(http.MethodConnect, "https://"+originURL.Host, pr)
+	req, err := http.NewRequest(http.MethodConnect, "https://"+ln.Addr().String(), pr)
 	require.NoError(t, err)
 	req.Header.Set(HeaderProxyAuthorization, "Basic Ym9iOmh1bnRlcjI=") // bob:hunter2
 
@@ -381,16 +396,18 @@ func TestProxyAuth_IdentityOnAnHTTP2Connect(t *testing.T) {
 	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
-	var found []string
-	for s := range p.Sessions() {
-		found = append(found, s.Identity())
-	}
-	assert.Equal(t, []string{"bob"}, found)
+	// The stream carries bytes that are not HTTP, so the proxy serves it as a stream.
+	_, err = pw.Write([]byte("ping\n"))
+	require.NoError(t, err)
+
+	found := waitForSessions(t, p, 1)
+	assert.Equal(t, "bob", found[0].Identity())
+	assert.Equal(t, KindTCP, found[0].Kind())
 }
 
 func TestProxyAuth_RefusedHTTP2Connect(t *testing.T) {
 	p := Must(WithProxyAuth(testBasic()))
-	p.MustAddTunnel("example.com")
+	p.MustAdd[TCP]("example.com", relayStream)
 	addr := startProxy(t, p)
 
 	raw, err := net.Dial("tcp", addr)

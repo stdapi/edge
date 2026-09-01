@@ -52,7 +52,7 @@ func FuzzParsePattern(f *testing.F) {
 	p := mustFuzzProxy(f)
 
 	f.Fuzz(func(t *testing.T, raw string) {
-		pat, _, err := p.parsePattern(raw)
+		pat, _, err := p.parsePattern(raw, KindHTTP)
 		if err != nil {
 			return
 		}
@@ -104,28 +104,28 @@ func FuzzRoundTripRegistration(f *testing.F) {
 	f.Fuzz(func(t *testing.T, raw string) {
 		p := mustFuzzProxy(t)
 
-		ic, err := p.AddInterceptor([]string{http.MethodGet}, raw, noopHandler)
+		ic, err := p.Add(raw, noopHandler, WithMethods(http.MethodGet))
 		if err != nil {
 			return
 		}
 
-		found := p.Interceptor([]string{http.MethodGet}, raw)
-		if found == nil {
-			t.Fatalf("interceptor registered as %q cannot be found again", raw)
+		found := lookupHTTP(p, raw, mustMethods(http.MethodGet))
+		if found == (Entry[HTTP]{}) {
+			t.Fatalf("entry registered as %q cannot be found again", raw)
 		}
 		if found != ic {
-			t.Fatalf("Interceptor returned a different entry for %q", raw)
+			t.Fatalf("Lookup returned a different entry for %q", raw)
 		}
 
-		deleted, err := p.DeleteInterceptor([]string{http.MethodGet}, raw)
+		deleted, err := p.Delete[HTTP](raw, WithMethods(http.MethodGet))
 		if err != nil {
 			t.Fatalf("delete %q: %v", raw, err)
 		}
 		if deleted != ic {
 			t.Fatalf("Delete returned a different interceptor for %q", raw)
 		}
-		if p.InterceptorsLen() != 0 {
-			t.Fatalf("tree still holds %d interceptors after deleting %q", p.InterceptorsLen(), raw)
+		if p.Len() != 0 {
+			t.Fatalf("tree still holds %d interceptors after deleting %q", p.Len(), raw)
 		}
 	})
 }

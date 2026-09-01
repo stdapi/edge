@@ -38,7 +38,7 @@ func TestLifecycle_ShutdownStopsAccepting(t *testing.T) {
 
 	p, err := New(WithCA(ca), WithTransport(tr))
 	require.NoError(t, err)
-	p.MustAddInterceptor(nil, originHost(originURL)+"/*{any}", DefaultNoInterceptorHandler)
+	p.MustAdd(originHost(originURL)+"/*{any}", forwardHandler)
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -144,11 +144,11 @@ func TestLifecycle_AmbiguousLengthIsNormalized(t *testing.T) {
 	require.NoError(t, err)
 
 	proxySeen := new(recorder)
-	p.MustAddInterceptor(nil, originHost(originURL)+"/+{any}", func(c *Context) (*http.Response, error) {
+	p.MustAdd(originHost(originURL)+"/+{any}", func(c *HTTPCtx) (*http.Response, error) {
 		proxySeen.add(c.Method() + " " + c.RoutingPath())
 		return c.Forward()
 	})
-	p.MustAddInterceptor(nil, originHost(originURL)+"/", func(c *Context) (*http.Response, error) {
+	p.MustAdd(originHost(originURL)+"/", func(c *HTTPCtx) (*http.Response, error) {
 		proxySeen.add(c.Method() + " " + c.RoutingPath())
 		return c.Forward()
 	})
@@ -190,33 +190,24 @@ func TestLifecycle_AmbiguousLengthIsNormalized(t *testing.T) {
 		"the framing must not have been resolved differently on the two sides")
 }
 
-func TestLifecycle_TunnelOnlyProxyNeedsNoCA(t *testing.T) {
-	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprint(w, "tunneled")
-	}))
-	defer origin.Close()
-
-	// A proxy that only relays never mints a certificate, so it never needs an authority.
-	// It still has to be told what to relay: nothing crosses a proxy that was not asked.
-	originURL, _ := url.Parse(origin.URL)
+// A proxy with no certificate authority still serves what needs no certificate. Registering a
+// kind that always carries TLS is refused up front, and a stream that turns out to be TLS
+// fails at the handshake rather than at registration: a stream may well be in the clear.
+func TestLifecycle_NoCASevesWhatNeedsNoCertificate(t *testing.T) {
 	p, err := New()
 	require.NoError(t, err)
 	require.Nil(t, p.cfg.ca)
-	p.MustAddTunnel(originHost(originURL))
 
-	addr := startProxy(t, p)
-	client := proxyClient(addr, originPool(t, origin))
-
-	resp, err := client.Get(origin.URL + "/")
+	_, err = p.Add[TCP]("plain.test:25", relayStream)
 	require.NoError(t, err)
-	defer func() { _ = resp.Body.Close() }()
+	_, err = p.Add[UDP]("[0.0.0.0/0]:53", func(*DatagramCtx) error { return nil })
+	require.NoError(t, err)
 
-	body, _ := io.ReadAll(resp.Body)
-	assert.Equal(t, "tunneled", string(body))
+	_, err = p.Add("api.test/v1", noopHandler)
+	require.ErrorIs(t, err, ErrNoCertificateAuthority)
+	_, err = p.Add[QUIC]("api.test:443", func(*QUICCtx) error { return nil })
+	require.ErrorIs(t, err, ErrNoCertificateAuthority)
 }
-
-// A listener the proxy accepts on itself is only ever closed by Shutdown or Close, so without
-// that the accept loop outlives the proxy and keeps taking connections nothing will serve.
 func TestLifecycle_ShutdownClosesTheTransparentListener(t *testing.T) {
 	p := testProxy(t)
 
@@ -251,8 +242,8 @@ func TestLifecycle_ShutdownClosesTheTransparentListener(t *testing.T) {
 }
 
 // blockingHandler signals that a request reached it, then holds it until release closes.
-func blockingHandler(started chan<- struct{}, release <-chan struct{}) HandlerFunc {
-	return func(c *Context) (*http.Response, error) {
+func blockingHandler(started chan<- struct{}, release <-chan struct{}) HTTP {
+	return func(c *HTTPCtx) (*http.Response, error) {
 		select {
 		case started <- struct{}{}:
 		default:
@@ -334,7 +325,7 @@ func TestLifecycle_ShutdownDrainsInterceptedHTTP1(t *testing.T) {
 
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})
-	p.MustAddInterceptor(nil, "example.test/", blockingHandler(started, release))
+	p.MustAdd("example.test/", blockingHandler(started, release))
 
 	addr := startProxy(t, p)
 	client := proxyClient(addr, ca.CertPool())
@@ -355,7 +346,7 @@ func TestLifecycle_ShutdownDrainsInterceptedHTTP2(t *testing.T) {
 
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})
-	p.MustAddInterceptor(nil, "example.test/", blockingHandler(started, release))
+	p.MustAdd("example.test/", blockingHandler(started, release))
 
 	addr := startProxy(t, p)
 	client := h2Client(addr, ca.CertPool())
@@ -374,7 +365,7 @@ func TestLifecycle_ShutdownDrainsInterceptedHTTP3(t *testing.T) {
 
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})
-	p.MustAddInterceptor(nil, h3Authority+"/", blockingHandler(started, release))
+	p.MustAdd(h3Authority+"/", blockingHandler(started, release))
 
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -473,7 +464,7 @@ func TestLifecycle_ShutdownDeadlineBoundsAStuckHandler(t *testing.T) {
 
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})
-	p.MustAddInterceptor(nil, "example.test/", blockingHandler(started, release))
+	p.MustAdd("example.test/", blockingHandler(started, release))
 
 	addr := startProxy(t, p)
 	client := proxyClient(addr, ca.CertPool())
@@ -518,7 +509,7 @@ func TestLifecycle_ShutdownDeadlineBoundsAStuckHTTP3Handler(t *testing.T) {
 
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})
-	p.MustAddInterceptor(nil, h3Authority+"/", blockingHandler(started, release))
+	p.MustAdd(h3Authority+"/", blockingHandler(started, release))
 
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -601,7 +592,7 @@ func TestLifecycle_ShutdownCutsTunnelsAtTheDeadline(t *testing.T) {
 
 	p, err := New()
 	require.NoError(t, err)
-	p.MustAddTunnel(originHost(originURL))
+	p.MustAdd[TCP](originHost(originURL), relayStream)
 
 	addr := startProxy(t, p)
 

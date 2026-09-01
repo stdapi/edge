@@ -30,10 +30,10 @@ func TestConcurrency_InterceptorMutationDuringTraffic(t *testing.T) {
 	p, authority, client := interceptingProxy(t, origin)
 
 	var served atomic.Int64
-	p.MustAddInterceptor([]string{http.MethodGet}, authority+"/stable", func(c *Context) (*http.Response, error) {
+	p.MustAdd(authority+"/stable", func(c *HTTPCtx) (*http.Response, error) {
 		served.Add(1)
 		return Text(http.StatusOK, "stable"), nil
-	})
+	}, WithMethods(http.MethodGet))
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
@@ -48,13 +48,15 @@ func TestConcurrency_InterceptorMutationDuringTraffic(t *testing.T) {
 			}
 
 			pattern := fmt.Sprintf("%s/churn/%d", authority, i%16)
-			ic, err := p.AddInterceptor([]string{http.MethodGet}, pattern, func(c *Context) (*http.Response, error) {
+			ic, err := p.Add(pattern, func(c *HTTPCtx) (*http.Response, error) {
 				return Text(http.StatusOK, "churn"), nil
-			})
+			}, WithMethods(http.MethodGet))
 			if err != nil {
 				continue
 			}
-			if _, err := p.removeInterceptor(ic); err != nil {
+			// The matchers identify an entry, methods included, so a delete names the same
+			// ones the add did.
+			if _, err := p.Delete[HTTP](ic.Pattern(), WithMethods(http.MethodGet)); err != nil {
 				t.Errorf("delete %s: %v", pattern, err)
 				return
 			}
@@ -92,7 +94,7 @@ func TestConcurrency_InterceptorMutationDuringTraffic(t *testing.T) {
 	wg.Wait()
 
 	assert.Positive(t, served.Load(), "no request was served")
-	assert.Equal(t, Intercept, p.ActionFor(target(authority)), "the authority the stable interceptor implies must have survived the churn")
+	assert.Equal(t, true, p.Admits(target(authority), KindHTTP), "the authority the stable interceptor implies must have survived the churn")
 }
 
 // TestConcurrency_AuthorityMutationDuringTraffic does the same for the authority entry set, which decides
@@ -111,17 +113,17 @@ func TestConcurrency_AuthorityMutationDuringTraffic(t *testing.T) {
 			default:
 			}
 			pattern := fmt.Sprintf("churn-%d.example.test", i%32)
-			if _, err := p.AddTunnel(pattern); err != nil {
+			if _, err := p.Add[TCP](pattern, relayStream); err != nil {
 				continue
 			}
-			if _, err := p.DeleteTunnel(pattern); err != nil {
+			if _, err := p.Delete[TCP](pattern); err != nil {
 				t.Errorf("delete tunnel %s: %v", pattern, err)
 				return
 			}
 		}
 	})
 
-	p.MustAddInterceptor(nil, "stable.example.test/*{any}", noopHandler)
+	p.MustAdd("stable.example.test/*{any}", noopHandler)
 
 	for range 8 {
 		wg.Go(func() {
@@ -131,13 +133,13 @@ func TestConcurrency_AuthorityMutationDuringTraffic(t *testing.T) {
 					return
 				default:
 				}
-				if got := p.ActionFor(target("stable.example.test:443")); got != Intercept {
-					t.Errorf("decide = %v, want intercept", got)
+				if !p.Admits(target("stable.example.test:443"), KindHTTP) {
+					t.Error("stable authority is not admitted")
 					return
 				}
-				// Named by nothing, so it stays refused however the authority entry set churns.
-				if got := p.ActionFor(target("other.example.test:443")); got != Reject {
-					t.Errorf("decide = %v, want reject", got)
+				// Named by nothing, so it stays refused however the entry set churns.
+				if p.Admits(target("other.example.test:443"), KindHTTP) {
+					t.Error("unnamed authority is admitted")
 					return
 				}
 			}

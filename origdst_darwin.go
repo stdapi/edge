@@ -96,7 +96,7 @@ func originalDstSocket(c net.Conn) (netip.AddrPort, error) {
 
 // setTransparentPacketOptions asks the socket to report the address each datagram was
 // delivered to, which a wildcard bound socket does not carry in its own local address and
-// which the pf lookup needs. A socket bound to one family refuses the option of the other,
+// which the pf lookup needs. A socket bound to one kind refuses the option of the other,
 // so it fails only when neither is accepted.
 func setTransparentPacketOptions(c *net.UDPConn) error {
 	raw, err := c.SyscallConn()
@@ -173,7 +173,7 @@ func natlook(proto byte, client, proxy netip.AddrPort) (netip.AddrPort, error) {
 
 	src, dst := client.Addr().Unmap(), proxy.Addr().Unmap()
 	if src.Is4() != dst.Is4() {
-		return netip.AddrPort{}, fmt.Errorf("edge: mismatched address families on %s and %s", client, proxy)
+		return netip.AddrPort{}, fmt.Errorf("edge: mismatched address kinds on %s and %s", client, proxy)
 	}
 	af := byte(afInet6)
 	if src.Is4() {

@@ -9,11 +9,11 @@ import (
 	"strings"
 )
 
-// maxAddrKey is the longest key the address root holds: one family byte and one byte per bit
+// maxAddrKey is the longest key the address root holds: one kind byte and one byte per bit
 // of a full IPv6 address.
 const maxAddrKey = 1 + 128
 
-// appendPrefixKey appends the address-root key of p to dst: a family byte, then one byte per
+// appendPrefixKey appends the address-root key of p to dst: a kind byte, then one byte per
 // prefix bit, most significant first. A longer prefix extends the key of every shorter one
 // covering it, which is what makes the radix walk a longest-prefix match, and only keys
 // built here ever enter the address root, so no host read off the wire is walked against it.

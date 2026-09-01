@@ -84,6 +84,17 @@ func (f *forwarder) roundTrip(req *http.Request, proto Protocol) (*http.Response
 	}
 }
 
+// stripPseudoHeaders removes the HTTP/2 and HTTP/3 pseudo headers net/http surfaces as
+// ordinary ones. A name starting with a colon is not a field name, so a transport asked to send
+// one refuses the whole request.
+func stripPseudoHeaders(h http.Header) {
+	for name := range h {
+		if len(name) > 0 && name[0] == ':' {
+			delete(h, name)
+		}
+	}
+}
+
 // stripResponseHopByHop removes the connection-scoped headers from a response, except on a
 // 101 where Connection and Upgrade are the whole point of the answer.
 func stripResponseHopByHop(resp *http.Response) {

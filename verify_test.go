@@ -61,7 +61,7 @@ func TestNameVerification_DecideTransparent(t *testing.T) {
 		host        string
 		named       bool
 		origin      netip.AddrPort
-		wantAction  Action
+		wantAdmit   bool
 		wantHost    string
 		wantVerdict nameVerdict
 		wantCalls   int32
@@ -69,88 +69,88 @@ func TestNameVerification_DecideTransparent(t *testing.T) {
 		{
 			name: "off trusts the name and never resolves", mode: VerifyOff,
 			tunnels: []string{"allowed.test"}, host: "allowed.test", named: true, origin: liar,
-			wantAction: Tunnel, wantHost: "allowed.test", wantVerdict: nameTrusted, wantCalls: 0,
+			wantAdmit: true, wantHost: "allowed.test", wantVerdict: nameTrusted, wantCalls: 0,
 		},
 		{
 			name: "loose keeps a confirmed name", mode: VerifyLoose,
 			tunnels:  []string{"allowed.test"},
 			resolved: map[string][]netip.Addr{"allowed.test": addrsOf("6.6.6.6")},
 			host:     "allowed.test", named: true, origin: liar,
-			wantAction: Tunnel, wantHost: "allowed.test", wantVerdict: nameTrusted, wantCalls: 1,
+			wantAdmit: true, wantHost: "allowed.test", wantVerdict: nameTrusted, wantCalls: 1,
 		},
 		{
 			name: "loose without a destination rule rejects the liar", mode: VerifyLoose,
 			tunnels:  []string{"allowed.test"},
 			resolved: map[string][]netip.Addr{"allowed.test": addrsOf("9.9.9.9")},
 			host:     "allowed.test", named: true, origin: liar,
-			wantAction: Reject, wantHost: "6.6.6.6", wantVerdict: nameDropped, wantCalls: 1,
+			wantAdmit: false, wantHost: "6.6.6.6", wantVerdict: nameDropped, wantCalls: 1,
 		},
 		{
 			name: "loose with a destination rule admits the flow on it", mode: VerifyLoose,
 			tunnels:  []string{"allowed.test", "6.6.6.6:443"},
 			resolved: map[string][]netip.Addr{"allowed.test": addrsOf("9.9.9.9")},
 			host:     "allowed.test", named: true, origin: liar,
-			wantAction: Tunnel, wantHost: "6.6.6.6", wantVerdict: nameDropped, wantCalls: 1,
+			wantAdmit: true, wantHost: "6.6.6.6", wantVerdict: nameDropped, wantCalls: 1,
 		},
 		{
 			name: "strict rejects a mismatch", mode: VerifyReject,
 			tunnels:  []string{"allowed.test"},
 			resolved: map[string][]netip.Addr{"allowed.test": addrsOf("9.9.9.9")},
 			host:     "allowed.test", named: true, origin: liar,
-			wantAction: Reject, wantHost: "allowed.test", wantVerdict: nameMismatch, wantCalls: 1,
+			wantAdmit: false, wantHost: "allowed.test", wantVerdict: nameMismatch, wantCalls: 1,
 		},
 		{
 			name: "strict rejects a name that does not resolve", mode: VerifyReject,
 			tunnels:    []string{"allowed.test"},
 			resolveErr: errors.New("no such host"),
 			host:       "allowed.test", named: true, origin: liar,
-			wantAction: Reject, wantHost: "allowed.test", wantVerdict: nameUnresolved, wantCalls: 1,
+			wantAdmit: false, wantHost: "allowed.test", wantVerdict: nameUnresolved, wantCalls: 1,
 		},
 		{
 			name: "loose falls back to the destination when resolution fails", mode: VerifyLoose,
 			tunnels:    []string{"allowed.test", "6.6.6.6:443"},
 			resolveErr: errors.New("no such host"),
 			host:       "allowed.test", named: true, origin: liar,
-			wantAction: Tunnel, wantHost: "6.6.6.6", wantVerdict: nameDropped, wantCalls: 1,
+			wantAdmit: true, wantHost: "6.6.6.6", wantVerdict: nameDropped, wantCalls: 1,
 		},
 		{
 			name: "a name refused either way is not resolved", mode: VerifyLoose,
 			host: "junk.test", named: true, origin: liar,
-			wantAction: Reject, wantHost: "junk.test", wantVerdict: nameTrusted, wantCalls: 0,
+			wantAdmit: false, wantHost: "junk.test", wantVerdict: nameTrusted, wantCalls: 0,
 		},
 		{
 			name: "strict never falls back, so a rejected name skips resolution", mode: VerifyReject,
 			tunnels: []string{"6.6.6.6:443"}, host: "junk.test", named: true, origin: liar,
-			wantAction: Reject, wantHost: "junk.test", wantVerdict: nameTrusted, wantCalls: 0,
+			wantAdmit: false, wantHost: "junk.test", wantVerdict: nameTrusted, wantCalls: 0,
 		},
 		{
 			name: "loose drops a name no rule matches without a lookup", mode: VerifyLoose,
 			tunnels: []string{"6.6.6.6:443"}, host: "junk.test", named: true, origin: liar,
-			wantAction: Tunnel, wantHost: "6.6.6.6", wantVerdict: nameDropped, wantCalls: 0,
+			wantAdmit: true, wantHost: "6.6.6.6", wantVerdict: nameDropped, wantCalls: 0,
 		},
 		{
 			name: "a rule-less name is dropped unresolved even when it would confirm", mode: VerifyLoose,
 			tunnels:  []string{"6.6.6.6:443"},
 			resolved: map[string][]netip.Addr{"junk.test": addrsOf("6.6.6.6")},
 			host:     "junk.test", named: true, origin: liar,
-			wantAction: Tunnel, wantHost: "6.6.6.6", wantVerdict: nameDropped, wantCalls: 0,
+			wantAdmit: true, wantHost: "6.6.6.6", wantVerdict: nameDropped, wantCalls: 0,
 		},
 		{
 			name: "a host that is not a client name is not checked", mode: VerifyReject,
 			tunnels: []string{"allowed.test"}, host: "allowed.test", named: false, origin: liar,
-			wantAction: Tunnel, wantHost: "allowed.test", wantVerdict: nameTrusted, wantCalls: 0,
+			wantAdmit: true, wantHost: "allowed.test", wantVerdict: nameTrusted, wantCalls: 0,
 		},
 		{
 			name: "no destination on record means nothing to verify", mode: VerifyReject,
 			tunnels: []string{"allowed.test"}, host: "allowed.test", named: true,
-			wantAction: Tunnel, wantHost: "allowed.test", wantVerdict: nameTrusted, wantCalls: 0,
+			wantAdmit: true, wantHost: "allowed.test", wantVerdict: nameTrusted, wantCalls: 0,
 		},
 		{
 			name: "a v4-mapped resolver answer confirms a v4 destination", mode: VerifyReject,
 			tunnels:  []string{"allowed.test"},
 			resolved: map[string][]netip.Addr{"allowed.test": addrsOf("::ffff:6.6.6.6")},
 			host:     "allowed.test", named: true, origin: liar,
-			wantAction: Tunnel, wantHost: "allowed.test", wantVerdict: nameTrusted, wantCalls: 1,
+			wantAdmit: true, wantHost: "allowed.test", wantVerdict: nameTrusted, wantCalls: 1,
 		},
 	}
 
@@ -160,12 +160,12 @@ func TestNameVerification_DecideTransparent(t *testing.T) {
 			p, err := New(WithNameVerification(tc.mode), WithNameResolver(r))
 			require.NoError(t, err)
 			for _, pattern := range tc.tunnels {
-				p.MustAddTunnel(pattern)
+				p.MustAdd[TCP](pattern, relayStream)
 			}
 
 			target := Target{Scheme: "https", Host: tc.host, Port: "443"}
-			action, matched, verdict := p.actionForTransparent(t.Context(), target, tc.origin, tc.named)
-			assert.Equal(t, tc.wantAction, action)
+			matched, admitted, verdict := p.targetForTransparent(t.Context(), target, tc.origin, tc.named, KindTCP)
+			assert.Equal(t, tc.wantAdmit, admitted)
 			assert.Equal(t, tc.wantHost, matched.Host)
 			assert.Equal(t, tc.wantVerdict, verdict)
 			assert.Equal(t, tc.wantCalls, r.calls.Load())
@@ -236,9 +236,11 @@ func lyingHandshake(t *testing.T, proxyAddr, name string) {
 func TestTransparent_NameVerificationStopsALyingServerName(t *testing.T) {
 	t.Run("off relays the liar to its destination", func(t *testing.T) {
 		origin, dials := countingOrigin(t)
-		p, err := New()
+		ca, cerr := GenerateCA()
+		require.NoError(t, cerr)
+		p, err := New(WithCA(ca))
 		require.NoError(t, err)
-		p.MustAddTunnel("allowed.test")
+		p.MustAdd[TCP]("allowed.test", relayStream)
 
 		addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) { return origin, nil })
 		lyingHandshake(t, addr, "allowed.test")
@@ -250,9 +252,11 @@ func TestTransparent_NameVerificationStopsALyingServerName(t *testing.T) {
 	t.Run("strict refuses the liar before any dial", func(t *testing.T) {
 		origin, dials := countingOrigin(t)
 		r := &fakeResolver{addrs: map[string][]netip.Addr{"allowed.test": addrsOf("9.9.9.9")}}
-		p, err := New(WithNameVerification(VerifyReject), WithNameResolver(r))
+		ca, cerr := GenerateCA()
+		require.NoError(t, cerr)
+		p, err := New(WithCA(ca), WithNameVerification(VerifyReject), WithNameResolver(r))
 		require.NoError(t, err)
-		p.MustAddTunnel("allowed.test")
+		p.MustAdd[TCP]("allowed.test", relayStream)
 
 		addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) { return origin, nil })
 		lyingHandshake(t, addr, "allowed.test")
@@ -265,9 +269,11 @@ func TestTransparent_NameVerificationStopsALyingServerName(t *testing.T) {
 	t.Run("loose without a destination rule refuses the liar", func(t *testing.T) {
 		origin, dials := countingOrigin(t)
 		r := &fakeResolver{addrs: map[string][]netip.Addr{"allowed.test": addrsOf("9.9.9.9")}}
-		p, err := New(WithNameVerification(VerifyLoose), WithNameResolver(r))
+		ca, cerr := GenerateCA()
+		require.NoError(t, cerr)
+		p, err := New(WithCA(ca), WithNameVerification(VerifyLoose), WithNameResolver(r))
 		require.NoError(t, err)
-		p.MustAddTunnel("allowed.test")
+		p.MustAdd[TCP]("allowed.test", relayStream)
 
 		addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) { return origin, nil })
 		lyingHandshake(t, addr, "allowed.test")
@@ -279,10 +285,12 @@ func TestTransparent_NameVerificationStopsALyingServerName(t *testing.T) {
 	t.Run("loose admits the flow through a rule on the destination", func(t *testing.T) {
 		origin, dials := countingOrigin(t)
 		r := &fakeResolver{addrs: map[string][]netip.Addr{"allowed.test": addrsOf("9.9.9.9")}}
-		p, err := New(WithNameVerification(VerifyLoose), WithNameResolver(r))
+		ca, cerr := GenerateCA()
+		require.NoError(t, cerr)
+		p, err := New(WithCA(ca), WithNameVerification(VerifyLoose), WithNameResolver(r))
 		require.NoError(t, err)
-		p.MustAddTunnel("allowed.test")
-		p.MustAddTunnel(origin.String())
+		p.MustAdd[TCP]("allowed.test", relayStream)
+		p.MustAdd[TCP](origin.String(), relayStream)
 
 		addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) { return origin, nil })
 		lyingHandshake(t, addr, "allowed.test")
@@ -291,7 +299,7 @@ func TestTransparent_NameVerificationStopsALyingServerName(t *testing.T) {
 		sessions := waitForSessions(t, p, 1)
 		assert.Equal(t, origin.Addr().String(), sessions[0].Target().Host,
 			"a dropped name leaves the destination as the session target, not the unproven name")
-		assert.Equal(t, Tunnel, sessions[0].Action())
+		assert.Equal(t, KindTCP, sessions[0].Kind())
 	})
 }
 
@@ -304,9 +312,14 @@ func TestTransparent_NameVerificationConfirmedNameTunnels(t *testing.T) {
 	originAddr := netip.MustParseAddrPort(originURL.Host)
 
 	r := &fakeResolver{addrs: map[string][]netip.Addr{"example.com": {originAddr.Addr()}}}
-	p, err := New(WithNameVerification(VerifyReject), WithNameResolver(r))
+	ca, err := GenerateCA()
 	require.NoError(t, err)
-	p.MustAddTunnel("example.com")
+	tr := DefaultTransport()
+	tr.RootCAs = originPool(t, origin)
+	p, err := New(WithCA(ca), WithTransport(tr),
+		WithNameVerification(VerifyReject), WithNameResolver(r))
+	require.NoError(t, err)
+	p.MustAdd[TCP]("example.com", relayStream)
 
 	addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) { return originAddr, nil })
 
@@ -315,7 +328,8 @@ func TestTransparent_NameVerificationConfirmedNameTunnels(t *testing.T) {
 		Transport: &http.Transport{
 			DialContext: pinnedDialer(addr),
 			TLSClientConfig: &tls.Config{
-				RootCAs:    originPool(t, origin),
+				// Terminated, so the certificate the client checks is the proxy's.
+				RootCAs:    ca.CertPool(),
 				MinVersion: tls.VersionTLS12,
 			},
 		},
@@ -335,9 +349,11 @@ func TestQUIC_NameVerificationRejectsALyingServerName(t *testing.T) {
 	origin := h3Origin(t, originCA)
 
 	r := &fakeResolver{addrs: map[string][]netip.Addr{h3Authority: addrsOf("9.9.9.9")}}
-	p, err := New(WithNameVerification(VerifyReject), WithNameResolver(r))
+	proxyCA, err := GenerateCA()
 	require.NoError(t, err)
-	p.MustAddTunnel(h3Authority)
+	p, err := New(WithCA(proxyCA), WithNameVerification(VerifyReject), WithNameResolver(r))
+	require.NoError(t, err)
+	p.MustAdd[QUIC](h3Authority, relayQUIC)
 
 	proxyAddr := startQUICRedirected(t, p, origin)
 
@@ -362,9 +378,16 @@ func TestQUIC_NameVerificationLooseFallsBackToTheDestination(t *testing.T) {
 	origin := h3Origin(t, originCA)
 
 	r := &fakeResolver{addrs: map[string][]netip.Addr{h3Authority: addrsOf("9.9.9.9")}}
-	p, err := New(WithNameVerification(VerifyLoose), WithNameResolver(r))
+	proxyCA, err := GenerateCA()
 	require.NoError(t, err)
-	p.MustAddTunnel(origin.String())
+	tr := DefaultTransport()
+	tr.RootCAs = poolOf(originCA)
+	p, err := New(WithCA(proxyCA), WithTransport(tr),
+		WithNameVerification(VerifyLoose), WithNameResolver(r))
+	require.NoError(t, err)
+	// The name does not resolve to the destination, so the connection is placed on the
+	// destination instead, and served stream by stream since nothing admits HTTP there.
+	p.MustAdd[QUIC](origin.String(), relayQUIC)
 
 	proxyAddr := startQUICRedirected(t, p, origin)
 
@@ -373,7 +396,7 @@ func TestQUIC_NameVerificationLooseFallsBackToTheDestination(t *testing.T) {
 	ctr := &quic.Transport{Conn: clientPC}
 	defer func() { _ = ctr.Close(); _ = clientPC.Close() }()
 
-	conn := dialSharedQUIC(t, ctr, proxyAddr, h3Authority, poolOf(originCA))
+	conn := dialSharedQUIC(t, ctr, proxyAddr, h3Authority, poolOf(proxyCA))
 	h3tr := &http3.Transport{}
 	defer func() { _ = h3tr.Close() }()
 	cc := h3tr.NewClientConn(conn)
@@ -381,10 +404,10 @@ func TestQUIC_NameVerificationLooseFallsBackToTheDestination(t *testing.T) {
 
 	sessions := waitForSessions(t, p, 1)
 	assert.Equal(t, origin.Addr().String(), sessions[0].Target().Host)
-	assert.Equal(t, Tunnel, sessions[0].Action())
+	assert.Equal(t, KindQUIC, sessions[0].Kind())
 }
 
-// The mitm handshake refines an explicit CONNECT target with the handshake's server name.
+// The handshake refines an explicit CONNECT target with the handshake's server name.
 // On a session with a dropped name it would put the unproven name back.
 func TestTransparent_NameVerificationInterceptionKeepsTheDroppedTarget(t *testing.T) {
 	origin, dials := countingOrigin(t)
@@ -394,10 +417,9 @@ func TestTransparent_NameVerificationInterceptionKeepsTheDroppedTarget(t *testin
 	r := &fakeResolver{addrs: map[string][]netip.Addr{"allowed.test": addrsOf("9.9.9.9")}}
 	p, err := New(WithCA(ca), WithNameVerification(VerifyLoose), WithNameResolver(r))
 	require.NoError(t, err)
-	p.MustAddInterceptor(nil, fmt.Sprintf("%s:%d/+{any}", origin.Addr(), origin.Port()),
-		func(c *Context) (*http.Response, error) {
-			return Text(http.StatusOK, "intercepted"), nil
-		})
+	p.MustAdd(fmt.Sprintf("%s:%d/+{any}", origin.Addr(), origin.Port()), func(c *HTTPCtx) (*http.Response, error) {
+		return Text(http.StatusOK, "intercepted"), nil
+	})
 
 	addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) { return origin, nil })
 
@@ -410,12 +432,17 @@ func TestTransparent_NameVerificationInterceptionKeepsTheDroppedTarget(t *testin
 		InsecureSkipVerify: true,
 		MinVersion:         tls.VersionTLS12,
 	})
-	require.NoError(t, tlsConn.Handshake(), "the dropped name is intercepted through the rule on its destination")
+	require.NoError(t, tlsConn.Handshake(), "the dropped name is served through the rule on its destination")
+
+	// The session appears once the traffic has said what it is, which for HTTP is the first
+	// request rather than the handshake.
+	_, err = tlsConn.Write([]byte("GET / HTTP/1.1\r\nHost: allowed.test\r\n\r\n"))
+	require.NoError(t, err)
 
 	sessions := waitForSessions(t, p, 1)
 	assert.Equal(t, origin.Addr().String(), sessions[0].Target().Host,
 		"the handshake must not put the unproven name back on the session")
-	assert.Equal(t, Intercept, sessions[0].Action())
+	assert.Equal(t, KindHTTP, sessions[0].Kind())
 	assert.Equal(t, int32(0), dials.Load(), "nothing forwarded, nothing dialed")
 }
 
@@ -434,11 +461,11 @@ func TestNameVerification_ResolutionCarriesADeadline(t *testing.T) {
 	r := new(deadlineResolver)
 	p, err := New(WithNameVerification(VerifyReject), WithNameResolver(r))
 	require.NoError(t, err)
-	p.MustAddTunnel("allowed.test")
+	p.MustAdd[TCP]("allowed.test", relayStream)
 
 	target := Target{Scheme: "https", Host: "allowed.test", Port: "443"}
-	action, _, verdict := p.actionForTransparent(t.Context(), target, netip.MustParseAddrPort("6.6.6.6:443"), true)
-	assert.Equal(t, Reject, action)
+	_, admitted, verdict := p.targetForTransparent(t.Context(), target, netip.MustParseAddrPort("6.6.6.6:443"), true, KindTCP)
+	assert.False(t, admitted)
 	assert.Equal(t, nameUnresolved, verdict)
 	assert.True(t, r.sawDeadline.Load(), "a resolver without a deadline could stall the connection forever")
 }

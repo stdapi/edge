@@ -41,9 +41,7 @@ func (p *Proxy) ListenAndServeTransparent(addr string) error {
 // The destination of a connection is resolved from what an [OriginalDestination] connection
 // reports, then the server name of a TLS ClientHello, then the Host header of a plaintext
 // request. A connection with none of the three cannot be placed and is closed. Wrap ln in
-// [TransparentListener] for the first of them. When a tunnel matches the destination of a
-// connection that is not TLS, the connection is relayed untouched rather than parsed as a
-// plaintext request.
+// [TransparentListener] for the first of them.
 func (p *Proxy) ServeTransparent(ln net.Listener) error {
 	// A refused registration means a shutdown started; accepting would run a loop nothing
 	// ever closes.
@@ -130,45 +128,7 @@ func (p *Proxy) ServeConn(conn net.Conn) error {
 	if head[0] == tlsHandshakeRecord {
 		return p.serveTransparentTLS(ctx, peeked, origin)
 	}
-	if origin.IsValid() {
-		target := Target{Host: origin.Addr().Unmap().String(), Port: fmt.Sprint(origin.Port())}
-		if p.ActionFor(target) == Tunnel {
-			return p.serveTransparentRaw(ctx, peeked, origin, target)
-		}
-	}
 	return p.serveTransparentPlain(ctx, peeked, origin)
-}
-
-// serveTransparentRaw relays a redirected connection that is not TLS and whose destination a
-// tunnel names, before any protocol is assumed of the bytes.
-func (p *Proxy) serveTransparentRaw(ctx context.Context, conn *peekConn, origin netip.AddrPort, target Target) error {
-	sess := newSession(ctx, conn, target, Tunnel, TCP)
-	sess.transparent = true
-	sess.upstream = origin
-	sess.closer = conn
-	if !p.srv.admitSession(sess) {
-		return ErrConnectionRejected
-	}
-	defer p.srv.trackSession(sess, false)
-
-	upstream, err := p.dialTransparentUpstream(ctx, target, origin)
-	if err != nil {
-		return err
-	}
-
-	// See connectHijack: without this, closing the client side at the deadline can leave
-	// the upstream read parked until the idle timeout.
-	if !p.srv.tryTrack(upstream) {
-		_ = upstream.Close()
-		return ErrProxyClosed
-	}
-	defer func() {
-		_ = upstream.Close()
-		p.srv.untrack(upstream)
-	}()
-
-	_, _, err = tunnel(conn, upstream, p.cfg.server.tunnelIdleTimeout)
-	return err
 }
 
 // serveTransparentTLS reads the server name out of the ClientHello without consuming it,
@@ -206,72 +166,49 @@ func (p *Proxy) serveTransparentTLS(ctx context.Context, conn *peekConn, origin 
 	}
 
 	named := hello != nil && hello.ServerName != ""
-	action, target, verdict := p.actionForTransparent(ctx, target, origin, named)
+	target, admitted, verdict := p.targetForTransparent(ctx, target, origin, named, KindHTTP, KindTCP)
 	switch verdict {
 	case nameMismatch:
 		return errNameMismatch
 	case nameUnresolved:
 		return errNameUnresolved
 	}
+	if !admitted {
+		return ErrConnectionRejected
+	}
 
-	sess := newSession(ctx, conn, target, action, TLS)
+	sess := newSession(ctx, conn, target, 0, 0)
 	sess.transparent = true
 	sess.upstream = origin
 	if hello != nil {
 		sess.clientHello = hello
 	}
 
-	switch sess.action {
-	case Reject:
-		return ErrConnectionRejected
-	case Tunnel:
-		sess.closer = conn
-		if !p.srv.admitSession(sess) {
-			return ErrConnectionRejected
-		}
-		defer p.srv.trackSession(sess, false)
-
-		upstream, err := p.dialTransparentUpstream(ctx, target, origin)
-		if err != nil {
-			return err
-		}
-
-		// See connectHijack: without this, closing the client side at the deadline can leave
-		// the upstream read parked until the idle timeout.
-		if !p.srv.tryTrack(upstream) {
-			_ = upstream.Close()
-			return ErrProxyClosed
-		}
-		defer func() {
-			_ = upstream.Close()
-			p.srv.untrack(upstream)
-		}()
-
-		_, _, err = tunnel(conn, upstream, p.cfg.server.tunnelIdleTimeout)
-		return err
-	default:
-		return p.intercept(ctx, conn, sess)
-	}
+	return p.terminate(ctx, conn, sess)
 }
 
-// serveTransparentPlain serves a redirected plaintext connection. There is nothing to sniff:
-// the destination is the Host header of each request, so the connection is parsed and every
-// request placed on its own.
+// serveTransparentPlain serves a redirected connection that is not TLS. What it carries is
+// already in the clear, so the first bytes name what it is, and the destination is the only
+// authority the connection has for an admission to answer on.
+//
+// HTTP is the residual: its requests each name an authority of their own, so a connection the
+// destination cannot place is still parsed and every request placed on its own.
 func (p *Proxy) serveTransparentPlain(ctx context.Context, conn *peekConn, origin netip.AddrPort) error {
 	target := Target{Scheme: "http", Port: "80"}
 	if origin.IsValid() {
-		target.Host = origin.Addr().Unmap().String()
-		target.Port = fmt.Sprint(origin.Port())
+		target = Target{
+			Scheme: schemeForPort(fmt.Sprint(origin.Port())),
+			Host:   origin.Addr().Unmap().String(),
+			Port:   fmt.Sprint(origin.Port()),
+		}
 	}
 
-	sess := newSession(ctx, conn, target, Intercept, HTTP11)
-	sess.upstream = origin
+	sess := newSession(ctx, conn, target, 0, 0)
 	sess.transparent = true
+	sess.upstream = origin
 	sess.perRequest = true
 
-	// The same work an intercepted connection does, and going through it keeps a single point
-	// where a session is registered.
-	return p.serveIntercepted(conn, sess, HTTP11)
+	return p.serveCandidates(ctx, conn, sess, sniffStreamCandidates(conn, p.cfg.server.sniffTimeout), nil)
 }
 
 // redirectedTo reports where a redirected connection was headed, or the zero value. A lookup
@@ -286,25 +223,6 @@ func redirectedTo(origin netip.AddrPort, local net.Addr) netip.AddrPort {
 		return netip.AddrPort{}
 	}
 	return origin
-}
-
-// dialTransparentUpstream reaches the origin a redirected connection was headed to. The
-// address the client had already resolved is preferred over resolving the name again, which
-// could land on a different member of the same pool or on nothing at all when the name only
-// resolves inside the client's own network.
-func (p *Proxy) dialTransparentUpstream(ctx context.Context, target Target, origin netip.AddrPort) (net.Conn, error) {
-	if origin.IsValid() {
-		dial := p.cfg.transport.DialContext
-		if dial == nil {
-			dial = (&net.Dialer{Timeout: 30 * time.Second}).DialContext
-		}
-		conn, err := dial(ctx, "tcp", origin.String())
-		if err != nil {
-			return nil, fmt.Errorf("dial original destination %s: %w", origin, err)
-		}
-		return conn, nil
-	}
-	return p.dialUpstream(ctx, target)
 }
 
 // clientHelloFromRecords parses the TLS records in raw and returns what the client offered,

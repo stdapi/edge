@@ -19,10 +19,8 @@ import (
 	"github.com/fox-toolkit/edge/internal/stringsutil"
 )
 
-// Protocol is the deepest framing the proxy itself established or parsed on a connection.
-// An HTTP version is spoken by the proxy, [TLS] and [QUIC] mean the handshake was
-// recognized on a connection the proxy does not terminate, and [TCP] and [UDP] mean the
-// bytes are relayed without inspection.
+// Protocol is the HTTP version spoken on a connection. It is the zero value on a connection
+// carrying something else, where the kind of the entry serving it is what names the traffic.
 type Protocol uint8
 
 const (
@@ -32,14 +30,6 @@ const (
 	HTTP2
 	// HTTP3 is HTTP/3 over QUIC.
 	HTTP3
-	// UDP is raw datagrams relayed without inspection.
-	UDP
-	// TCP is a raw byte stream relayed without inspection.
-	TCP
-	// TLS is TLS relayed with its payload opaque.
-	TLS
-	// QUIC is QUIC relayed with its payload opaque.
-	QUIC
 )
 
 func (p Protocol) String() string {
@@ -50,14 +40,6 @@ func (p Protocol) String() string {
 		return "HTTP/2.0"
 	case HTTP3:
 		return "HTTP/3.0"
-	case UDP:
-		return "UDP"
-	case TCP:
-		return "TCP"
-	case TLS:
-		return "TLS"
-	case QUIC:
-		return "QUIC"
 	default:
 		return "unknown"
 	}
@@ -85,33 +67,6 @@ func protocolFromALPN(s string) Protocol {
 		return HTTP3
 	default:
 		return HTTP11
-	}
-}
-
-// Action is what the proxy does with a connection to a given authority.
-type Action uint8
-
-const (
-	// Tunnel relays the connection byte for byte. The proxy never sees the plaintext and
-	// no interceptor is consulted.
-	Tunnel Action = iota + 1
-	// Intercept terminates TLS with a minted leaf certificate and routes every request on
-	// the connection.
-	Intercept
-	// Reject refuses the connection. Explicit proxy clients get 403 Forbidden.
-	Reject
-)
-
-func (a Action) String() string {
-	switch a {
-	case Tunnel:
-		return "tunnel"
-	case Intercept:
-		return "intercept"
-	case Reject:
-		return "reject"
-	default:
-		return "unknown"
 	}
 }
 
@@ -155,10 +110,14 @@ func (t Target) IsDefaultPort() bool {
 
 var sessionSeq atomic.Uint64
 
-// Session is a client connection handled by the proxy. Every request multiplexed on that
-// connection belongs to the same session, so an HTTP/2 or HTTP/3 connection has a single
-// session and many requests. This does not apply to a protocol upgrade, which gets a session
-// of its own.
+// Session is a client connection handled by the proxy. Every unit carried on that connection
+// belongs to the same session, so an HTTP/2 or HTTP/3 connection has a single session and
+// many requests. This does not apply to a protocol upgrade, which gets a session of its own.
+//
+// A session is decided once, when the traffic names the kind it belongs to. What happens to
+// each unit on it is decided again, on the tree as it stands then, so an entry added or
+// removed while the connection is open takes effect on the next unit rather than on the next
+// connection.
 //
 // A Session is safe for concurrent use by the goroutines serving its requests.
 type Session struct {
@@ -184,13 +143,14 @@ type Session struct {
 	// client's own network.
 	upstream  netip.AddrPort
 	identity  string
+	alpn      string
 	id        uint64
 	closeOnce sync.Once
 	// proto is the protocol of the connection. The front listener builds its session from
 	// ConnContext, before the protocol is known, so unlike every other field it is written
 	// once a request has been read, from a goroutine serving one of them.
-	proto  atomic.Uint32
-	action Action
+	proto atomic.Uint32
+	kind  Kind
 	// perRequest marks a redirected plaintext connection, decided on the Host header of each
 	// request rather than once at the connection. It is not reported by [Proxy.Sessions].
 	perRequest  bool
@@ -202,7 +162,7 @@ func (s *Session) ID() uint64 { return s.id }
 
 // Identity returns what the configured [ProxyAuthenticator] reported for the request that
 // established this connection, or an empty string when none did. It is what a revoked
-// credential sweeps on, the only lever a tunnel offers since no handler ever runs on one.
+// credential sweeps on.
 func (s *Session) Identity() string { return s.identity }
 
 // RemoteAddr returns the address of the client, or the zero value when the connection has
@@ -235,7 +195,7 @@ func addrPort(a net.Addr) netip.AddrPort {
 	return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
 }
 
-// Target returns the authority the client asked for. For a CONNECT it is the tunnel target,
+// Target returns the authority the client asked for. For a CONNECT it is the request target,
 // and in transparent mode it comes from the TLS server name or the Host header.
 //
 // A client sending plain requests through the proxy can ask for a different authority on each
@@ -243,10 +203,9 @@ func addrPort(a net.Addr) netip.AddrPort {
 // serving from the [Context], which always has it.
 func (s *Session) Target() Target { return s.target }
 
-// Protocol returns the deepest framing the proxy established or parsed on the connection.
-// It describes the connection, so it is the same for every request multiplexed on it. A
-// tunneled connection reports [TLS] or [QUIC] since what those frame stays opaque, and a
-// raw relay reports [TCP] or [UDP].
+// Protocol returns the HTTP version spoken on the connection, or the zero value when it
+// carries something else. It describes the connection, so it is the same for every request
+// multiplexed on it.
 func (s *Session) Protocol() Protocol {
 	//nolint:gosec // the field is only ever written by setProtocol, from a Protocol.
 	return Protocol(s.proto.Load())
@@ -284,19 +243,22 @@ func (s *Session) Upstream() netip.AddrPort { return s.upstream }
 // it, its traffic having been redirected by the network.
 func (s *Session) Transparent() bool { return s.transparent }
 
-// Action returns what let this connection through, a tunnel or an interceptor. It is read
-// once, when the connection is established, and never revisited.
-func (s *Session) Action() Action { return s.action }
+// Kind returns the kind of traffic this connection was admitted as. The traffic itself fixes
+// it, from the negotiated ALPN or from what the first bytes are, never the tree.
+func (s *Session) Kind() Kind { return s.kind }
 
-// Close ends the connection immediately, without draining it. A tunnel is cut in both
-// directions, an intercepted connection is dropped along with the requests in flight on it.
-// Closing a connection that already ended is a no-op.
+// ALPN returns the application protocol negotiated with the client, or an empty string when
+// the connection carries no TLS or the client offered none.
+func (s *Session) ALPN() string { return s.alpn }
+
+// Close ends the connection immediately, without draining it: it is dropped along with the
+// units in flight on it. Closing a connection that already ended is a no-op.
 //
-// Closing a tunneled QUIC connection also closes the connections the same client tunnels to
-// the same origin, which then re-handshake and are decided again. The orphaned datagrams of
-// the closed connections are dropped for up to a minute rather than re-admitted, and closing
-// a raw UDP session drops its client's datagrams the same way. The drop applies even to a
-// session that already ended, unless a newer connection to its destination is live.
+// Closing is not how a configuration change is applied. Every unit is routed on the tree as
+// it stands, so removing an entry already governs the next request, the next stream or the
+// next datagram of a connection that stays open. Close is for ending a connection on its own
+// terms, revoking an identity being the usual one, and a client is free to open another,
+// which the tree decides again.
 func (s *Session) Close() error {
 	if s.closer == nil {
 		return nil

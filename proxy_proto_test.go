@@ -55,13 +55,13 @@ func TestProxy_InterceptHTTP2(t *testing.T) {
 	}
 
 	var clientProto, clientALPN string
-	p.MustAddInterceptor([]string{http.MethodGet}, originHost(originURL)+"/h2", func(c *Context) (*http.Response, error) {
+	p.MustAdd(originHost(originURL)+"/h2", func(c *HTTPCtx) (*http.Response, error) {
 		clientProto = c.Protocol().String()
 		if st := c.Request().TLS; st != nil {
 			clientALPN = st.NegotiatedProtocol
 		}
 		return c.Forward()
-	})
+	}, WithMethods(http.MethodGet))
 
 	addr := startProxy(t, p)
 	client := h2Client(addr, ca.CertPool())
@@ -96,7 +96,8 @@ func TestProxy_ALPNMirrorsClientOffer(t *testing.T) {
 		{name: "http/1.1 only", offer: []string{"http/1.1"}, negotiated: "http/1.1"},
 		{name: "h2 preferred", offer: []string{"h2", "http/1.1"}, negotiated: "h2"},
 		{name: "http/1.1 preferred", offer: []string{"http/1.1", "h2"}, negotiated: "http/1.1"},
-		{name: "nothing in common", offer: []string{"spdy/3"}, negotiated: ""},
+		// A client offering only http/1.1 among what it wants still lands on HTTP.
+		{name: "http/1.1 behind another", offer: []string{"spdy/3", "http/1.1"}, negotiated: "http/1.1"},
 		{name: "no offer", offer: nil, negotiated: ""},
 	}
 
@@ -109,7 +110,7 @@ func TestProxy_ALPNMirrorsClientOffer(t *testing.T) {
 			}
 
 			var negotiated string
-			p.MustAddInterceptor(nil, "example.test/", func(c *Context) (*http.Response, error) {
+			p.MustAdd("example.test/", func(c *HTTPCtx) (*http.Response, error) {
 				negotiated = c.Request().TLS.NegotiatedProtocol
 				return Text(http.StatusOK, "ok"), nil
 			})
@@ -171,9 +172,9 @@ func TestProxy_StreamsWithoutBuffering(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new proxy: %v", err)
 	}
-	p.MustAddInterceptor([]string{http.MethodGet}, originHost(originURL)+"/events", func(c *Context) (*http.Response, error) {
+	p.MustAdd(originHost(originURL)+"/events", func(c *HTTPCtx) (*http.Response, error) {
 		return c.Forward()
-	})
+	}, WithMethods(http.MethodGet))
 
 	addr := startProxy(t, p)
 	client := proxyClient(addr, ca.CertPool())
@@ -220,7 +221,7 @@ func TestProxy_ForwardsTrailers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new proxy: %v", err)
 	}
-	p.MustAddInterceptor(nil, originHost(originURL)+"/*{any}", DefaultNoInterceptorHandler)
+	p.MustAdd(originHost(originURL)+"/*{any}", forwardHandler)
 
 	addr := startProxy(t, p)
 	client := proxyClient(addr, ca.CertPool())
@@ -260,7 +261,7 @@ func TestProxy_AnnouncesTETrailersOverHTTP2(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new proxy: %v", err)
 	}
-	p.MustAddInterceptor(nil, originHost(originURL)+"/*{any}", DefaultNoInterceptorHandler)
+	p.MustAdd(originHost(originURL)+"/*{any}", forwardHandler)
 
 	addr := startProxy(t, p)
 	client := h2Client(addr, ca.CertPool())
@@ -320,7 +321,7 @@ func TestProto_HTTP2ClientWithoutConnect(t *testing.T) {
 
 	var seenScheme, seenAuthority, seenPath string
 	var seenProto, seenSessProto Protocol
-	p.MustAddInterceptor(nil, originHost(originURL)+"/*{any}", func(c *Context) (*http.Response, error) {
+	p.MustAdd(originHost(originURL)+"/*{any}", func(c *HTTPCtx) (*http.Response, error) {
 		seenScheme, seenAuthority, seenPath = c.Scheme(), c.Authority(), c.RoutingPath()
 		seenProto, seenSessProto = c.Protocol(), c.Session().Protocol()
 		return c.Forward()
@@ -384,7 +385,7 @@ func TestProto_SessionTLSOnATLSFrontListener(t *testing.T) {
 	require.NoError(t, err)
 
 	var state *tls.ConnectionState
-	p.MustAddInterceptor(nil, originHost(originURL)+"/*{any}", func(c *Context) (*http.Response, error) {
+	p.MustAdd(originHost(originURL)+"/*{any}", func(c *HTTPCtx) (*http.Response, error) {
 		state = c.Session().TLS()
 		return c.Forward()
 	})
@@ -421,7 +422,7 @@ func TestProto_H2CClientWithoutConnect(t *testing.T) {
 	p := testProxy(t)
 	var seenScheme, seenAuthority, seenPath string
 	var seenProto, seenSessProto Protocol
-	p.MustAddInterceptor(nil, originHost(originURL)+"/*{any}", func(c *Context) (*http.Response, error) {
+	p.MustAdd(originHost(originURL)+"/*{any}", func(c *HTTPCtx) (*http.Response, error) {
 		seenScheme, seenAuthority, seenPath = c.Scheme(), c.Authority(), c.RoutingPath()
 		seenProto, seenSessProto = c.Protocol(), c.Session().Protocol()
 		return c.Forward()
@@ -501,7 +502,7 @@ func TestProto_H2CConnect(t *testing.T) {
 
 	var seenProto Protocol
 	var seenAuthority string
-	p.MustAddInterceptor(nil, originHost(originURL)+"/*{any}", func(c *Context) (*http.Response, error) {
+	p.MustAdd(originHost(originURL)+"/*{any}", func(c *HTTPCtx) (*http.Response, error) {
 		seenProto, seenAuthority = c.Protocol(), c.Authority()
 		return c.Forward()
 	})
@@ -544,4 +545,63 @@ func TestProto_H2CConnect(t *testing.T) {
 	assert.Equal(t, originURL.Host, seenAuthority)
 	// The tunnel carries HTTP/1.1 inside, whatever the stream that opened it was.
 	assert.Equal(t, HTTP11, seenProto)
+}
+
+// A client offering no HTTP protocol is not asking for HTTP, so an HTTP entry does not serve
+// it. What it offered is echoed back, the way an origin supporting everything would, and the
+// connection is refused unless something admits it as a stream.
+func TestProxy_NonHTTPALPNIsNotHTTP(t *testing.T) {
+	ca, _ := GenerateCA()
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+	p.MustAdd("example.test/", noopHandler)
+	addr := startProxy(t, p)
+
+	dial := func() (*tls.Conn, error) {
+		raw, derr := net.Dial("tcp", addr)
+		if derr != nil {
+			return nil, derr
+		}
+		if _, werr := raw.Write([]byte("CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\n")); werr != nil {
+			return nil, werr
+		}
+		br := bufio.NewReader(raw)
+		if _, rerr := http.ReadResponse(br, nil); rerr != nil {
+			return nil, rerr
+		}
+		tc := tls.Client(raw, &tls.Config{
+			RootCAs:    ca.CertPool(),
+			ServerName: "example.test",
+			MinVersion: tls.VersionTLS12,
+			NextProtos: []string{"spdy/3"},
+		})
+		return tc, tc.Handshake()
+	}
+
+	// ALPN is settled inside the handshake, so a connection refused for what it turned out to
+	// be is refused just after it, not before: the handshake completes and nothing follows.
+	refused, err := dial()
+	require.NoError(t, err)
+	require.NoError(t, refused.SetReadDeadline(time.Now().Add(5*time.Second)))
+	_, err = refused.Read(make([]byte, 1))
+	assert.Error(t, err, "nothing admits a spdy stream on this authority")
+	_ = refused.Close()
+
+	// With a stream entry the same connection is served, and the protocol the client asked
+	// for is the one it gets.
+	p.MustAdd[TCP]("example.test:443", func(c *TCPCtx) error {
+		assert.Equal(t, "spdy/3", c.ALPN())
+		_, _ = c.Client().Write([]byte("hello"))
+		return nil
+	})
+
+	tc, err := dial()
+	require.NoError(t, err)
+	defer func() { _ = tc.Close() }()
+	assert.Equal(t, "spdy/3", tc.ConnectionState().NegotiatedProtocol)
+
+	buf := make([]byte, 5)
+	_, err = io.ReadFull(tc, buf)
+	require.NoError(t, err)
+	assert.Equal(t, "hello", string(buf))
 }

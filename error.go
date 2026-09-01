@@ -12,12 +12,10 @@ import (
 )
 
 var (
-	// ErrInterceptorNotFound is returned when no interceptor matches the lookup.
-	ErrInterceptorNotFound = errors.New("interceptor not found")
-	// ErrInvalidInterceptor is returned when an interceptor cannot be built from the given arguments.
-	ErrInvalidInterceptor = errors.New("invalid interceptor")
-	// ErrTunnelNotFound is returned when no tunnel is registered for an authority.
-	ErrTunnelNotFound = errors.New("tunnel not found")
+	// ErrEntryNotFound is returned when no interceptor matches the lookup.
+	ErrEntryNotFound = errors.New("interceptor not found")
+	// ErrInvalidEntry is returned when an interceptor cannot be built from the given arguments.
+	ErrInvalidEntry = errors.New("invalid interceptor")
 	// ErrInvalidAuthority is returned when an authority pattern cannot be parsed.
 	ErrInvalidAuthority = errors.New("invalid authority")
 	// ErrReadOnlyTxn is returned on a write in a read-only transaction.
@@ -36,23 +34,23 @@ var (
 	ErrProxyClosed = errors.New("proxy closed")
 	// ErrConnectionRejected is returned when the proxy refuses a connection.
 	ErrConnectionRejected = errors.New("connection rejected")
-	// ErrAuthorityConflict is returned when a tunnel and the interceptors registered under
-	// the same authority disagree on what should happen to its connections.
+	// ErrAuthorityConflict is returned when two registrations on one authority disagree on
+	// what should happen to its connections.
 	ErrAuthorityConflict = errors.New("authority conflict")
 )
 
-// InterceptorConflictError represents a conflict that occurred during interceptor registration.
+// EntryConflictError represents a conflict that occurred during interceptor registration.
 // It contains the interceptor being registered, and the existing interceptors that caused the conflict.
-type InterceptorConflictError struct {
+type EntryConflictError struct {
 	// New is the interceptor that was being registered when the conflict was detected.
-	New *Interceptor
+	New *entry
 	// Conflicts contains the previously registered interceptors that conflict with New.
-	Conflicts []*Interceptor
+	Conflicts []*entry
 	// isShadowed indicate that the New interceptor shadow other interceptors.
 	isShadowed bool
 }
 
-func (e *InterceptorConflictError) Error() string {
+func (e *EntryConflictError) Error() string {
 	sb := new(strings.Builder)
 	sb.WriteString("interceptor conflict: new interceptor\n")
 	entryf(sb, e.New, 4, true)
@@ -75,16 +73,16 @@ func (e *InterceptorConflictError) Error() string {
 	return sb.String()
 }
 
-// InterceptorNameConflictError represents a conflict that occurred during interceptor name registration.
+// EntryNameConflictError represents a conflict that occurred during interceptor name registration.
 // It contains the interceptor being registered, and the existing interceptor that caused the conflict.
-type InterceptorNameConflictError struct {
+type EntryNameConflictError struct {
 	// New is the interceptor that was being registered when the conflict was detected.
-	New *Interceptor
+	New *entry
 	// Conflict is the previously registered interceptor that conflicts with New.
-	Conflict *Interceptor
+	Conflict *entry
 }
 
-func (e *InterceptorNameConflictError) Error() string {
+func (e *EntryNameConflictError) Error() string {
 	sb := new(strings.Builder)
 	sb.WriteString("interceptor name already registered: new interceptor\n")
 	entryf(sb, e.New, 4, true)
@@ -93,12 +91,12 @@ func (e *InterceptorNameConflictError) Error() string {
 	return sb.String()
 }
 
-func newInterceptorNotFoundError(ic *Interceptor) error {
+func newEntryNotFoundError(ic *entry) error {
 	sb := new(strings.Builder)
 	sb.WriteString("interceptor\n")
 	entryf(sb, ic, 4, false)
 	sb.WriteString("\nis not registered")
-	return fmt.Errorf("%w: %s", ErrInterceptorNotFound, sb.String())
+	return fmt.Errorf("%w: %s", ErrEntryNotFound, sb.String())
 }
 
 type PatternError struct {

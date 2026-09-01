@@ -1,272 +1,127 @@
+// Copyright 2025 Sylvain Müller. All rights reserved.
+// Mount of this source code is governed by a Apache-2.0 license that can be found
+// at https://github.com/fox-toolkit/edge/blob/master/LICENSE.txt.
+
 package edge
 
 import (
 	"fmt"
 	"slices"
 	"strings"
-
-	"github.com/fox-toolkit/edge/internal/slicesutil"
-	"golang.org/x/net/http/httpguts"
 )
 
 // Txn is a read or write transaction on the routing tree.
 //
-// A Txn must not be used concurrently by multiple goroutines. It is however
-// safe to run multiple transactions from different goroutines, each on its
-// own Txn. Read transactions operate on a point-in-time snapshot and never
-// block, while write transactions are serialized by the proxy. A write Txn
-// must be finalized with [Txn.Commit] or [Txn.Abort]. Routing requests never
-// block, even while a write transaction is in progress.
+// A Txn must not be used concurrently by multiple goroutines. It is however safe to run
+// multiple transactions from different goroutines, each on its own Txn. Read transactions
+// operate on a point-in-time snapshot and never block, while write transactions are
+// serialized by the proxy. A write Txn must be finalized with [Txn.Commit] or [Txn.Abort].
+// Routing never blocks, even while a write transaction is in progress.
 type Txn struct {
 	p       *Proxy
 	rootTxn *tXn
 	write   bool
 }
 
-// addImpliedAuthority registers the authority entry an interceptor implies, or bumps the
-// reference count of the one already there.
-func (txn *Txn) addImpliedAuthority(ic *Interceptor) error {
-	authority, err := txn.p.impliedAuthorityFor(ic)
-	if err != nil {
-		return err
-	}
-	if txn.p.cfg.ca == nil {
-		return fmt.Errorf("%w: interceptor %s needs to intercept %s",
-			ErrNoCertificateAuthority, ic.pattern.str, authority.pattern.str)
-	}
-
-	t := txn.rootTxn
-	existing := t.searchAuthority(authority)
-	switch {
-	case existing == nil:
-		authority.refs = 1
-		return t.insert(authority, modeInsert)
-	case !existing.implicit && existing.action == Intercept:
-		// The authority is already intercepted by a declaration the caller owns. The
-		// interceptor rides on it and takes no reference on a decision it did not create.
-		return nil
-	case !existing.implicit:
-		// The tunnel says do not look at this authority, the interceptor says handle its requests.
-		// Nothing can honour both, and the interceptor is the one that would silently never run.
-		return fmt.Errorf("%w: %s is %s, so interceptor %s would never run",
-			ErrAuthorityConflict, existing.pattern.str, existing.action, ic.pattern.str)
-	default:
-		return replaceAuthorityRefs(t, existing, existing.refs+1)
-	}
-}
-
-// dropImpliedAuthority releases one reference on the authority an interceptor implied,
-// removing it once the last interceptor that needed it is gone.
-func (txn *Txn) dropImpliedAuthority(ic *Interceptor) {
-	authority, err := txn.p.impliedAuthorityFor(ic)
-	if err != nil {
-		return
-	}
-
-	t := txn.rootTxn
-	existing := t.searchAuthority(authority)
-	if existing == nil || !existing.implicit {
-		return
-	}
-	if existing.refs > 1 {
-		_ = replaceAuthorityRefs(t, existing, existing.refs-1)
-		return
-	}
-	t.delete(existing)
-}
-
-// replaceAuthorityRefs swaps an entry for a copy holding a different reference count. Entries are
-// immutable once published, so the count cannot be bumped in place.
-func replaceAuthorityRefs(t *tXn, existing *Interceptor, refs uint32) error {
-	next := *existing
-	next.refs = refs
-	if _, ok := t.delete(existing); !ok {
-		return fmt.Errorf("internal error: authority %s vanished during refcount update", existing.pattern.str)
-	}
-	return t.insert(&next, modeInsert)
-}
-
-// AddInterceptor registers a new interceptor for the given methods, pattern and matchers. On success, it returns the newly registered [Interceptor].
-// If an error occurs, it returns one of the following:
-//   - [*PatternError]: If the pattern syntax is invalid.
-//   - [*InterceptorConflictError]: If the interceptor conflict with others.
-//   - [*InterceptorNameConflictError]: If the interceptor name is already registered.
-//   - [ErrInvalidInterceptor]: If the method is invalid, the handler is nil or the pattern is empty.
-//   - [ErrInvalidConfig]: If the provided option are invalid.
-//   - [ErrInvalidMatcher]: If the provided matcher options are invalid.
-//   - [ErrReadOnlyTxn]: On write in a read-only transaction.
-//
-// To override an existing handler, use [Txn.UpdateInterceptor].
-func (txn *Txn) AddInterceptor(methods []string, pattern string, handler HandlerFunc, opts ...InterceptorOption) (*Interceptor, error) {
+// Add registers handler for pattern. See [Proxy.Add]. Adding on a read-only transaction
+// returns [ErrReadOnlyTxn].
+func (txn *Txn) Add[H Handler](pattern string, handler H, opts ...EntryOption) (Entry[H], error) {
 	if txn.rootTxn == nil {
 		panic(ErrSettledTxn)
 	}
 	if !txn.write {
-		return nil, ErrReadOnlyTxn
+		return Entry[H]{}, ErrReadOnlyTxn
 	}
 
-	ic, err := txn.p.newInterceptor(methods, pattern, handler, opts...)
+	e, err := newEntry(txn.p, pattern, handler, opts...)
 	if err != nil {
-		return nil, err
+		return Entry[H]{}, err
 	}
 
-	if err = txn.addImpliedAuthority(ic); err != nil {
-		return nil, err
+	// The entry goes in first. Admitting an authority for an entry that then fails to insert
+	// leaves an admission nothing needs and nothing can withdraw, since a delete has no entry
+	// to release it from.
+	if err = txn.rootTxn.insert(e, modeInsert); err != nil {
+		return Entry[H]{}, err
 	}
-	if err = txn.rootTxn.insert(ic, modeInsert); err != nil {
-		return nil, err
-	}
-	return ic, nil
-}
-
-// UpdateInterceptor override an existing interceptor for the given methods, pattern and matchers. On success, it returns the newly registered [Interceptor].
-// If an error occurs, it returns one of the following:
-//   - [*PatternError]: If the pattern syntax is invalid.
-//   - [ErrInterceptorNotFound]: If the interceptor does not exist.
-//   - [*InterceptorNameConflictError]: If the interceptor name is already registered.
-//   - [ErrInvalidInterceptor]: If the method is invalid, the handler is nil or the pattern is empty.
-//   - [ErrInvalidConfig]: If the provided option are invalid.
-//   - [ErrInvalidMatcher]: If the provided matcher options are invalid.
-//   - [ErrReadOnlyTxn]: On write in a read-only transaction.
-//
-// Interceptor-specific options and middleware must be reapplied when updating one. If not, any middleware and option will
-// be removed (or reset to their default value), and the interceptor will fall back to using global configuration (if any).
-// To add a new handler, use [Txn.AddInterceptor].
-func (txn *Txn) UpdateInterceptor(methods []string, pattern string, handler HandlerFunc, opts ...InterceptorOption) (*Interceptor, error) {
-	if txn.rootTxn == nil {
-		panic(ErrSettledTxn)
-	}
-
-	if !txn.write {
-		return nil, ErrReadOnlyTxn
-	}
-
-	ic, err := txn.p.newInterceptor(methods, pattern, handler, opts...)
-	if err != nil {
-		return nil, err
-	}
-
-	if err = txn.rootTxn.insert(ic, modeUpdate); err != nil {
-		return nil, err
-	}
-
-	return ic, nil
-}
-
-// DeleteInterceptor deletes an existing interceptor for the given methods, pattern and matchers. On success, it returns the deleted [Interceptor].
-// If an error occurs, it returns one of the following:
-//   - [*PatternError]: If the pattern syntax is invalid.
-//   - [ErrInterceptorNotFound]: If the interceptor does not exist.
-//   - [ErrInvalidInterceptor]: If the method is invalid or the pattern is empty.
-//   - [ErrInvalidConfig]: If the provided options are invalid.
-//   - [ErrInvalidMatcher]: If the provided matcher options are invalid.
-//   - [ErrReadOnlyTxn]: On write in a read-only transaction.
-func (txn *Txn) DeleteInterceptor(methods []string, pattern string, opts ...MatcherOption) (*Interceptor, error) {
-	if txn.rootTxn == nil {
-		panic(ErrSettledTxn)
-	}
-	if !txn.write {
-		return nil, ErrReadOnlyTxn
-	}
-
-	for _, method := range methods {
-		if !validMethod(method) {
-			return nil, fmt.Errorf("%w: invalid method '%s'", ErrInvalidInterceptor, method)
+	if err = txn.admit(e); err != nil {
+		if _, ok := txn.rootTxn.delete(e); !ok {
+			return Entry[H]{}, fmt.Errorf("internal error: entry %s vanished while unwinding: %w",
+				e.pattern.str, err)
 		}
+		return Entry[H]{}, err
+	}
+	return Entry[H]{e: e}, nil
+}
+
+// Update overrides the handler and options of an existing entry. See [Proxy.Update].
+// Updating on a read-only transaction returns [ErrReadOnlyTxn].
+func (txn *Txn) Update[H Handler](pattern string, handler H, opts ...EntryOption) (Entry[H], error) {
+	if txn.rootTxn == nil {
+		panic(ErrSettledTxn)
+	}
+	if !txn.write {
+		return Entry[H]{}, ErrReadOnlyTxn
 	}
 
-	pat, _, err := txn.p.parsePattern(pattern)
+	e, err := newEntry(txn.p, pattern, handler, opts...)
 	if err != nil {
-		return nil, err
+		return Entry[H]{}, err
+	}
+	if err = txn.rootTxn.insert(e, modeUpdate); err != nil {
+		return Entry[H]{}, err
+	}
+	return Entry[H]{e: e}, nil
+}
+
+// Delete removes the entry registered for the given kind, pattern and matchers. See
+// [Proxy.Delete]. Deleting on a read-only transaction returns [ErrReadOnlyTxn].
+func (txn *Txn) Delete[H Handler](pattern string, opts ...MatcherOption) (Entry[H], error) {
+	if txn.rootTxn == nil {
+		panic(ErrSettledTxn)
+	}
+	if !txn.write {
+		return Entry[H]{}, ErrReadOnlyTxn
 	}
 
-	ic := &Interceptor{pattern: pat}
+	kind := kindOf[H]()
+	pat, _, err := txn.p.parsePattern(pattern, kind)
+	if err != nil {
+		return Entry[H]{}, err
+	}
 
+	e := &entry{pattern: pat, kind: kind}
 	for _, opt := range opts {
-		if err = opt.applyMatcher(sealedOption{proxy: txn.p, interceptor: ic}); err != nil {
-			return nil, err
+		if err = opt.applyMatcher(sealedOption{proxy: txn.p, entry: e}); err != nil {
+			return Entry[H]{}, err
 		}
 	}
-
-	if len(ic.matchers) > txn.p.cfg.maxMatchers {
-		return nil, fmt.Errorf("%w: %w", ErrInvalidInterceptor, ErrTooManyMatchers)
+	if len(e.matchers) > txn.p.cfg.maxMatchers {
+		return Entry[H]{}, fmt.Errorf("%w: %w", ErrInvalidEntry, ErrTooManyMatchers)
 	}
 
-	// If this interceptor is registered with methods, push the internal matcher at first position.
-	if len(methods) > 0 {
-		// As a defensive mesure, keep our own copy of the provided slice.
-		ic.methods = make([]string, len(methods))
-		copy(ic.methods, methods)
-		slices.Sort(ic.methods)
-		ic.methods = slices.Compact(ic.methods)
+	deleted, ok := txn.rootTxn.delete(e)
+	if !ok {
+		return Entry[H]{}, newEntryNotFoundError(e)
 	}
+	txn.release(deleted)
 
-	ic, deleted := txn.rootTxn.delete(ic)
-	if !deleted {
-		return nil, newInterceptorNotFoundError(ic)
-	}
-	txn.dropImpliedAuthority(ic)
-
-	return ic, nil
+	return Entry[H]{e: deleted}, nil
 }
 
-// removeInterceptor deletes an existing interceptor that match the provided [Interceptor] pattern and matchers. On success, it returns
-// the deleted [Interceptor]. If an error occurs, it returns one of the following:
-//   - [ErrInterceptorNotFound]: If the interceptor does not exist.
-//   - [ErrInvalidInterceptor]: If the interceptor is missing.
-//   - [ErrReadOnlyTxn]: On write in a read-only transaction.
-func (txn *Txn) removeInterceptor(ic *Interceptor) (*Interceptor, error) {
-	if txn.rootTxn == nil {
-		panic(ErrSettledTxn)
-	}
-	if !txn.write {
-		return nil, ErrReadOnlyTxn
-	}
-
-	if ic == nil || ic.hbase == nil {
-		return nil, ErrInvalidInterceptor
-	}
-
-	ic, deleted := txn.rootTxn.delete(ic)
-	if !deleted {
-		return nil, newInterceptorNotFoundError(ic)
-	}
-	txn.dropImpliedAuthority(ic)
-
-	return ic, nil
+// Has reports whether an entry is registered for the given kind, pattern and matchers.
+func (txn *Txn) Has[H Handler](pattern string, matchers ...Matcher) bool {
+	_, ok := txn.Lookup[H](pattern, matchers...)
+	return ok
 }
 
-// Truncate empties the tree, removing the interceptors and the authority entries together.
-// Truncating on a read-only transaction returns ErrReadOnlyTxn.
-func (txn *Txn) Truncate() error {
+// Lookup returns the entry registered for the given kind, pattern and matchers.
+func (txn *Txn) Lookup[H Handler](pattern string, matchers ...Matcher) (Entry[H], bool) {
 	if txn.rootTxn == nil {
 		panic(ErrSettledTxn)
 	}
 
-	if !txn.write {
-		return ErrReadOnlyTxn
-	}
-	txn.rootTxn.truncate()
-	return nil
-}
-
-// Has allows to check if the given methods, pattern and matchers exactly match a registered interceptor.
-// See also [Txn.Interceptor] as an alternative.
-func (txn *Txn) Has(methods []string, pattern string, matchers ...Matcher) bool {
-	if txn.rootTxn == nil {
-		panic(ErrSettledTxn)
-	}
-
-	return txn.Interceptor(methods, pattern, matchers...) != nil
-}
-
-// Interceptor performs a lookup for a registered interceptor matching the given methods, pattern and matchers. It returns the [Interceptor] if a
-// match is found or nil otherwise. See also [Txn.Has] or [Iter.Interceptors] as an alternative.
-func (txn *Txn) Interceptor(methods []string, pattern string, matchers ...Matcher) *Interceptor {
-	if txn.rootTxn == nil {
-		panic(ErrSettledTxn)
-	}
-
+	kind := kindOf[H]()
 	key, isAddr := patternKey(pattern)
 	root := txn.rootTxn.patterns
 	if isAddr {
@@ -274,23 +129,61 @@ func (txn *Txn) Interceptor(methods []string, pattern string, matchers ...Matche
 	}
 	matched := root.searchPattern(key)
 	if matched == nil || !matched.isLeaf() {
-		return nil
+		return Entry[H]{}, false
 	}
 
-	idx := slices.IndexFunc(matched.entries, func(r *Interceptor) bool {
-		return r.pattern.path != "" && r.pattern.str == pattern &&
-			slicesutil.EqualUnsorted(r.methods, methods) && r.matchersEqual(matchers)
+	idx := slices.IndexFunc(matched.entries, func(r *entry) bool {
+		return r.handler != nil && r.kind == kind && r.pattern.str == pattern &&
+			r.matchersEqual(matchers)
 	})
 	if idx < 0 {
-		return nil
+		return Entry[H]{}, false
 	}
-	return matched.entries[idx]
+	return Entry[H]{e: matched.entries[idx]}, true
 }
 
-// ActionFor reports what the proxy would do with a connection to target, resolved on the tree
-// this transaction sees rather than on the published one. A write transaction can therefore
-// check the effect of a change before it commits. See [Proxy.ActionFor].
-func (txn *Txn) ActionFor(target Target) Action {
+// Named returns the entry registered under name for the given kind.
+func (txn *Txn) Named[H Handler](name string) (Entry[H], bool) {
+	if txn.rootTxn == nil {
+		panic(ErrSettledTxn)
+	}
+
+	matched := txn.rootTxn.names.searchName(name)
+	if matched == nil || !matched.isLeaf() || matched.entries[0].name != name {
+		return Entry[H]{}, false
+	}
+	e := matched.entries[0]
+	if e.kind != kindOf[H]() {
+		return Entry[H]{}, false
+	}
+	return Entry[H]{e: e}, true
+}
+
+// Truncate empties the tree, removing the entries and the admissions they imply together.
+// Truncating on a read-only transaction returns [ErrReadOnlyTxn].
+func (txn *Txn) Truncate() error {
+	if txn.rootTxn == nil {
+		panic(ErrSettledTxn)
+	}
+	if !txn.write {
+		return ErrReadOnlyTxn
+	}
+	txn.rootTxn.truncate()
+	return nil
+}
+
+// Len returns the number of registered entries.
+func (txn *Txn) Len() int {
+	if txn.rootTxn == nil {
+		panic(ErrSettledTxn)
+	}
+	return txn.rootTxn.handlers
+}
+
+// Admits reports whether a connection to target carrying kind's traffic is admitted, resolved
+// on the tree this transaction sees rather than on the published one. A write transaction can
+// therefore check the effect of a change before it commits. See [Proxy.Admits].
+func (txn *Txn) Admits(target Target, kind Kind) bool {
 	if txn.rootTxn == nil {
 		panic(ErrSettledTxn)
 	}
@@ -298,48 +191,15 @@ func (txn *Txn) ActionFor(target Target) Action {
 	t := txn.rootTxn
 	// The context comes from the pool of the tree the transaction forked from. Its
 	// capacities are a sizing hint that the lookup grows when it has to, and nothing on the
-	// authority path reads the tree the context was allocated for.
+	// admission path reads the tree the context was allocated for.
 	pool := &t.tree.pool
-	c := pool.Get().(*Context)
+	c := pool.Get().(*routeCtx)
 	defer pool.Put(c)
 
-	return resolveAction(t.patterns, t.addrs, t.authorities, c, target)
+	return resolveAdmission(t.patterns, t.addrs, t.handlers+t.admissions, c, target, kind) != nil
 }
 
-// Name performs a lookup for a registered interceptor matching the given name. It returns
-// the [Interceptor] if a match is found or nil otherwise. See also [Txn.Interceptor] as an alternative.
-func (txn *Txn) Name(name string) *Interceptor {
-	if txn.rootTxn == nil {
-		panic(ErrSettledTxn)
-	}
-
-	root := txn.rootTxn.names
-	matched := root.searchName(name)
-	if matched == nil || !matched.isLeaf() || matched.entries[0].name != name {
-		return nil
-	}
-
-	return matched.entries[0]
-}
-
-// InterceptorsLen returns the number of registered interceptors.
-func (txn *Txn) InterceptorsLen() int {
-	if txn.rootTxn == nil {
-		panic(ErrSettledTxn)
-	}
-	return txn.rootTxn.interceptors
-}
-
-// AuthoritiesLen returns the number of registered authority entries. See
-// [Proxy.AuthoritiesLen].
-func (txn *Txn) AuthoritiesLen() int {
-	if txn.rootTxn == nil {
-		panic(ErrSettledTxn)
-	}
-	return txn.rootTxn.authorities
-}
-
-// Commit finalize the transaction. This is a noop for read transactions, already aborted or
+// Commit finalizes the transaction. This is a noop for read transactions, already aborted or
 // committed transactions.
 func (txn *Txn) Commit() {
 	// Noop for a read transaction
@@ -352,38 +212,29 @@ func (txn *Txn) Commit() {
 		return
 	}
 
-	newRoot := txn.rootTxn.commit()
-	// Authorities are published first. An interceptor visible before the authority entry that intercepts its
-	// authority would never fire; an authority entry visible before its interceptor only means the authority
-	// is intercepted and forwarded unchanged for an instant.
-	txn.p.tree.Store(newRoot)
+	txn.p.tree.Store(txn.rootTxn.commit())
 
 	// Clear the txn
 	txn.rootTxn = nil
 	txn.p.mu.Unlock()
 }
 
-// Abort cancel the transaction. This is a noop for read transactions, already aborted or
+// Abort cancels the transaction. This is a noop for read transactions, already aborted or
 // committed transactions.
 func (txn *Txn) Abort() {
-	// Noop for a read transaction
 	if !txn.write {
 		return
 	}
-
-	// Check if already aborted or committed
 	if txn.rootTxn == nil {
 		return
 	}
 
-	// Clear the txn
 	txn.rootTxn = nil
 	txn.p.mu.Unlock()
 }
 
-// Snapshot returns a point in time snapshot of the current state of the transaction.
-// Returns a new read-only transaction or nil if the transaction is already aborted
-// or committed.
+// Snapshot returns a point in time snapshot of the current state of the transaction. It
+// contains any uncommitted writes, and further mutations to either are independent.
 func (txn *Txn) Snapshot() *Txn {
 	if txn.rootTxn == nil {
 		return nil
@@ -395,23 +246,113 @@ func (txn *Txn) Snapshot() *Txn {
 	}
 }
 
-func validMethod(method string) bool {
-	/*
-	     Method         = "OPTIONS"                ; Section 9.2
-	                    | "GET"                    ; Section 9.3
-	                    | "HEAD"                   ; Section 9.4
-	                    | "POST"                   ; Section 9.5
-	                    | "PUT"                    ; Section 9.6
-	                    | "DELETE"                 ; Section 9.7
-	                    | "TRACE"                  ; Section 9.8
-	                    | "CONNECT"                ; Section 9.9
-	                    | extension-method
-	   extension-method = token
-	     token          = 1*<any CHAR except CTLs or separators>
-	*/
-	return len(method) > 0 && strings.IndexFunc(method, isNotToken) == -1
+// admit registers the admission a per-message entry implies, or bumps the reference count of
+// the one already there. An entry that routes whole connections is its own admission and
+// needs none.
+func (txn *Txn) admit(e *entry) error {
+	if !e.kind.perMessage() {
+		return txn.requireCA(e)
+	}
+
+	adm, err := txn.p.newAdmission(admissionPattern(e.pattern), e.kind.admittedAs())
+	if err != nil {
+		return err
+	}
+	if err = txn.requireCA(adm); err != nil {
+		return err
+	}
+
+	t := txn.rootTxn
+	existing := t.searchAdmission(adm)
+	if existing == nil {
+		adm.refs = 1
+		return t.insert(adm, modeInsert)
+	}
+	return replaceRefs(t, existing, existing.refs+1)
 }
 
-func isNotToken(r rune) bool {
-	return !httpguts.IsTokenRune(r)
+// release drops one reference on the admission a deleted entry implied, removing it once the
+// last entry that needed it is gone.
+func (txn *Txn) release(e *entry) {
+	if !e.kind.perMessage() {
+		return
+	}
+
+	adm, err := txn.p.newAdmission(admissionPattern(e.pattern), e.kind.admittedAs())
+	if err != nil {
+		return
+	}
+
+	t := txn.rootTxn
+	existing := t.searchAdmission(adm)
+	if existing == nil {
+		return
+	}
+	if existing.refs > 1 {
+		_ = replaceRefs(t, existing, existing.refs-1)
+		return
+	}
+	t.delete(existing)
+}
+
+// requireCA refuses a registration the proxy could not serve. QUIC is always TLS, and the HTTP
+// kind is in practice, so an entry of either kind registered without a certificate authority
+// would admit connections nothing can answer.
+//
+// A stream or a datagram is not necessarily encrypted, so those are left to fail at the
+// handshake that actually needs a certificate, if one ever comes.
+func (txn *Txn) requireCA(e *entry) error {
+	if txn.p.cfg.ca != nil || (e.kind != KindHTTP && e.kind != KindQUIC) {
+		return nil
+	}
+	return fmt.Errorf("%w: %s admits %s, which carries TLS",
+		ErrNoCertificateAuthority, e.kind, e.pattern.str)
+}
+
+// replaceRefs swaps an entry for a copy holding a different reference count. Entries are
+// immutable once published, so the count cannot be bumped in place.
+func replaceRefs(t *tXn, existing *entry, refs uint32) error {
+	next := *existing
+	next.refs = refs
+	if _, ok := t.delete(existing); !ok {
+		return fmt.Errorf("internal error: admission %s vanished during refcount update", existing.pattern.str)
+	}
+	return t.insert(&next, modeInsert)
+}
+
+// newAdmission builds the entry admitting one authority for one kind. It carries no
+// handler and no matcher: nothing has been read off the connection at the point it is
+// consulted.
+func (p *Proxy) newAdmission(pattern string, kind Kind) (*entry, error) {
+	pat, paramsCnt, err := p.parseAuthorityPattern(pattern)
+	if err != nil {
+		return nil, err
+	}
+
+	e := &entry{pattern: pat, kind: kind, implied: true}
+	e.params = make([]string, 0, paramsCnt)
+	for _, tk := range pat.tokens {
+		if tk.typ != nodeStatic {
+			e.params = append(e.params, tk.value)
+		}
+	}
+	return e, nil
+}
+
+// admissionPattern spells the authority pattern naming pat's host and port. Only an address
+// host is ever bracketed, a range for its '/' as an IPv6 literal is for its colons. A name is
+// left alone, the colon of a regexp constraint lives inside braces and the parser reads it
+// back there.
+//
+// An entry restricted to one port implies an admission restricted to the same one:
+// terminating TLS on a port no entry can serve would be visible to the client for nothing.
+func admissionPattern(pat pattern) string {
+	host := pat.host
+	if pat.prefix.IsValid() && strings.ContainsAny(host, ":/") {
+		host = "[" + host + "]"
+	}
+	if pat.port == "" {
+		return host
+	}
+	return host + ":" + pat.port
 }

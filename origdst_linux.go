@@ -54,9 +54,9 @@ func originalDstSocket(c net.Conn) (netip.AddrPort, error) {
 	return addr, lookupErr
 }
 
-// originalDst reads SO_ORIGINAL_DST, choosing the option level from the family the listener
-// is bound to. A dual-stack listener reports IPv4 peers as IPv4-mapped, so the family of the
-// local address is what decides, not the family of the peer.
+// originalDst reads SO_ORIGINAL_DST, choosing the option level from the kind the listener
+// is bound to. A dual-stack listener reports IPv4 peers as IPv4-mapped, so the kind of the
+// local address is what decides, not the kind of the peer.
 func originalDst(fd int, local net.Addr) (netip.AddrPort, error) {
 	tcpLocal, _ := local.(*net.TCPAddr)
 	if tcpLocal != nil && tcpLocal.IP.To4() == nil {
@@ -93,7 +93,7 @@ func ntohs(v uint16) uint16 {
 }
 
 // setTransparentPacketOptions asks the socket to report the pre-redirect destination of every
-// datagram it delivers. A socket bound to one family refuses the option of the other, so it
+// datagram it delivers. A socket bound to one kind refuses the option of the other, so it
 // fails only when neither is accepted.
 func setTransparentPacketOptions(c *net.UDPConn) error {
 	raw, err := c.SyscallConn()
@@ -184,14 +184,14 @@ func originalDstFromOOB(oob []byte, _, _ netip.AddrPort) netip.AddrPort {
 	for _, m := range msgs {
 		switch {
 		case m.Header.Level == unix.IPPROTO_IP && m.Header.Type == unix.IP_ORIGDSTADDR:
-			// sockaddr_in, laid out as family, port, address.
+			// sockaddr_in, laid out as kind, port, address.
 			if len(m.Data) < 8 {
 				continue
 			}
 			port := binary.BigEndian.Uint16(m.Data[2:4])
 			return netip.AddrPortFrom(netip.AddrFrom4([4]byte(m.Data[4:8])), port)
 		case m.Header.Level == unix.IPPROTO_IPV6 && m.Header.Type == unix.IPV6_ORIGDSTADDR:
-			// sockaddr_in6, laid out as family, port, flow label, address, scope.
+			// sockaddr_in6, laid out as kind, port, flow label, address, scope.
 			if len(m.Data) < 24 {
 				continue
 			}

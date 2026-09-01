@@ -5,160 +5,140 @@
 package edge_test
 
 import (
-	"bytes"
 	"fmt"
 	"log"
 	"net/http"
-	"os"
+	"time"
 
 	"github.com/fox-toolkit/edge"
 )
 
-// Capture the traffic of an application under test: intercept one API, tunnel everything
-// else end to end.
-func Example() {
+// The handler signature selects the kind of traffic served, so no type argument is needed.
+func ExampleProxy_Add() {
 	ca, err := edge.GenerateCA()
 	if err != nil {
 		log.Fatal(err)
 	}
+	p := edge.Must(edge.WithCA(ca))
 
-	p, err := edge.New(edge.WithCA(ca))
-	if err != nil {
-		log.Fatal(err)
-	}
+	// One request, on a hostname and a path.
+	p.MustAdd("api.stripe.com/v1/charges/{id}", func(c *edge.HTTPCtx) (*http.Response, error) {
+		if c.Param("id") == "ch_denied" {
+			return edge.Text(http.StatusPaymentRequired, "declined"), nil
+		}
+		return c.Forward()
+	}, edge.WithMethods(http.MethodGet, http.MethodPost))
 
-	p.MustAddInterceptor([]string{http.MethodPost}, "api.stripe.com/v1/charges", func(c *edge.Context) (*http.Response, error) {
-		if c.Request().Header.Get("Idempotency-Key") == "" {
-			return edge.Text(http.StatusBadRequest, "missing idempotency key"), nil
+	// The catch-all is a route, not a hidden default: what passes through is written down.
+	p.MustAdd("api.stripe.com/*{any}", func(c *edge.HTTPCtx) (*http.Response, error) {
+		return c.Forward()
+	})
+
+	fmt.Println(p.Len())
+	// Output: 2
+}
+
+// A kind that routes whole connections is keyed on an authority alone, with no path.
+func ExampleProxy_Add_stream() {
+	ca, _ := edge.GenerateCA()
+	p := edge.Must(edge.WithCA(ca))
+
+	p.MustAdd[edge.TCP]("smtp.test:465", func(c *edge.TCPCtx) error {
+		// TLS is already terminated, so the bytes are in the clear and the upstream
+		// handshake mirrors what the client asked for.
+		log.Printf("smtp over %q", c.ALPN())
+		return c.Relay(edge.Throttle(256<<10), edge.Delay(50*time.Millisecond))
+	})
+
+	fmt.Println(p.Admits(edge.Target{Scheme: "https", Host: "smtp.test", Port: "465"}, edge.KindTCP))
+	// Output: true
+}
+
+// Datagrams have units to lose, which is what makes drop and delay expressible.
+func ExampleProxy_Add_datagram() {
+	p := edge.Must()
+
+	p.MustAdd("[0.0.0.0/0]:53", func(d *edge.DatagramCtx) error {
+		if d.Seq()%50 == 0 {
+			return d.Drop()
+		}
+		return d.Forward(edge.Delay(20 * time.Millisecond))
+	})
+
+	fmt.Println(p.Len())
+	// Output: 1
+}
+
+// A gRPC entry and an HTTP entry can name the same path. The request tells them apart.
+func ExampleProxy_Add_grpc() {
+	ca, _ := edge.GenerateCA()
+	p := edge.Must(edge.WithCA(ca))
+
+	var calls int
+	p.MustAdd("api.test/billing.v1.Billing/Charge", func(c *edge.GRPCCtx) error {
+		calls++
+		if calls <= 2 {
+			return c.Fail(edge.Unavailable, "upstream flaky")
 		}
 		return c.Forward()
 	})
 
-	// The application needs to trust the authority the proxy signs with.
-	if err := os.WriteFile("ca.pem", ca.CertificatePEM(), 0o600); err != nil {
-		log.Fatal(err)
-	}
-
-	log.Fatal(p.ListenAndServe(":8080"))
+	fmt.Println(p.Admits(edge.Target{Scheme: "https", Host: "api.test", Port: "443"}, edge.KindHTTP))
+	// Output: true
 }
 
-// Rewrite a response on the way back to the client.
-func ExampleRewrite() {
+// Past the 101 a connection is no longer HTTP, so its unit is the frame.
+func ExampleProxy_Add_webSocket() {
 	ca, _ := edge.GenerateCA()
-	p, _ := edge.New(edge.WithCA(ca))
+	p := edge.Must(edge.WithCA(ca))
 
-	p.MustAddInterceptor([]string{http.MethodGet}, "api.example.test/v1/status", func(c *edge.Context) (*http.Response, error) {
-		resp, err := c.Forward()
-		if err != nil {
-			return nil, err
-		}
-
-		// DecodeBody undoes any Content-Encoding and drops the header, so the patched bytes
-		// can go straight back out.
-		body, err := edge.DecodeBody(resp, 1<<20)
-		if err != nil {
-			return nil, err
-		}
-
-		patched := bytes.ReplaceAll(body, []byte(`"healthy"`), []byte(`"degraded"`))
-		return edge.Rewrite(resp, patched), nil
-	})
-}
-
-// Tell apart two local services that share a host, which is what a test environment is
-// usually made of. The port belongs to the pattern.
-func Example_port() {
-	ca, _ := edge.GenerateCA()
-	p, _ := edge.New(edge.WithCA(ca))
-
-	p.MustAddInterceptor([]string{http.MethodGet}, "localhost:8080/api/health", func(c *edge.Context) (*http.Response, error) {
-		return edge.Text(http.StatusOK, "stubbed"), nil
+	p.MustAdd("chat.test/ws", func(c *edge.WebSocketCtx) error {
+		// The ping is swallowed rather than relayed, to see how the client's keepalive
+		// reacts.
+		return c.Relay(edge.DropFrame(func(f edge.Frame) bool {
+			return f.Opcode() == edge.OpPing
+		}))
 	})
 
-	fmt.Println(p.InterceptorsLen())
+	fmt.Println(p.Len())
 	// Output: 1
 }
 
-// Carve a tunnel out of a broader interception. Authorities are evaluated most specific
-// first, so a static authority beats a wildcard. Nothing about traffic policy is decided at
-// construction: authorities change while the proxy is serving. An authority named by neither is
-// refused, so an application reaching somewhere the test did not plan for says so.
-func ExampleProxy_AddTunnel() {
-	ca, _ := edge.GenerateCA()
-
-	p, err := edge.New(edge.WithCA(ca))
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// An interceptor names the authority it intercepts, so registering one arms it. Here nothing
-	// is rewritten, the catch-all just forwards, which is enough to observe the traffic.
-	if _, err := p.AddInterceptor(nil, "+{sub}.stripe.com/*{any}", edge.DefaultNoInterceptorHandler); err != nil {
-		log.Fatal(err)
-	}
-	if _, err := p.AddTunnel("checkout.stripe.com"); err != nil {
-		log.Fatal(err)
-	}
-
-	fmt.Println(p.ActionFor(edge.Target{Scheme: "https", Host: "api.stripe.com", Port: "443"}))
-	fmt.Println(p.ActionFor(edge.Target{Scheme: "https", Host: "checkout.stripe.com", Port: "443"}))
-	fmt.Println(p.ActionFor(edge.Target{Scheme: "https", Host: "example.test", Port: "443"}))
-	// Output:
-	// intercept
-	// tunnel
-	// reject
-}
-
-// Record every request that crosses the proxy, whatever it is routed to.
-func ExampleWithMiddleware() {
-	ca, _ := edge.GenerateCA()
-
-	var recorded []string
-	record := func(next edge.HandlerFunc) edge.HandlerFunc {
-		return func(c *edge.Context) (*http.Response, error) {
-			recorded = append(recorded, c.Method()+" "+c.Scheme()+"://"+c.Authority()+c.RoutingPath())
-			return next(c)
-		}
-	}
-
-	p, _ := edge.New(
-		edge.WithCA(ca),
-		edge.WithMiddleware(record),
-	)
-	// A catch-all that forwards untouched: it arms the authority and records its traffic
-	// without changing a byte of it.
-	_, _ = p.AddInterceptor(nil, "api.example.test/*{any}", edge.DefaultNoInterceptorHandler)
-}
-
-// Change interceptors while traffic is flowing. Lookups never block on a write.
+// Entries change while traffic flows, and every unit is routed on the tree as it stands.
 func ExampleProxy_Updates() {
 	ca, _ := edge.GenerateCA()
-	p, _ := edge.New(edge.WithCA(ca))
+	p := edge.Must(edge.WithCA(ca))
+	p.MustAdd("api.test/v1", func(c *edge.HTTPCtx) (*http.Response, error) { return c.Forward() })
 
 	err := p.Updates(func(txn *edge.Txn) error {
-		if _, err := txn.AddInterceptor([]string{http.MethodGet}, "api.example.test/v1/health", failOnce()); err != nil {
+		if _, err := txn.Delete[edge.HTTP]("api.test/v1"); err != nil {
 			return err
 		}
-		_, err := txn.AddInterceptor([]string{http.MethodPost}, "api.example.test/v1/orders", failOnce())
+		_, err := txn.Add("api.test/v1", func(c *edge.HTTPCtx) (*http.Response, error) {
+			return edge.Text(http.StatusTeapot, "closed"), nil
+		})
 		return err
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	fmt.Println(p.InterceptorsLen())
-	// Output: 2
+	fmt.Println(p.Len())
+	// Output: 1
 }
 
-// failOnce returns a handler that fails the first request it sees and forwards the rest,
-// which is the shape of most fault injection in a test.
-func failOnce() edge.HandlerFunc {
-	var failed bool
-	return func(c *edge.Context) (*http.Response, error) {
-		if !failed {
-			failed = true
-			return edge.Status(http.StatusServiceUnavailable), nil
+// Removing an entry governs the next request on connections that are already open. Closing is
+// for ending a connection on its own terms, revoking an identity being the usual one.
+func ExampleProxy_Sessions() {
+	ca, _ := edge.GenerateCA()
+	p := edge.Must(edge.WithCA(ca))
+
+	revoked := "alice"
+	for s := range p.Sessions() {
+		if s.Identity() == revoked {
+			_ = s.Close()
 		}
-		return c.Forward()
 	}
+	fmt.Println("swept")
+	// Output: swept
 }

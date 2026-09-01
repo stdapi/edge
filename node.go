@@ -14,7 +14,7 @@ import (
 
 type node struct {
 	// entries holds the registered handlers if this node is a leaf.
-	entries []*Interceptor
+	entries []*entry
 
 	// regexp is an optional compiled regular expression constraint for param and wildcard nodes.
 	// When present, captured segments must match this pattern during lookup.
@@ -59,14 +59,14 @@ type node struct {
 
 // lookupByAddr resolves key, the encoded address of a target, against the address root. The
 // walk is a longest-prefix match: every node the key fully covers is a candidate, the
-// deepest answers first, and a refusal falls back to the next shorter prefix. With authority
-// set a candidate answers through its authority entries, otherwise through the path subtree
-// under its '/' edge.
+// deepest answers first, and a refusal falls back to the next shorter prefix. With admit set
+// a candidate answers through the entry admitting that kind, otherwise through the path
+// subtree under its '/' edge.
 //
 // A registered prefix always ends on a node boundary. The insert splits nodes to attach its
 // entries or its path subtree, and a delete never merges a node that still carries either,
 // which is what lets the walk test candidacy only where a child key was consumed whole.
-func lookupByAddr(root *node, method string, key []byte, path string, c *Context, lazy, authority bool) (int, *node) {
+func lookupByAddr(root *node, key []byte, path string, c *routeCtx, lazy bool, admit Kind) (int, *node) {
 	// One slot per consumed-key position, the root included even though it can never
 	// qualify today, so a new candidate class cannot overflow the array.
 	var cands [maxAddrKey + 1]*node
@@ -75,7 +75,7 @@ func lookupByAddr(root *node, method string, key []byte, path string, c *Context
 	matched := root
 	search := key
 	for {
-		if authority {
+		if admit != 0 {
 			if matched.isLeaf() {
 				cands[n] = matched
 				n++
@@ -101,14 +101,14 @@ func lookupByAddr(root *node, method string, key []byte, path string, c *Context
 
 	for i := n - 1; i >= 0; i-- {
 		cand := cands[i]
-		if authority {
-			if idx, ok := findAuthority(cand, c); ok {
+		if admit != 0 {
+			if idx, ok := findAdmission(cand, c, admit); ok {
 				return idx, cand
 			}
 			continue
 		}
 		paramCnt := len(*c.params)
-		if idx, subNode := lookupByPath(cand, method, path, c, lazy, 0); subNode != nil {
+		if idx, subNode := lookupByPath(cand, path, c, lazy, 0); subNode != nil {
 			return idx, subNode
 		}
 		*c.skipStack = (*c.skipStack)[:0]
@@ -117,11 +117,11 @@ func lookupByAddr(root *node, method string, key []byte, path string, c *Context
 	return 0, nil
 }
 
-// lookupByHostname walks the hostname portion of the key. With authority set it stops there
-// and answers with the entry sitting on the node the hostname ended on, instead of descending
-// into the path. An authority key carries no path at all, which is what keeps the two kinds
+// lookupByHostname walks the hostname portion of the key. With admit set it stops there and
+// answers with the entry sitting on the node the hostname ended on, instead of descending
+// into the path. An admission key carries no path at all, which is what keeps the two kinds
 // of entry from ever reaching each other.
-func lookupByHostname(root *node, method, host, path string, c *Context, lazy, authority bool) (index int, n *node) {
+func lookupByHostname(root *node, host, path string, c *routeCtx, lazy bool, admit Kind) (index int, n *node) {
 	var (
 		charsMatched     int
 		skipStatic       bool
@@ -299,8 +299,8 @@ Walk:
 					*c.params = append(*c.params, search)
 				}
 
-				if authority {
-					if i, ok := findAuthority(wildcardNode, c); ok {
+				if admit != 0 {
+					if i, ok := findAdmission(wildcardNode, c, admit); ok {
 						return i, wildcardNode
 					}
 					*c.params = (*c.params)[:paramCnt]
@@ -308,7 +308,7 @@ Walk:
 				}
 
 				stackOffset := len(*c.skipStack)
-				if idx, subNode := lookupByPath(wildcardNode, method, path, c, lazy, stackOffset); subNode != nil {
+				if idx, subNode := lookupByPath(wildcardNode, path, c, lazy, stackOffset); subNode != nil {
 					return idx, subNode
 				}
 
@@ -320,13 +320,13 @@ Walk:
 		goto Backtrack
 	}
 
-	if authority {
-		if i, ok := findAuthority(matched, c); ok {
+	if admit != 0 {
+		if i, ok := findAdmission(matched, c, admit); ok {
 			return i, matched
 		}
 	} else if _, pathChild := matched.getStaticEdge(slashDelim); pathChild != nil {
 		stackOffset := len(*c.skipStack)
-		idx, subNode := lookupByPath(matched, method, path, c, lazy, stackOffset)
+		idx, subNode := lookupByPath(matched, path, c, lazy, stackOffset)
 		if subNode != nil {
 			return idx, subNode
 		}
@@ -375,7 +375,7 @@ Backtrack:
 // recorded and only used when no suffix catch-all at the same node matches directly.
 //
 // A slash candidate never crosses a "//" boundary, so /foo// and /foo/ stay distinct.
-func lookupByPath(root *node, method, path string, c *Context, lazy bool, stackOffset int) (index int, n *node) {
+func lookupByPath(root *node, path string, c *routeCtx, lazy bool, stackOffset int) (index int, n *node) {
 
 	var (
 		charsMatched     int
@@ -425,7 +425,7 @@ Walk:
 				// Child key is exactly search plus a trailing slash (e.g. search /foo, key /foo/),
 				// excluding keys ending in "//". The length check keeps the common mismatch cheap.
 				if keyLen == len(search)+1 && child.key[keyLen-1] == '/' && child.key[keyLen-2] != '/' && strings.HasPrefix(child.key, search) {
-					if i, slashNode := matchTrailingSlash(child, method, c, lazy); slashNode != nil {
+					if i, slashNode := matchTrailingSlash(child, c, lazy); slashNode != nil {
 						return i, slashNode
 					}
 				}
@@ -511,7 +511,7 @@ Walk:
 									break
 								}
 								for j, ic := range child.entries {
-									if ic.handleSlash != ExactSlash && ic.match(method, c) {
+									if ic.handleSlash != ExactSlash && ic.match(c) {
 										// This is the only case where we don't return a slash match immediately. Interceptors
 										// like /+{args}/ (with RelaxedSlash) and /+{args} can coexist. For a request like
 										// /a/b/c, the infix /+{args}/ would match with a trailing slash added, but we must
@@ -595,7 +595,7 @@ Walk:
 				}
 
 				for i, ic := range wildcardNode.entries {
-					if ic.match(method, c) {
+					if ic.match(c) {
 						if !lazy {
 							*c.params = append(*c.params, search)
 						}
@@ -618,7 +618,7 @@ Walk:
 
 	if matched.isLeaf() {
 		for i, ic := range matched.entries {
-			if ic.match(method, c) {
+			if ic.match(c) {
 				return i, matched
 			}
 		}
@@ -627,7 +627,7 @@ Walk:
 	// Try to catch empty for wildcard supporting it.
 	for _, wildcardNode := range matched.wildcards {
 		for i, ic := range wildcardNode.entries {
-			if ic.pattern.optionalCatchAll && ic.match(method, c) {
+			if ic.pattern.optionalCatchAll && ic.match(c) {
 				if !lazy {
 					*c.params = append(*c.params, "")
 				}
@@ -637,12 +637,12 @@ Walk:
 	}
 
 	if _, child := matched.getStaticEdge(slashDelim); child != nil && child.key == "/" && !strings.HasSuffix(path, "/") {
-		if i, slashNode := matchTrailingSlash(child, method, c, lazy); slashNode != nil {
+		if i, slashNode := matchTrailingSlash(child, c, lazy); slashNode != nil {
 			return i, slashNode
 		}
 	} else if matched.key == "/" && parent != nil && parent.isLeaf() && !strings.HasSuffix(path, "//") {
 		for i, ic := range parent.entries {
-			if ic.handleSlash != ExactSlash && !ic.pattern.catchAll && ic.match(method, c) {
+			if ic.handleSlash != ExactSlash && !ic.pattern.catchAll && ic.match(c) {
 				return i, parent
 			}
 		}
@@ -651,7 +651,7 @@ Walk:
 Backtrack:
 	if search == "/" && matched.isLeaf() && !strings.HasSuffix(path, "//") {
 		for i, ic := range matched.entries {
-			if ic.handleSlash != ExactSlash && !ic.pattern.catchAll && ic.match(method, c) {
+			if ic.handleSlash != ExactSlash && !ic.pattern.catchAll && ic.match(c) {
 				return i, matched
 			}
 		}
@@ -681,19 +681,19 @@ Backtrack:
 // matchTrailingSlash returns a trailing slash candidate on child, a static node whose
 // key appends a "/" to the matched path: either a non-strict interceptor on child itself or
 // an empty match on one of its optional catch-all. Returns (-1, nil) when none match.
-func matchTrailingSlash(child *node, method string, c *Context, lazy bool) (int, *node) {
+func matchTrailingSlash(child *node, c *routeCtx, lazy bool) (int, *node) {
 	if child.isLeaf() {
 		for i, ic := range child.entries {
-			if ic.handleSlash != ExactSlash && ic.match(method, c) {
+			if ic.handleSlash != ExactSlash && ic.match(c) {
 				return i, child
 			}
 		}
 	}
-	// Since /foo/ and /foo/*{any} are permitted with different set of matchers and methods,
+	// Since /foo/ and /foo/*{any} are permitted with different sets of matchers,
 	// we still need to search for a matching empty catch-all.
 	for _, wildcardNode := range child.wildcards {
 		for i, ic := range wildcardNode.entries {
-			if ic.handleSlash != ExactSlash && ic.pattern.optionalCatchAll && ic.match(method, c) {
+			if ic.handleSlash != ExactSlash && ic.pattern.optionalCatchAll && ic.match(c) {
 				if !lazy {
 					// record empty match
 					*c.params = append(*c.params, "")
@@ -705,9 +705,8 @@ func matchTrailingSlash(child *node, method string, c *Context, lazy bool) (int,
 	return -1, nil
 }
 
-func (n *node) addEntry(ic *Interceptor) {
-	// Method-less and no matchers is always evaluated last.
-	if len(ic.methods) == 0 && len(ic.matchers) == 0 && ic.pattern.port == "" {
+func (n *node) addEntry(ic *entry) {
+	if !ic.narrowed() {
 		// Nothing narrows it, so it is the fallback and belongs last.
 		n.entries = append(n.entries, ic)
 		return
@@ -717,15 +716,22 @@ func (n *node) addEntry(ic *Interceptor) {
 	n.entries = slices.Insert(n.entries, pos, ic)
 }
 
-func (n *node) replaceEntry(idx int, ic *Interceptor) {
+// narrowed reports whether anything selects this entry beyond its pattern: a port, a kind
+// that refines the kind it rides on, or a matcher. An entry narrowed by nothing is the
+// fallback of its node.
+func (e *entry) narrowed() bool {
+	return e.pattern.port != "" || e.kind.refines() || len(e.matchers) > 0
+}
+
+func (n *node) replaceEntry(idx int, ic *entry) {
 	// Priority unchanged or nothing to order on, replace in place. A port is part of the
 	// pattern, so an update never changes it: the two would be different entries.
-	if n.entries[idx].priority == ic.priority || (len(ic.matchers) == 0 && ic.pattern.port == "") {
+	if n.entries[idx].priority == ic.priority || !ic.narrowed() {
 		n.entries[idx] = ic
 		return
 	}
 
-	// Priority changed with matchers, we need to reposition the interceptor.
+	// Priority changed with matchers, we need to reposition the entry.
 	n.entries = slices.Delete(n.entries, idx, idx+1)
 	pos := n.findInsertPosition(ic)
 	n.entries = slices.Insert(n.entries, pos, ic)
@@ -734,20 +740,21 @@ func (n *node) replaceEntry(idx int, ic *Interceptor) {
 // findInsertPosition orders the entries of a node from the most narrowly targeted to the
 // least, so a lookup takes the first one that accepts and never has to look further.
 //
-// The tiers run from what a request is addressed to toward how it is shaped: the port, which
-// is the last piece of the target that stays out of the key, then the method, then the
-// matchers, which are arbitrary predicates. Within the matcher tier, priority decides.
-func (n *node) findInsertPosition(ic *Interceptor) int {
+// The tiers run from what the traffic is addressed to toward how it is shaped: the port,
+// which is the last piece of the target that stays out of the key, then the kind, a refined
+// one carrying a precondition the kind it rides on does not, then the matchers, which are
+// arbitrary predicates. Within the matcher tier, priority decides.
+func (n *node) findInsertPosition(ic *entry) int {
 	hasPort := ic.pattern.port != ""
-	hasMethods := len(ic.methods) > 0
+	refined := ic.kind.refines()
 	hasMatchers := len(ic.matchers) > 0
 
 	for i, existing := range n.entries {
 		existingHasPort := existing.pattern.port != ""
-		existingHasMethods := len(existing.methods) > 0
+		existingRefined := existing.kind.refines()
 		existingHasMatchers := len(existing.matchers) > 0
 
-		// Interceptors naming a port before those accepting every one
+		// Entries naming a port before those accepting every one.
 		if hasPort && !existingHasPort {
 			return i
 		}
@@ -755,19 +762,18 @@ func (n *node) findInsertPosition(ic *Interceptor) int {
 			continue
 		}
 
-		// Interceptors with methods before those without
-		if hasMethods && !existingHasMethods {
+		// A refined kind before the kind it rides on.
+		if refined && !existingRefined {
 			return i
 		}
 
-		// Within same method tier...
-		if hasMethods == existingHasMethods {
-			// Interceptors with matchers before those without
+		if refined == existingRefined {
+			// Entries with matchers before those without.
 			if hasMatchers && !existingHasMatchers {
 				return i
 			}
 
-			// Within same matchers tier, higher priority first
+			// Within same matchers tier, higher priority first.
 			if hasMatchers && existingHasMatchers && ic.priority > existing.priority {
 				return i
 			}
@@ -1048,16 +1054,16 @@ func (n *node) isLeaf() bool {
 	return len(n.entries) > 0
 }
 
-// findAuthority returns the index of the authority entry on n that accepts the port of c.
-// An authority entry carries nothing else to select on: it has no method, and only an
-// interceptor carries matchers.
+// findAdmission returns the index of the entry on n that admits the traffic of kind admit on
+// the port of c. An admission entry selects on the port and the kind alone: it carries no
+// matcher, because nothing has been read off the connection yet to evaluate one against.
 //
-// It is also the only kind of entry that can sit on a hostname node, since an interceptor's
-// tokens always end in its path and it is never a leaf before the '/'. The path test is what
-// keeps that structural fact checked rather than assumed.
-func findAuthority(n *node, c *Context) (int, bool) {
-	for i, entry := range n.entries {
-		if entry.pattern.path == "" && entry.acceptsPort(c) {
+// It is also the only kind of entry that can sit on a hostname node, since a per-message
+// entry's tokens always end in its path and it is never a leaf before the '/'. The path test
+// is what keeps that structural fact checked rather than assumed.
+func findAdmission(n *node, c *routeCtx, admit Kind) (int, bool) {
+	for i, e := range n.entries {
+		if e.pattern.path == "" && e.kind == admit && e.acceptsPort(c) {
 			return i, true
 		}
 	}
@@ -1099,16 +1105,9 @@ func (n *node) string(space int) string {
 		sb.WriteString("=> ")
 		sb.WriteString(ic.pattern.str)
 
-		if len(ic.methods) > 0 {
-			sb.WriteString(" [methods: ")
-			for i, method := range ic.methods {
-				if i > 0 {
-					sb.WriteString(", ")
-				}
-				sb.WriteString(method)
-			}
-			sb.WriteByte(']')
-		}
+		sb.WriteString(" [kind: ")
+		sb.WriteString(ic.kind.String())
+		sb.WriteByte(']')
 
 		if len(ic.matchers) > 0 {
 			sb.WriteString(" [matchers: ")

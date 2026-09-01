@@ -1,0 +1,107 @@
+// Copyright 2025 Sylvain Müller. All rights reserved.
+// Mount of this source code is governed by a Apache-2.0 license that can be found
+// at https://github.com/fox-toolkit/edge/blob/master/LICENSE.txt.
+
+package edge
+
+// Admits reports whether the proxy admits a connection to target carrying the traffic of the
+// given kind. It is the same lookup the proxy runs when a connection arrives, exported so a
+// caller can reason about a configuration, or sweep the sessions a change no longer covers.
+//
+//	p.Delete[edge.HTTP]("api.test/*{any}")
+//	for s := range p.Sessions() {
+//		if !p.Admits(s.Target(), s.Kind()) {
+//			s.Close()
+//		}
+//	}
+//
+// The kind is what the traffic itself named, which is why a session reports it. An authority
+// admitted for one kind is not admitted for another: a QUIC entry does not admit HTTP/3, and an
+// HTTP entry does not admit a raw stream. A kind that refines another is admitted by what
+// carries it, so a WebSocket connection and a gRPC call both ask about HTTP.
+func (p *Proxy) Admits(target Target, kind Kind) bool {
+	return p.admission(target, kind) != nil
+}
+
+func (p *Proxy) admission(target Target, kind Kind) *entry {
+	tree := p.getTree()
+	c := tree.pool.Get().(*routeCtx)
+	defer tree.pool.Put(c)
+	return tree.admission(c, target, kind)
+}
+
+func (t *iTree) admission(c *routeCtx, target Target, kind Kind) *entry {
+	return resolveAdmission(t.patterns, t.addrs, t.handlers+t.admissions, c, target, kind)
+}
+
+// resolveAdmission walks the admission entries under the given roots and returns the one that
+// admits kind on target, or nil. A transaction and the published tree share the node
+// structure under different roots, so the roots are passed in rather than read off a receiver.
+func resolveAdmission(patterns, addrs *node, total int, c *routeCtx, target Target, kind Kind) *entry {
+	if total == 0 || kind == 0 {
+		return nil
+	}
+	// A refinement is admitted by what carries it: a WebSocket connection and a gRPC call are
+	// HTTP traffic, and the entry admitting the authority is the HTTP one they implied. The
+	// mapping lives here so no caller can reach the walk without it.
+	kind = kind.admittedAs()
+
+	scheme := target.Scheme
+	port := target.Port
+	if scheme == "" {
+		scheme = schemeForPort(port)
+	}
+	if port == "" {
+		port = defaultPort(scheme)
+	}
+	c.resetForAdmission(nil, scheme, target.Host, port)
+
+	idx, n := lookupTarget(patterns, addrs, target.Host, "", c, true, kind)
+	if n == nil {
+		return nil
+	}
+	return n.entries[idx]
+}
+
+// admitWith resolves the entry admitting kind on target and copies out the parameters its
+// pattern captured, which a handler serving a whole connection keeps for longer than the
+// pooled state of the lookup lives.
+func (p *Proxy) admitWith(target Target, kind Kind) (*entry, []Param) {
+	tree := p.getTree()
+	c := tree.pool.Get().(*routeCtx)
+	defer tree.pool.Put(c)
+
+	e := tree.admission(c, target, kind)
+	if e == nil {
+		return nil, nil
+	}
+	c.entry = e
+	return e, c.capturedParams()
+}
+
+// admitsAny reports whether any of the given kinds is admitted on target. It answers the
+// question a connection raises before it has said what it carries: an authority nothing admits
+// at all is refused there and then, rather than after a handshake that could never be served.
+func (p *Proxy) admitsAny(target Target, kinds ...Kind) bool {
+	tree := p.getTree()
+	c := tree.pool.Get().(*routeCtx)
+	defer tree.pool.Put(c)
+
+	for _, k := range kinds {
+		if tree.admission(c, target, k) != nil {
+			return true
+		}
+	}
+	return false
+}
+
+// admitsAny is [Proxy.admitsAny] on one tree snapshot and one borrowed context, for a caller
+// already holding both.
+func (t *iTree) admitsAny(c *routeCtx, target Target, kinds []Kind) bool {
+	for _, k := range kinds {
+		if t.admission(c, target, k) != nil {
+			return true
+		}
+	}
+	return false
+}

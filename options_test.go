@@ -41,7 +41,6 @@ func TestOptions_Rejected(t *testing.T) {
 		opt  ProxyOption
 	}{
 		{"nil CA", WithCA(nil)},
-		{"nil no interceptor handler", WithNoInterceptorHandler(nil)},
 		{"nil error handler", WithErrorHandler(nil)},
 		{"nil middleware", WithMiddleware(nil)},
 		{"nil transport", WithTransport(nil)},
@@ -50,7 +49,7 @@ func TestOptions_Rejected(t *testing.T) {
 		{"zero max param key bytes", WithMaxPatternParamKeyBytes(0)},
 		{"negative read header timeout", WithReadHeaderTimeout(-time.Second)},
 		{"negative idle timeout", WithIdleTimeout(-time.Second)},
-		{"negative tunnel idle timeout", WithTunnelIdleTimeout(-time.Second)},
+		{"negative sniff timeout", WithSniffTimeout(-time.Second)},
 		{"zero max header bytes", WithMaxHeaderBytes(0)},
 		{"unknown trailing slash", WithTrailingSlash(TrailingSlashOption(99))},
 	}
@@ -99,10 +98,10 @@ func TestOptions_LimitsAreEnforced(t *testing.T) {
 		p, err := New(WithCA(ca), WithMaxPatternParams(2))
 		require.NoError(t, err)
 
-		_, err = p.AddInterceptor([]string{http.MethodGet}, "api.test/{a}/{b}", noopHandler)
+		_, err = p.Add("api.test/{a}/{b}", noopHandler, WithMethods(http.MethodGet))
 		require.NoError(t, err)
 
-		_, err = p.AddInterceptor([]string{http.MethodGet}, "api.test/{a}/{b}/{c}", noopHandler)
+		_, err = p.Add("api.test/{a}/{b}/{c}", noopHandler, WithMethods(http.MethodGet))
 		var pe *PatternError
 		require.ErrorAs(t, err, &pe)
 		assert.Contains(t, pe.Error(), "too many parameters")
@@ -112,7 +111,7 @@ func TestOptions_LimitsAreEnforced(t *testing.T) {
 		p, err := New(WithCA(ca), WithMaxPatternParamKeyBytes(4))
 		require.NoError(t, err)
 
-		_, err = p.AddInterceptor([]string{http.MethodGet}, "api.test/{abcde}", noopHandler)
+		_, err = p.Add("api.test/{abcde}", noopHandler, WithMethods(http.MethodGet))
 		var pe *PatternError
 		require.ErrorAs(t, err, &pe)
 		assert.Contains(t, pe.Error(), "key too large")
@@ -125,8 +124,7 @@ func TestOptions_LimitsAreEnforced(t *testing.T) {
 		header, err := MatchHeader("X-Channel", "beta")
 		require.NoError(t, err)
 
-		_, err = p.AddInterceptor([]string{http.MethodGet}, "api.test/v1", noopHandler,
-			WithScheme("https"), WithMatcher(header))
+		_, err = p.Add("api.test/v1", noopHandler, WithScheme("https"), WithMatcher(header), WithMethods(http.MethodGet))
 		require.ErrorIs(t, err, ErrTooManyMatchers)
 	})
 
@@ -134,7 +132,7 @@ func TestOptions_LimitsAreEnforced(t *testing.T) {
 		p, err := New(WithCA(ca))
 		require.NoError(t, err)
 
-		_, err = p.AddInterceptor([]string{http.MethodGet}, "api.test/{id:[0-9]+}", noopHandler)
+		_, err = p.Add("api.test/{id:[0-9]+}", noopHandler, WithMethods(http.MethodGet))
 		var pe *PatternError
 		require.ErrorAs(t, err, &pe)
 		assert.Contains(t, pe.Error(), "feature not enabled")
@@ -143,16 +141,16 @@ func TestOptions_LimitsAreEnforced(t *testing.T) {
 
 func TestOptions_RegexpParam(t *testing.T) {
 	p := testProxy(t, WithRegexpParam(true))
-	p.MustAddInterceptor([]string{http.MethodGet}, "api.test/v1/{id:ch_[0-9]+}", noopHandler)
+	p.MustAdd("api.test/v1/{id:ch_[0-9]+}", noopHandler, WithMethods(http.MethodGet))
 
-	assert.NotNil(t, match(t, p, http.MethodGet, "https", "api.test:443", "/v1/ch_123"))
-	assert.Nil(t, match(t, p, http.MethodGet, "https", "api.test:443", "/v1/re_123"))
+	assert.NotZero(t, match(t, p, http.MethodGet, "https", "api.test:443", "/v1/ch_123"))
+	assert.Zero(t, match(t, p, http.MethodGet, "https", "api.test:443", "/v1/re_123"))
 }
 
 func TestPatternError_PointsAtTheOffendingSegment(t *testing.T) {
 	p := testProxy(t)
 
-	_, err := p.AddInterceptor([]string{http.MethodGet}, "api.test/v1/{}", noopHandler)
+	_, err := p.Add("api.test/v1/{}", noopHandler, WithMethods(http.MethodGet))
 	var pe *PatternError
 	require.ErrorAs(t, err, &pe)
 
@@ -175,7 +173,7 @@ func TestSession_Accessors(t *testing.T) {
 	remote := &net.TCPAddr{IP: net.ParseIP("192.0.2.10"), Port: 4242}
 	local := &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 8080}
 
-	sess := newSession(t.Context(), nil, Target{Scheme: "https", Host: "api.test", Port: "443"}, Intercept, HTTP2)
+	sess := newSession(t.Context(), nil, Target{Scheme: "https", Host: "api.test", Port: "443"}, KindHTTP, HTTP2)
 	sess.remoteAddr = remote
 	sess.localAddr = local
 
@@ -213,35 +211,35 @@ func TestTarget_String(t *testing.T) {
 	assert.False(t, Target{Scheme: "https", Host: "a.test", Port: "8443"}.IsDefaultPort())
 }
 
-func TestAction_String(t *testing.T) {
-	assert.Equal(t, "tunnel", Tunnel.String())
-	assert.Equal(t, "intercept", Intercept.String())
-	assert.Equal(t, "reject", Reject.String())
-	assert.Equal(t, "unknown", Action(0).String())
+func TestKind_String(t *testing.T) {
+	assert.Equal(t, "HTTP", KindHTTP.String())
+	assert.Equal(t, "gRPC", KindGRPC.String())
+	assert.Equal(t, "WebSocket", KindWebSocket.String())
+	assert.Equal(t, "TCP", KindTCP.String())
+	assert.Equal(t, "QUIC", KindQUIC.String())
+	assert.Equal(t, "UDP", KindUDP.String())
+	assert.Equal(t, "unknown", Kind(0).String())
 }
 
-// A scope naming no handler would register middleware that never fires. Fox validates this
-// and edge did not, so the value was accepted and the middleware silently dropped.
-func TestOptions_MiddlewareScopeMustWrapSomething(t *testing.T) {
+// Middleware names the kind it wraps by its own signature, so a value that is not a handler
+// wrapper at all has no kind to be registered under.
+func TestOptions_MiddlewareMustWrapAHandler(t *testing.T) {
 	ca, _ := GenerateCA()
-	noop := func(next HandlerFunc) HandlerFunc { return next }
 
-	for _, scope := range []HandlerScope{0, 1 << 6} {
-		_, err := New(WithCA(ca), WithMiddlewareFor(scope, noop))
-		require.ErrorIs(t, err, ErrInvalidConfig, "scope %d", scope)
-	}
+	_, err := New(WithCA(ca), WithMiddleware(func(int) int { return 0 }))
+	require.ErrorIs(t, err, ErrInvalidConfig)
 
-	_, err := New(WithCA(ca), WithMiddlewareFor(AllHandlers, noop))
+	_, err = New(WithCA(ca), WithMiddleware(func(next TCP) TCP { return next }))
 	require.NoError(t, err)
 }
 
 // One option, both placements: the same WithMiddleware works proxy-wide and on a single
-// interceptor, which is the shape Fox uses and edge had split in two.
+// entry.
 func TestOptions_MiddlewareIsComposable(t *testing.T) {
 	var seen []string
-	tag := func(name string) MiddlewareFunc {
-		return func(next HandlerFunc) HandlerFunc {
-			return func(c *Context) (*http.Response, error) {
+	tag := func(name string) Middleware[HTTP] {
+		return func(next HTTP) HTTP {
+			return func(c *HTTPCtx) (*http.Response, error) {
 				seen = append(seen, name)
 				return next(c)
 			}
@@ -249,14 +247,15 @@ func TestOptions_MiddlewareIsComposable(t *testing.T) {
 	}
 
 	p := testProxy(t, WithMiddleware(tag("proxy")))
-	ic := p.MustAddInterceptor(nil, "api.test/v1", func(c *Context) (*http.Response, error) {
+	ic := p.MustAdd("api.test/v1", func(c *HTTPCtx) (*http.Response, error) {
 		seen = append(seen, "handler")
 		return Status(http.StatusOK), nil
 	}, WithMiddleware(tag("interceptor")))
 
-	c := &Context{}
-	_, err := ic.hall(c)
+	served, _ := ic.e.serve.(HTTP)
+	require.NotNil(t, served)
+	_, err := served(nil)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"proxy", "interceptor", "handler"}, seen,
-		"the proxy-wide middleware wraps the interceptor's")
+		"the proxy-wide middleware wraps the entry's")
 }

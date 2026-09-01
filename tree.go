@@ -2,7 +2,6 @@ package edge
 
 import (
 	"fmt"
-	"maps"
 	"net/netip"
 	"regexp"
 	"slices"
@@ -10,52 +9,48 @@ import (
 	"sync"
 
 	"github.com/fox-toolkit/edge/internal/simplelru"
-	"github.com/fox-toolkit/edge/internal/slicesutil"
 )
 
 const defaultModifiedCache = 4096
 
 type iTree struct {
-	pool         sync.Pool
-	p            *Proxy
-	patterns     *node
-	addrs        *node
-	names        *node
-	methods      map[string]uint
-	interceptors int
-	authorities  int
-	maxParams    int
-	maxDepth     int
+	pool       sync.Pool
+	p          *Proxy
+	patterns   *node
+	addrs      *node
+	names      *node
+	handlers   int
+	admissions int
+	maxParams  int
+	maxDepth   int
 }
 
 func (t *iTree) txn() *tXn {
 	return &tXn{
-		tree:         t,
-		patterns:     t.patterns,
-		addrs:        t.addrs,
-		names:        t.names,
-		methods:      t.methods,
-		interceptors: t.interceptors,
-		authorities:  t.authorities,
-		maxParams:    t.maxParams,
-		maxDepth:     t.maxDepth,
+		tree:       t,
+		patterns:   t.patterns,
+		addrs:      t.addrs,
+		names:      t.names,
+		handlers:   t.handlers,
+		admissions: t.admissions,
+		maxParams:  t.maxParams,
+		maxDepth:   t.maxDepth,
 	}
 }
 
-func (t *iTree) lookup(method, host, path string, c *Context, lazy bool) (int, *node) {
-	return lookupTarget(t.patterns, t.addrs, method, host, path, c, lazy, false)
+func (t *iTree) lookup(host, path string, c *routeCtx, lazy bool) (int, *node) {
+	return lookupTarget(t.patterns, t.addrs, host, path, c, lazy, 0)
 }
 
-// lookupTarget is the single entry of both lookups, the request routing and the authority
+// lookupTarget is the single entry of both lookups, the request routing and the admission
 // decision. It canonicalizes the host and routes it to the root of its kind: an address
 // consults addrs, a name consults patterns, and neither ever falls back to the other. Both
-// entries share this so the two cannot canonicalize differently, which is an interception
+// entries share this so the two cannot canonicalize differently, which is a termination
 // bypass: a host normalized by one and not the other gets its TLS terminated on a decision
 // its requests then miss.
 //
-// With authority set the walks stop on the host and answer with an authority entry, and no
-// method is compared because an authority carries none.
-func lookupTarget(patterns, addrs *node, method, host, path string, c *Context, lazy, authority bool) (int, *node) {
+// With admit set the walks stop on the host and answer with the entry admitting that kind.
+func lookupTarget(patterns, addrs *node, host, path string, c *routeCtx, lazy bool, admit Kind) (int, *node) {
 	*c.skipStack = (*c.skipStack)[:0]
 	// The canonical form exists only inside the lookup, like the routing path of a request.
 	if len(host) > 0 && host[len(host)-1] == '.' {
@@ -65,26 +60,26 @@ func lookupTarget(patterns, addrs *node, method, host, path string, c *Context, 
 		if addr, ok := routingAddr(host); ok {
 			var buf [maxAddrKey]byte
 			key := appendPrefixKey(buf[:0], netip.PrefixFrom(addr, addr.BitLen()))
-			return lookupByAddr(addrs, method, key, path, c, lazy, authority)
+			return lookupByAddr(addrs, key, path, c, lazy, admit)
 		}
 	}
-	return lookupByHostname(patterns, method, host, path, c, lazy, authority)
+	return lookupByHostname(patterns, host, path, c, lazy, admit)
 }
 
-func (t *iTree) allocateContext() *Context {
-	return &Context{
+func (t *iTree) allocateContext() *routeCtx {
+	c := &routeCtx{
 		params:    new(make([]string, 0, t.maxParams)),
 		skipStack: new(make(skipStack, 0, t.maxDepth)),
-		// Read only, never reset: the context always belongs to this tree's pool.
-		tree: t,
 		// Read only, never reset.
 		p: t.p,
 	}
+	c.http.r = c
+	return c
 }
 
-// interceptor returns the interceptor registered for the exact combination of methods, pattern and
+// entryFor returns the entry registered for the exact combination of kind, pattern and
 // matchers, or nil.
-func (t *iTree) interceptor(methods []string, pattern string, matchers []Matcher) *Interceptor {
+func (t *iTree) entryFor(kind Kind, pattern string, matchers []Matcher) *entry {
 	key, isAddr := patternKey(pattern)
 	root := t.patterns
 	if isAddr {
@@ -95,9 +90,9 @@ func (t *iTree) interceptor(methods []string, pattern string, matchers []Matcher
 		return nil
 	}
 
-	idx := slices.IndexFunc(matched.entries, func(r *Interceptor) bool {
-		return r.pattern.path != "" && r.pattern.str == pattern &&
-			slicesutil.EqualUnsorted(r.methods, methods) && r.matchersEqual(matchers)
+	idx := slices.IndexFunc(matched.entries, func(r *entry) bool {
+		return r.handler != nil && r.kind == kind && r.pattern.str == pattern &&
+			r.matchersEqual(matchers)
 	})
 	if idx < 0 {
 		return nil
@@ -106,7 +101,7 @@ func (t *iTree) interceptor(methods []string, pattern string, matchers []Matcher
 }
 
 // byName returns the interceptor registered under name, or nil.
-func (t *iTree) byName(name string) *Interceptor {
+func (t *iTree) byName(name string) *entry {
 	matched := t.names.searchName(name)
 	if matched == nil || !matched.isLeaf() {
 		return nil
@@ -118,31 +113,28 @@ func (t *iTree) byName(name string) *Interceptor {
 }
 
 type tXn struct {
-	tree         *iTree
-	writable     *simplelru.LRU[*node, struct{}]
-	patterns     *node
-	addrs        *node
-	names        *node
-	methods      map[string]uint
-	interceptors int
-	authorities  int
-	maxParams    int
-	maxDepth     int
-	forked       bool
-	mode         insertMode
+	tree       *iTree
+	writable   *simplelru.LRU[*node, struct{}]
+	patterns   *node
+	addrs      *node
+	names      *node
+	handlers   int
+	admissions int
+	maxParams  int
+	maxDepth   int
+	mode       insertMode
 }
 
 func (t *tXn) commit() *iTree {
 	tc := &iTree{
-		patterns:     t.patterns,
-		addrs:        t.addrs,
-		names:        t.names,
-		methods:      t.methods,
-		p:            t.tree.p,
-		interceptors: t.interceptors,
-		authorities:  t.authorities,
-		maxParams:    t.maxParams,
-		maxDepth:     t.maxDepth,
+		patterns:   t.patterns,
+		addrs:      t.addrs,
+		names:      t.names,
+		p:          t.tree.p,
+		handlers:   t.handlers,
+		admissions: t.admissions,
+		maxParams:  t.maxParams,
+		maxDepth:   t.maxDepth,
 	}
 	tc.pool = sync.Pool{
 		New: func() any {
@@ -150,7 +142,6 @@ func (t *tXn) commit() *iTree {
 		},
 	}
 	t.writable = nil
-	t.forked = false
 	return tc
 }
 
@@ -159,31 +150,29 @@ func (t *tXn) commit() *iTree {
 // in different tree on commit.
 func (t *tXn) clone() *tXn {
 	t.writable = nil
-	t.forked = false
 	tx := &tXn{
-		tree:         t.tree,
-		patterns:     t.patterns,
-		addrs:        t.addrs,
-		names:        t.names,
-		methods:      t.methods,
-		interceptors: t.interceptors,
-		authorities:  t.authorities,
-		maxParams:    t.maxParams,
-		maxDepth:     t.maxDepth,
+		tree:       t.tree,
+		patterns:   t.patterns,
+		addrs:      t.addrs,
+		names:      t.names,
+		handlers:   t.handlers,
+		admissions: t.admissions,
+		maxParams:  t.maxParams,
+		maxDepth:   t.maxDepth,
 	}
 	return tx
 }
 
 // rootFor returns the root ic's pattern lives under. The insert, delete and search
 // machinery walks whatever root it is handed, so this is the whole of the dispatch.
-func (t *tXn) rootFor(ic *Interceptor) *node {
+func (t *tXn) rootFor(ic *entry) *node {
 	if ic.pattern.prefix.IsValid() {
 		return t.addrs
 	}
 	return t.patterns
 }
 
-func (t *tXn) setRootFor(ic *Interceptor, root *node) {
+func (t *tXn) setRootFor(ic *entry, root *node) {
 	if ic.pattern.prefix.IsValid() {
 		t.addrs = root
 		return
@@ -191,7 +180,7 @@ func (t *tXn) setRootFor(ic *Interceptor, root *node) {
 	t.patterns = root
 }
 
-func (t *tXn) insertName(ic *Interceptor, mode insertMode) error {
+func (t *tXn) insertName(ic *entry, mode insertMode) error {
 	newRoot, err := t.insertNameIn(t.names, ic.name, ic, mode)
 	if err != nil {
 		return err
@@ -202,18 +191,18 @@ func (t *tXn) insertName(ic *Interceptor, mode insertMode) error {
 	return nil
 }
 
-func (t *tXn) insertNameIn(n *node, search string, ic *Interceptor, mode insertMode) (*node, error) {
+func (t *tXn) insertNameIn(n *node, search string, ic *entry, mode insertMode) (*node, error) {
 	if len(search) == 0 {
 		if n.isLeaf() && mode != modeUpdate {
 			// Unlike the regular insert path, where we don't know whether an interceptor exists for the given name,
 			// update mode provides a stronger guarantee: the caller has already verified that old.name == new.name
 			// before invoking insert. This precondition eliminates the need to check for update errors in cases
 			// like node splitting, which the standard insert path must handle.
-			return nil, &InterceptorNameConflictError{New: ic, Conflict: n.entries[0]}
+			return nil, &EntryNameConflictError{New: ic, Conflict: n.entries[0]}
 		}
 
 		nc := t.writeNode(n)
-		nc.entries = []*Interceptor{ic}
+		nc.entries = []*entry{ic}
 		return nc, nil
 	}
 
@@ -222,7 +211,7 @@ func (t *tXn) insertNameIn(n *node, search string, ic *Interceptor, mode insertM
 		newChild := &node{
 			label:   search[0],
 			key:     search,
-			entries: []*Interceptor{ic},
+			entries: []*entry{ic},
 		}
 
 		nc := t.writeNode(n)
@@ -256,19 +245,19 @@ func (t *tXn) insertNameIn(n *node, search string, ic *Interceptor, mode insertM
 
 	search = search[commonPrefix:]
 	if len(search) == 0 {
-		splitNode.entries = []*Interceptor{ic}
+		splitNode.entries = []*entry{ic}
 		return nc, nil
 	}
 
 	splitNode.addStaticEdge(&node{
 		label:   search[0],
 		key:     search,
-		entries: []*Interceptor{ic},
+		entries: []*entry{ic},
 	})
 	return nc, nil
 }
 
-func (t *tXn) deleteName(ic *Interceptor) bool {
+func (t *tXn) deleteName(ic *entry) bool {
 	newRoot := t.deleteNameIn(t.names, t.names, ic.name)
 	if newRoot != nil {
 		t.names = newRoot
@@ -323,7 +312,7 @@ func (t *tXn) deleteNameIn(root, n *node, search string) *node {
 }
 
 // insert performs a recursive copy-on-write insertion.
-func (t *tXn) insert(ic *Interceptor, mode insertMode) error {
+func (t *tXn) insert(ic *entry, mode insertMode) error {
 	t.mode = mode
 
 	newRoot, err := t.insertTokens(nil, t.rootFor(ic), ic.pattern.tokens, ic)
@@ -335,40 +324,30 @@ func (t *tXn) insert(ic *Interceptor, mode insertMode) error {
 		t.maxDepth = max(t.maxDepth, t.computePathDepth(newRoot, ic.pattern.tokens))
 		t.maxParams = max(t.maxParams, len(ic.params))
 		if t.mode == modeInsert {
-			if ic.pattern.path == "" {
-				t.authorities++
+			if ic.handler == nil {
+				t.admissions++
 			} else {
-				t.interceptors++
-			}
-			if len(ic.methods) > 0 {
-				if !t.forked {
-					t.methods = maps.Clone(t.methods)
-					t.forked = true
-				}
-
-				for _, method := range ic.methods {
-					t.methods[method]++
-				}
+				t.handlers++
 			}
 		}
 	}
 	return nil
 }
 
-func (t *tXn) insertTokens(p, n *node, tokens []token, ic *Interceptor) (*node, error) {
+func (t *tXn) insertTokens(p, n *node, tokens []token, ic *entry) (*node, error) {
 	// Base case: no tokens left, attach the interceptor
 	if len(tokens) == 0 {
 		switch t.mode {
 		case modeInsert:
 			if n.isLeaf() {
-				var conflicts []*Interceptor
+				var conflicts []*entry
 				for _, r := range n.entries {
-					if r.samePort(ic) && r.matchersEqual(ic.matchers) && slicesutil.Overlap(r.methods, ic.methods) {
+					if r.kind == ic.kind && r.samePort(ic) && r.matchersEqual(ic.matchers) {
 						conflicts = append(conflicts, r)
 					}
 				}
 				if len(conflicts) > 0 {
-					return nil, &InterceptorConflictError{New: ic, Conflicts: conflicts}
+					return nil, &EntryConflictError{New: ic, Conflicts: conflicts}
 				}
 			}
 
@@ -380,33 +359,33 @@ func (t *tXn) insertTokens(p, n *node, tokens []token, ic *Interceptor) (*node, 
 			//   1. /foo/ then /foo/*{any}: check parent for existing exact match
 			//   2. /foo/*{any} then /foo/: check child wildcards with catchEmpty flag
 			//
-			// Conflicts are method-aware: GET /foo/ and POST /foo/*{any} don't conflict since they route to different method sets.
-			// A method-less exact interceptor matches every method, so it conflicts with a catch-all regardless of its methods.
+			// Conflicts are kind-aware: an HTTP entry and a gRPC entry on one pattern never shadow one
+			// another, the request itself telling them apart.
 			// Conflicts are matcher-aware: /foo/?x=y and /foo/*{any}?a=b don't conflict because the exact path's matcher
 			// creates a gap, such as request with ?a=b (but not ?x=y) fail the exact match and fall through to the catch-empty.
 			// Since pattern matching precedes matcher evaluation, a conflict occurs when the exact path has no matchers (shadows all requests
 			// to that pattern) or matchers equal to the catch-empty's (both match the same request).
-			var conflicts []*Interceptor
+			var conflicts []*entry
 			if ic.pattern.optionalCatchAll && p != nil {
 				for _, r := range p.entries {
-					if r.samePort(ic) && (len(r.matchers) == 0 || r.matchersEqual(ic.matchers)) && (len(r.methods) == 0 || slicesutil.Overlap(r.methods, ic.methods)) {
+					if r.kind == ic.kind && r.samePort(ic) && (len(r.matchers) == 0 || r.matchersEqual(ic.matchers)) {
 						conflicts = append(conflicts, r)
 					}
 				}
 			}
 			if len(conflicts) > 0 {
-				return nil, &InterceptorConflictError{New: ic, Conflicts: conflicts, isShadowed: true}
+				return nil, &EntryConflictError{New: ic, Conflicts: conflicts, isShadowed: true}
 			}
 
 			for _, wildcard := range n.wildcards {
 				for _, r := range wildcard.entries {
-					if r.pattern.optionalCatchAll && r.samePort(ic) && (len(ic.matchers) == 0 || ic.matchersEqual(r.matchers)) && (len(ic.methods) == 0 || slicesutil.Overlap(ic.methods, r.methods)) {
+					if r.pattern.optionalCatchAll && r.kind == ic.kind && r.samePort(ic) && (len(ic.matchers) == 0 || ic.matchersEqual(r.matchers)) {
 						conflicts = append(conflicts, r)
 					}
 				}
 			}
 			if len(conflicts) > 0 {
-				return nil, &InterceptorConflictError{New: ic, Conflicts: conflicts, isShadowed: true}
+				return nil, &EntryConflictError{New: ic, Conflicts: conflicts, isShadowed: true}
 			}
 
 			if ic.name != "" {
@@ -419,11 +398,11 @@ func (t *tXn) insertTokens(p, n *node, tokens []token, ic *Interceptor) (*node, 
 			nc.addEntry(ic)
 			return nc, nil
 		case modeUpdate:
-			idx := slices.IndexFunc(n.entries, func(r *Interceptor) bool {
-				return r.pattern.str == ic.pattern.str && slices.Equal(r.methods, ic.methods) && r.matchersEqual(ic.matchers)
+			idx := slices.IndexFunc(n.entries, func(r *entry) bool {
+				return r.kind == ic.kind && r.pattern.str == ic.pattern.str && r.matchersEqual(ic.matchers)
 			})
 			if idx == -1 {
-				return nil, newInterceptorNotFoundError(ic)
+				return nil, newEntryNotFoundError(ic)
 			}
 
 			oldIC := n.entries[idx]
@@ -490,7 +469,7 @@ func (t *tXn) insertTokens(p, n *node, tokens []token, ic *Interceptor) (*node, 
 	}
 }
 
-func (t *tXn) insertStatic(p, n *node, tk token, remaining []token, ic *Interceptor) (*node, error) {
+func (t *tXn) insertStatic(p, n *node, tk token, remaining []token, ic *entry) (*node, error) {
 	search := tk.value
 
 	if len(search) == 0 {
@@ -500,7 +479,7 @@ func (t *tXn) insertStatic(p, n *node, tk token, remaining []token, ic *Intercep
 	idx, child := n.getStaticEdge(search[0])
 	if child == nil {
 		if t.mode == modeUpdate {
-			return nil, newInterceptorNotFoundError(ic)
+			return nil, newEntryNotFoundError(ic)
 		}
 
 		newChild, err := t.insertTokens(
@@ -536,7 +515,7 @@ func (t *tXn) insertStatic(p, n *node, tk token, remaining []token, ic *Intercep
 	}
 
 	if t.mode == modeUpdate {
-		return nil, newInterceptorNotFoundError(ic)
+		return nil, newEntryNotFoundError(ic)
 	}
 
 	// All following case require creating a split node.
@@ -581,7 +560,7 @@ func (t *tXn) insertStatic(p, n *node, tk token, remaining []token, ic *Intercep
 		modChild.label = modChild.key[commonPrefix]
 		modChild.key = modChild.key[commonPrefix:]
 		splitNode.addStaticEdge(modChild)
-		splitNode.entries = []*Interceptor{ic}
+		splitNode.entries = []*entry{ic}
 		return nc, nil
 	}
 
@@ -612,12 +591,12 @@ func (t *tXn) insertStatic(p, n *node, tk token, remaining []token, ic *Intercep
 	return nc, nil
 }
 
-func (t *tXn) insertParam(n *node, tk token, remaining []token, ic *Interceptor) (*node, error) {
+func (t *tXn) insertParam(n *node, tk token, remaining []token, ic *entry) (*node, error) {
 	key := canonicalKey(tk)
 	idx, child := n.getParamEdge(key)
 	if child == nil {
 		if t.mode == modeUpdate {
-			return nil, newInterceptorNotFoundError(ic)
+			return nil, newEntryNotFoundError(ic)
 		}
 
 		newChild, err := t.insertTokens(
@@ -648,12 +627,12 @@ func (t *tXn) insertParam(n *node, tk token, remaining []token, ic *Interceptor)
 	return nc, nil
 }
 
-func (t *tXn) insertWildcard(n *node, tk token, remaining []token, ic *Interceptor) (*node, error) {
+func (t *tXn) insertWildcard(n *node, tk token, remaining []token, ic *entry) (*node, error) {
 	key := canonicalKey(tk)
 	idx, child := n.getWildcardEdge(key)
 	if child == nil {
 		if t.mode == modeUpdate {
-			return nil, newInterceptorNotFoundError(ic)
+			return nil, newEntryNotFoundError(ic)
 		}
 
 		newChild, err := t.insertTokens(
@@ -682,44 +661,34 @@ func (t *tXn) insertWildcard(n *node, tk token, remaining []token, ic *Intercept
 	return nc, nil
 }
 
-// delete performs a recursive copy-on-write deletion.
-// searchAuthority returns the entry registered for the same authority pattern as ic,
-// whatever its action, or nil. An authority carries no method, so it identifies at most one.
-func (t *tXn) searchAuthority(ic *Interceptor) *Interceptor {
+// searchAdmission returns the entry admitting the same authority and kind as ic, declared or
+// implied, or nil. An admission carries no matcher, so a pattern and a kind identify at most
+// one.
+func (t *tXn) searchAdmission(ic *entry) *entry {
 	matched := t.rootFor(ic).searchPattern(ic.pattern.key)
 	if matched == nil || !matched.isLeaf() {
 		return nil
 	}
 	for _, r := range matched.entries {
-		if r.pattern.str == ic.pattern.str && r.matchersEqual(ic.matchers) {
+		if r.kind == ic.kind && r.admits() && r.pattern.str == ic.pattern.str {
 			return r
 		}
 	}
 	return nil
 }
 
-func (t *tXn) delete(ic *Interceptor) (*Interceptor, bool) {
+func (t *tXn) delete(ic *entry) (*entry, bool) {
 	root := t.rootFor(ic)
 	newRoot, oldIC := t.deleteTokens(root, root, ic.pattern.tokens, ic)
 	if newRoot != nil {
 		t.setRootFor(ic, newRoot)
-		if !t.forked && len(ic.methods) > 0 {
-			t.methods = maps.Clone(t.methods)
-			t.forked = true
-		}
 	}
 
 	if oldIC != nil {
-		if ic.pattern.path == "" {
-			t.authorities--
+		if oldIC.handler == nil {
+			t.admissions--
 		} else {
-			t.interceptors--
-		}
-		for _, method := range ic.methods {
-			t.methods[method]--
-			if n, ok := t.methods[method]; ok && n == 0 {
-				delete(t.methods, method)
-			}
+			t.handlers--
 		}
 		return oldIC, true
 	}
@@ -727,14 +696,14 @@ func (t *tXn) delete(ic *Interceptor) (*Interceptor, bool) {
 	return nil, false
 }
 
-func (t *tXn) deleteTokens(root, n *node, tokens []token, ic *Interceptor) (*node, *Interceptor) {
+func (t *tXn) deleteTokens(root, n *node, tokens []token, ic *entry) (*node, *entry) {
 	if len(tokens) == 0 {
 		if !n.isLeaf() {
 			return nil, nil
 		}
 
-		idx := slices.IndexFunc(n.entries, func(r *Interceptor) bool {
-			return r.pattern.str == ic.pattern.str && slices.Equal(r.methods, ic.methods) && r.matchersEqual(ic.matchers)
+		idx := slices.IndexFunc(n.entries, func(r *entry) bool {
+			return r.kind == ic.kind && r.pattern.str == ic.pattern.str && r.matchersEqual(ic.matchers)
 		})
 		if idx == -1 {
 			return nil, nil
@@ -744,7 +713,7 @@ func (t *tXn) deleteTokens(root, n *node, tokens []token, ic *Interceptor) (*nod
 		nc := t.writeNode(n)
 		nc.delIC(idx)
 		if oldIC.name != "" {
-			t.deleteName(oldIC) // The root key always hold the http method.
+			t.deleteName(oldIC)
 		}
 
 		if n != root &&
@@ -773,7 +742,7 @@ func (t *tXn) deleteTokens(root, n *node, tokens []token, ic *Interceptor) (*nod
 	}
 }
 
-func (t *tXn) deleteStatic(root, n *node, search string, remaining []token, ic *Interceptor) (*node, *Interceptor) {
+func (t *tXn) deleteStatic(root, n *node, search string, remaining []token, ic *entry) (*node, *entry) {
 	if len(search) == 0 {
 		return t.deleteTokens(root, n, remaining, ic)
 	}
@@ -819,7 +788,7 @@ func (t *tXn) deleteStatic(root, n *node, search string, remaining []token, ic *
 	return nc, deletedIC
 }
 
-func (t *tXn) deleteParam(root, n *node, key string, remaining []token, ic *Interceptor) (*node, *Interceptor) {
+func (t *tXn) deleteParam(root, n *node, key string, remaining []token, ic *entry) (*node, *entry) {
 	idx, child := n.getParamEdge(key)
 	if child == nil {
 		return nil, nil
@@ -855,7 +824,7 @@ func (t *tXn) deleteParam(root, n *node, key string, remaining []token, ic *Inte
 	return nc, deletedIC
 }
 
-func (t *tXn) deleteWildcard(root, n *node, key string, remaining []token, ic *Interceptor) (*node, *Interceptor) {
+func (t *tXn) deleteWildcard(root, n *node, key string, remaining []token, ic *entry) (*node, *entry) {
 	idx, child := n.getWildcardEdge(key)
 	if child == nil {
 		return nil, nil
@@ -894,13 +863,11 @@ func (t *tXn) truncate() {
 	t.patterns = new(node)
 	t.addrs = new(node)
 	t.names = new(node)
-	t.methods = make(map[string]uint)
 	t.maxDepth = 0
 	t.maxParams = 0
-	t.interceptors = 0
-	t.authorities = 0
+	t.handlers = 0
+	t.admissions = 0
 	t.writable = nil
-	t.forked = true
 }
 
 func (t *tXn) computePathDepth(root *node, tokens []token) int {
@@ -962,7 +929,7 @@ func (t *tXn) writeNode(n *node) *node {
 	}
 
 	if len(n.entries) != 0 {
-		nc.entries = make([]*Interceptor, len(n.entries))
+		nc.entries = make([]*entry, len(n.entries))
 		copy(nc.entries, n.entries)
 	}
 	if len(n.statics) != 0 {
@@ -1000,7 +967,7 @@ func (t *tXn) mergeChild(n *node) {
 	n.key = concat(n.key, child.key)
 
 	if len(child.entries) != 0 {
-		n.entries = make([]*Interceptor, len(child.entries))
+		n.entries = make([]*entry, len(child.entries))
 		copy(n.entries, child.entries)
 	}
 

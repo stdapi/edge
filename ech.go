@@ -6,7 +6,6 @@ package edge
 
 import (
 	"fmt"
-	"net"
 )
 
 // extensionECH is the encrypted_client_hello extension type. A real offer and the GREASE
@@ -156,29 +155,4 @@ func inspectECH(pc *peekConn) error {
 		return errECHUnverifiable
 	}
 	return checkECH(raw)
-}
-
-// echGate wraps a tunneled connection whose first client bytes have not been seen yet.
-// The inspection waits for the first read so a tunnel toward a server that speaks first is
-// not stalled waiting for client bytes.
-type echGate struct {
-	*peekConn
-	checked bool
-}
-
-func newECHGate(c net.Conn) *echGate {
-	return &echGate{peekConn: newPeekConnSize(c, clientHelloPeekSize)}
-}
-
-// Read is only called by the client to upstream copy of a tunnel, so the checked flag
-// needs no lock.
-func (g *echGate) Read(b []byte) (int, error) {
-	if !g.checked {
-		g.checked = true
-		if err := inspectECH(g.peekConn); err != nil {
-			_ = g.Close()
-			return 0, err
-		}
-	}
-	return g.peekConn.Read(b)
 }

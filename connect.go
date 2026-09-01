@@ -8,18 +8,21 @@ import (
 	"bufio"
 	"cmp"
 	"context"
-	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"strconv"
-	"time"
 
 	"github.com/fox-toolkit/edge/internal/stringsutil"
 )
 
 // serveConnect handles a CONNECT request. The authority decides whether the connection is
-// relayed byte for byte, terminated so its requests can be routed, or refused.
+// terminated so its traffic can be routed, or refused.
+//
+// Nothing has been negotiated at this point, so the admission here only asks whether the
+// authority is known at all. Which kind the connection carries is decided once the traffic
+// says so, past the handshake, and an authority that admits no kind the connection turns
+// out to speak is refused there instead.
 func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request, identity string) {
 	target, ok := targetFromConnect(r)
 	if !ok {
@@ -27,21 +30,20 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request, identity st
 		return
 	}
 
-	action := p.ActionFor(target)
-	if action == Reject {
-		http.Error(w, "edge: connection rejected, no interceptor or tunnel matches this authority", http.StatusForbidden)
+	if !p.admitsAny(target, KindHTTP, KindTCP) {
+		http.Error(w, "edge: connection rejected, no entry admits this authority", http.StatusForbidden)
 		return
 	}
 
 	if r.ProtoMajor >= 2 {
-		p.connectStream(w, r, target, action, identity)
+		p.connectStream(w, r, target, identity)
 		return
 	}
-	p.connectHijack(w, r, target, action, identity)
+	p.connectHijack(w, r, target, identity)
 }
 
 // connectHijack takes over an HTTP/1.1 connection after CONNECT.
-func (p *Proxy) connectHijack(w http.ResponseWriter, r *http.Request, target Target, action Action, identity string) {
+func (p *Proxy) connectHijack(w http.ResponseWriter, r *http.Request, target Target, identity string) {
 	rc := http.NewResponseController(w)
 	client, brw, err := rc.Hijack()
 	if err != nil {
@@ -49,11 +51,32 @@ func (p *Proxy) connectHijack(w http.ResponseWriter, r *http.Request, target Tar
 		return
 	}
 
-	// Anything the reader buffered past the CONNECT request is already tunnel payload: a
-	// client that writes its ClientHello without waiting for the 200 would otherwise lose it.
+	// Anything the reader buffered past the CONNECT request is already payload: a client that
+	// writes its ClientHello without waiting for the 200 would otherwise lose it.
 	conn := newPeekConn(client, brw.Reader)
 
-	sess := newSession(r.Context(), client, target, action, HTTP11)
+	// The connection outlives the request that opened it, so what bounds it is the connection,
+	// not the request. ConnContext built exactly that context and handed it to the session, and
+	// it ends when the connection closes. The request context is one cancel deeper and ends
+	// with the request, which for a hijacked connection is at the hijack: borrowing it would
+	// cut a handshake or a dial the moment net/http considered the CONNECT over.
+	base := context.WithoutCancel(r.Context())
+	if s := sessionFromRequest(r); s != nil {
+		base = s.Context()
+	}
+	ctx, cancel := context.WithCancel(base)
+	defer cancel()
+	// Mounted in a server of its own the proxy has no ConnContext, and the fallback above
+	// carries no cancellation, so a shutdown is watched for explicitly.
+	go func() {
+		select {
+		case <-p.srv.closed:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+
+	sess := newSession(ctx, client, target, 0, 0)
 	sess.identity = identity
 	if s := sessionFromRequest(r); s != nil {
 		sess.remoteAddr = s.remoteAddr
@@ -70,48 +93,8 @@ func (p *Proxy) connectHijack(w http.ResponseWriter, r *http.Request, target Tar
 		p.srv.untrack(conn)
 	}()
 
-	if action == Tunnel {
-		sess.closer = conn
-		if !p.srv.admitSession(sess) {
-			_ = writeRawStatus(brw, http.StatusForbidden,
-				"connection rejected, no interceptor or tunnel matches this authority")
-			return
-		}
-		defer p.srv.trackSession(sess, false)
-
-		upstream, derr := p.dialUpstream(r.Context(), target)
-		if derr != nil {
-			_ = writeRawStatus(brw, http.StatusBadGateway, derr.Error())
-			p.logf(r.Context(), slog.LevelWarn, "tunnel dial failed", sess, derr)
-			return
-		}
-
-		// The far side is tracked too: past the deadline a shutdown ends the upstream read
-		// that closing the client side alone would leave parked until the idle timeout.
-		if !p.srv.tryTrack(upstream) {
-			_ = upstream.Close()
-			return
-		}
-		defer func() {
-			_ = upstream.Close()
-			p.srv.untrack(upstream)
-		}()
-
-		if werr := writeRawStatus(brw, http.StatusOK, ""); werr != nil {
-			return
-		}
-		client := net.Conn(conn)
-		if p.cfg.rejectECH {
-			client = newECHGate(conn)
-		}
-		if _, _, terr := tunnel(client, upstream, p.cfg.server.tunnelIdleTimeout); terr != nil {
-			p.logf(r.Context(), slog.LevelDebug, "tunnel closed", sess, terr)
-		}
-		return
-	}
-
-	// Interception answers before reaching the upstream: a handler may serve the whole
-	// exchange locally, and the client needs the tunnel open to send its ClientHello.
+	// Termination answers before reaching the upstream: a handler may serve the whole
+	// exchange locally, and the client needs the connection open to send its ClientHello.
 	if werr := writeRawStatus(brw, http.StatusOK, ""); werr != nil {
 		return
 	}
@@ -120,18 +103,18 @@ func (p *Proxy) connectHijack(w http.ResponseWriter, r *http.Request, target Tar
 		// The reader behind conn is sized for requests, not for a full ClientHello.
 		pc = newPeekConnSize(conn, clientHelloPeekSize)
 		if err := inspectECH(pc); err != nil {
-			p.logf(r.Context(), slog.LevelDebug, "intercepted connection closed", sess, err)
+			p.logf(ctx, slog.LevelDebug, "connection closed", sess, err)
 			return
 		}
 	}
-	if ierr := p.intercept(r.Context(), pc, sess); ierr != nil {
-		p.logf(r.Context(), slog.LevelDebug, "intercepted connection closed", sess, ierr)
+	if ierr := p.terminate(ctx, pc, sess); ierr != nil {
+		p.logf(ctx, slog.LevelDebug, "connection closed", sess, ierr)
 	}
 }
 
 // connectStream handles a CONNECT carried on an HTTP/2 or HTTP/3 stream, where the stream
-// itself is the tunnel rather than the whole connection.
-func (p *Proxy) connectStream(w http.ResponseWriter, r *http.Request, target Target, action Action, identity string) {
+// itself is the connection rather than the whole transport.
+func (p *Proxy) connectStream(w http.ResponseWriter, r *http.Request, target Target, identity string) {
 	front := sessionFromRequest(r)
 	var local, remote net.Addr
 	if front != nil {
@@ -139,12 +122,12 @@ func (p *Proxy) connectStream(w http.ResponseWriter, r *http.Request, target Tar
 	}
 
 	stream := newH2Stream(w, r, local, remote)
-	sess := newSession(r.Context(), nil, target, action, protoOfRequest(r))
+	sess := newSession(r.Context(), nil, target, 0, 0)
 	sess.localAddr, sess.remoteAddr = local, remote
 	sess.identity = identity
 
-	// A refused registration means the proxy is stopping. Returning would let net/http
-	// answer 200 for a tunnel that is already gone, so the stream is reset instead.
+	// A refused registration means the proxy is stopping. Returning would let net/http answer
+	// 200 for a connection that is already gone, so the stream is reset instead.
 	if !p.srv.tryTrack(stream) {
 		panic(http.ErrAbortHandler)
 	}
@@ -153,47 +136,6 @@ func (p *Proxy) connectStream(w http.ResponseWriter, r *http.Request, target Tar
 		p.srv.untrack(stream)
 	}()
 
-	if action == Tunnel {
-		// Nothing has been written to the stream yet, so a refusal here is an ordinary status
-		// rather than a tunnel granted and then torn down.
-		sess.closer = stream
-		if !p.srv.admitSession(sess) {
-			http.Error(w, "edge: connection rejected, no interceptor or tunnel matches this authority",
-				http.StatusForbidden)
-			return
-		}
-		defer p.srv.trackSession(sess, false)
-
-		upstream, err := p.dialUpstream(r.Context(), target)
-		if err != nil {
-			http.Error(w, "edge: "+err.Error(), http.StatusBadGateway)
-			return
-		}
-
-		// See connectHijack: without this, closing the client side at the deadline can leave
-		// the upstream read parked until the idle timeout.
-		if !p.srv.tryTrack(upstream) {
-			_ = upstream.Close()
-			panic(http.ErrAbortHandler)
-		}
-		defer func() {
-			_ = upstream.Close()
-			p.srv.untrack(upstream)
-		}()
-
-		w.WriteHeader(http.StatusOK)
-		_ = http.NewResponseController(w).Flush()
-
-		client := net.Conn(stream)
-		if p.cfg.rejectECH {
-			client = newECHGate(stream)
-		}
-		if _, _, terr := tunnel(client, upstream, p.cfg.server.tunnelIdleTimeout); terr != nil {
-			p.logf(r.Context(), slog.LevelDebug, "tunnel closed", sess, terr)
-		}
-		return
-	}
-
 	w.WriteHeader(http.StatusOK)
 	_ = http.NewResponseController(w).Flush()
 
@@ -201,30 +143,17 @@ func (p *Proxy) connectStream(w http.ResponseWriter, r *http.Request, target Tar
 	if p.cfg.rejectECH {
 		pc = newPeekConnSize(stream, clientHelloPeekSize)
 		if err := inspectECH(pc); err != nil {
-			p.logf(r.Context(), slog.LevelDebug, "intercepted stream closed", sess, err)
+			p.logf(r.Context(), slog.LevelDebug, "stream closed", sess, err)
 			return
 		}
 	}
-	if err := p.intercept(r.Context(), pc, sess); err != nil {
-		p.logf(r.Context(), slog.LevelDebug, "intercepted stream closed", sess, err)
+	if err := p.terminate(r.Context(), pc, sess); err != nil {
+		p.logf(r.Context(), slog.LevelDebug, "stream closed", sess, err)
 	}
-}
-
-// dialUpstream opens a TCP connection to target using the configured dialer.
-func (p *Proxy) dialUpstream(ctx context.Context, target Target) (net.Conn, error) {
-	dial := p.cfg.transport.DialContext
-	if dial == nil {
-		dial = (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext
-	}
-	conn, err := dial(ctx, "tcp", target.Authority())
-	if err != nil {
-		return nil, fmt.Errorf("dial %s: %w", target.Authority(), err)
-	}
-	return conn, nil
 }
 
 // targetFromConnect reads the authority out of a CONNECT request. A CONNECT target must
-// carry a port, but a client that omits it clearly means the default for a tunnel.
+// carry a port, but a client that omits it clearly means the default for a secure connection.
 func targetFromConnect(r *http.Request) (Target, bool) {
 	authority := r.Host
 	if r.URL != nil && r.URL.Host != "" {
@@ -292,7 +221,7 @@ func (p *Proxy) logf(ctx context.Context, level slog.Level, msg string, sess *Se
 	}
 	attrs = append(attrs,
 		slog.Uint64("session", sess.id),
-		slog.String("action", sess.action.String()),
+		slog.String("kind", sess.kind.String()),
 	)
 	if err != nil {
 		attrs = append(attrs, slog.String("error", err.Error()))

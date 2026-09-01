@@ -9,87 +9,119 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"runtime"
 	"strconv"
 	"strings"
 )
 
-// dispatchRequest serves one request under the action registered for the authority it names,
-// which is not always the authority the connection was opened for.
+// dispatchRequest routes one request and runs whatever serves it. The lookup runs on the tree
+// as it stands now, so an entry added or removed while the connection was open governs this
+// request rather than the next connection.
 func (p *Proxy) dispatchRequest(w http.ResponseWriter, r *http.Request, sess *Session, target Target, identity string) {
 	tree := p.getTree()
-	c := tree.pool.Get().(*Context)
+	c := tree.pool.Get().(*routeCtx)
 	defer tree.pool.Put(c)
 
-	switch tree.actionFor(c, target) {
-	case Reject:
-		http.Error(w, "edge: connection rejected, no interceptor or tunnel matches this authority", http.StatusForbidden)
-	case Tunnel:
-		p.relay(c, w, r, sess, target, identity)
-	default:
-		p.serve(c, w, r, sess, target, identity)
+	if isExtendedConnect(r) {
+		// RFC 8441 turns a stream into something that is no longer HTTP, the way a 101 does,
+		// but there is no hijack on an HTTP/2 stream and no translation written for it. The
+		// proxy says so rather than failing the exchange somewhere further in.
+		http.Error(w, "edge: extended CONNECT is not served, WebSocket goes over HTTP/1.1",
+			http.StatusNotImplemented)
+		return
 	}
-}
 
-// serve routes one intercepted request on c.tree, runs its handler and writes the result back
-// to the client.
-func (p *Proxy) serve(c *Context, w http.ResponseWriter, r *http.Request, sess *Session, target Target, identity string) {
 	c.reset(sess, r, target.Scheme, target.Host, target.Port)
 	c.identity = identity
 
-	handler := p.noInterceptor
-	if r.Method != "" {
-		if idx, n := c.tree.lookup(r.Method, target.Host, routingPath(r), c, false); n != nil {
-			c.interceptor = n.entries[idx]
-			handler = c.interceptor.hall
-		}
-	}
-	if c.interceptor == nil {
+	idx, n := tree.lookup(target.Host, routingPath(r), c, false)
+	if n == nil {
 		// A lookup that failed may have left captures behind from a branch it backtracked
-		// out of, and no interceptor means no names to read them under.
+		// out of, and no entry means no names to read them under.
 		*c.params = (*c.params)[:0]
-		c.scope = NoInterceptorHandler
+		http.Error(w, "edge: no entry matches this request", http.StatusForbidden)
+		return
+	}
+	c.entry = n.entries[idx]
+
+	switch c.entry.kind {
+	case KindGRPC:
+		p.serveGRPC(c, w, r, sess)
+	case KindWebSocket:
+		p.serveWebSocketUpgrade(c, w, r, sess)
+	default:
+		p.serveHTTPEntry(c, w, r, sess)
+	}
+}
+
+// serveHTTPEntry runs an [HTTP] handler and writes what it returns back to the client.
+func (p *Proxy) serveHTTPEntry(c *routeCtx, w http.ResponseWriter, r *http.Request, sess *Session) {
+	handler, _ := c.entry.serve.(HTTP)
+	if handler == nil {
+		http.Error(w, "edge: entry has no HTTP handler", http.StatusInternalServerError)
+		return
 	}
 
-	resp, err := p.runHandler(c, handler)
+	resp, err := runHTTPHandler(&c.http, handler)
 	if err != nil {
-		resp = p.onError(c, err)
-		if resp == nil {
-			resp = Status(http.StatusBadGateway)
-		}
+		resp = p.onError(&c.http, err)
 	}
 	if resp == nil {
 		resp = Status(http.StatusBadGateway)
 	}
 
-	if werr := writeResponse(c, w, r, resp, Intercept); werr != nil {
+	if resp.StatusCode == http.StatusSwitchingProtocols {
+		// Past the 101 the connection is no longer HTTP, so the entry that served the
+		// handshake cannot serve what follows. What follows is a byte stream in the clear,
+		// which is what a stream entry is for; without one nothing would ever see it, and a
+		// relay nothing sees is the one thing this proxy does not do.
+		if err := p.serveUpgradedStream(c, w, r, resp, sess); err != nil {
+			p.logf(r.Context(), slog.LevelDebug, "upgraded stream closed", sess, err)
+		}
+		return
+	}
+
+	if werr := writeResponse(w, r, resp); werr != nil {
 		p.logf(r.Context(), slog.LevelDebug, "write response", sess, werr)
 	}
 }
 
-// relay forwards a request a tunnel asked the proxy not to look at. No interceptor is consulted
-// and no middleware runs, so a tunneled authority stays unobserved even when it arrives as a
-// plain request the proxy had to parse to route it at all.
-func (p *Proxy) relay(c *Context, w http.ResponseWriter, r *http.Request, sess *Session, target Target, identity string) {
-	c.reset(sess, r, target.Scheme, target.Host, target.Port)
-	c.identity = identity
-
-	resp, err := c.Forward()
-	if err != nil {
-		p.logf(r.Context(), slog.LevelWarn, "relay failed", sess, err)
-		http.Error(w, "edge: "+err.Error(), http.StatusBadGateway)
+// serveGRPC runs a [GRPC] handler. The call is a request like any other underneath, so the
+// answer travels back the same way.
+func (p *Proxy) serveGRPC(c *routeCtx, w http.ResponseWriter, r *http.Request, sess *Session) {
+	handler, _ := c.entry.serve.(GRPC)
+	if handler == nil {
+		http.Error(w, "edge: entry has no gRPC handler", http.StatusInternalServerError)
 		return
 	}
-	if werr := writeResponse(c, w, r, resp, Tunnel); werr != nil {
-		p.logf(r.Context(), slog.LevelDebug, "write relayed response", sess, werr)
+
+	gc := &GRPCCtx{http: &c.http, ctx: r.Context()}
+	err := runKindHandler(p, sess, func() error { return handler(gc) })
+	if err == nil {
+		var resp *http.Response
+		if resp, err = gc.response(); err == nil {
+			if werr := writeResponse(w, r, resp); werr != nil {
+				p.logf(r.Context(), slog.LevelDebug, "write gRPC response", sess, werr)
+			}
+			return
+		}
+	}
+	// The call failed after the handler had a response in hand. Nothing will write it, so
+	// nothing else will close the upstream body it holds.
+	gc.discard()
+
+	// A failed call is still a 200 carrying a status, which is how a gRPC client reads an
+	// error at all.
+	resp := grpcStatusResponse(Unavailable, err.Error())
+	if werr := writeResponse(w, r, resp); werr != nil {
+		p.logf(r.Context(), slog.LevelDebug, "write gRPC status", sess, werr)
 	}
 }
 
-// runHandler calls the handler and turns a panic into a [PanicError]. Nothing is logged here,
-// the error takes the normal path and the [ErrorHandler] decides what a panic answers.
-func (p *Proxy) runHandler(c *Context, handler HandlerFunc) (resp *http.Response, err error) {
+// runHTTPHandler calls the handler and turns a panic into a [PanicError]. Nothing is logged
+// here, the error takes the normal path and the [ErrorHandler] decides what a panic answers.
+func runHTTPHandler(c *HTTPCtx, handler HTTP) (resp *http.Response, err error) {
 	defer func() {
 		rec := recover()
 		if rec == nil {
@@ -140,14 +172,8 @@ func stacktrace(skip int) string {
 	return sb.String()
 }
 
-// writeResponse relays resp to the client. action is what let the request through, which an
-// upgrade needs because past the 101 it becomes a connection of its own.
-func writeResponse(c *Context, w http.ResponseWriter, r *http.Request, resp *http.Response, action Action) error {
-	// An upgrade takes ownership of the body, which is the tunnel rather than a payload.
-	if resp.StatusCode == http.StatusSwitchingProtocols {
-		return spliceUpgrade(c, w, r, resp, action)
-	}
-
+// writeResponse relays resp to the client.
+func writeResponse(w http.ResponseWriter, r *http.Request, resp *http.Response) error {
 	if resp.Body != nil {
 		defer func() { _ = resp.Body.Close() }()
 	}
@@ -185,8 +211,8 @@ func writeResponse(c *Context, w http.ResponseWriter, r *http.Request, resp *htt
 	return nil
 }
 
-// announceTrailers copies the trailer names the upstream declared into the response header,
-// so an HTTP/1.1 client knows to expect them after the body.
+// announceTrailers copies the trailer names the upstream declared into the response header, so
+// an HTTP/1.1 client knows to expect them after the body.
 func announceTrailers(dst http.Header, resp *http.Response) {
 	if len(resp.Trailer) == 0 {
 		return
@@ -230,116 +256,11 @@ func (f flushWriter) Write(b []byte) (int, error) {
 	return n, nil
 }
 
-// upgradedPipe is what an upgrade leaves behind, the client socket joined to the upstream one.
-// Closing it ends both directions, which is the only way to stop a splice.
-type upgradedPipe struct {
-	client  net.Conn
-	backend io.Closer
-}
-
-func (u *upgradedPipe) Close() error {
-	cerr := u.client.Close()
-	berr := u.backend.Close()
-	return errors.Join(cerr, berr)
-}
-
-// pipeSession describes the pipe an upgrade left behind.
-//
-// It gets a session of its own because a request routes on its Host header, which can differ
-// from the CONNECT authority. Reusing the connection's would report an authority the pipe does
-// not talk to, and a sweep would keep the wrong one.
-func pipeSession(c *Context, r *http.Request, action Action, pipe io.Closer) *Session {
-	target := Target{Scheme: c.scheme, Host: c.host, Port: c.port}
-	sess := newSession(r.Context(), nil, target, action, protoOfRequest(r))
-	sess.closer = pipe
-	// An upgrade outlives the request that established it, so a revocation can only reach it
-	// through the identity that request carried.
-	sess.identity = c.identity
-
-	front := c.sess
-	if front == nil {
-		return sess
-	}
-	sess.remoteAddr = front.remoteAddr
-	sess.localAddr = front.localAddr
-	sess.clientHello = front.clientHello
-	sess.upstream = front.upstream
-	sess.transparent = front.transparent
-	if state := front.tlsState.Load(); state != nil {
-		sess.tlsState.Store(state)
-	} else {
-		// The explicit proxy reached over TLS builds its session before the handshake, so the
-		// state only exists behind the connection.
-		sess.tlsConn = front.tlsConn
-	}
-	return sess
-}
-
-// spliceUpgrade completes a protocol upgrade, WebSocket being the common case. Past the 101
-// the connection is no longer HTTP, so both ends are joined and relayed byte for byte.
-func spliceUpgrade(c *Context, w http.ResponseWriter, r *http.Request, resp *http.Response, action Action) error {
-	backend, ok := resp.Body.(io.ReadWriteCloser)
-	if !ok {
-		if resp.Body != nil {
-			_ = resp.Body.Close()
-		}
-		return errors.New("edge: upstream returned 101 without a writable body")
-	}
-	defer func() { _ = backend.Close() }()
-
-	rc := http.NewResponseController(w)
-	client, brw, err := rc.Hijack()
-	if err != nil {
-		return fmt.Errorf("hijack for protocol upgrade: %w", err)
-	}
-	defer func() { _ = client.Close() }()
-
-	// After the hijack http.Server neither closes nor waits for the connection, so tracking it
-	// here is what lets a shutdown and a route change reach the pipe. A refusal means the
-	// proxy is stopping; the 101 has not been written, so the client sees the upgrade fail.
-	pipe := &upgradedPipe{client: client, backend: backend}
-	sess := pipeSession(c, r, action, pipe)
-
-	if !c.p.srv.tryTrack(pipe) {
-		return nil
-	}
-	defer c.p.srv.untrack(pipe)
-
-	// The 101 has not reached the client yet, so a pipe the tree no longer accepts is refused
-	// with an ordinary status rather than granted and then torn down.
-	if !c.p.srv.admitSession(sess) {
-		return writeRawStatus(brw, http.StatusForbidden,
-			"connection rejected, no interceptor or tunnel matches this authority")
-	}
-	defer c.p.srv.trackSession(sess, false)
-
-	// Response.Write copies the body after the headers, and here the body is the pipe. Leaving
-	// it in place would block forever trying to drain a stream that only ends when the peers
-	// are done talking.
-	resp.Body = nil
-	if err := resp.Write(brw); err != nil {
-		return fmt.Errorf("write upgrade response: %w", err)
-	}
-	if err := brw.Flush(); err != nil {
-		return fmt.Errorf("flush upgrade response: %w", err)
-	}
-
-	errc := make(chan error, 2)
-	go func() {
-		buf := getCopyBuf()
-		defer putCopyBuf(buf)
-		_, cerr := io.CopyBuffer(backend, brw, buf)
-		errc <- cerr
-	}()
-	go func() {
-		buf := getCopyBuf()
-		defer putCopyBuf(buf)
-		_, cerr := io.CopyBuffer(client, backend, buf)
-		errc <- cerr
-	}()
-
-	<-errc
-	return nil
+// isExtendedConnect reports whether the request is an RFC 8441 CONNECT, which carries a
+// :protocol pseudo header. Go's HTTP/2 server advertises the setting and surfaces the pseudo
+// header as an ordinary one.
+func isExtendedConnect(r *http.Request) bool {
+	return r != nil && r.Method == http.MethodConnect && r.Header.Get(":protocol") != ""
 }
 
 func isClientGone(err error) bool {

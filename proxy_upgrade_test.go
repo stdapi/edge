@@ -75,10 +75,12 @@ func TestProxy_ProtocolUpgrade(t *testing.T) {
 	require.NoError(t, err)
 
 	var sawUpgrade string
-	p.MustAddInterceptor([]string{http.MethodGet}, originHost(originURL)+"/ws", func(c *Context) (*http.Response, error) {
+	// Past the 101 the connection is a byte stream, and a stream entry is what serves it.
+	p.MustAdd[TCP](originHost(originURL), relayStream)
+	p.MustAdd(originHost(originURL)+"/ws", func(c *HTTPCtx) (*http.Response, error) {
 		sawUpgrade = c.Request().Header.Get("Upgrade")
 		return c.Forward()
-	})
+	}, WithMethods(http.MethodGet))
 
 	addr := startProxy(t, p)
 
@@ -152,9 +154,10 @@ func TestUpgrade_TransparentPlaintextPipeIsListedAndClosed(t *testing.T) {
 	tr := DefaultTransport()
 	tr.DialContext = pinnedDialer(originURL.Host)
 	p := testProxy(t, WithTransport(tr))
-	p.MustAddInterceptor([]string{http.MethodGet}, "ws.example.test/ws", func(c *Context) (*http.Response, error) {
+	p.MustAdd[TCP]("ws.example.test", relayStream)
+	p.MustAdd("ws.example.test/ws", func(c *HTTPCtx) (*http.Response, error) {
 		return c.Forward()
-	})
+	}, WithMethods(http.MethodGet))
 
 	addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) {
 		return originAddr, nil
@@ -173,7 +176,7 @@ func TestUpgrade_TransparentPlaintextPipeIsListedAndClosed(t *testing.T) {
 	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
 
 	sessions := waitForSessions(t, p, 1)
-	assert.Equal(t, Intercept, sessions[0].Action())
+	assert.Equal(t, KindTCP, sessions[0].Kind())
 	assert.Equal(t, "ws.example.test", sessions[0].Target().Host)
 	assert.True(t, sessions[0].Transparent())
 
@@ -198,10 +201,11 @@ func TestUpgrade_HostDivergesFromTheConnectAuthority(t *testing.T) {
 
 	p, err := New(WithCA(ca), WithTransport(tr))
 	require.NoError(t, err)
-	p.MustAddInterceptor(nil, "a.example.test/*{rest}", noopHandler)
-	p.MustAddInterceptor([]string{http.MethodGet}, "b.example.test/ws", func(c *Context) (*http.Response, error) {
+	p.MustAdd("a.example.test/*{rest}", noopHandler)
+	p.MustAdd[TCP]("b.example.test", relayStream)
+	p.MustAdd("b.example.test/ws", func(c *HTTPCtx) (*http.Response, error) {
 		return c.Forward()
-	})
+	}, WithMethods(http.MethodGet))
 
 	raw, err := dialThroughProxy(t, startProxy(t, p), "a.example.test:443", ca)
 	require.NoError(t, err)
@@ -224,18 +228,20 @@ func TestUpgrade_HostDivergesFromTheConnectAuthority(t *testing.T) {
 	slices.Sort(hosts)
 	assert.Equal(t, []string{"a.example.test", "b.example.test"}, hosts)
 
-	_, err = p.DeleteInterceptor([]string{http.MethodGet}, "b.example.test/ws")
+	// The pipe is a stream past the 101, so what admits it is the stream entry on the host
+	// its request named, not the one the connection was opened for.
+	_, err = p.Delete[TCP]("b.example.test")
 	require.NoError(t, err)
 
 	var closed int
 	for s := range p.Sessions() {
-		if p.ActionFor(s.Target()) == Reject {
+		if !p.Admits(s.Target(), s.Kind()) {
 			require.NoError(t, s.Close())
 			closed++
 		}
 	}
 	assert.Equal(t, 1, closed, "the pipe is swept while its connection stays allowed")
-	assert.Equal(t, Intercept, p.ActionFor(target("a.example.test:443")))
+	assert.Equal(t, true, p.Admits(target("a.example.test:443"), KindHTTP))
 }
 
 // The tree can change while the upstream is answering. The pipe is registered before the 101
@@ -251,15 +257,21 @@ func TestUpgrade_RefusedWhenTheRouteGoesAwayFirst(t *testing.T) {
 
 	p, err := New(WithCA(ca), WithTransport(tr))
 	require.NoError(t, err)
-	p.MustAddInterceptor([]string{http.MethodGet}, pattern, func(c *Context) (*http.Response, error) {
+	p.MustAdd[TCP](originHost(originURL), relayStream)
+	p.MustAdd(pattern, func(c *HTTPCtx) (*http.Response, error) {
 		resp, ferr := c.Forward()
 		if ferr != nil {
 			return nil, ferr
 		}
 		// Between the upstream 101 and the splice, which is the window the re-check covers.
-		_, derr := p.DeleteInterceptor([]string{http.MethodGet}, pattern)
+		// What the 101 switches to is a stream, so withdrawing the stream entry is what
+		// leaves the upgrade with nothing to serve it.
+		if _, derr := p.Delete[TCP](originHost(originURL)); derr != nil {
+			return nil, derr
+		}
+		_, derr := p.Delete[HTTP](pattern, WithMethods(http.MethodGet))
 		return resp, derr
-	})
+	}, WithMethods(http.MethodGet))
 
 	raw, err := dialThroughProxy(t, startProxy(t, p), originURL.Host, ca)
 	require.NoError(t, err)
@@ -271,9 +283,11 @@ func TestUpgrade_RefusedWhenTheRouteGoesAwayFirst(t *testing.T) {
 	resp, err := http.ReadResponse(bufio.NewReader(raw), nil)
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusForbidden, resp.StatusCode, "the client never sees the 101")
-	// The refusal is written on a connection the splice had already hijacked, so it unwinds
-	// with the request. What matters is that no pipe was left behind.
-	waitForSessions(t, p, 0)
+	// The refusal is written before the hijack, so the client reads an ordinary status and
+	// keeps its connection. What matters is that no pipe was left behind: the one session is
+	// the terminated connection itself.
+	sessions := waitForSessions(t, p, 1)
+	assert.Equal(t, KindHTTP, sessions[0].Kind())
 }
 
 // A hijacked connection is one http.Server neither closes nor waits for, so without the pipe
@@ -283,9 +297,10 @@ func TestUpgrade_CloseEndsAPipeOnAFrontConnection(t *testing.T) {
 	originURL, _ := url.Parse(origin.URL)
 
 	p := testProxy(t)
-	p.MustAddInterceptor([]string{http.MethodGet}, originHost(originURL)+"/ws", func(c *Context) (*http.Response, error) {
+	p.MustAdd[TCP](originHost(originURL), relayStream)
+	p.MustAdd(originHost(originURL)+"/ws", func(c *HTTPCtx) (*http.Response, error) {
 		return c.Forward()
-	})
+	}, WithMethods(http.MethodGet))
 
 	raw, err := net.Dial("tcp", startProxy(t, p))
 	require.NoError(t, err)

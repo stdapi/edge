@@ -1,0 +1,209 @@
+// Copyright 2025 Sylvain Müller. All rights reserved.
+// Mount of this source code is governed by a Apache-2.0 license that can be found
+// at https://github.com/fox-toolkit/edge/blob/master/LICENSE.txt.
+
+package edge
+
+import (
+	"errors"
+	"net"
+	"os"
+	"slices"
+	"time"
+)
+
+// negotiateALPN returns the protocols to offer a client, in the order the proxy prefers them.
+// An HTTP protocol wins when the client offers one, and otherwise the client's own first
+// choice is echoed back, which is what an origin supporting everything would do.
+//
+// An offer with nothing in it leaves ALPN unset, which falls back to HTTP/1.1 rather than
+// failing the handshake with no_application_protocol.
+func negotiateALPN(offered []string, over Kind) []string {
+	if len(offered) == 0 {
+		return nil
+	}
+	supported := httpOver(over)
+	for _, proto := range offered {
+		if slices.Contains(supported, proto) {
+			// The client offered HTTP. Everything it offered that the proxy speaks is
+			// echoed, in the client's own preference order.
+			out := make([]string, 0, len(offered))
+			for _, p := range offered {
+				if slices.Contains(supported, p) {
+					out = append(out, p)
+				}
+			}
+			return out
+		}
+	}
+	// No HTTP in the offer. The connection is a byte stream whatever the label says, and
+	// echoing the client's first choice keeps the label the one it asked for.
+	return offered[:1]
+}
+
+// httpOver lists the HTTP protocols a transport can carry. h3 does not run on TCP and h2 does
+// not run on QUIC, so a peer naming one on the wrong transport has not named HTTP.
+func httpOver(over Kind) []string {
+	if over == KindQUIC {
+		return []string{"h3"}
+	}
+	return []string{"h2", "http/1.1"}
+}
+
+// candidatesForALPN reports the kinds that may serve a connection speaking this protocol,
+// most refined first. An empty protocol means the client offered none, which says nothing, so
+// the caller sniffs instead.
+//
+// The traffic says what a connection is; the tree says at which granularity it is served. An
+// HTTP connection can be served request by request or as the byte stream it runs on, and both
+// see it in the clear, so both are candidates and the entries registered decide. A granularity
+// where the handler would see ciphertext the proxy holds the keys for is never a candidate:
+// that is a relay nothing observes, which is the one thing this proxy does not do.
+func candidatesForALPN(alpn string, over Kind) []Kind {
+	if alpn == "" {
+		return nil
+	}
+	if slices.Contains(httpOver(over), alpn) {
+		return []Kind{KindHTTP, over}
+	}
+	return []Kind{over}
+}
+
+// sniffStreamCandidates reports the kinds that may serve a stream, read off its first bytes.
+// It consumes nothing: the peek leaves the bytes for whatever ends up serving the connection.
+//
+// HTTP is what it recognizes, and everything else is a byte stream and nothing more. The
+// recognizer reads the traffic and nothing else, never the tree, so what a connection is can
+// never depend on what happened to be registered when it arrived.
+func sniffStreamCandidates(conn *peekConn, wait time.Duration) []Kind {
+	if wait > 0 {
+		// A protocol whose server speaks first sends nothing here. The wait is what tells it
+		// apart from a client that is merely slow, and it is only ever paid once.
+		_ = conn.SetReadDeadline(time.Now().Add(wait))
+		defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
+	}
+
+	if looksLikeHTTPRequestLine(conn) {
+		return []Kind{KindHTTP, KindTCP}
+	}
+	return []Kind{KindTCP}
+}
+
+// requestLinePeek bounds how much of a first line the sniff reads. A request target longer
+// than this is not what tells HTTP from anything else.
+const requestLinePeek = 512
+
+// looksLikeHTTPRequestLine reports whether what is waiting on conn starts with an HTTP/1.x
+// request line, "method SP target SP HTTP/1.d". The HTTP/2 connection preface is one too, its
+// method being PRI and its version 2.0, so both are recognized by the same scan.
+func looksLikeHTTPRequestLine(conn *peekConn) bool {
+	for n := 16; ; n = min(n*4, requestLinePeek) {
+		b, err := conn.Peek(n)
+		if len(b) > 0 {
+			switch verdict := scanRequestLine(b); verdict {
+			case sniffYes:
+				return true
+			case sniffNo:
+				return false
+			}
+		}
+		if err != nil {
+			// Short of a full line, and nothing more is coming: a timeout means the peer is
+			// waiting to be spoken to, which HTTP never does.
+			return false
+		}
+		if n >= requestLinePeek {
+			return false
+		}
+	}
+}
+
+type sniffVerdict uint8
+
+const (
+	sniffMore sniffVerdict = iota
+	sniffYes
+	sniffNo
+)
+
+func scanRequestLine(b []byte) sniffVerdict {
+	// method
+	i := 0
+	for i < len(b) && b[i] != ' ' {
+		if !isTokenByte(b[i]) {
+			return sniffNo
+		}
+		i++
+	}
+	if i == 0 {
+		return sniffNo
+	}
+	if i == len(b) {
+		return sniffMore
+	}
+
+	// target, anything without a space or a control byte
+	i++
+	start := i
+	for i < len(b) && b[i] != ' ' {
+		if b[i] < 0x21 || b[i] == 0x7f {
+			return sniffNo
+		}
+		i++
+	}
+	if i == start {
+		return sniffNo
+	}
+	if i == len(b) {
+		return sniffMore
+	}
+
+	// version
+	i++
+	const version = "HTTP/"
+	rest := b[i:]
+	if len(rest) < len(version)+3 {
+		if len(rest) < len(version) {
+			if string(rest) != version[:len(rest)] {
+				return sniffNo
+			}
+			return sniffMore
+		}
+		if string(rest[:len(version)]) != version {
+			return sniffNo
+		}
+		return sniffMore
+	}
+	if string(rest[:len(version)]) != version {
+		return sniffNo
+	}
+	rest = rest[len(version):]
+	if !isDigit(rest[0]) || rest[1] != '.' || !isDigit(rest[2]) {
+		return sniffNo
+	}
+	return sniffYes
+}
+
+func isDigit(b byte) bool { return b >= '0' && b <= '9' }
+
+// isTokenByte reports whether b may appear in an HTTP token (RFC 9110 section 5.6.2).
+func isTokenByte(b byte) bool {
+	switch {
+	case b >= 'a' && b <= 'z', b >= 'A' && b <= 'Z', b >= '0' && b <= '9':
+		return true
+	}
+	switch b {
+	case '!', '#', '$', '%', '&', '\'', '*', '+', '-', '.', '^', '_', '`', '|', '~':
+		return true
+	}
+	return false
+}
+
+// isTimeout reports whether err is a deadline rather than a failure.
+func isTimeout(err error) bool {
+	if errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	ne, ok := errors.AsType[net.Error](err)
+	return ok && ne.Timeout()
+}
