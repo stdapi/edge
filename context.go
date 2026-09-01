@@ -18,12 +18,9 @@ type Param struct {
 	Value string
 }
 
-// RequestContext is the read-only view of a request handed to a [Matcher]. Its lifetime is
-// the [Matcher.Match] call; the underlying context is reused once that call returns.
-//
-// It exposes what the request itself carries and nothing else. A matcher selects one request
-// while a connection carries many, so reading the connection here would let an entry be
-// chosen on state its own request does not describe.
+// RequestContext is the read-only view of a request handed to a [Matcher]. It is valid during
+// the [Matcher.Match] call and reused once that call returns. It exposes the request and
+// nothing of the connection, which serves many requests.
 type RequestContext interface {
 	// Request returns the request being routed.
 	Request() *http.Request
@@ -49,18 +46,15 @@ type RequestContext interface {
 	// Header returns the first request header value for key.
 	Header(key string) string
 	// RemoteAddr returns the address the request was received from, or the zero value when
-	// it carries none.
+	// it has none.
 	RemoteAddr() netip.AddrPort
 	// Protocol returns the protocol the request was received over.
 	Protocol() Protocol
 }
 
-// routeCtx is the state of one routing lookup: what the tree walks with, what it captures,
-// and what the handler serving the unit reads back. It is pooled per tree.
-//
-// The HTTP view lives inside it rather than beside it. Serving a request is the hot path, and
-// a wrapper allocated around the state on every request would be one allocation the proxy
-// does not need to make.
+// routeCtx is the state of one routing lookup, what the tree walks with, what it captures and
+// what the handler reads back. It is pooled per tree, and the HTTP view lives inside it so
+// serving a request allocates nothing.
 type routeCtx struct {
 	req  *http.Request
 	sess *Session
@@ -118,8 +112,8 @@ func (c *routeCtx) capturedParams() []Param {
 }
 
 // routingPath returns the canonical form of the request path used for matching. The request
-// is never rewritten to it: a proxy must put back on the wire exactly what the client sent,
-// so the canonical form only ever exists inside the lookup.
+// is never rewritten to it, since a proxy must put back on the wire exactly what the client
+// sent.
 func routingPath(r *http.Request) string {
 	if r == nil || r.URL == nil {
 		return ""

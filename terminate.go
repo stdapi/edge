@@ -23,10 +23,10 @@ const tlsHandshakeRecord = 0x16
 // terminate takes over an admitted connection, terminating TLS when there is TLS, works out
 // what the traffic is, and serves it.
 //
-// What a connection is comes from the traffic alone: the negotiated ALPN when the client
-// offered one, and what the first bytes are otherwise. That fixes the kinds that could serve
-// it, most refined first, and the tree picks among those. An HTTP connection with only a
-// stream entry on its authority is served as a stream, and both see it in the clear.
+// What a connection is comes from the traffic alone, the negotiated ALPN when the client
+// offered one and the first bytes otherwise. That fixes the kinds that could serve it, most
+// specific first, and the tree picks among those. An HTTP connection with only a stream entry
+// on its authority is served as a stream, and both see it in the clear.
 func (p *Proxy) terminate(ctx context.Context, conn *peekConn, sess *Session) error {
 	head, err := conn.Peek(1)
 	if err != nil {
@@ -87,9 +87,9 @@ func (p *Proxy) serveCandidates(ctx context.Context, conn net.Conn, sess *Sessio
 		return p.serveTerminatedStream(ctx, conn, sess, state, e, params)
 	}
 
-	// The residual, and only for a connection whose requests each name their own authority:
-	// it has none of its own for an admission to answer on, so the requests place themselves
-	// and each is admitted or refused alone.
+	// The residual, only for a connection whose requests each have their own authority. It
+	// has none of its own for an admission to answer on, so each request is admitted or
+	// refused alone.
 	if sess.perRequest && slices.Contains(candidates, KindHTTP) {
 		sess.kind = KindHTTP
 		return p.serveHTTPConnection(conn, sess, state)
@@ -185,9 +185,9 @@ func (p *Proxy) serverTLSConfig(sess *Session) *tls.Config {
 // serveTerminatedHTTP runs the HTTP server side of a terminated connection. The requests it
 // reads are ordinary origin-form requests, which is exactly what the routing tree expects.
 //
-// One server serves both protocols: an HTTP/2 client, ALPN or not, opens with the connection
+// One server serves both protocols. An HTTP/2 client, ALPN or not, opens with the connection
 // preface, which the server detects on the plaintext it is handed and answers natively. That
-// single path is what ties every terminated connection to the server's graceful shutdown.
+// single path ties every terminated connection to the server's graceful shutdown.
 func (p *Proxy) serveTerminatedHTTP(conn net.Conn, sess *Session) error {
 	if sess.remoteAddr == nil {
 		sess.remoteAddr = conn.RemoteAddr()
@@ -220,24 +220,25 @@ func (p *Proxy) serveTerminatedRequest(w http.ResponseWriter, r *http.Request) {
 		sess = newSession(r.Context(), nil, Target{}, KindHTTP, protoOfRequest(r))
 	}
 	// A plaintext connection is announced as HTTP/1.1 before http.Server has had a chance to
-	// read a connection preface; the request knows what was actually negotiated.
+	// read a connection preface. The request knows what was negotiated.
 	sess.setProtocol(protoOfRequest(r))
 
 	if state := sess.tlsState.Load(); r.TLS == nil && state != nil {
-		// http.Server only recognizes a bare *tls.Conn, and the connection it was handed is
-		// wrapped. Handlers still expect Request.TLS to describe the handshake.
+		// http.Server only recognizes an unwrapped *tls.Conn, and the connection it was
+		// handed is wrapped. Handlers still expect Request.TLS to describe the handshake.
 		r.TLS = state
 	}
 
-	// Nothing on a terminated connection is challenged: the client believes it is talking to
-	// the origin. Whatever established the connection carries the identity, or none.
+	// Nothing on a terminated connection is challenged, since the client believes it is
+	// talking to the origin. The identity is the one of whatever established the connection,
+	// or none.
 	p.dispatchRequest(w, r, sess, terminatedTarget(r, sess), sess.identity)
 }
 
 // terminatedTarget resolves the target of a request read off a terminated connection. The Host
 // header is what the client addressed the request to and is what an origin would route on, so
-// it wins over the authority of the connection; the port comes from the connection, since an
-// origin-form request carries none of its own.
+// it wins over the authority of the connection. The port comes from the connection, since an
+// origin-form request has none of its own.
 func terminatedTarget(r *http.Request, sess *Session) Target {
 	scheme := sess.target.Scheme
 	if scheme == "" {

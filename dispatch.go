@@ -14,8 +14,8 @@ import (
 )
 
 // dispatchRequest routes one request and runs whatever serves it. The lookup runs on the tree
-// as it stands now, so an entry added or removed while the connection was open governs this
-// request rather than the next connection.
+// as it stands now, so an entry added or removed while the connection was open applies to
+// this request.
 func (p *Proxy) dispatchRequest(w http.ResponseWriter, r *http.Request, sess *Session, target Target, identity string) {
 	tree := p.getTree()
 	c := tree.pool.Get().(*routeCtx)
@@ -23,8 +23,8 @@ func (p *Proxy) dispatchRequest(w http.ResponseWriter, r *http.Request, sess *Se
 
 	if isExtendedConnect(r) {
 		// RFC 8441 turns a stream into something that is no longer HTTP, the way a 101 does,
-		// but there is no hijack on an HTTP/2 stream and no translation written for it. The
-		// proxy says so rather than failing the exchange somewhere further in.
+		// and there is no hijack on an HTTP/2 stream. The proxy refuses it here, before the
+		// exchange fails further in.
 		http.Error(w, "edge: extended CONNECT is not served, WebSocket goes over HTTP/1.1",
 			http.StatusNotImplemented)
 		return
@@ -72,8 +72,8 @@ func (p *Proxy) serveHTTPEntry(c *routeCtx, w http.ResponseWriter, r *http.Reque
 	if resp.StatusCode == http.StatusSwitchingProtocols {
 		// Past the 101 the connection is no longer HTTP, so the entry that served the
 		// handshake cannot serve what follows. What follows is a byte stream in the clear,
-		// which is what a stream entry is for; without one nothing would ever see it, and a
-		// relay nothing sees is the one thing this proxy does not do.
+		// served by a stream entry when one admits the authority and refused otherwise, since
+		// nothing may be relayed unobserved.
 		if err := p.serveUpgradedStream(c, w, r, resp, sess); err != nil {
 			p.logf(r.Context(), slog.LevelDebug, "upgraded stream closed", sess, err)
 		}
@@ -135,7 +135,7 @@ func runHTTPHandler(c *HTTPCtx, handler HTTP) (resp *http.Response, err error) {
 			return
 		}
 		if e, ok := rec.(error); ok && errors.Is(e, http.ErrAbortHandler) {
-			// The caller deliberately aborted; let net/http see it.
+			// The caller aborted on purpose, and net/http must see it.
 			panic(rec)
 		}
 		resp = nil

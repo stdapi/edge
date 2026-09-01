@@ -69,7 +69,7 @@ func (p *Proxy) spliceWebSocket(c *routeCtx, w http.ResponseWriter, r *http.Requ
 
 	// After the hijack http.Server neither closes nor waits for the connection, so tracking
 	// it here is what lets a shutdown and a route change reach it. A refusal means the proxy
-	// is stopping; the 101 has not been written, so the client sees the upgrade fail.
+	// is stopping, and the 101 has not been written yet, so the client sees the upgrade fail.
 	pipe := &upgradedPipe{client: client, backend: backend}
 	sess := pipeSession(c, r, KindWebSocket, pipe)
 
@@ -78,8 +78,8 @@ func (p *Proxy) spliceWebSocket(c *routeCtx, w http.ResponseWriter, r *http.Requ
 	}
 	defer p.srv.untrack(pipe)
 
-	// The 101 has not reached the client yet, so a connection the tree no longer accepts is
-	// refused with an ordinary status rather than granted and then torn down.
+	// The 101 has not reached the client yet, so a connection no entry admits any more is
+	// refused with an ordinary status.
 	if !p.srv.admitSession(sess) {
 		return writeRawStatus(brw, http.StatusForbidden, "no entry admits this authority any more")
 	}
@@ -114,9 +114,9 @@ func (p *Proxy) spliceWebSocket(c *routeCtx, w http.ResponseWriter, r *http.Requ
 	return runKindHandler(p, sess, func() error { return handler(wc) })
 }
 
-// serveUpgradedStream serves what an upgrade left behind as the byte stream it now is. The
-// entry that answered the handshake was an HTTP one, and HTTP ends at the 101: the bytes past
-// it are served by the stream entry admitting the authority, or by nothing at all.
+// serveUpgradedStream serves what an upgrade left behind as the byte stream it now is. HTTP
+// ends at the 101, so the bytes past it are served by the stream entry admitting the
+// authority, or refused when there is none.
 func (p *Proxy) serveUpgradedStream(c *routeCtx, w http.ResponseWriter, r *http.Request, resp *http.Response, sess *Session) error {
 	target := Target{Scheme: c.scheme, Host: c.host, Port: c.port}
 	e, params := p.admitWith(target, KindTCP)
@@ -182,8 +182,8 @@ func (p *Proxy) serveUpgradedStream(c *routeCtx, w http.ResponseWriter, r *http.
 		target:   target,
 		identity: c.identity,
 	}
-	// The far side is the connection the 101 left behind, not something to dial: marking the
-	// dial done is what makes Relay carry this one instead of opening another.
+	// The far side is the connection the 101 left behind. Marking the dial done makes Relay
+	// use it instead of opening another.
 	sc.dialed = pipeConn{ReadWriteCloser: backend}
 	sc.dialOnce.Do(func() {})
 	defer sc.close()
@@ -193,7 +193,7 @@ func (p *Proxy) serveUpgradedStream(c *routeCtx, w http.ResponseWriter, r *http.
 
 // readWriteCloser joins the buffered reader and writer of a hijacked connection to the
 // connection's own Close. Anything the reader buffered past the handshake is already frame
-// data, so reads must go through it rather than around it.
+// data, so reads must go through it.
 type readWriteCloser struct {
 	r io.Reader
 	w io.Writer
