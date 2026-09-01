@@ -48,9 +48,9 @@ type middleware struct {
 // Proxy is a forward proxy that terminates what it admits. TLS is terminated when there is
 // TLS, so every handler sees the traffic in the clear, and nothing is relayed encrypted.
 //
-// A Proxy is safe for concurrent use. Entries can be added and removed while traffic flows:
-// lookups are lock-free and never observe a partially applied write, and every unit, request,
-// stream or datagram, is routed on the tree as it stands when it arrives.
+// A Proxy is safe for concurrent use. Entries can be added and removed while traffic flows.
+// Lookups are lock-free and never observe a partially applied write, and every request and
+// every datagram is routed on the entries as they stand when it arrives.
 type Proxy struct {
 	cfg  *config
 	tree atomic.Pointer[iTree]
@@ -196,9 +196,9 @@ func (p *Proxy) MustAdd[H Handler](pattern string, handler H, opts ...EntryOptio
 // Registering an entry admits its authority for the traffic its kind rides on, and nothing
 // else. An authority no entry names is refused, and so is a unit no entry matches.
 //
-// The entry takes effect on the next unit routed, so a connection already open keeps the
-// kind it was decided as. See [Session.ServableAs] to close the connections a new entry
-// would serve at a more specific kind.
+// The entry takes effect on the next request or datagram routed, and a connection already
+// open keeps the kind it was decided as. See [Session.ServableAs] to close the connections a
+// new entry would serve at a more specific kind.
 //
 // If an error occurs, it returns one of the following:
 //   - [*PatternError]: the pattern syntax is invalid.
@@ -239,8 +239,9 @@ func (p *Proxy) Update[H Handler](pattern string, handler H, opts ...EntryOption
 //
 //	p.Delete[edge.HTTP]("api.test/v1/charges/{id}")
 //
-// The connections already open are left untouched, though the units on them are routed again
-// and refused when nothing matches any more. See [Proxy.Sessions] to close them instead.
+// The connections already open are left untouched. Their next request or datagram is routed
+// again and refused when nothing matches any more, and a TCP, QUIC or WebSocket connection
+// keeps its handler until it ends. See [Proxy.Sessions] to close those.
 func (p *Proxy) Delete[H Handler](pattern string, opts ...MatcherOption) (Entry[H], error) {
 	txn := p.Txn(true)
 	defer txn.Abort()

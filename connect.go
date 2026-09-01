@@ -76,7 +76,12 @@ func (p *Proxy) connectHijack(w http.ResponseWriter, r *http.Request, target Tar
 		}
 	}()
 
-	sess := newSession(ctx, client, target, 0, 0)
+	// The hijacked connection is the front one, so its handshake describes the proxy and not
+	// the tunnel. The session takes the addresses alone and the tunnel's own termination
+	// fills in the TLS state.
+	sess := newSession(ctx, nil, target, 0, 0)
+	sess.remoteAddr = client.RemoteAddr()
+	sess.localAddr = client.LocalAddr()
 	sess.identity = identity
 	if s := sessionFromRequest(r); s != nil {
 		sess.remoteAddr = s.remoteAddr

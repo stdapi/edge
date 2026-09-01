@@ -110,10 +110,7 @@ var sessionSeq atomic.Uint64
 // belongs to the same session, so an HTTP/2 or HTTP/3 connection has a single session and
 // many requests. This does not apply to a protocol upgrade, which gets a session of its own.
 //
-// A session is decided once, when the traffic names the kind it belongs to. What happens to
-// each unit on it is decided again, on the tree as it stands then, so an entry added or
-// removed while the connection is open takes effect on the next unit rather than on the next
-// connection.
+// The proxy decides a session once, when the connection arrives.
 //
 // A Session is safe for concurrent use by the goroutines serving its requests.
 type Session struct {
@@ -276,20 +273,21 @@ func (s *Session) ServableAs() []Kind {
 // the connection carries no TLS or the client offered none. The value appears once the
 // handshake completes.
 func (s *Session) ALPN() string {
-	if state := s.TLS(); state != nil {
+	if state := s.tlsState.Load(); state != nil {
 		return state.NegotiatedProtocol
+	}
+	if s.tlsConn != nil {
+		if state := s.tlsConn.ConnectionState(); state.HandshakeComplete {
+			return state.NegotiatedProtocol
+		}
 	}
 	return ""
 }
 
-// Close ends the connection immediately, without draining it: it is dropped along with the
-// units in flight on it. Closing a connection that already ended is a no-op.
-//
-// Closing is not how a configuration change is applied. Every unit is routed on the tree as
-// it stands, so removing an entry already governs the next request, the next stream or the
-// next datagram of a connection that stays open. Close is for ending a connection on its own
-// terms, revoking an identity being the usual one, and a client is free to open another,
-// which the tree decides again.
+// Close ends the connection immediately, without draining it, and drops the requests or
+// streams in flight. Closing a connection that already ended is a no-op. The client is free
+// to reconnect, and the proxy decides the new connection again. Revoking an identity uses
+// the same call, see [Session.Identity].
 func (s *Session) Close() error {
 	if s.closer == nil {
 		return nil

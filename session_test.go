@@ -5,11 +5,13 @@
 package edge
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -157,6 +159,73 @@ func TestSession_ServableAsSweepsRefinableStream(t *testing.T) {
 	})
 	assert.Equal(t, 1, sweep(), "an HTTP entry now serves what this connection carries")
 	waitForSessions(t, p, 0)
+}
+
+// A tunnel opened over a TLS front carries its own traffic, so a plaintext tunnel reports no
+// TLS state and no ALPN even though the connection to the proxy negotiated both.
+func TestSession_PlaintextTunnelOverTLSFront(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+
+	origin, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = origin.Close() })
+	go func() {
+		for {
+			c, aerr := origin.Accept()
+			if aerr != nil {
+				return
+			}
+			go func() {
+				_, _ = io.Copy(c, c)
+				_ = c.Close()
+			}()
+		}
+	}()
+	p.MustAdd[TCP](origin.Addr().String(), relayStream)
+
+	proxyCert := selfSignedFor(t, ca, "localhost")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	go func() { _ = p.ServeTLS(ln, proxyCert) }()
+	t.Cleanup(func() { _ = p.Close() })
+
+	conn, err := tls.Dial("tcp", ln.Addr().String(), &tls.Config{
+		ServerName: "localhost",
+		RootCAs:    poolOf(ca),
+		NextProtos: []string{"http/1.1"},
+		MinVersion: tls.VersionTLS13,
+	})
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+	require.Equal(t, "http/1.1", conn.ConnectionState().NegotiatedProtocol,
+		"the front handshake must have an ALPN for the leak to be observable")
+
+	authority := origin.Addr().String()
+	_, err = fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", authority, authority)
+	require.NoError(t, err)
+	br := bufio.NewReader(conn)
+	line, err := br.ReadString('\n')
+	require.NoError(t, err)
+	require.Contains(t, line, "200")
+	for line != "\r\n" {
+		line, err = br.ReadString('\n')
+		require.NoError(t, err)
+	}
+
+	_, err = conn.Write([]byte("hello\n"))
+	require.NoError(t, err)
+	echo, err := br.ReadString('\n')
+	require.NoError(t, err)
+	require.Equal(t, "hello\n", echo)
+
+	sess := waitForSessions(t, p, 1)[0]
+	assert.Equal(t, KindTCP, sess.Kind())
+	assert.Nil(t, sess.TLS(), "the front handshake belongs to the proxy, the tunnel has none")
+	assert.Empty(t, sess.ALPN())
+	assert.Equal(t, conn.LocalAddr().String(), sess.RemoteAddr().String())
 }
 
 func TestSession_InterceptedIsListedAndClosed(t *testing.T) {

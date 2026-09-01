@@ -386,11 +386,11 @@ func (s *server) admitSession(sess *Session) bool {
 // serving. Each [Session] is one client connection, a CONNECT tunnel, a redirected TLS or
 // QUIC connection, or a datagram flow, and covers every request or stream multiplexed on it.
 // A protocol upgrade is reported as a session of its own, under the authority its request
-// was routed on. Connections addressed to the proxy itself and redirected plaintext
-// connections are not reported, the latter being decided on the Host header of each request.
+// was routed on. Connections addressed to the proxy itself are not reported, and neither is
+// a redirected plaintext connection decided on the Host header of each request.
 //
-// Deleting an entry refuses new traffic but does not close the connections already open. Use
-// Sessions with [Session.Close] to end them.
+// Deleting an entry does not close the connections already open. Use Sessions with
+// [Session.Close] to end them.
 //
 //	p.Delete[edge.TCP]("example.com")
 //	for s := range p.Sessions() {
