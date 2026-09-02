@@ -832,10 +832,18 @@ func TestChain_ReplacedHTTP2ConnectionEndsWithTheDialer(t *testing.T) {
 	require.NoError(t, cc1.Err(), "a connection with a tunnel on it stays until the tunnel ends")
 
 	u.close()
-	for _, srv := range []net.Conn{srv1, srv2} {
+	for i, srv := range []net.Conn{srv1, srv2} {
+		// The GOAWAY the close sends arrives ahead of the end, and a socket closed with the
+		// peer's bytes still unread ends in a reset rather than an EOF.
 		require.NoError(t, srv.SetReadDeadline(time.Now().Add(2*time.Second)))
-		_, err = srv.Read(make([]byte, 1))
-		require.ErrorIs(t, err, io.EOF, "a connection outlived the dialer")
+		for {
+			_, err = srv.Read(make([]byte, 64))
+			if err != nil {
+				break
+			}
+		}
+		require.Error(t, err)
+		require.False(t, isTimeout(err), "connection %d outlived the dialer", i+1)
 	}
 	_, err = str.Read(make([]byte, 1))
 	require.Error(t, err)

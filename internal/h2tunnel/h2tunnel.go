@@ -385,34 +385,27 @@ func (c *Conn) Open(ctx context.Context, req Request) (*Stream, *Response, error
 		resp:       make(chan *Response, 1),
 		done:       make(chan struct{}),
 	}
-	c.mu.Lock()
-	switch {
-	case c.err != nil:
-		c.mu.Unlock()
-		return nil, nil, c.err
-	case c.retired:
-		c.mu.Unlock()
-		return nil, nil, ErrGoAway
-	case req.Protocol != "" && !c.extendedConnect:
-		c.mu.Unlock()
-		return nil, nil, ErrExtendedConnect
-	case int64(len(c.streams)) >= c.maxStreams:
-		c.mu.Unlock()
-		return nil, nil, errTooManyStreams
+	if err := c.refuses(req); err != nil {
+		return nil, nil, err
 	}
-	s.id = c.nextID
-	c.nextID += 2
-	s.sendWindow = c.initialWindow
-	s.recvWindow = window
-	c.streams[s.id] = s
-	maxFrame := int(c.maxFrameSize)
-	c.mu.Unlock()
 
-	// An error from the writer ends the connection, and headers that do not fit have not
-	// reached it, so they are reported apart.
-	tooLarge := false
+	// The stream ID is taken on the writer, so that HEADERS reach the peer in the order of
+	// the IDs. A HEADERS behind a higher ID would find its stream implicitly closed, RFC 9113
+	// section 5.1.1. An error from the writer ends the connection, so what only refuses this
+	// stream is reported apart.
+	var refused error
 	err := c.write(func(fr *http2.Framer) error {
 		c.mu.Lock()
+		if refused = c.refusesLocked(req); refused != nil {
+			c.mu.Unlock()
+			return nil
+		}
+		s.id = c.nextID
+		c.nextID += 2
+		s.sendWindow = c.initialWindow
+		s.recvWindow = window
+		c.streams[s.id] = s
+		maxFrame := int(c.maxFrameSize)
 		if c.encTableChanged {
 			c.enc.SetMaxDynamicTableSize(c.encTableSize)
 			c.encTableChanged = false
@@ -435,21 +428,21 @@ func (c *Conn) Open(ctx context.Context, req Request) (*Stream, *Response, error
 			}
 		}
 		if c.encBuf.Len() > maxFrame {
-			tooLarge = true
+			c.mu.Lock()
+			delete(c.streams, s.id)
+			c.mu.Unlock()
+			refused = errHeadersTooLarge
 			return nil
 		}
 		return fr.WriteHeaders(http2.HeadersFrameParam{StreamID: s.id, BlockFragment: c.encBuf.Bytes(), EndHeaders: true})
 	})
-	if err == nil && tooLarge {
-		c.mu.Lock()
-		delete(c.streams, s.id)
-		c.mu.Unlock()
-		s.end(errHeadersTooLarge)
-		return nil, nil, errHeadersTooLarge
-	}
 	if err != nil {
 		c.fail(err, false)
 		return nil, nil, err
+	}
+	if refused != nil {
+		s.end(refused)
+		return nil, nil, refused
 	}
 
 	select {
@@ -461,6 +454,27 @@ func (c *Conn) Open(ctx context.Context, req Request) (*Stream, *Response, error
 		s.reset(http2.ErrCodeCancel)
 		return nil, nil, ctx.Err()
 	}
+}
+
+// refuses reports why a stream cannot be opened now, nil when it can.
+func (c *Conn) refuses(req Request) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.refusesLocked(req)
+}
+
+func (c *Conn) refusesLocked(req Request) error {
+	switch {
+	case c.err != nil:
+		return c.err
+	case c.retired:
+		return ErrGoAway
+	case req.Protocol != "" && !c.extendedConnect:
+		return ErrExtendedConnect
+	case int64(len(c.streams)) >= c.maxStreams:
+		return errTooManyStreams
+	}
+	return nil
 }
 
 func (c *Conn) field(name, value string) {

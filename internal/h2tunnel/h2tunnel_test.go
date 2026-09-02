@@ -881,3 +881,216 @@ func TestConn_HeadersTooLargeFailAlone(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "still here", string(buf[:n]))
 }
+
+// FuzzPeerFrames plays the peer of a connection, its frames built from the fuzz input, one
+// frame per record of type, flags, stream ID and payload, and checks that the client neither
+// panics nor hangs, whatever the peer sends.
+func FuzzPeerFrames(f *testing.F) {
+	var seed bytes.Buffer
+	fr := http2.NewFramer(&seed, nil)
+	_ = fr.WriteWindowUpdate(0, 1<<20)
+	_ = fr.WriteData(1, false, []byte("hello"))
+	_ = fr.WriteData(1, true, nil)
+	_ = fr.WritePing(false, [8]byte{1, 2, 3})
+	_ = fr.WriteRSTStream(1, http2.ErrCodeCancel)
+	_ = fr.WriteGoAway(1, http2.ErrCodeNo, nil)
+	_ = fr.WriteSettings(http2.Setting{ID: http2.SettingMaxFrameSize, Val: 1 << 20})
+	_ = fr.WriteWindowUpdate(1, 1<<31-1)
+	_ = fr.WriteRawFrame(http2.FramePushPromise, 0, 1, []byte{0, 0, 0, 2})
+	_ = fr.WriteRawFrame(http2.FrameType(0x42), 0, 0, []byte("unknown"))
+	f.Add(seed.Bytes())
+	f.Add([]byte{})
+
+	f.Fuzz(func(t *testing.T, raw []byte) {
+		cli, srv := memPipe()
+		t.Cleanup(func() { _ = cli.Close(); _ = srv.Close() })
+		answered := make(chan uint32, 1)
+		go func() {
+			peer, err := startFakePeer(srv, http2.Setting{ID: http2.SettingEnableConnectProtocol, Val: 1})
+			if err != nil {
+				return
+			}
+			for {
+				fr, rerr := peer.fr.ReadFrame()
+				if rerr != nil {
+					return
+				}
+				if mh, ok := fr.(*http2.MetaHeadersFrame); ok {
+					_ = peer.answer(mh.StreamID)
+					select {
+					case answered <- mh.StreamID:
+					default:
+					}
+					// The fuzz input follows the answer, frame by frame, however malformed
+					// the framer lets a raw frame be.
+					in := http2.NewFramer(nil, bytes.NewReader(raw))
+					in.AllowIllegalReads = true
+					peer.wmu.Lock()
+					for {
+						f, perr := in.ReadFrame()
+						if perr != nil {
+							break
+						}
+						var payload []byte
+						if d, ok := f.(*http2.DataFrame); ok {
+							payload = d.Data()
+						}
+						_ = peer.fr.WriteRawFrame(f.Header().Type, f.Header().Flags, f.Header().StreamID, payload)
+					}
+					_ = peer.fr.WriteRawFrame(http2.FrameData, http2.FlagDataEndStream, mh.StreamID, nil)
+					peer.wmu.Unlock()
+				}
+			}
+		}()
+
+		c, err := Client(cli)
+		require.NoError(t, err)
+		defer func() { _ = c.Close() }()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		s, _, err := c.Open(ctx, Request{Protocol: "connect-udp", Scheme: "https", Authority: "proxy.test", Path: "/.well-known/masque/udp/192.0.2.1/53/"})
+		if err != nil {
+			return
+		}
+		_ = s.SetDeadline(time.Now().Add(2 * time.Second))
+		_, _ = s.Write([]byte("ping"))
+		buf := make([]byte, 64<<10)
+		for {
+			if _, rerr := s.Read(buf); rerr != nil {
+				break
+			}
+		}
+		_ = s.Close()
+	})
+}
+
+// Many streams open, echo and close at once while the peer changes its settings under them.
+func TestConn_ConcurrentStreamsUnderSettingsChurn(t *testing.T) {
+	srv := echoServer(t, nil)
+	c := dial(t, srv)
+	var wg sync.WaitGroup
+	for range 32 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range 8 {
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				s, resp, err := c.Open(ctx, Request{Authority: "origin.test:443"})
+				cancel()
+				if !assert.NoError(t, err) {
+					return
+				}
+				assert.Equal(t, http.StatusOK, resp.StatusCode)
+				payload := make([]byte, (i+1)*20<<10)
+				_, _ = rand.Read(payload)
+				done := make(chan error, 1)
+				go func() {
+					got := make([]byte, len(payload))
+					_, rerr := io.ReadFull(s, got)
+					if rerr == nil && !bytes.Equal(payload, got) {
+						rerr = errors.New("the echo differs")
+					}
+					done <- rerr
+				}()
+				_, err = s.Write(payload)
+				assert.NoError(t, err)
+				assert.NoError(t, <-done)
+				if i%2 == 0 {
+					assert.NoError(t, s.Close())
+				} else {
+					assert.NoError(t, s.CloseWrite())
+					_, _ = io.Copy(io.Discard, s)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	require.True(t, c.CanOpen())
+}
+
+// memPipe is a connected pair in memory with a buffer in each direction, so a write never
+// waits for a read the way net.Pipe's does. Fuzzing opens one per input, which a TCP pair
+// would run the ephemeral ports out with.
+func memPipe() (a, b net.Conn) {
+	ab, ba := newMemBuf(), newMemBuf()
+	return &memConn{r: ba, w: ab}, &memConn{r: ab, w: ba}
+}
+
+type memBuf struct {
+	mu       sync.Mutex
+	cond     *sync.Cond
+	buf      []byte
+	closed   bool
+	deadline time.Time
+}
+
+func newMemBuf() *memBuf {
+	b := &memBuf{}
+	b.cond = sync.NewCond(&b.mu)
+	return b
+}
+
+type memConn struct {
+	r, w *memBuf
+}
+
+func (c *memConn) Read(p []byte) (int, error) {
+	b := c.r
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for len(b.buf) == 0 {
+		if b.closed {
+			return 0, io.EOF
+		}
+		if !b.deadline.IsZero() {
+			if !time.Now().Before(b.deadline) {
+				return 0, os.ErrDeadlineExceeded
+			}
+			time.AfterFunc(time.Until(b.deadline), b.cond.Broadcast)
+		}
+		b.cond.Wait()
+	}
+	n := copy(p, b.buf)
+	b.buf = b.buf[n:]
+	return n, nil
+}
+
+func (c *memConn) Write(p []byte) (int, error) {
+	b := c.w
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return 0, io.ErrClosedPipe
+	}
+	b.buf = append(b.buf, p...)
+	b.cond.Broadcast()
+	return len(p), nil
+}
+
+func (c *memConn) Close() error {
+	for _, b := range []*memBuf{c.r, c.w} {
+		b.mu.Lock()
+		b.closed = true
+		b.cond.Broadcast()
+		b.mu.Unlock()
+	}
+	return nil
+}
+
+func (c *memConn) SetReadDeadline(t time.Time) error {
+	c.r.mu.Lock()
+	c.r.deadline = t
+	c.r.cond.Broadcast()
+	c.r.mu.Unlock()
+	return nil
+}
+
+func (c *memConn) LocalAddr() net.Addr              { return emptyAddr{} }
+func (c *memConn) RemoteAddr() net.Addr             { return emptyAddr{} }
+func (c *memConn) SetDeadline(t time.Time) error    { return c.SetReadDeadline(t) }
+func (c *memConn) SetWriteDeadline(time.Time) error { return nil }
+
+type emptyAddr struct{}
+
+func (emptyAddr) Network() string { return "mem" }
+func (emptyAddr) String() string  { return "mem" }
