@@ -5,6 +5,7 @@
 package edge
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -33,8 +34,12 @@ const (
 	// stalled client does not stall the stack serving every other tunnel.
 	tunnelSendQueue = 64
 	// tunnelBufSize exceeds the largest packet the terminating stack writes, 1452 bytes in
-	// quic-go, plus the context ID.
+	// quic-go, plus the context ID and the capsule header.
 	tunnelBufSize = 2048
+	// tunnelDrainTimeout bounds the writes that end a tunnel to a client that stopped reading.
+	tunnelDrainTimeout = time.Second
+	// connectUDPUpgrade is the Upgrade token and the :protocol of RFC 9298.
+	connectUDPUpgrade = "connect-udp"
 )
 
 var (
@@ -42,15 +47,10 @@ var (
 	tunnelBufPool = sync.Pool{New: func() any { return new([tunnelBufSize]byte) }}
 )
 
-// serveConnectUDP handles a CONNECT-UDP request, RFC 9298. The tunnel's datagrams are placed
-// by the demultiplexer like a redirected socket's, and the tunnel is a session of its own.
+// serveConnectUDP handles a CONNECT-UDP request, RFC 9298, an extended CONNECT over HTTP/2
+// and HTTP/3 and a GET with an Upgrade over HTTP/1.1. The tunnel's datagrams are placed by
+// the demultiplexer like a redirected socket's, and the tunnel is a session of its own.
 func (p *Proxy) serveConnectUDP(w http.ResponseWriter, r *http.Request, identity string) {
-	if r.ProtoMajor < 3 {
-		// Over HTTP/2 the datagrams travel as capsules on the stream, which is not
-		// implemented.
-		p.writeStatus(w, r, http.StatusNotImplemented, "CONNECT-UDP is served over HTTP/3")
-		return
-	}
 	target, err := targetFromConnectUDP(r)
 	if err != nil {
 		p.writeStatus(w, r, http.StatusBadRequest, err.Error())
@@ -79,17 +79,20 @@ func (p *Proxy) serveConnectUDP(w http.ResponseWriter, r *http.Request, identity
 		return
 	}
 
-	ctx, cancel := context.WithCancel(r.Context())
+	ctx, cancel := p.tunnelContext(r)
 	defer cancel()
-	sess := newSession(p, ctx, nil, target, kind, HTTP3)
+	sess := newSession(p, ctx, nil, target, kind, protoOfRequest(r))
 	sess.servableAs = candidates
 	sess.setUpstream(upstream)
 	sess.identity = identity
 	sess.tunnel = true
-	if front := sessionFromRequest(r); front != nil {
+	front := sessionFromRequest(r)
+	if front != nil {
 		sess.remoteAddr, sess.localAddr = front.remoteAddr, front.localAddr
 		if state := front.tlsState.Load(); state != nil {
 			sess.tlsState.Store(state)
+		} else {
+			sess.tlsConn = front.tlsConn
 		}
 	}
 
@@ -114,14 +117,70 @@ func (p *Proxy) serveConnectUDP(w http.ResponseWriter, r *http.Request, identity
 	}
 	defer p.srv.trackSession(sess, false)
 
-	streamer, ok := w.(http3.HTTPStreamer)
-	if !ok {
-		p.writeStatus(w, r, http.StatusInternalServerError, "the stream has no datagram support")
+	pipe := p.openTunnel(w, r, tun)
+	if pipe == nil {
 		return
 	}
-	w.Header().Set(http3.CapsuleProtocolHeader, "?1")
-	w.WriteHeader(http.StatusOK)
-	tun.serve(ctx, streamer.HTTPStream())
+	tun.serve(ctx, pipe)
+}
+
+// tunnelContext returns the context a tunnel lives under. A stream ends with its request. A
+// hijacked HTTP/1.1 connection outlives the request that opened it, the way a CONNECT does.
+func (p *Proxy) tunnelContext(r *http.Request) (context.Context, context.CancelFunc) {
+	if r.ProtoMajor >= 2 {
+		return context.WithCancel(r.Context())
+	}
+	return p.hijackedContext(r)
+}
+
+// openTunnel answers the request and returns the pipe of the tunnel, nil once the client was
+// answered with an error. Over HTTP/3 the datagrams are QUIC datagrams, over HTTP/2 capsules
+// on the CONNECT stream, over HTTP/1.1 capsules on the connection the 101 leaves behind.
+func (p *Proxy) openTunnel(w http.ResponseWriter, r *http.Request, tun *connectUDPTunnel) tunnelPipe {
+	switch r.ProtoMajor {
+	case 3:
+		streamer, ok := w.(http3.HTTPStreamer)
+		if !ok {
+			p.writeStatus(w, r, http.StatusInternalServerError, "the stream has no datagram support")
+			return nil
+		}
+		w.Header().Set(http3.CapsuleProtocolHeader, "?1")
+		w.WriteHeader(http.StatusOK)
+		pipe := newDatagramPipe(streamer.HTTPStream(), quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+		pipe.run(tun.close)
+		return pipe
+	case 2:
+		w.Header().Set(http3.CapsuleProtocolHeader, "?1")
+		w.WriteHeader(http.StatusOK)
+		_ = http.NewResponseController(w).Flush()
+		stream := newH2Stream(w, r, tun.sess.localAddr, tun.sess.remoteAddr)
+		return newCapsulePipe(stream, bufio.NewReader(stream))
+	default:
+		client, brw, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			p.writeStatus(w, r, http.StatusInternalServerError, "cannot hijack the connection for CONNECT-UDP")
+			return nil
+		}
+		if err := writeConnectUDPUpgrade(brw); err != nil {
+			_ = client.Close()
+			return nil
+		}
+		// Anything the reader buffered past the request is already capsule data.
+		return newCapsulePipe(client, brw.Reader)
+	}
+}
+
+func writeConnectUDPUpgrade(brw *bufio.ReadWriter) error {
+	if _, err := brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: " +
+		connectUDPUpgrade + "\r\n" + http3.CapsuleProtocolHeader + ": ?1\r\n\r\n"); err != nil {
+		return err
+	}
+	return brw.Flush()
+}
+
+func isConnectUDPUpgrade(r *http.Request) bool {
+	return r.Method == http.MethodGet && r.ProtoMajor == 1 &&
+		strings.EqualFold(upgradeType(r.Header), connectUDPUpgrade)
 }
 
 // targetFromConnectUDP reads the target out of the request path. The host arrives
@@ -192,7 +251,7 @@ type connectUDPTunnel struct {
 	key       flowKey
 	d         *quicDemux
 	sess      *Session
-	str       *http3.Stream
+	pipe      tunnelPipe
 	addr      *tunnelAddr
 	cancel    context.CancelFunc
 	sendCh    chan []byte
@@ -239,18 +298,17 @@ type tunnelAddr struct {
 func (a *tunnelAddr) Network() string { return "connect-udp" }
 func (a *tunnelAddr) String() string  { return a.name }
 
-// serve reads the datagrams off the tunnel and places each, until the tunnel ends.
-func (t *connectUDPTunnel) serve(ctx context.Context, str *http3.Stream) {
-	t.str = str
-	// A reset or the loss of the front connection cancels the request context. A FIN alone
-	// does not, which the capsule reader catches.
+// serve reads the datagrams off the pipe and places each, until the tunnel ends.
+func (t *connectUDPTunnel) serve(ctx context.Context, pipe tunnelPipe) {
+	t.pipe = pipe
+	// A reset or the loss of the front connection cancels the context. A FIN alone does
+	// not, which the pipe reports as the end of its reads.
 	stop := context.AfterFunc(ctx, t.close)
 	defer stop()
 	go t.sender()
-	go t.drainCapsules()
 
 	for {
-		b, err := str.ReceiveDatagram(ctx)
+		b, err := pipe.recv(ctx)
 		if err != nil {
 			break
 		}
@@ -265,39 +323,24 @@ func (t *connectUDPTunnel) serve(ctx context.Context, str *http3.Stream) {
 	<-t.sent
 }
 
-// drainCapsules drops every capsule the client sends, RFC 9297 section 3.2, and ends the
-// tunnel on the client's FIN.
-func (t *connectUDPTunnel) drainCapsules() {
-	parser := http3.NewCapsuleParser(t.str)
-	for {
-		_, r, err := parser.Next()
-		if err != nil {
-			t.close()
-			return
-		}
-		if err := r.Discard(); err != nil {
-			t.close()
-			return
-		}
-	}
-}
-
 // send queues b for the client and drops it when the queue is full.
 func (t *connectUDPTunnel) send(b []byte) {
 	// The stack reuses its buffer once the write returns, and the context ID goes first.
-	var out []byte
-	if 1+len(b) <= tunnelBufSize {
-		out = tunnelBufPool.Get().(*[tunnelBufSize]byte)[:1+len(b)]
-	} else {
-		out = make([]byte, 1+len(b))
-	}
-	out[0] = 0
-	copy(out[1:], b)
+	out := tunnelBuf(capsuleHeadroom + 1 + len(b))
+	out[capsuleHeadroom] = 0
+	copy(out[capsuleHeadroom+1:], b)
 	select {
 	case t.sendCh <- out:
 	default:
 		putTunnelBuf(out)
 	}
+}
+
+func tunnelBuf(n int) []byte {
+	if n <= tunnelBufSize {
+		return tunnelBufPool.Get().(*[tunnelBufSize]byte)[:n]
+	}
+	return make([]byte, n)
 }
 
 func putTunnelBuf(b []byte) {
@@ -306,9 +349,8 @@ func putTunnelBuf(b []byte) {
 	}
 }
 
-// sender is the one goroutine writing the stream. Once the tunnel is done it drains the queue,
-// the CONNECTION_CLOSE of every inner connection among it, then ends the stream with a FIN on
-// the response and a STOP_SENDING on the request.
+// sender is the one goroutine writing the pipe. Once the tunnel is done it drains the queue,
+// the CONNECTION_CLOSE of every inner connection among it, then ends the pipe.
 func (t *connectUDPTunnel) sender() {
 	defer close(t.sent)
 	for {
@@ -320,6 +362,7 @@ func (t *connectUDPTunnel) sender() {
 		}
 		break
 	}
+	_ = t.pipe.setWriteDeadline(time.Now().Add(tunnelDrainTimeout))
 	for {
 		select {
 		case b := <-t.sendCh:
@@ -329,18 +372,17 @@ func (t *connectUDPTunnel) sender() {
 		}
 		break
 	}
-	_ = t.str.Close()
-	t.str.CancelRead(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+	_ = t.pipe.close()
 }
 
 func (t *connectUDPTunnel) sendDatagram(b []byte) {
-	err := t.str.SendDatagram(b)
+	err := t.pipe.send(b)
 	putTunnelBuf(b)
 	if err != nil {
 		if tooLarge, ok := errors.AsType[*quic.DatagramTooLargeError](err); ok {
 			t.d.p.cfg.logger.Debug("edge: datagram larger than the tunnel carries",
 				slog.String("target", t.target.String()),
-				slog.Int("size", len(b)),
+				slog.Int("size", len(b)-capsuleHeadroom),
 				slog.Int64("max", tooLarge.MaxDatagramPayloadSize))
 		}
 	}

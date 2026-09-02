@@ -50,7 +50,7 @@ Point the application at it with `HTTPS_PROXY=http://localhost:8080` and install
 | Tunnel end to end    | yes      | yes    | yes    |
 | Intercept and route  | yes      | yes    | yes    |
 
-A classic proxy setting sends an HTTP/3 client back to TCP, since `CONNECT` tunnels a stream and HTTP/3 needs datagrams. `CONNECT-UDP` (RFC 9298, the MASQUE tunnel) tunnels them, and `ListenAndServeQUIC` serves it over an HTTP/3 front. A client that speaks it reaches HTTP/3 origins and any other UDP through a proxy setting, and the tunnel and everything inside it show up in `Sessions()`. A client that does not is reached by routing it to the transparent listener instead.
+A classic proxy setting sends an HTTP/3 client back to TCP, since `CONNECT` tunnels a stream and HTTP/3 needs datagrams. `CONNECT-UDP` (RFC 9298, the MASQUE tunnel) tunnels them. `ListenAndServeQUIC` serves it over an HTTP/3 front, and the TCP fronts serve it as capsules on the stream, an extended CONNECT over HTTP/2 or a GET the proxy upgrades over HTTP/1.1, for a client that cannot reach the proxy over UDP. A client that speaks it reaches HTTP/3 origins and any other UDP through a proxy setting, and the tunnel and everything inside it show up in `Sessions()`. A client that does not is reached by routing it to the transparent listener instead. Go's HTTP/2 server accepts an extended CONNECT only with `GODEBUG=http2xconnect=1` in the environment.
 
 Protocol upgrades, including WebSocket, are spliced through in both modes. Server-sent events and other streamed bodies are relayed as they are produced, not buffered. Trailers are forwarded.
 

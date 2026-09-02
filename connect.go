@@ -60,26 +60,8 @@ func (p *Proxy) connectHijack(w http.ResponseWriter, r *http.Request, target Tar
 	}
 	conn := newPeekConn(client, early, clientHelloPeekSize)
 
-	// The connection outlives the request that opened it, so what bounds it is the connection,
-	// not the request. ConnContext built exactly that context and handed it to the session, and
-	// it ends when the connection closes. The request context is one cancel deeper and ends
-	// with the request, which for a hijacked connection is at the hijack: borrowing it would
-	// cut a handshake or a dial the moment net/http considered the CONNECT over.
-	base := context.WithoutCancel(r.Context())
-	if s := sessionFromRequest(r); s != nil {
-		base = s.Context()
-	}
-	ctx, cancel := context.WithCancel(base)
+	ctx, cancel := p.hijackedContext(r)
 	defer cancel()
-	// Mounted in a server of its own the proxy has no ConnContext, and the fallback above
-	// carries no cancellation, so a shutdown is watched for explicitly.
-	go func() {
-		select {
-		case <-p.srv.closed:
-			cancel()
-		case <-ctx.Done():
-		}
-	}()
 
 	// The hijacked connection is the front one, so its handshake describes the proxy and not
 	// the tunnel. The session takes the addresses alone and the tunnel's own termination
@@ -112,6 +94,27 @@ func (p *Proxy) connectHijack(w http.ResponseWriter, r *http.Request, target Tar
 	if ierr := p.terminate(ctx, conn, sess); ierr != nil {
 		p.logf(ctx, slog.LevelDebug, "connection closed", sess, ierr)
 	}
+}
+
+// hijackedContext returns the context of a connection taken over after r, the one
+// ConnContext built, which ends when the connection closes. The request context ends at the
+// hijack and would cut a handshake or a dial there.
+func (p *Proxy) hijackedContext(r *http.Request) (context.Context, context.CancelFunc) {
+	base := context.WithoutCancel(r.Context())
+	if s := sessionFromRequest(r); s != nil {
+		base = s.Context()
+	}
+	ctx, cancel := context.WithCancel(base)
+	// Mounted in a server of its own the proxy has no ConnContext, and the fallback above
+	// has no cancellation, so a shutdown is watched for explicitly.
+	go func() {
+		select {
+		case <-p.srv.closed:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
 }
 
 // connectStream handles a CONNECT carried on an HTTP/2 or HTTP/3 stream, where the stream

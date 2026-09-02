@@ -310,7 +310,7 @@ func (t *idleTracker) stop() {
 type h2Stream struct {
 	r       *deadlineReader
 	body    io.ReadCloser
-	w       io.Writer
+	w       http.ResponseWriter
 	flusher http.Flusher
 	local   net.Addr
 	remote  net.Addr
@@ -379,7 +379,14 @@ func (s *h2Stream) SetReadDeadline(t time.Time) error {
 	return nil
 }
 
-func (s *h2Stream) SetWriteDeadline(time.Time) error { return nil }
+// SetWriteDeadline bounds the writes that follow. Past it the server resets the stream and a
+// blocked write returns.
+func (s *h2Stream) SetWriteDeadline(t time.Time) error {
+	if s.closed.Load() {
+		return net.ErrClosed
+	}
+	return http.NewResponseController(s.w).SetWriteDeadline(t)
+}
 
 // deadlineReader gives a reader that has no deadline of its own one, by keeping at most one
 // read outstanding and handing back what it produced on the next call. A read the deadline cut

@@ -5,6 +5,7 @@
 package edge
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
@@ -17,10 +18,13 @@ import (
 	"net/url"
 	"os"
 	"strconv"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/fox-toolkit/edge/internal/h2tunnel"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/quic-go/quicvarint"
@@ -168,7 +172,7 @@ func (c *masqueConn) SetWriteDeadline(time.Time) error  { return nil }
 
 // innerH3 opens an HTTP/3 connection to origin through the tunnel, as a client of name that
 // trusts the certificates ca mints, and returns a round tripper on it.
-func innerH3(t *testing.T, pconn *masqueConn, origin netip.AddrPort, name string, ca *CA) (*http3.ClientConn, *quic.Conn) {
+func innerH3(t *testing.T, pconn net.PacketConn, origin netip.AddrPort, name string, ca *CA) (*http3.ClientConn, *quic.Conn) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -232,6 +236,14 @@ func udpEcho(t *testing.T) netip.AddrPort {
 // h3Authority, resolving that name to the origin, and serves it on an HTTP/3 front.
 func masqueProxy(t *testing.T, opts ...ProxyOption) (*Proxy, *CA, netip.AddrPort, netip.AddrPort) {
 	t.Helper()
+	p, proxyCA, origin := newMasqueProxy(t, opts...)
+	front, _ := startQUICFront(t, p, proxyCA)
+	return p, proxyCA, front, origin
+}
+
+// newMasqueProxy builds the proxy masqueProxy serves, without a front.
+func newMasqueProxy(t *testing.T, opts ...ProxyOption) (*Proxy, *CA, netip.AddrPort) {
+	t.Helper()
 	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
 	require.NoError(t, err)
 	origin := h3Origin(t, originCA)
@@ -248,8 +260,7 @@ func masqueProxy(t *testing.T, opts ...ProxyOption) (*Proxy, *CA, netip.AddrPort
 	}, opts...)...)
 	require.NoError(t, err)
 	p.MustAdd(h3Authority+"/+{any}", forwardHandler)
-	front, _ := startQUICFront(t, p, proxyCA)
-	return p, proxyCA, front, origin
+	return p, proxyCA, origin
 }
 
 // A CONNECT-UDP tunnel carries an HTTP/3 connection the proxy terminates and routes request
@@ -624,4 +635,457 @@ func TestConnectUDP_TunnelStaleOnTheKind(t *testing.T) {
 	_, err = p.Delete[HTTP](h3Authority + "/echo")
 	require.NoError(t, err)
 	assert.True(t, tunnel.Stale(), "a new tunnel would be admitted under QUIC")
+}
+
+// capsuleClient is a CONNECT-UDP client over a byte stream written from RFC 9297 and RFC
+// 9298, the counterpart of what the proxy implements over HTTP/2 and HTTP/1.1. It is a
+// net.PacketConn over the tunnel, every datagram in a DATAGRAM capsule with context ID 0.
+type capsuleClient struct {
+	rw       io.ReadWriteCloser
+	in       chan []byte
+	done     chan struct{}
+	err      error
+	deadline atomic.Pointer[time.Time]
+	wmu      sync.Mutex
+}
+
+func newCapsuleClient(rw io.ReadWriteCloser) *capsuleClient {
+	c := &capsuleClient{rw: rw, in: make(chan []byte, 64), done: make(chan struct{})}
+	go c.read()
+	return c
+}
+
+// read parses the capsules the proxy sends. The error ending the stream is sticky, every
+// reader of the tunnel sees it.
+func (c *capsuleClient) read() {
+	br := bufio.NewReader(c.rw)
+	for {
+		typ, err := quicvarint.Read(br)
+		if err != nil {
+			c.err = err
+			close(c.done)
+			return
+		}
+		length, err := quicvarint.Read(br)
+		if err != nil {
+			c.err = err
+			close(c.done)
+			return
+		}
+		value := make([]byte, length)
+		if _, err := io.ReadFull(br, value); err != nil {
+			c.err = err
+			close(c.done)
+			return
+		}
+		if typ != 0 {
+			continue
+		}
+		c.in <- value
+	}
+}
+
+func (c *capsuleClient) ReadFrom(b []byte) (int, net.Addr, error) {
+	var timeout <-chan time.Time
+	if dl := c.deadline.Load(); dl != nil && !dl.IsZero() {
+		timer := time.NewTimer(time.Until(*dl))
+		defer timer.Stop()
+		timeout = timer.C
+	}
+	for {
+		select {
+		case value := <-c.in:
+			id, n, err := quicvarint.Parse(value)
+			if err != nil || id != 0 {
+				continue
+			}
+			return copy(b, value[n:]), emptyAddr{}, nil
+		case <-c.done:
+			return 0, nil, c.err
+		case <-timeout:
+			return 0, nil, os.ErrDeadlineExceeded
+		}
+	}
+}
+
+func (c *capsuleClient) WriteTo(b []byte, _ net.Addr) (int, error) {
+	out := make([]byte, 1+len(b))
+	copy(out[1:], b)
+	return len(b), c.writeCapsule(0, out)
+}
+
+// writeCapsule writes one capsule of any type, in as many writes as the caller wants to see
+// it split into.
+func (c *capsuleClient) writeCapsule(typ uint64, value []byte) error {
+	hdr := quicvarint.Append(quicvarint.Append(nil, typ), uint64(len(value)))
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	if _, err := c.rw.Write(hdr); err != nil {
+		return err
+	}
+	_, err := c.rw.Write(value)
+	return err
+}
+
+// CloseWrite ends the client's direction alone, a FIN on the stream.
+func (c *capsuleClient) CloseWrite() error {
+	return c.rw.(interface{ CloseWrite() error }).CloseWrite()
+}
+
+func (c *capsuleClient) Close() error                      { return c.rw.Close() }
+func (c *capsuleClient) LocalAddr() net.Addr               { return emptyAddr{} }
+func (c *capsuleClient) SetReadBuffer(int) error           { return nil }
+func (c *capsuleClient) SetWriteBuffer(int) error          { return nil }
+func (c *capsuleClient) SetDeadline(t time.Time) error     { return c.SetReadDeadline(t) }
+func (c *capsuleClient) SetReadDeadline(t time.Time) error { c.deadline.Store(&t); return nil }
+func (c *capsuleClient) SetWriteDeadline(time.Time) error  { return nil }
+
+// startTLSFront serves p as an explicit proxy over TLS, offering protos in ALPN.
+func startTLSFront(t *testing.T, p *Proxy, ca *CA, protos ...string) netip.AddrPort {
+	t.Helper()
+	cert, err := ca.Leaf("127.0.0.1")
+	require.NoError(t, err)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	cfg := &tls.Config{Certificates: []tls.Certificate{*cert}, MinVersion: tls.VersionTLS12, NextProtos: protos}
+	go func() { _ = p.serveFront(tls.NewListener(cancelListener{ln}, cfg)) }()
+	t.Cleanup(func() { _ = p.Close() })
+	return netip.MustParseAddrPort(ln.Addr().String())
+}
+
+// tunnelOpener asks the front for a tunnel to target, host:port, with the given headers. A
+// refusal returns the response the proxy answered with.
+type tunnelOpener func(target string, header http.Header) (*capsuleClient, *http.Response, error)
+
+// capsuleFront is one way of reaching the proxy over TCP, and how a tunnel is opened on it.
+type capsuleFront struct {
+	open  func(t *testing.T, front netip.AddrPort, ca *CA) tunnelOpener
+	name  string
+	alpn  string
+	proto Protocol
+}
+
+var capsuleFronts = []capsuleFront{
+	{name: "h2", alpn: "h2", proto: HTTP2, open: openTunnelsH2},
+	{name: "h1", alpn: "http/1.1", proto: HTTP11, open: openTunnelsH1},
+}
+
+// extendedConnectEnabled reports whether Go's HTTP/2 server accepts an extended CONNECT,
+// which it does behind GODEBUG=http2xconnect=1, read from the environment at startup.
+func extendedConnectEnabled() bool {
+	return strings.Contains(os.Getenv("GODEBUG"), "http2xconnect=1")
+}
+
+// skipWithoutExtendedConnect skips a test of the HTTP/2 front unless Go's server accepts
+// extended CONNECT.
+func skipWithoutExtendedConnect(t *testing.T, f capsuleFront) {
+	t.Helper()
+	if f.alpn == "h2" && !extendedConnectEnabled() {
+		t.Skip("run with GODEBUG=http2xconnect=1, Go's HTTP/2 server refuses extended CONNECT without it")
+	}
+}
+
+func connectUDPURL(front netip.AddrPort, target string) (string, error) {
+	host, port, err := net.SplitHostPort(target)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("https://%s%s%s/%s/", front, connectUDPPath, url.PathEscape(host), port), nil
+}
+
+func dialFront(t *testing.T, front netip.AddrPort, ca *CA, alpn string) *tls.Conn {
+	t.Helper()
+	tc, err := tls.Dial("tcp", front.String(), &tls.Config{
+		RootCAs:    poolOf(ca),
+		ServerName: "127.0.0.1",
+		NextProtos: []string{alpn},
+		MinVersion: tls.VersionTLS12,
+	})
+	require.NoError(t, err)
+	require.Equal(t, alpn, tc.ConnectionState().NegotiatedProtocol)
+	return tc
+}
+
+// openTunnelsH2 opens one HTTP/2 connection to the front and returns an opener sending an
+// extended CONNECT on it for every tunnel, RFC 9298 section 3.4. Go's client cannot send one,
+// so the connection is the proxy's own client.
+func openTunnelsH2(t *testing.T, front netip.AddrPort, ca *CA) tunnelOpener {
+	t.Helper()
+	tc := dialFront(t, front, ca, "h2")
+	cc, err := h2tunnel.Client(tc)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = cc.Close() })
+	return func(target string, header http.Header) (*capsuleClient, *http.Response, error) {
+		host, port, err := net.SplitHostPort(target)
+		if err != nil {
+			return nil, nil, err
+		}
+		req := h2tunnel.Request{
+			Protocol:  "connect-udp",
+			Scheme:    "https",
+			Authority: front.String(),
+			Path:      connectUDPPath + url.PathEscape(host) + "/" + port + "/",
+			Header:    http.Header{http3.CapsuleProtocolHeader: {"?1"}},
+		}
+		for k, vv := range header {
+			req.Header[k] = vv
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		str, resp, err := cc.Open(ctx, req)
+		if err != nil {
+			return nil, nil, err
+		}
+		hresp := &http.Response{StatusCode: resp.StatusCode, Header: resp.Header}
+		if resp.StatusCode != http.StatusOK {
+			_ = str.Close()
+			return nil, hresp, fmt.Errorf("CONNECT-UDP refused with %d", resp.StatusCode)
+		}
+		c := newCapsuleClient(str)
+		t.Cleanup(func() { _ = c.Close() })
+		return c, hresp, nil
+	}
+}
+
+// h1TunnelStream is the client side of a connection an Upgrade left behind, read through the
+// buffer the response was read with.
+type h1TunnelStream struct {
+	*tls.Conn
+	br *bufio.Reader
+}
+
+func (s *h1TunnelStream) Read(b []byte) (int, error) { return s.br.Read(b) }
+
+// openTunnelsH1 returns an opener dialing the front and sending a GET with an Upgrade for
+// every tunnel, RFC 9298 section 3.2.
+func openTunnelsH1(t *testing.T, front netip.AddrPort, ca *CA) tunnelOpener {
+	t.Helper()
+	return func(target string, header http.Header) (*capsuleClient, *http.Response, error) {
+		u, err := connectUDPURL(front, target)
+		if err != nil {
+			return nil, nil, err
+		}
+		req, err := http.NewRequest(http.MethodGet, u, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		req.Header.Set("Connection", "Upgrade")
+		req.Header.Set("Upgrade", "connect-udp")
+		req.Header.Set(http3.CapsuleProtocolHeader, "?1")
+		for k, vv := range header {
+			req.Header[k] = vv
+		}
+		tc := dialFront(t, front, ca, "http/1.1")
+		t.Cleanup(func() { _ = tc.Close() })
+		if err := req.WriteProxy(tc); err != nil {
+			return nil, nil, err
+		}
+		br := bufio.NewReader(tc)
+		resp, err := http.ReadResponse(br, req)
+		if err != nil {
+			return nil, nil, err
+		}
+		if resp.StatusCode != http.StatusSwitchingProtocols {
+			_ = resp.Body.Close()
+			return nil, resp, fmt.Errorf("CONNECT-UDP refused with %d", resp.StatusCode)
+		}
+		c := newCapsuleClient(&h1TunnelStream{Conn: tc, br: br})
+		return c, resp, nil
+	}
+}
+
+// A tunnel over TCP carries an HTTP/3 connection the proxy terminates and routes request by
+// request, the tunnel reporting the front's protocol, and closing it ends the stream.
+func TestConnectUDP_Capsules_TerminatesTheInnerHTTP3(t *testing.T) {
+	for _, f := range capsuleFronts {
+		t.Run(f.name, func(t *testing.T) {
+			skipWithoutExtendedConnect(t, f)
+			p, ca, origin := newMasqueProxy(t)
+			front := startTLSFront(t, p, ca, f.alpn)
+			open := f.open(t, front, ca)
+			target := fmt.Sprintf("%s:%d", h3Authority, origin.Port())
+
+			pconn, resp, err := open(target, nil)
+			require.NoError(t, err)
+			assert.Equal(t, "?1", resp.Header.Get(http3.CapsuleProtocolHeader))
+
+			inner, _ := innerH3(t, pconn, origin, h3Authority, ca)
+			body, err := getThrough(inner, fmt.Sprintf("https://%s/echo", target))
+			require.NoError(t, err)
+			assert.Contains(t, body, "path=/echo")
+			assert.Contains(t, body, "proto=HTTP/3.0", "the origin was reached over HTTP/3")
+
+			var tunnel, conn *Session
+			for _, s := range waitForSessions(t, p, 2) {
+				if s.Tunnel() {
+					tunnel = s
+				} else {
+					conn = s
+				}
+			}
+			require.NotNil(t, tunnel)
+			require.NotNil(t, conn)
+			assert.Equal(t, KindHTTP, tunnel.Kind())
+			assert.Equal(t, f.proto, tunnel.Protocol())
+			assert.Equal(t, h3Authority, tunnel.Target().Host)
+			assert.Equal(t, origin, tunnel.Upstream())
+			assert.NotNil(t, tunnel.TLS(), "the front handshake")
+			assert.Nil(t, tunnel.Via())
+			assert.Same(t, tunnel, conn.Via())
+			assert.Equal(t, HTTP3, conn.Protocol())
+			assert.Equal(t, tunnel.RemoteAddr(), conn.RemoteAddr())
+
+			// Closing the tunnel ends what it carries, and the client sees its stream end.
+			require.NoError(t, tunnel.Close())
+			waitForSessions(t, p, 0)
+			require.NoError(t, pconn.SetReadDeadline(time.Now().Add(5*time.Second)))
+			_, _, err = pconn.ReadFrom(make([]byte, 64))
+			require.Error(t, err)
+			assert.NotErrorIs(t, err, os.ErrDeadlineExceeded, "the stream ended rather than went quiet")
+
+			// The front connection survives, and a new tunnel is decided afresh.
+			pconn2, _, err := open(target, nil)
+			require.NoError(t, err)
+			again, _ := innerH3(t, pconn2, origin, h3Authority, ca)
+			body, err = getThrough(again, fmt.Sprintf("https://%s/again", target))
+			require.NoError(t, err)
+			assert.Contains(t, body, "path=/again")
+		})
+	}
+}
+
+// Raw datagrams in a tunnel over TCP are routed one by one on the declared target.
+func TestConnectUDP_Capsules_RoutesRawDatagramsOnTheDeclaredTarget(t *testing.T) {
+	for _, f := range capsuleFronts {
+		t.Run(f.name, func(t *testing.T) {
+			skipWithoutExtendedConnect(t, f)
+			echo := udpEcho(t)
+			ca, err := GenerateCA()
+			require.NoError(t, err)
+			resolver := &fakeResolver{addrs: map[string][]netip.Addr{"echo.udp.test": {echo.Addr()}}}
+			p, err := New(WithCA(ca), WithNameResolver(resolver))
+			require.NoError(t, err)
+			seen := new(recorder)
+			p.MustAdd[UDP](fmt.Sprintf("{name}.udp.test:%d", echo.Port()), func(c *DatagramCtx) error {
+				seen.add(fmt.Sprintf("%s %s %v %s", c.Param("name"), c.Target().Host, c.Inbound(), c.Bytes()))
+				return c.Forward()
+			})
+			front := startTLSFront(t, p, ca, f.alpn)
+			open := f.open(t, front, ca)
+
+			pconn, _, err := open(fmt.Sprintf("echo.udp.test:%d", echo.Port()), nil)
+			require.NoError(t, err)
+			_, err = pconn.WriteTo([]byte("ping"), nil)
+			require.NoError(t, err)
+			require.NoError(t, pconn.SetReadDeadline(time.Now().Add(5*time.Second)))
+			buf := make([]byte, 64)
+			n, _, err := pconn.ReadFrom(buf)
+			require.NoError(t, err)
+			assert.Equal(t, "ping", string(buf[:n]))
+			assert.Equal(t, []string{"echo echo.udp.test false ping", "echo echo.udp.test true ping"}, seen.all())
+
+			for _, s := range waitForSessions(t, p, 2) {
+				assert.Equal(t, KindUDP, s.Kind())
+				assert.Equal(t, "echo.udp.test", s.Target().Host)
+				if s.Tunnel() {
+					assert.Equal(t, f.proto, s.Protocol())
+				} else {
+					require.NotNil(t, s.Via())
+				}
+			}
+		})
+	}
+}
+
+// A refused or unresolvable target is answered with an ordinary status, before any tunnel
+// exists, on a TCP front as on the HTTP/3 one.
+func TestConnectUDP_Capsules_RefusesBeforeTheTunnelExists(t *testing.T) {
+	for _, f := range capsuleFronts {
+		t.Run(f.name, func(t *testing.T) {
+			skipWithoutExtendedConnect(t, f)
+			ca, err := GenerateCA()
+			require.NoError(t, err)
+			resolver := &fakeResolver{addrs: map[string][]netip.Addr{"spray.test": addrsOf("10.9.9.9")}}
+			p, err := New(WithCA(ca), WithNameResolver(resolver))
+			require.NoError(t, err)
+			p.MustAdd("unresolved.test/+{any}", forwardHandler)
+			front := startTLSFront(t, p, ca, f.alpn)
+			open := f.open(t, front, ca)
+
+			_, resp, err := open("spray.test:443", nil)
+			require.Error(t, err)
+			require.NotNil(t, resp)
+			assert.Equal(t, http.StatusForbidden, resp.StatusCode, "a name no entry admits")
+			assert.Zero(t, resolver.calls.Load(), "a refused name is not resolved")
+
+			_, resp, err = open("unresolved.test:443", nil)
+			require.Error(t, err)
+			require.NotNil(t, resp)
+			assert.Equal(t, http.StatusBadGateway, resp.StatusCode, "a name the proxy cannot resolve")
+			assert.Empty(t, waitForSessions(t, p, 0))
+		})
+	}
+}
+
+// The client ending its direction ends the tunnel, and so does dropping the stream.
+func TestConnectUDP_Capsules_ClientEndEndsTheTunnel(t *testing.T) {
+	for _, f := range capsuleFronts {
+		t.Run(f.name, func(t *testing.T) {
+			skipWithoutExtendedConnect(t, f)
+			p, ca, origin := newMasqueProxy(t)
+			front := startTLSFront(t, p, ca, f.alpn)
+			open := f.open(t, front, ca)
+			target := fmt.Sprintf("%s:%d", h3Authority, origin.Port())
+
+			pconn, _, err := open(target, nil)
+			require.NoError(t, err)
+			inner, innerConn := innerH3(t, pconn, origin, h3Authority, ca)
+			_, err = getThrough(inner, fmt.Sprintf("https://%s/echo", target))
+			require.NoError(t, err)
+			waitForSessions(t, p, 2)
+			require.NoError(t, pconn.CloseWrite())
+			waitForSessions(t, p, 0)
+			requireEnded(t, innerConn, "the inner connection is closed through the tunnel")
+
+			pconn, _, err = open(target, nil)
+			require.NoError(t, err)
+			inner, innerConn = innerH3(t, pconn, origin, h3Authority, ca)
+			_, err = getThrough(inner, fmt.Sprintf("https://%s/echo", target))
+			require.NoError(t, err)
+			waitForSessions(t, p, 2)
+			require.NoError(t, pconn.Close())
+			waitForSessions(t, p, 0)
+			requireEnded(t, innerConn, "the inner connection ends with the stream")
+		})
+	}
+}
+
+// A capsule of another type is skipped, RFC 9297 section 3.2, and a DATAGRAM capsule larger
+// than a UDP payload can be is dropped, neither ending the tunnel.
+func TestConnectUDP_Capsules_SkipsWhatIsNotADatagram(t *testing.T) {
+	for _, f := range capsuleFronts {
+		t.Run(f.name, func(t *testing.T) {
+			skipWithoutExtendedConnect(t, f)
+			echo := udpEcho(t)
+			ca, err := GenerateCA()
+			require.NoError(t, err)
+			p, err := New(WithCA(ca))
+			require.NoError(t, err)
+			p.MustAdd[UDP]("127.0.0.1", forwardDatagram)
+			front := startTLSFront(t, p, ca, f.alpn)
+			open := f.open(t, front, ca)
+
+			pconn, _, err := open(echo.String(), nil)
+			require.NoError(t, err)
+			require.NoError(t, pconn.writeCapsule(0x2b, []byte("an extension the proxy does not know")))
+			require.NoError(t, pconn.writeCapsule(0, make([]byte, maxCapsuleDatagram+1)))
+			_, err = pconn.WriteTo([]byte("still here"), nil)
+			require.NoError(t, err)
+			require.NoError(t, pconn.SetReadDeadline(time.Now().Add(5*time.Second)))
+			buf := make([]byte, 64)
+			n, _, err := pconn.ReadFrom(buf)
+			require.NoError(t, err)
+			assert.Equal(t, "still here", string(buf[:n]))
+		})
+	}
 }

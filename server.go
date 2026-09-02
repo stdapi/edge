@@ -183,7 +183,9 @@ func newServer(p *Proxy) (*server, error) {
 
 // ListenAndServe listens on addr and serves as an explicit forward proxy. Clients point at
 // it with their proxy setting: plain HTTP requests carry an absolute target, HTTPS requests
-// start with CONNECT.
+// start with CONNECT, and UDP goes through a CONNECT-UDP tunnel, RFC 9298, an Upgrade over
+// HTTP/1.1 or an extended CONNECT over HTTP/2. The HTTP/2 form needs GODEBUG=http2xconnect=1
+// in the environment of the process.
 //
 // ListenAndServe always returns a non-nil error. After [Proxy.Shutdown] or [Proxy.Close] it
 // returns [ErrProxyClosed].
@@ -441,6 +443,11 @@ func (p *Proxy) serveProxyRequest(w http.ResponseWriter, r *http.Request) {
 		default:
 			p.writeStatus(w, r, http.StatusNotImplemented, "extended CONNECT is not served, WebSocket goes over HTTP/1.1")
 		}
+		return
+	}
+
+	if isConnectUDPUpgrade(r) {
+		p.serveConnectUDP(w, r, identity)
 		return
 	}
 
