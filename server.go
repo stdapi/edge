@@ -58,11 +58,11 @@ type server struct {
 	p   *Proxy
 	fwd *forwarder
 
-	// h1 and h3 serve the explicit proxy port, over TCP and over QUIC. mitm serves the
+	// h1 and h3 serve the explicit proxy port, over TCP and over QUIC. term serves the
 	// connections the proxy terminated itself, which speak origin semantics.
 	h1   *http.Server
 	h3   *http3.Server
-	mitm *http.Server
+	term *http.Server
 
 	listeners map[*net.Listener]struct{}
 	// active tracks connections the proxy owns outside of http.Server, which is every
@@ -105,7 +105,7 @@ func newServer(p *Proxy) (*server, error) {
 
 	// A client may speak HTTP/2 over plaintext, with the connection preface instead of ALPN.
 	// Without unencrypted HTTP/2 enabled it is answered as if it had sent a request whose
-	// method is "PRI". Both servers can receive one, and for mitm it is the only HTTP/2
+	// method is "PRI". Both servers can receive one, and for term it is the only HTTP/2
 	// path: an intercepted connection arrives with its TLS already terminated, so even a
 	// client that negotiated h2 through ALPN reaches the server as plaintext carrying the
 	// preface every HTTP/2 connection must start with.
@@ -158,7 +158,7 @@ func newServer(p *Proxy) (*server, error) {
 		},
 	}
 
-	s.mitm = &http.Server{
+	s.term = &http.Server{
 		Handler:           http.HandlerFunc(p.serveTerminatedRequest),
 		Protocols:         protocols,
 		HTTP2:             http2Cfg,
@@ -309,13 +309,13 @@ func (p *Proxy) Shutdown(ctx context.Context) error {
 	p.srv.mu.Unlock()
 
 	// The planes drain together. An intercepted connection carried on a CONNECT stream of
-	// the front server only ends once the mitm server drains it, so draining one server
-	// after the other would hold the first open until the deadline.
+	// the front server only ends once the terminating server drains it, so draining one
+	// server after the other would hold the first open until the deadline.
 	errs := make([]error, 3+len(demuxes))
 	var drains sync.WaitGroup
 	drains.Go(func() { errs[0] = p.srv.h1.Shutdown(ctx) })
 	drains.Go(func() { errs[1] = p.srv.h3.Shutdown(ctx) })
-	drains.Go(func() { errs[2] = p.srv.mitm.Shutdown(ctx) })
+	drains.Go(func() { errs[2] = p.srv.term.Shutdown(ctx) })
 	for i, d := range demuxes {
 		drains.Go(func() { errs[3+i] = d.shutdown(ctx) })
 	}
@@ -359,7 +359,7 @@ func (p *Proxy) Shutdown(ctx context.Context) error {
 // Close stops the proxy at once, dropping every connection including the traffic in flight.
 func (p *Proxy) Close() error {
 	p.srv.beginClose()
-	err := errors.Join(p.srv.closeListeners(), p.srv.h1.Close(), p.srv.h3.Close(), p.srv.mitm.Close())
+	err := errors.Join(p.srv.closeListeners(), p.srv.h1.Close(), p.srv.h3.Close(), p.srv.term.Close())
 	p.srv.closeActive()
 	p.srv.fwd.close()
 	return err

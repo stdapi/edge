@@ -248,7 +248,7 @@ func (p *Proxy) serveTerminatedHTTP(conn net.Conn, sess *Session) error {
 	defer p.srv.trackSession(sess, false)
 
 	ln := newSingleConnListener(conn, sess)
-	err := p.srv.mitm.Serve(ln)
+	err := p.srv.term.Serve(ln)
 	ln.wait()
 	if errors.Is(err, net.ErrClosed) || errors.Is(err, http.ErrServerClosed) {
 		return nil
