@@ -1224,3 +1224,172 @@ func TestQUIC_StaleWhenTheLastHTTPEntryGoes(t *testing.T) {
 	p.MustAdd(h3Authority+"/+{any}", forwardHandler)
 	assert.False(t, sess.Stale(), "HTTP admits it again, and each request is routed on its own")
 }
+
+// A QUIC handler dials the origin through the transport's dialer, on the socket it returns,
+// and the socket is closed once the handler has returned.
+func TestQUIC_DialUsesTheTransportDialer(t *testing.T) {
+	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
+	require.NoError(t, err)
+	origin := h3Origin(t, originCA)
+
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	upstream := DefaultTransport()
+	upstream.RootCAs = poolOf(originCA)
+	var seenNetwork, local atomic.Pointer[string]
+	upstream.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		conn, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		seenNetwork.Store(&network)
+		l := conn.LocalAddr().String()
+		local.Store(&l)
+		return conn, nil
+	}
+	p, err := New(WithCA(proxyCA), WithTransport(upstream))
+	require.NoError(t, err)
+	p.MustAdd[QUIC](h3Authority, relayQUIC)
+
+	proxyAddr := startQUICRedirected(t, p, origin)
+	tr := dialQUICTo(proxyAddr, poolOf(proxyCA))
+
+	req, err := http.NewRequest(http.MethodGet,
+		fmt.Sprintf("https://%s:%d/echo", h3Authority, proxyAddr.Port()), nil)
+	require.NoError(t, err)
+	resp, err := tr.RoundTrip(req)
+	require.NoError(t, err)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	assert.Contains(t, string(body), "path=/echo")
+	require.NotNil(t, seenNetwork.Load())
+	assert.Equal(t, "udp", *seenNetwork.Load())
+
+	require.NoError(t, tr.Close())
+	assert.Eventually(t, func() bool {
+		pc, err := net.ListenPacket("udp", *local.Load())
+		if err != nil {
+			return false
+		}
+		_ = pc.Close()
+		return true
+	}, 5*time.Second, 20*time.Millisecond, "the socket the handler dialed on is still open")
+}
+
+// closeTrackedConn reports when a connection a dialer handed out is closed.
+type closeTrackedConn struct {
+	net.Conn
+	closed atomic.Bool
+}
+
+func (c *closeTrackedConn) Close() error {
+	c.closed.Store(true)
+	return c.Conn.Close()
+}
+
+// An h3 upstream is reached through the transport's dialer, whatever connection it returns,
+// and the connection is closed with the QUIC connection it carried.
+func TestQUIC_H3UpstreamUsesTheTransportDialer(t *testing.T) {
+	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
+	require.NoError(t, err)
+	origin := h3Origin(t, originCA)
+
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	upstream := DefaultTransport()
+	upstream.AllowHTTP3 = true
+	upstream.RootCAs = poolOf(originCA)
+	var dialed atomic.Pointer[closeTrackedConn]
+	upstream.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		require.Equal(t, "udp", network)
+		conn, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, network, origin.String())
+		if err != nil {
+			return nil, err
+		}
+		tracked := &closeTrackedConn{Conn: conn}
+		dialed.Store(tracked)
+		return tracked, nil
+	}
+	p, err := New(WithCA(proxyCA), WithTransport(upstream))
+	require.NoError(t, err)
+	seen := new(recorder)
+	p.MustAdd(h3Authority+"/+{any}", func(c *HTTPCtx) (*http.Response, error) {
+		seen.add(c.Protocol().String())
+		return c.Forward()
+	})
+
+	proxyAddr := startQUICRedirected(t, p, origin)
+	tr := dialQUICTo(proxyAddr, poolOf(proxyCA))
+	defer func() { _ = tr.Close() }()
+
+	req, err := http.NewRequest(http.MethodGet,
+		fmt.Sprintf("https://%s:%d/echo", h3Authority, proxyAddr.Port()), nil)
+	require.NoError(t, err)
+	resp, err := tr.RoundTrip(req)
+	require.NoError(t, err)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	assert.Contains(t, string(body), "path=/echo")
+	assert.Equal(t, []string{"HTTP/3.0"}, seen.all())
+	require.NotNil(t, dialed.Load(), "the h3 upstream was not reached through the dialer")
+	assert.False(t, dialed.Load().closed.Load())
+
+	require.NoError(t, p.Close())
+	assert.Eventually(t, func() bool { return dialed.Load().closed.Load() },
+		5*time.Second, 20*time.Millisecond, "the socket the h3 upstream ran on is still open")
+}
+
+// A dialer that returns a socket with no peer fails the dial, since a QUIC connection needs
+// one address to write to.
+func TestQUIC_DialRefusesASocketWithNoPeer(t *testing.T) {
+	tr := DefaultTransport()
+	tr.DialContext = func(context.Context, string, string) (net.Conn, error) {
+		return net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	}
+	cfg := &tls.Config{ServerName: h3Authority, NextProtos: []string{"h3"}, InsecureSkipVerify: true}
+	conn, err := tr.dialQUIC(t.Context(), "127.0.0.1:1", cfg, &quic.Config{})
+	require.Error(t, err)
+	assert.Nil(t, conn)
+	assert.Contains(t, err.Error(), "no peer")
+}
+
+// noDeadlineConn is a connected socket whose deadlines do nothing, as a tunnel's often do.
+type noDeadlineConn struct{ net.Conn }
+
+func (c noDeadlineConn) SetReadDeadline(time.Time) error { return nil }
+func (c noDeadlineConn) SetDeadline(time.Time) error     { return nil }
+
+// The socket a QUIC connection ran on is released when the connection ends, even when a read
+// deadline cannot end its read loop.
+func TestQUIC_DialReleasesASocketWithoutDeadlines(t *testing.T) {
+	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
+	require.NoError(t, err)
+	origin := h3Origin(t, originCA)
+
+	tr := DefaultTransport()
+	var local atomic.Pointer[string]
+	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		c, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		l := c.LocalAddr().String()
+		local.Store(&l)
+		return noDeadlineConn{c}, nil
+	}
+	cfg := &tls.Config{ServerName: h3Authority, NextProtos: []string{"h3"}, RootCAs: poolOf(originCA), MinVersion: tls.VersionTLS13}
+	conn, err := tr.dialQUIC(t.Context(), origin.String(), cfg, &quic.Config{})
+	require.NoError(t, err)
+	require.NoError(t, conn.CloseWithError(0, ""))
+
+	assert.Eventually(t, func() bool {
+		pc, err := net.ListenPacket("udp", *local.Load())
+		if err != nil {
+			return false
+		}
+		_ = pc.Close()
+		return true
+	}, 5*time.Second, 20*time.Millisecond, "the socket the connection ran on is still open")
+}

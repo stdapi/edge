@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
@@ -25,9 +26,10 @@ import (
 // target, and a destination keeps at most MaxIdleConnsPerHost idle connections. Requests with
 // no fixed destination share one pool, bounded by MaxIdleConns.
 type Transport struct {
-	// DialContext dials an upstream. It defaults to a net.Dialer with a 30s timeout and
-	// keep-alives enabled. Override it to pin a resolver, force a source address, or route
-	// upstream traffic through a tunnel.
+	// DialContext dials an upstream. It is called with network tcp for a TCP upstream and udp
+	// for a QUIC one, and a QUIC connection runs on the socket it returns. It defaults to a
+	// net.Dialer with a 30s timeout and keep-alives enabled. Override it to pin a resolver,
+	// force a source address, or route upstream traffic through a tunnel.
 	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 
 	// Proxy selects an upstream proxy for a request, chaining this proxy behind another.
@@ -71,10 +73,7 @@ type Transport struct {
 // DefaultTransport returns the upstream configuration the proxy uses when none is given.
 func DefaultTransport() *Transport {
 	return &Transport{
-		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
+		DialContext:           defaultDialer.DialContext,
 		AllowHTTP2:            true,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: time.Second,
@@ -82,6 +81,16 @@ func DefaultTransport() *Transport {
 		MaxIdleConns:          256,
 		MaxIdleConnsPerHost:   32,
 	}
+}
+
+var defaultDialer = &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+
+// dialer returns the function every upstream is dialed with.
+func (t *Transport) dialer() func(context.Context, string, string) (net.Conn, error) {
+	if t.DialContext != nil {
+		return t.DialContext
+	}
+	return defaultDialer.DialContext
 }
 
 func dialFixed(dial func(context.Context, string, string) (net.Conn, error), fixed string) func(context.Context, string, string) (net.Conn, error) {
@@ -112,7 +121,7 @@ func (t *Transport) httpTransport(allowH2 bool, fixed string) *http.Transport {
 
 	tr := &http.Transport{
 		Proxy:                 t.Proxy,
-		DialContext:           t.DialContext,
+		DialContext:           dialFixed(t.dialer(), fixed),
 		TLSClientConfig:       tlsCfg,
 		TLSHandshakeTimeout:   t.TLSHandshakeTimeout,
 		ResponseHeaderTimeout: t.ResponseHeaderTimeout,
@@ -134,10 +143,6 @@ func (t *Transport) httpTransport(allowH2 bool, fixed string) *http.Transport {
 		// A destination serves one authority, so the per host limit is its limit.
 		tr.MaxIdleConns = cmp.Or(t.MaxIdleConnsPerHost, http.DefaultMaxIdleConnsPerHost)
 	}
-	if tr.DialContext == nil {
-		tr.DialContext = (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext
-	}
-	tr.DialContext = dialFixed(tr.DialContext, fixed)
 	return tr
 }
 
@@ -190,20 +195,62 @@ func newHTTP3Transport(t *Transport, fixed string) (http.RoundTripper, error) {
 			if fixed != "" {
 				addr = fixed
 			}
-			udpAddr, err := net.ResolveUDPAddr("udp", addr)
-			if err != nil {
-				return nil, err
-			}
-			pc, err := net.ListenUDP("udp", nil)
-			if err != nil {
-				return nil, err
-			}
-			conn, err := quic.Dial(ctx, pc, udpAddr, cfg, qcfg)
-			if err != nil {
-				_ = pc.Close()
-				return nil, err
-			}
-			return conn, nil
+			return t.dialQUIC(ctx, addr, cfg, qcfg)
 		},
 	}, nil
 }
+
+// dialQUIC opens a QUIC connection to addr on a socket the transport's dialer returns. The
+// socket is closed when the connection ends.
+func (t *Transport) dialQUIC(ctx context.Context, addr string, tlsCfg *tls.Config, qcfg *quic.Config) (*quic.Conn, error) {
+	sock, err := t.dialer()(ctx, "udp", addr)
+	if err != nil {
+		return nil, err
+	}
+	if sock.RemoteAddr() == nil {
+		_ = sock.Close()
+		return nil, fmt.Errorf("edge: dial %s: the dialer returned a socket with no peer", addr)
+	}
+	tr := &quic.Transport{Conn: packetConnOf(sock)}
+	// The socket goes first, so the read loop the transport waits on ends whatever the socket
+	// does with a read deadline.
+	release := func() {
+		_ = sock.Close()
+		_ = tr.Close()
+	}
+	conn, err := tr.Dial(ctx, sock.RemoteAddr(), tlsCfg, qcfg)
+	if err != nil {
+		release()
+		return nil, err
+	}
+	context.AfterFunc(conn.Context(), release)
+	return conn, nil
+}
+
+// packetConnOf presents a connected socket as the packet connection quic-go reads and writes.
+func packetConnOf(c net.Conn) net.PacketConn {
+	if u, ok := c.(*net.UDPConn); ok {
+		return connectedUDPConn{u}
+	}
+	return connectedConn{c}
+}
+
+// connectedUDPConn keeps the batched reads, ECN and GSO quic-go enables on a *net.UDPConn. A
+// write on a connected socket must carry no address, so the one quic-go passes is dropped.
+type connectedUDPConn struct{ *net.UDPConn }
+
+func (c connectedUDPConn) WriteTo(b []byte, _ net.Addr) (int, error) { return c.Write(b) }
+
+func (c connectedUDPConn) WriteMsgUDP(b, oob []byte, _ *net.UDPAddr) (int, int, error) {
+	return c.UDPConn.WriteMsgUDP(b, oob, nil)
+}
+
+// connectedConn serves any other connected socket, a tunnel for instance, one packet per read.
+type connectedConn struct{ net.Conn }
+
+func (c connectedConn) ReadFrom(b []byte) (int, net.Addr, error) {
+	n, err := c.Read(b)
+	return n, c.RemoteAddr(), err
+}
+
+func (c connectedConn) WriteTo(b []byte, _ net.Addr) (int, error) { return c.Write(b) }

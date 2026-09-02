@@ -24,7 +24,6 @@ import (
 type QUICCtx struct {
 	ctx       context.Context
 	dialErr   error
-	sock      net.PacketConn
 	acceptErr error
 	endErr    error
 
@@ -33,7 +32,6 @@ type QUICCtx struct {
 	entry  *entry
 	conn   *quic.Conn
 	dialed *quic.Conn
-	tr     *quic.Transport
 
 	acceptCh     chan *QUICStream
 	acceptCancel context.CancelFunc
@@ -41,19 +39,11 @@ type QUICCtx struct {
 
 	identity string
 	params   []Param
-	extra    []quicDialed
+	extra    []*quic.Conn
 
 	dialOnce   sync.Once
 	acceptOnce sync.Once
 	endOnce    sync.Once
-}
-
-// quicDialed is one connection a handler opened with [QUICCtx.DialTo], with the transport and
-// socket it lives on.
-type quicDialed struct {
-	conn *quic.Conn
-	tr   *quic.Transport
-	sock net.PacketConn
 }
 
 // Context returns a context canceled when the connection ends.
@@ -108,11 +98,7 @@ func (c *QUICCtx) Proxy() *Proxy { return c.p }
 // application protocol the proxy negotiated with the client, and an origin that rejects that
 // protocol fails the dial. The connection is closed when the handler returns.
 func (c *QUICCtx) Dial() (*quic.Conn, error) {
-	c.dialOnce.Do(func() {
-		var d quicDialed
-		d, c.dialErr = c.dialQUIC(c.ctx, c.upstreamAddr(), c.target.Host)
-		c.dialed, c.tr, c.sock = d.conn, d.tr, d.sock
-	})
+	c.dialOnce.Do(func() { c.dialed, c.dialErr = c.dialQUIC(c.ctx, c.upstreamAddr(), c.target.Host) })
 	return c.dialed, c.dialErr
 }
 
@@ -124,12 +110,12 @@ func (c *QUICCtx) DialTo(ctx context.Context, addr string) (*quic.Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("edge: dial %q: %w", addr, err)
 	}
-	d, err := c.dialQUIC(ctx, addr, host)
+	conn, err := c.dialQUIC(ctx, addr, host)
 	if err != nil {
 		return nil, err
 	}
-	c.extra = append(c.extra, d)
-	return d.conn, nil
+	c.extra = append(c.extra, conn)
+	return conn, nil
 }
 
 func (c *QUICCtx) upstreamAddr() string {
@@ -139,34 +125,21 @@ func (c *QUICCtx) upstreamAddr() string {
 	return c.target.Authority()
 }
 
-func (c *QUICCtx) dialQUIC(ctx context.Context, addr, serverName string) (quicDialed, error) {
-	udpAddr, err := net.ResolveUDPAddr("udp", addr)
-	if err != nil {
-		return quicDialed{}, err
-	}
-
+func (c *QUICCtx) dialQUIC(ctx context.Context, addr, serverName string) (*quic.Conn, error) {
 	cfg := c.p.cfg.transport.upstreamTLSConfig()
 	cfg.MinVersion = tls.VersionTLS13
 	cfg.ServerName = serverName
 	if alpn := c.ALPN(); alpn != "" {
 		cfg.NextProtos = []string{alpn}
 	}
-
-	sock, err := net.ListenUDP("udp", nil)
-	if err != nil {
-		return quicDialed{}, err
-	}
-	tr := &quic.Transport{Conn: sock}
-	conn, err := tr.Dial(ctx, udpAddr, cfg, &quic.Config{
+	conn, err := c.p.cfg.transport.dialQUIC(ctx, addr, cfg, &quic.Config{
 		MaxIdleTimeout:  c.p.cfg.server.idleTimeout,
 		EnableDatagrams: false,
 	})
 	if err != nil {
-		_ = tr.Close()
-		_ = sock.Close()
-		return quicDialed{}, fmt.Errorf("dial quic %s: %w", addr, err)
+		return nil, fmt.Errorf("dial quic %s: %w", addr, err)
 	}
-	return quicDialed{conn: conn, tr: tr, sock: sock}, nil
+	return conn, nil
 }
 
 // close releases the connections the handler opened, once the handler has returned.
@@ -177,16 +150,8 @@ func (c *QUICCtx) close() {
 	if c.dialed != nil {
 		_ = closeNoError(c.dialed)
 	}
-	if c.tr != nil {
-		_ = c.tr.Close()
-	}
-	if c.sock != nil {
-		_ = c.sock.Close()
-	}
-	for _, d := range c.extra {
-		_ = closeNoError(d.conn)
-		_ = d.tr.Close()
-		_ = d.sock.Close()
+	for _, conn := range c.extra {
+		_ = closeNoError(conn)
 	}
 }
 

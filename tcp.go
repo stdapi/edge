@@ -12,7 +12,6 @@ import (
 	"net"
 	"slices"
 	"sync"
-	"time"
 )
 
 // TCPCtx is one byte stream, handed to a [TCP] handler. When the client used TLS, the proxy
@@ -134,11 +133,7 @@ func (c *TCPCtx) DialTo(ctx context.Context, addr string) (net.Conn, error) {
 }
 
 func (c *TCPCtx) dialAddr(ctx context.Context, addr, serverName string) (net.Conn, error) {
-	dial := c.p.cfg.transport.DialContext
-	if dial == nil {
-		dial = (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext
-	}
-	conn, err := dial(ctx, "tcp", addr)
+	conn, err := c.p.cfg.transport.dialer()(ctx, "tcp", addr)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", addr, err)
 	}
