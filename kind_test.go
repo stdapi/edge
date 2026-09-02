@@ -69,6 +69,41 @@ func TestKindUDP_HandlerSeesEveryDatagramBothWays(t *testing.T) {
 	assert.Equal(t, int64(1), in.Load(), "the answer to the one forwarded did too")
 }
 
+// The kernel hands an ICMP message for the origin to the flow's connected socket as a read or
+// write error. The flow lives on, as it would on an unconnected socket, until it falls idle.
+func TestKindUDP_FlowSurvivesAnICMPPortUnreachable(t *testing.T) {
+	// A datagram to a loopback port nobody listens on draws an ICMP port unreachable.
+	dead, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	origin := netip.MustParseAddrPort(dead.LocalAddr().String())
+	require.NoError(t, dead.Close())
+
+	var sess atomic.Pointer[Session]
+	p, err := New()
+	require.NoError(t, err)
+	p.MustAdd("[0.0.0.0/0]:"+fmt.Sprint(origin.Port()), func(d *DatagramCtx) error {
+		sess.CompareAndSwap(nil, d.Session())
+		return d.Forward()
+	})
+	_, proxyAddr := startTProxyQUIC(t, p, origin)
+
+	client, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+	_, err = client.WriteTo([]byte("one"), net.UDPAddrFromAddrPort(proxyAddr))
+	require.NoError(t, err)
+	time.Sleep(700 * time.Millisecond)
+
+	first := sess.Load()
+	require.NotNil(t, first)
+	assert.NoError(t, first.Context().Err(), "the flow survives the ICMP port unreachable")
+	open := 0
+	for range p.Sessions() {
+		open++
+	}
+	assert.Equal(t, 1, open, "the flow is still open")
+}
+
 // A datagram flow is admitted per datagram, so removing the entry stops it at the next one
 // rather than at the next flow.
 func TestKindUDP_DeleteStopsTheFlowAtTheNextDatagram(t *testing.T) {

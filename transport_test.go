@@ -85,16 +85,28 @@ func TestTransport_ConnectedSocketSkipsICMPErrors(t *testing.T) {
 	_, _, err = pc.ReadFrom(make([]byte, 1))
 	timesOut(err)
 
-	// A write may be the call that meets the error, and it goes through on a retry.
+	// A write may be the call that meets the error, and it goes through on a retry. Each write
+	// path gets a socket of its own, as the kernel hands a socket one error at a time.
 	_, err = pc.WriteTo([]byte("x"), nil)
 	require.NoError(t, err)
 	time.Sleep(50 * time.Millisecond)
 	_, err = pc.WriteTo([]byte("x"), nil)
 	require.NoError(t, err)
-	_, _, err = pc.WriteMsgUDP([]byte("x"), nil, nil)
-	require.NoError(t, err)
 	require.NoError(t, sock.SetReadDeadline(time.Now().Add(200*time.Millisecond)))
 	_, _, err = pc.ReadFrom(make([]byte, 1))
+	timesOut(err)
+
+	sock2, err := net.DialUDP("udp4", nil, target)
+	require.NoError(t, err)
+	defer sock2.Close()
+	pc2 := packetConnOf(sock2).(*connectedUDPConn)
+	_, _, err = pc2.WriteMsgUDP([]byte("x"), nil, nil)
+	require.NoError(t, err)
+	time.Sleep(50 * time.Millisecond)
+	_, _, err = pc2.WriteMsgUDP([]byte("x"), nil, nil)
+	require.NoError(t, err)
+	require.NoError(t, sock2.SetReadDeadline(time.Now().Add(200*time.Millisecond)))
+	_, _, err = pc2.ReadFrom(make([]byte, 1))
 	timesOut(err)
 
 	// The socket a datagram flow reads and writes, and any other connected socket the dialer

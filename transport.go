@@ -9,11 +9,9 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"errors"
 	"net"
 	"net/http"
 	"net/url"
-	"syscall"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -229,23 +227,6 @@ func (c noICMPConn) Write(b []byte) (int, error) {
 	return n, err
 }
 
-// icmpError reports whether err is what the kernel makes of an ICMP message received for a
-// connected UDP socket, handed to its next read or write. An unconnected socket never sees one,
-// and QUIC finds its path MTU and its peer's absence on its own, so a read skips it and a write
-// is retried.
-func icmpError(err error) bool {
-	errno, ok := errors.AsType[syscall.Errno](err)
-	if !ok {
-		return false
-	}
-	switch errno {
-	case syscall.EMSGSIZE, syscall.ECONNREFUSED, syscall.EHOSTUNREACH, syscall.ENETUNREACH,
-		syscall.EHOSTDOWN, syscall.ENOPROTOOPT:
-		return true
-	}
-	return false
-}
-
 // connectedUDPConn keeps the batched reads, ECN and GSO quic-go enables on a *net.UDPConn. A
 // write on a connected socket takes no address, so the one quic-go passes is dropped.
 type connectedUDPConn struct {
@@ -290,7 +271,7 @@ func (c *connectedUDPConn) WriteMsgUDP(b, oob []byte, _ *net.UDPAddr) (int, int,
 }
 
 // connectedConn serves any other connected socket, a tunnel for instance, one packet per read.
-type connectedConn struct{ net.Conn }
+type connectedConn struct{ noICMPConn }
 
 func (c connectedConn) ReadFrom(b []byte) (int, net.Addr, error) {
 	n, err := c.Read(b)
