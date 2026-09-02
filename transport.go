@@ -9,13 +9,16 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"net"
 	"net/http"
 	"net/url"
+	"syscall"
 	"time"
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
+	"golang.org/x/net/ipv4"
 )
 
 // Transport configures how the proxy reaches upstream servers. The zero value is not usable;
@@ -200,30 +203,90 @@ func newHTTP3Transport(up *upstreamDialer, fixed string) (http.RoundTripper, err
 // packetConnOf presents a connected socket as the packet connection quic-go reads and writes.
 func packetConnOf(c net.Conn) net.PacketConn {
 	if u, ok := c.(*net.UDPConn); ok {
-		return connectedUDPConn{u}
+		return &connectedUDPConn{UDPConn: u, batch: ipv4.NewPacketConn(u)}
 	}
 	return connectedConn{c}
 }
 
+// icmpError reports whether err is what the kernel makes of an ICMP message received for a
+// connected UDP socket, handed to its next read or write. An unconnected socket never sees one,
+// and QUIC finds its path MTU and its peer's absence on its own, so a read skips it and a write
+// is retried.
+func icmpError(err error) bool {
+	errno, ok := errors.AsType[syscall.Errno](err)
+	if !ok {
+		return false
+	}
+	switch errno {
+	case syscall.EMSGSIZE, syscall.ECONNREFUSED, syscall.EHOSTUNREACH, syscall.ENETUNREACH,
+		syscall.EHOSTDOWN, syscall.ENOPROTOOPT:
+		return true
+	}
+	return false
+}
+
 // connectedUDPConn keeps the batched reads, ECN and GSO quic-go enables on a *net.UDPConn. A
 // write on a connected socket takes no address, so the one quic-go passes is dropped.
-type connectedUDPConn struct{ *net.UDPConn }
+type connectedUDPConn struct {
+	*net.UDPConn
+	batch *ipv4.PacketConn
+}
 
-func (c connectedUDPConn) WriteTo(b []byte, _ net.Addr) (int, error) { return c.Write(b) }
+func (c *connectedUDPConn) ReadFrom(b []byte) (int, net.Addr, error) {
+	for {
+		n, addr, err := c.UDPConn.ReadFrom(b)
+		if !icmpError(err) {
+			return n, addr, err
+		}
+	}
+}
 
-func (c connectedUDPConn) WriteMsgUDP(b, oob []byte, _ *net.UDPAddr) (int, int, error) {
-	return c.UDPConn.WriteMsgUDP(b, oob, nil)
+// quic-go batches its reads through ReadBatch when the connection offers one, and otherwise
+// on the socket itself, past this wrapper.
+func (c *connectedUDPConn) ReadBatch(ms []ipv4.Message, flags int) (int, error) {
+	for {
+		n, err := c.batch.ReadBatch(ms, flags)
+		if !icmpError(err) {
+			return n, err
+		}
+	}
+}
+
+func (c *connectedUDPConn) WriteTo(b []byte, _ net.Addr) (int, error) {
+	n, err := c.Write(b)
+	if icmpError(err) {
+		n, err = c.Write(b)
+	}
+	return n, err
+}
+
+func (c *connectedUDPConn) WriteMsgUDP(b, oob []byte, _ *net.UDPAddr) (int, int, error) {
+	n, oobn, err := c.UDPConn.WriteMsgUDP(b, oob, nil)
+	if icmpError(err) {
+		n, oobn, err = c.UDPConn.WriteMsgUDP(b, oob, nil)
+	}
+	return n, oobn, err
 }
 
 // connectedConn serves any other connected socket, a tunnel for instance, one packet per read.
 type connectedConn struct{ net.Conn }
 
 func (c connectedConn) ReadFrom(b []byte) (int, net.Addr, error) {
-	n, err := c.Read(b)
-	return n, c.RemoteAddr(), err
+	for {
+		n, err := c.Read(b)
+		if !icmpError(err) {
+			return n, c.RemoteAddr(), err
+		}
+	}
 }
 
-func (c connectedConn) WriteTo(b []byte, _ net.Addr) (int, error) { return c.Write(b) }
+func (c connectedConn) WriteTo(b []byte, _ net.Addr) (int, error) {
+	n, err := c.Write(b)
+	if icmpError(err) {
+		n, err = c.Write(b)
+	}
+	return n, err
+}
 
 func (connectedConn) SetReadBuffer(int) error  { return nil }
 func (connectedConn) SetWriteBuffer(int) error { return nil }
