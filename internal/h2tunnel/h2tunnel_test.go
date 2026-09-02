@@ -1094,3 +1094,185 @@ type emptyAddr struct{}
 
 func (emptyAddr) Network() string { return "mem" }
 func (emptyAddr) String() string  { return "mem" }
+
+// Headers that do not fit a frame are refused before anything reaches the encoder, so the
+// next CONNECT on the connection still shares its table with the peer.
+func TestConn_OversizeHeadersLeaveTheEncoderIntact(t *testing.T) {
+	srv := echoServer(t, nil)
+	c := dial(t, srv)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, _, err := c.Open(ctx, Request{Authority: "origin.test:443",
+		Header: http.Header{"X-Poison": {"pv"}, "X-Big": {strings.Repeat("x", 2<<20)}}})
+	require.ErrorIs(t, err, errHeadersTooLarge)
+	s, resp, err := c.Open(ctx, Request{Authority: "origin.test:443", Header: http.Header{"X-Poison": {"pv"}}})
+	require.NoError(t, err, "the connection did not survive the header block that was never sent")
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	_ = s.Close()
+}
+
+// DATA past the peer's END_STREAM is a stream error, RFC 9113 section 5.1, and never reaches
+// the reader.
+func TestStream_DataAfterEndStreamIsAnError(t *testing.T) {
+	cli, srv := tcpPair(t)
+	reset := make(chan http2.ErrCode, 1)
+	go func() {
+		peer, err := startFakePeer(srv)
+		if err != nil {
+			return
+		}
+		for {
+			f, rerr := peer.fr.ReadFrame()
+			if rerr != nil {
+				return
+			}
+			switch f := f.(type) {
+			case *http2.MetaHeadersFrame:
+				_ = peer.answer(f.StreamID)
+				peer.wmu.Lock()
+				_ = peer.fr.WriteData(f.StreamID, true, []byte("a"))
+				_ = peer.fr.WriteData(f.StreamID, false, []byte("b"))
+				peer.wmu.Unlock()
+			case *http2.RSTStreamFrame:
+				reset <- f.ErrCode
+			}
+		}
+	}()
+	c, err := Client(cli)
+	require.NoError(t, err)
+	defer func() { _ = c.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	s, _, err := c.Open(ctx, Request{Authority: "origin.test:443"})
+	require.NoError(t, err)
+	body, err := io.ReadAll(s)
+	require.NoError(t, err)
+	assert.Equal(t, "a", string(body), "bytes past END_STREAM reached the reader")
+	select {
+	case code := <-reset:
+		assert.Equal(t, http2.ErrCodeStreamClosed, code)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the peer was not told")
+	}
+	require.True(t, c.CanOpen())
+}
+
+// stuckPeers answers n streams, then stops reading its socket, and returns the streams
+// once the client's writer is stuck on it, the first of them filling the socket.
+func stuckPeer(t *testing.T, n int) (*Conn, []*Stream) {
+	t.Helper()
+	cli, srv := tcpPair(t)
+	answered := make(chan struct{}, n)
+	go func() {
+		peer, err := startFakePeer(srv, http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1 << 24})
+		if err != nil {
+			return
+		}
+		_ = peer.fr.WriteWindowUpdate(0, 1<<28)
+		seen := 0
+		for seen < n {
+			f, rerr := peer.fr.ReadFrame()
+			if rerr != nil {
+				return
+			}
+			if mh, ok := f.(*http2.MetaHeadersFrame); ok {
+				_ = peer.answer(mh.StreamID)
+				answered <- struct{}{}
+				seen++
+			}
+		}
+		// Nothing reads the socket from here on.
+	}()
+	conn, err := Client(cli)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	streams := make([]*Stream, 0, n)
+	for range n {
+		s, _, oerr := conn.Open(ctx, Request{Authority: "origin.test:443"})
+		require.NoError(t, oerr)
+		<-answered
+		streams = append(streams, s)
+	}
+	go func() { _, _ = streams[0].Write(make([]byte, 64<<20)) }()
+	time.Sleep(300 * time.Millisecond)
+	return conn, streams
+}
+
+// An Open behind a writer stuck on a peer that stopped reading returns when its context
+// ends, not when the writer does.
+func TestConn_OpenHonoursItsContextBehindAStuckWriter(t *testing.T) {
+	c, _ := stuckPeer(t, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, _, err := c.Open(ctx, Request{Authority: "origin.test:443"})
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, time.Since(start), time.Second, "Open outlived its context behind the stuck writer")
+}
+
+// A write behind a stuck writer returns at its deadline.
+func TestStream_WriteDeadlineBehindAStuckWriter(t *testing.T) {
+	_, streams := stuckPeer(t, 2)
+	s := streams[1]
+	require.NoError(t, s.SetWriteDeadline(time.Now().Add(200*time.Millisecond)))
+	start := time.Now()
+	_, err := s.Write([]byte("late"))
+	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+	assert.Less(t, time.Since(start), time.Second, "Write outlived its deadline behind the stuck writer")
+}
+
+// The peer may not send more than the connection window the client advertised, whatever
+// the streams' own windows add up to.
+func TestConn_ConnectionWindowIsEnforced(t *testing.T) {
+	cli, srv := tcpPair(t)
+	answered := make(chan uint32, 8)
+	ready := make(chan *fakePeer, 1)
+	go func() {
+		peer, err := startFakePeer(srv)
+		if err != nil {
+			close(ready)
+			return
+		}
+		ready <- peer
+		for {
+			f, rerr := peer.fr.ReadFrame()
+			if rerr != nil {
+				return
+			}
+			if mh, ok := f.(*http2.MetaHeadersFrame); ok {
+				_ = peer.answer(mh.StreamID)
+				answered <- mh.StreamID
+			}
+		}
+	}()
+	c, err := Client(cli)
+	require.NoError(t, err)
+	defer func() { _ = c.Close() }()
+	peer := <-ready
+	require.NotNil(t, peer)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	for range 4 {
+		_, _, err := c.Open(ctx, Request{Authority: "origin.test:443"})
+		if err != nil {
+			// The connection ended on the first stream past the window.
+			break
+		}
+		id := <-answered
+		for sent := 0; sent < window; sent += 16384 {
+			if werr := peer.writeData(id, make([]byte, 16384)); werr != nil {
+				break
+			}
+		}
+	}
+	select {
+	case <-c.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the client took four stream windows against one connection window")
+	}
+	var ce http2.ConnectionError
+	require.ErrorAs(t, c.Err(), &ce)
+	assert.Equal(t, http2.ErrCodeFlowControl, http2.ErrCode(ce))
+}

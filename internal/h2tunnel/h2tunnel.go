@@ -61,6 +61,7 @@ var (
 	errClosed          = errors.New("h2tunnel: connection closed")
 	errStreamClosed    = errors.New("h2tunnel: stream closed")
 	errHeadersTooLarge = errors.New("h2tunnel: request headers exceed a frame")
+	errCancelled       = errors.New("h2tunnel: write cancelled")
 )
 
 // Request describes one CONNECT. Protocol is the :protocol of an extended CONNECT and empty
@@ -107,6 +108,7 @@ type Conn struct {
 	// sendWindow is what the peer lets the connection send, and recvUnacked what the peer
 	// sent and the streams consumed since the last WINDOW_UPDATE on the connection.
 	sendWindow  int64
+	recvWindow  int64
 	recvUnacked int64
 	// peer settings, read once under mu when a stream is opened.
 	initialWindow int64
@@ -137,6 +139,7 @@ func Client(nc net.Conn) (*Conn, error) {
 		streams:       make(map[uint32]*Stream),
 		nextID:        1,
 		sendWindow:    defaultWindow,
+		recvWindow:    window,
 		initialWindow: defaultWindow,
 		maxFrameSize:  16384,
 		maxStreams:    1<<32 - 1,
@@ -178,24 +181,32 @@ func Client(nc net.Conn) (*Conn, error) {
 
 type writeRequest struct {
 	f func(*http2.Framer) error
-	// res receives the outcome, nil when the caller does not wait for it.
-	res chan error
+	// res receives the outcome. cancel, when not nil, releases the caller and has the
+	// writer skip the frame, running skip in its place.
+	res    chan error
+	cancel <-chan struct{}
+	skip   func()
 }
 
-// write has the writer run f and flush, and returns its outcome, or the connection's error
-// once it ended.
-func (c *Conn) write(f func(*http2.Framer) error) error {
-	req := writeRequest{f: f, res: make(chan error, 1)}
+// write has the writer run f and flush, and returns its outcome, the connection's error
+// once it ended, or errCancelled once cancel fired, in which case the frame may still go
+// out unless the writer reached it after the cancel.
+func (c *Conn) write(f func(*http2.Framer) error, cancel <-chan struct{}, skip func()) error {
+	req := writeRequest{f: f, res: make(chan error, 1), cancel: cancel, skip: skip}
 	select {
 	case c.writes <- req:
 	case <-c.done:
 		return c.Err()
+	case <-cancel:
+		return errCancelled
 	}
 	select {
 	case err := <-req.res:
 		return err
 	case <-c.done:
 		return c.Err()
+	case <-cancel:
+		return errCancelled
 	}
 }
 
@@ -224,18 +235,26 @@ func (c *Conn) writeLoop() {
 				return
 			default:
 			}
-			_ = c.nc.SetWriteDeadline(time.Now().Add(writeTimeout))
-			err = c.writeNow(req.f)
-			if req.res != nil {
-				req.res <- err
+			if req.cancel != nil {
+				select {
+				case <-req.cancel:
+					if req.skip != nil {
+						req.skip()
+					}
+					continue
+				default:
+				}
 			}
+			c.armWriteDeadline()
+			err = c.writeNow(req.f)
+			req.res <- err
 		case <-c.control:
 			select {
 			case <-c.done:
 				return
 			default:
 			}
-			_ = c.nc.SetWriteDeadline(time.Now().Add(writeTimeout))
+			c.armWriteDeadline()
 			err = c.writeNow(c.writeControl)
 		case <-c.done:
 			return
@@ -267,6 +286,7 @@ func (c *Conn) writeControl(fr *http2.Framer) error {
 	}
 	if c.creditOwed && c.recvUnacked > 0 {
 		updates = append(updates, windowUpdate{incr: uint32(c.recvUnacked)}) //nolint:gosec // at most a window per stream
+		c.recvWindow += c.recvUnacked
 		c.recvUnacked = 0
 	}
 	c.creditOwed = false
@@ -298,6 +318,17 @@ func (c *Conn) writeControl(fr *http2.Framer) error {
 type windowUpdate struct {
 	id   uint32
 	incr uint32
+}
+
+// armWriteDeadline bounds the next frame, and keeps the closing deadline a fail armed
+// meanwhile.
+func (c *Conn) armWriteDeadline() {
+	_ = c.nc.SetWriteDeadline(time.Now().Add(writeTimeout))
+	select {
+	case <-c.done:
+		_ = c.nc.SetWriteDeadline(time.Now().Add(closeTimeout))
+	default:
+	}
 }
 
 // writeNow runs f with the framer and flushes what it wrote, on the writer's goroutine or
@@ -356,9 +387,12 @@ func (c *Conn) fail(err error, goAway bool) {
 		<-c.writerDone
 		_ = c.nc.SetWriteDeadline(time.Now().Add(closeTimeout))
 		if goAway {
-			_ = c.writeNow(func(fr *http2.Framer) error {
-				return fr.WriteGoAway(0, http2.ErrCodeNo, nil)
-			})
+			code := http2.ErrCodeNo
+			var ce http2.ConnectionError
+			if errors.As(err, &ce) {
+				code = http2.ErrCode(ce)
+			}
+			_ = c.writeNow(func(fr *http2.Framer) error { return fr.WriteGoAway(0, code, nil) })
 		}
 		_ = c.nc.Close()
 		for _, s := range streams {
@@ -400,6 +434,20 @@ func (c *Conn) Open(ctx context.Context, req Request) (*Stream, *Response, error
 			c.mu.Unlock()
 			return nil
 		}
+		// The bound comes before the encoder, whose table keeps every field it indexes
+		// whether the block goes out or not.
+		if req.headerSize() > int(c.maxFrameSize) {
+			refused = errHeadersTooLarge
+			c.mu.Unlock()
+			return nil
+		}
+		select {
+		case <-s.done:
+			// The caller gave up while the frame waited, and nothing reached the peer.
+			c.mu.Unlock()
+			return nil
+		default:
+		}
 		s.id = c.nextID
 		c.nextID += 2
 		s.sendWindow = c.initialWindow
@@ -428,14 +476,14 @@ func (c *Conn) Open(ctx context.Context, req Request) (*Stream, *Response, error
 			}
 		}
 		if c.encBuf.Len() > maxFrame {
-			c.mu.Lock()
-			delete(c.streams, s.id)
-			c.mu.Unlock()
-			refused = errHeadersTooLarge
-			return nil
+			return errors.New("h2tunnel: request headers exceed a frame past the bound")
 		}
 		return fr.WriteHeaders(http2.HeadersFrameParam{StreamID: s.id, BlockFragment: c.encBuf.Bytes(), EndHeaders: true})
-	})
+	}, ctx.Done(), nil)
+	if errors.Is(err, errCancelled) {
+		s.reset(http2.ErrCodeCancel)
+		return nil, nil, ctx.Err()
+	}
 	if err != nil {
 		c.fail(err, false)
 		return nil, nil, err
@@ -454,6 +502,21 @@ func (c *Conn) Open(ctx context.Context, req Request) (*Stream, *Response, error
 		s.reset(http2.ErrCodeCancel)
 		return nil, nil, ctx.Err()
 	}
+}
+
+// headerSize is the size of the header list, RFC 7541 section 4.1, which the encoded block
+// does not exceed.
+func (req Request) headerSize() int {
+	n := len(":method") + len("CONNECT") + len(":authority") + len(req.Authority) + 3*32
+	if req.Protocol != "" {
+		n += len(":scheme") + len(req.Scheme) + len(":path") + len(req.Path) + len(":protocol") + len(req.Protocol) + 3*32
+	}
+	for k, vv := range req.Header {
+		for _, v := range vv {
+			n += len(k) + len(v) + 32
+		}
+	}
+	return n
 }
 
 // refuses reports why a stream cannot be opened now, nil when it can.
@@ -496,14 +559,19 @@ func (c *Conn) readLoop() {
 				c.resetStream(se.StreamID, se.Code, false)
 				continue
 			}
-			c.fail(err, false)
+			c.fail(err, isConnectionError(err))
 			return
 		}
 		if err := c.handle(f); err != nil {
-			c.fail(err, false)
+			c.fail(err, isConnectionError(err))
 			return
 		}
 	}
+}
+
+func isConnectionError(err error) bool {
+	var ce http2.ConnectionError
+	return errors.As(err, &ce)
 }
 
 // handle applies one frame. An error is a connection error.
@@ -595,7 +663,11 @@ func (c *Conn) handleHeaders(f *http2.MetaHeadersFrame) error {
 	if s == nil {
 		return nil
 	}
-	if status := f.PseudoValue("status"); status != "" {
+	status := f.PseudoValue("status")
+	if status == "" && !s.answered.Load() {
+		return http2.StreamError{StreamID: f.StreamID, Code: http2.ErrCodeProtocol}
+	}
+	if status != "" {
 		code, err := strconv.Atoi(status)
 		if err != nil {
 			return http2.StreamError{StreamID: f.StreamID, Code: http2.ErrCodeProtocol}
@@ -608,6 +680,7 @@ func (c *Conn) handleHeaders(f *http2.MetaHeadersFrame) error {
 		for _, hf := range f.RegularFields() {
 			header.Add(hf.Name, hf.Value)
 		}
+		s.answered.Store(true)
 		select {
 		case s.resp <- &Response{StatusCode: code, Header: header}:
 		default:
@@ -622,13 +695,26 @@ func (c *Conn) handleHeaders(f *http2.MetaHeadersFrame) error {
 func (c *Conn) handleData(f *http2.DataFrame) error {
 	// Padding counts against the windows, RFC 9113 section 6.9.1.
 	n := int64(f.Header().Length)
-	s := c.stream(f.StreamID)
+	c.mu.Lock()
+	c.recvWindow -= n
+	over := c.recvWindow < 0
+	s := c.streams[f.StreamID]
+	c.mu.Unlock()
+	if over {
+		return http2.ConnectionError(http2.ErrCodeFlowControl)
+	}
 	if s == nil {
 		// A stream that ended still had its window on the connection.
 		c.consumed(nil, n)
 		return nil
 	}
 	s.mu.Lock()
+	if s.peerEnded {
+		s.mu.Unlock()
+		c.consumed(nil, n)
+		c.resetStream(f.StreamID, http2.ErrCodeStreamClosed, false)
+		return nil
+	}
 	if n > s.recvWindow {
 		s.mu.Unlock()
 		return http2.ConnectionError(http2.ErrCodeFlowControl)
@@ -796,7 +882,10 @@ type Stream struct {
 	id  uint32
 
 	fromPeer atomic.Bool
+	answered atomic.Bool
 	closed   bool
+	// peerEnded is set by the peer's END_STREAM, past which its DATA is an error.
+	peerEnded bool
 	// windowReturned says end gave the connection window back for what was buffered.
 	windowReturned bool
 }
@@ -822,6 +911,7 @@ func (s *Stream) addSendWindow(delta int64) bool {
 // endRead ends the reads with err once the buffered chunks are drained.
 func (s *Stream) endRead(err error) {
 	s.mu.Lock()
+	s.peerEnded = true
 	if s.readErr == nil {
 		s.readErr = err
 	}
@@ -943,7 +1033,21 @@ func (s *Stream) writeFrame(b []byte) (int, error) {
 		s.mu.Unlock()
 		s.c.mu.Unlock()
 		if n > 0 {
-			if err := s.c.write(func(fr *http2.Framer) error { return fr.WriteData(s.id, false, b[:n]) }); err != nil {
+			var cancel <-chan struct{}
+			if dl := s.writeDeadline.Load(); dl != nil && !dl.IsZero() {
+				cancel = deadlineChan(*dl)
+			}
+			err := s.c.write(func(fr *http2.Framer) error { return fr.WriteData(s.id, false, b[:n]) }, cancel, func() {
+				// The frame never left, its window is free again.
+				s.c.mu.Lock()
+				s.c.sendWindow += n
+				s.c.mu.Unlock()
+				s.addSendWindow(n)
+			})
+			if errors.Is(err, errCancelled) {
+				return 0, os.ErrDeadlineExceeded
+			}
+			if err != nil {
 				return 0, err
 			}
 			return int(n), nil
@@ -952,6 +1056,17 @@ func (s *Stream) writeFrame(b []byte) (int, error) {
 			return 0, err
 		}
 	}
+}
+
+// deadlineChan is closed at t, at once when t has passed.
+func deadlineChan(t time.Time) <-chan struct{} {
+	ch := make(chan struct{})
+	if d := time.Until(t); d <= 0 {
+		close(ch)
+	} else {
+		time.AfterFunc(d, func() { close(ch) })
+	}
+	return ch
 }
 
 // CloseWrite ends the proxy-bound direction with END_STREAM.
@@ -965,7 +1080,7 @@ func (s *Stream) CloseWrite() error {
 	}
 	s.closed = true
 	s.mu.Unlock()
-	return s.c.write(func(fr *http2.Framer) error { return fr.WriteData(s.id, true, nil) })
+	return s.c.write(func(fr *http2.Framer) error { return fr.WriteData(s.id, true, nil) }, nil, nil)
 }
 
 // Close ends the stream. The peer is told with RST_STREAM unless it ended the stream first.
