@@ -16,6 +16,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"slices"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -105,7 +106,7 @@ func TestSession_SweepAfterDeleteStream(t *testing.T) {
 
 	var closed int
 	for s := range p.Sessions() {
-		if !p.Admits(s.Target(), s.Kind()) {
+		if s.Stale() {
 			require.NoError(t, s.Close())
 			closed++
 		}
@@ -117,10 +118,9 @@ func TestSession_SweepAfterDeleteStream(t *testing.T) {
 	require.Error(t, err)
 }
 
-// Registering a more specific entry never moves a connection already open. ServableAs records
-// what the traffic allows, so the sweep can find the connections such an entry would serve
-// and end them.
-func TestSession_ServableAsSweepsRefinableStream(t *testing.T) {
+// Registering an entry at a more specific kind never moves a connection already open. Stale
+// reports it, since the traffic allowed that kind from the start and the entries admit it now.
+func TestSession_StaleWhenAFinerKindIsAdmitted(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
 	p := testProxyWithCA(t, ca)
@@ -135,30 +135,160 @@ func TestSession_ServableAsSweepsRefinableStream(t *testing.T) {
 	require.Equal(t, KindTCP, sess.Kind())
 	assert.Equal(t, []Kind{KindHTTP, KindTCP}, sess.ServableAs(),
 		"the traffic said HTTP, the tree had no entry for it")
+	assert.False(t, sess.Stale(), "nothing finer is admitted yet")
 
-	sweep := func() int {
-		closed := 0
-		for s := range p.Sessions() {
-			for _, kind := range s.ServableAs() {
-				if kind == s.Kind() {
-					break
-				}
-				if p.Admits(s.Target(), kind) {
-					_ = s.Close()
-					closed++
-					break
-				}
+	p.MustAdd(originHost(originURL)+"/*{rest}", forwardHandler)
+	assert.True(t, sess.Stale(), "an HTTP entry now serves the traffic of this connection")
+
+	var closed int
+	for s := range p.Sessions() {
+		if s.Stale() {
+			require.NoError(t, s.Close())
+			closed++
+		}
+	}
+	assert.Equal(t, 1, closed)
+	waitForSessions(t, p, 0)
+
+	// The client comes back and is decided on the entries as they stand.
+	resp, gerr = client.Get(originURL.String())
+	require.NoError(t, gerr)
+	_, _ = io.Copy(io.Discard, resp.Body)
+	require.NoError(t, resp.Body.Close())
+	assert.Equal(t, KindHTTP, waitForSessions(t, p, 1)[0].Kind())
+}
+
+// A connection keeps the entry it was decided on, and Stale reports when the entries as they
+// stand would pick another one, whether a more specific entry appeared, that entry went away
+// again, or the one serving it was replaced.
+func TestSession_StaleFollowsTheEntry(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p := testProxyWithCA(t, ca)
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, "origin")
+	}))
+	t.Cleanup(origin.Close)
+	originURL, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+	p.cfg.transport.RootCAs = originPool(t, origin)
+
+	_, port := splitHostPort(originURL.Host)
+	catchAll, specific := "[127.0.0.0/8]:"+port, originHost(originURL)+":"+port
+	p.MustAdd[TCP](catchAll, relayStream)
+	client := proxyClient(startProxy(t, p), ca.CertPool())
+
+	resp, err := client.Get(originURL.String())
+	require.NoError(t, err)
+	_, _ = io.Copy(io.Discard, resp.Body)
+	require.NoError(t, resp.Body.Close())
+
+	sess := waitForSessions(t, p, 1)[0]
+	require.Equal(t, KindTCP, sess.Kind())
+	assert.False(t, sess.Stale(), "decided on the only entry there is")
+
+	p.MustAdd[TCP](specific, relayStream)
+	assert.True(t, sess.Stale(), "a more specific entry would serve it now")
+
+	_, err = p.Delete[TCP](specific)
+	require.NoError(t, err)
+	assert.False(t, sess.Stale(), "back on the entry it was decided on")
+
+	_, err = p.Update[TCP](catchAll, relayStream)
+	require.NoError(t, err)
+	assert.True(t, sess.Stale(), "the entry serving it was replaced")
+
+	_, err = p.Delete[TCP](catchAll)
+	require.NoError(t, err)
+	assert.True(t, sess.Stale(), "nothing admits it any more")
+}
+
+// A WebSocket session keeps the entry that served its upgrade. Stale replays the request
+// lookup, so an entry that would now serve the upgrade first makes it stale.
+func TestSession_StaleWebSocket(t *testing.T) {
+	origin, originURL := wsOrigin(t, nil)
+	p := testProxy(t)
+	relayFrames := func(c *WebSocketCtx) error { return c.Relay() }
+	catchAll, specific := originHost(originURL)+"/+{any}", originHost(originURL)+"/ws"
+	p.MustAdd(catchAll, relayFrames)
+
+	resp := wsUpgrade(t, startProxy(t, p), origin, "")
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+
+	sess := waitForSessions(t, p, 1)[0]
+	require.Equal(t, KindWebSocket, sess.Kind())
+	assert.False(t, sess.Stale())
+
+	p.MustAdd(specific, relayFrames)
+	assert.True(t, sess.Stale(), "a more specific entry would serve the upgrade now")
+
+	_, err := p.Delete[WebSocket](specific)
+	require.NoError(t, err)
+	assert.False(t, sess.Stale())
+
+	_, err = p.Update[WebSocket](catchAll, relayFrames)
+	require.NoError(t, err)
+	assert.True(t, sess.Stale(), "the entry serving it was replaced")
+
+	_, err = p.Delete[WebSocket](catchAll)
+	require.NoError(t, err)
+	assert.True(t, sess.Stale(), "nothing admits it any more")
+}
+
+// A connection served request by request has no decision of its own to go stale.
+func TestSession_FrontIsNeverStale(t *testing.T) {
+	p := testProxy(t)
+	stale := make(chan bool, 1)
+	p.MustAdd("example.test/", func(c *HTTPCtx) (*http.Response, error) {
+		stale <- c.Session().Stale()
+		return Text(http.StatusOK, "ok"), nil
+	})
+	client := proxyClient(startProxy(t, p), nil)
+
+	resp, err := client.Get("http://example.test/")
+	require.NoError(t, err)
+	_, _ = io.Copy(io.Discard, resp.Body)
+	require.NoError(t, resp.Body.Close())
+	assert.False(t, <-stale)
+}
+
+// Stale reads a session while the entries change under it, and while the connection it
+// describes is being decided and registered.
+func TestSession_StaleUnderConcurrentChanges(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p := testProxyWithCA(t, ca)
+	client, originURL, _ := streamedOrigin(t, p, ca)
+	specific := originHost(originURL)
+
+	deadline := time.Now().Add(300 * time.Millisecond)
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		for time.Now().Before(deadline) {
+			_, _ = p.Add[TCP]("[127.0.0.0/8]", relayStream)
+			_, _ = p.Update[TCP](specific, relayStream)
+			_, _ = p.Delete[TCP]("[127.0.0.0/8]")
+		}
+	})
+	wg.Go(func() {
+		for time.Now().Before(deadline) {
+			for s := range p.Sessions() {
+				_ = s.Stale()
 			}
 		}
-		return closed
-	}
-	assert.Zero(t, sweep(), "nothing finer is admitted yet")
-
-	p.MustAdd(originHost(originURL)+"/*{rest}", func(c *HTTPCtx) (*http.Response, error) {
-		return c.Forward()
 	})
-	assert.Equal(t, 1, sweep(), "an HTTP entry now serves what this connection carries")
-	waitForSessions(t, p, 0)
+	wg.Go(func() {
+		for time.Now().Before(deadline) {
+			resp, gerr := client.Get(originURL.String())
+			if gerr != nil {
+				client.CloseIdleConnections()
+				continue
+			}
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+		}
+	})
+	wg.Wait()
 }
 
 // A tunnel opened over a TLS front carries its own traffic, so a plaintext tunnel reports no
@@ -330,24 +460,52 @@ func TestSession_CloseUnderTraffic(t *testing.T) {
 	wg.Wait()
 }
 
-// admitSession is what leaves no window between a delete and a sweep. A connection registered
-// after the delete committed reads the tree again and refuses itself.
-func TestSession_AdmitAfterDelete(t *testing.T) {
-	p := testProxy(t)
-	p.MustAdd[TCP]("example.test", relayStream)
-	target := Target{Scheme: "https", Host: "example.test", Port: "443"}
+// admitSession is what leaves no window between a commit and a sweep. A connection decided
+// before the commit and registered after it replays its decision and is refused.
+func TestSession_AdmitAfterChange(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		change func(t *testing.T, p *Proxy)
+	}{
+		{"the entry deleted", func(t *testing.T, p *Proxy) {
+			_, err := p.Delete[TCP]("+{any}")
+			require.NoError(t, err)
+		}},
+		{"a more specific entry", func(_ *testing.T, p *Proxy) {
+			p.MustAdd[TCP]("example.test", relayStream)
+		}},
+		{"the serving entry updated", func(t *testing.T, p *Proxy) {
+			_, err := p.Update[TCP]("+{any}", relayStream)
+			require.NoError(t, err)
+		}},
+		{"a finer kind admitted", func(_ *testing.T, p *Proxy) {
+			p.MustAdd("example.test/", forwardHandler)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := testProxy(t)
+			p.MustAdd[TCP]("+{any}", relayStream)
+			target := Target{Scheme: "https", Host: "example.test", Port: "443"}
+			decide := func() *Session {
+				kind, e, _ := p.firstAdmittedWith(target, []Kind{KindHTTP, KindTCP})
+				require.Equal(t, KindTCP, kind)
+				sess := newSession(p, context.Background(), nil, target, kind, 0)
+				sess.servableAs = []Kind{KindHTTP, KindTCP}
+				sess.entry.Store(e)
+				return sess
+			}
 
-	admitted := newSession(context.Background(), nil, target, KindTCP, 0)
-	require.True(t, p.srv.admitSession(admitted))
-	require.Len(t, slices.Collect(p.Sessions()), 1)
-	p.srv.trackSession(admitted, false)
+			admitted := decide()
+			require.True(t, p.srv.admitSession(admitted))
+			require.Len(t, slices.Collect(p.Sessions()), 1)
+			p.srv.trackSession(admitted, false)
 
-	_, err := p.Delete[TCP]("example.test")
-	require.NoError(t, err)
-
-	refused := newSession(context.Background(), nil, target, KindTCP, 0)
-	assert.False(t, p.srv.admitSession(refused))
-	assert.Empty(t, slices.Collect(p.Sessions()), "a refused connection is not reported")
+			late := decide()
+			tc.change(t, p)
+			assert.False(t, p.srv.admitSession(late), "decided before the change, registered after it")
+			assert.Empty(t, slices.Collect(p.Sessions()), "a refused connection is not reported")
+		})
+	}
 }
 
 // frontSessionContext runs one plain proxied request through client, captures the session
@@ -467,4 +625,96 @@ func TestCanonicalPort(t *testing.T) {
 		assert.Equal(t, want.ok, ok, in)
 		assert.Equal(t, want.port, got, in)
 	}
+}
+
+// wsOrigin answers every request with a 101 and keeps the connection open. before runs while
+// the proxy waits on that answer.
+func wsOrigin(t *testing.T, before func()) (*httptest.Server, *url.URL) {
+	t.Helper()
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if before != nil {
+			before()
+		}
+		conn, brw, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			t.Errorf("origin hijack: %v", err)
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, _ = brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+		_ = brw.Flush()
+		_, _ = io.Copy(io.Discard, brw)
+	}))
+	t.Cleanup(origin.Close)
+	originURL, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+	return origin, originURL
+}
+
+// wsUpgrade sends an upgrade request for /ws through the proxy and returns the answer.
+func wsUpgrade(t *testing.T, proxyAddr string, origin *httptest.Server, extraHeaders string) *http.Response {
+	t.Helper()
+	originURL, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+	raw, err := net.Dial("tcp", proxyAddr)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = raw.Close() })
+	_, err = fmt.Fprintf(raw, "GET %s/ws HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n"+
+		extraHeaders+"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+		origin.URL, originURL.Host)
+	require.NoError(t, err)
+	resp, err := http.ReadResponse(bufio.NewReader(raw), nil)
+	require.NoError(t, err)
+	return resp
+}
+
+// A WebSocket handler owns the upgrade request it is handed, so Stale replays a copy while
+// the handler writes to the original.
+func TestSession_StaleReadsACopyOfTheUpgrade(t *testing.T) {
+	origin, originURL := wsOrigin(t, nil)
+	p := testProxy(t)
+	done := make(chan struct{})
+	started := make(chan struct{})
+	p.MustAdd(originHost(originURL)+"/ws", func(c *WebSocketCtx) error {
+		close(started)
+		for i := 0; ; i++ {
+			select {
+			case <-done:
+				return nil
+			default:
+			}
+			c.Request().Header.Set("X-Churn", strconv.Itoa(i))
+		}
+	})
+	resp := wsUpgrade(t, startProxy(t, p), origin, "")
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+	<-started
+
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		for s := range p.Sessions() {
+			assert.False(t, s.Stale())
+		}
+	}
+	close(done)
+}
+
+// An entry committed while the origin answers the upgrade makes the decision stale before the
+// session is registered, so the client is refused and reads the status alone.
+func TestSession_UpgradeRefusedAfterAChangeInTheWindow(t *testing.T) {
+	p := testProxy(t)
+	relayFrames := func(c *WebSocketCtx) error { return c.Relay() }
+	var originURL *url.URL
+	origin, originURL := wsOrigin(t, func() {
+		p.MustAdd(originHost(originURL)+"/ws", relayFrames, WithMatcher(
+			MatcherFunc(func(rc RequestContext) bool { return rc.Header("X-Tenant") == "acme" })))
+	})
+	p.MustAdd(originHost(originURL)+"/ws", relayFrames)
+
+	resp := wsUpgrade(t, startProxy(t, p), origin, "X-Tenant: acme\r\n")
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+	assert.Equal(t, http.StatusText(http.StatusForbidden)+"\n", string(body))
+	assert.Empty(t, slices.Collect(p.Sessions()), "a refused upgrade is not reported")
 }

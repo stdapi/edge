@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/http"
 	"net/netip"
 	"slices"
 	"strconv"
@@ -113,8 +114,9 @@ var sessionSeq atomic.Uint64
 // protocol upgrade gets a session of its own.
 //
 // Every request and every datagram is routed on the entries as they stand when it arrives.
-// What was decided when the session arrived does not change when entries do, and
-// [Session.Close] ends the session so the client comes back and is decided again.
+// How a session is served is settled when it arrives and does not change when entries do.
+// [Session.Stale] reports a session that would be served differently if it arrived now, and
+// [Session.Close] ends it so the client connects again.
 //
 // A Session is safe for concurrent use by the goroutines serving its requests.
 type Session struct {
@@ -122,6 +124,7 @@ type Session struct {
 	remoteAddr net.Addr
 	localAddr  net.Addr
 	ctx        context.Context
+	p          *Proxy
 	// closer ends the connection. Each listener sets its own, a connection, a CONNECT stream,
 	// or the bookkeeping a QUIC connection needs, before the session is registered and never
 	// after.
@@ -130,10 +133,16 @@ type Session struct {
 	// tlsState is atomic because the QUIC path fills it in once the handshake reaches the
 	// server, by which point [Proxy.Sessions] already reports the session.
 	tlsState atomic.Pointer[tls.ConnectionState]
+	// entry is the one serving a connection whose handler owns it, TCP, QUIC or WebSocket,
+	// and nil where each unit is routed on its own. Atomic for the same reason as tlsState.
+	entry atomic.Pointer[entry]
 	// tlsConn is set instead of tlsState when the session is created before the handshake,
 	// so TLS() can read the state once it exists.
 	tlsConn     *tls.Conn
 	clientHello *ClientHello
+	// upgrade is a copy of the request that switched the connection to the frames a WebSocket
+	// session serves.
+	upgrade *http.Request
 	// via is the CONNECT-UDP tunnel this session arrived through, nil off a socket.
 	via *Session
 	// verified is the decision a plaintext connection took on the last Host it checked. The
@@ -167,9 +176,10 @@ type Session struct {
 	tunnel bool
 }
 
-func newSession(ctx context.Context, c net.Conn, target Target, kind Kind, proto Protocol) *Session {
+func newSession(p *Proxy, ctx context.Context, c net.Conn, target Target, kind Kind, proto Protocol) *Session {
 	s := &Session{
 		id:        sessionSeq.Add(1),
+		p:         p,
 		target:    target,
 		kind:      kind,
 		createdAt: time.Now(),
@@ -302,27 +312,33 @@ func (s *Session) Via() *Session { return s.via }
 // ServableAs returns the kinds that can serve this connection, from the most specific to the
 // least. The negotiated ALPN or the first bytes fix the list when the connection arrives,
 // and [Session.Kind] is always one of them. For example, an h3 connection reports KindHTTP
-// then KindQUIC even when only a QUIC entry admits it.
-//
-// Use ServableAs with [Proxy.Admits] to close the connections that a newly added entry would
-// serve at a more specific kind, so the clients reconnect onto it.
-//
-//	for s := range p.Sessions() {
-//		for _, kind := range s.ServableAs() {
-//			if kind == s.Kind() {
-//				break
-//			}
-//			if p.Admits(s.Target(), kind) {
-//				s.Close()
-//				break
-//			}
-//		}
-//	}
+// then KindQUIC even when only a QUIC entry admits it. [Session.Stale] reports when a kind
+// before [Session.Kind] in this list is admitted.
 func (s *Session) ServableAs() []Kind {
 	if len(s.servableAs) == 0 {
 		return []Kind{s.kind}
 	}
 	return slices.Clone(s.servableAs)
+}
+
+// Stale reports whether the client would be served differently if it connected again now.
+// That is the case once an Add, an Update or a Delete leaves its authority admitted by
+// nothing, by a handler of a more specific kind, or by another handler of the same kind. An
+// HTTP connection, a datagram flow and a CONNECT-UDP tunnel already route each request and
+// each datagram on the current handlers, so they only go stale when their kind would change.
+//
+// Closing a stale session makes the client connect again, and the current handlers serve it.
+//
+//	for s := range p.Sessions() {
+//		if s.Stale() {
+//			s.Close()
+//		}
+//	}
+func (s *Session) Stale() bool {
+	if s.p == nil || s.target.Host == "" || (s.perRequest && s.kind == KindHTTP) {
+		return false
+	}
+	return s.p.stale(s)
 }
 
 // ALPN returns the application protocol negotiated with the client, or an empty string when

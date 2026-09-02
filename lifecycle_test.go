@@ -120,7 +120,7 @@ func TestLifecycle_OriginFormRequestIsRefused(t *testing.T) {
 
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
 	body, _ := io.ReadAll(resp.Body)
-	assert.Contains(t, string(body), "forward proxy")
+	assert.Equal(t, http.StatusText(http.StatusBadRequest)+"\n", string(body), "the client learns the status and nothing else")
 }
 
 // TestLifecycle_AmbiguousLengthIsNormalized covers a request carrying both a Content-Length

@@ -121,7 +121,7 @@ func TestContext_UnmatchedRequestIsRefused(t *testing.T) {
 	_ = resp.Body.Close()
 
 	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
-	assert.Contains(t, string(body), "no entry matches this request")
+	assert.Equal(t, http.StatusText(http.StatusForbidden)+"\n", string(body), "the client learns the status and nothing else")
 
 	// The catch-all is a route like any other, and writing it restores the old behavior.
 	p.MustAdd(host+"/*{any}", forwardHandler)

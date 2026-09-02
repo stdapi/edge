@@ -23,14 +23,13 @@ import (
 func (p *Proxy) serveWebSocketUpgrade(c *routeCtx, w http.ResponseWriter, r *http.Request, sess *Session) {
 	handler, _ := c.entry.serve.(WebSocket)
 	if handler == nil {
-		http.Error(w, "edge: entry has no WebSocket handler", http.StatusInternalServerError)
+		p.writeStatus(w, r, http.StatusInternalServerError, "entry has no WebSocket handler")
 		return
 	}
 
 	resp, err := c.http.Forward()
 	if err != nil {
-		p.logf(r.Context(), slog.LevelWarn, "websocket handshake failed", sess, err)
-		http.Error(w, "edge: "+err.Error(), http.StatusBadGateway)
+		p.writeStatus(w, r, http.StatusBadGateway, "websocket handshake failed: "+err.Error())
 		return
 	}
 
@@ -71,17 +70,20 @@ func (p *Proxy) spliceWebSocket(c *routeCtx, w http.ResponseWriter, r *http.Requ
 	// it here is what lets a shutdown and a route change reach it. A refusal means the proxy
 	// is stopping, and the 101 has not been written yet, so the client sees the upgrade fail.
 	pipe := &upgradedPipe{client: client, backend: backend}
-	sess := pipeSession(c, r, KindWebSocket, pipe)
+	sess := p.pipeSession(c, r, KindWebSocket, c.entry, pipe)
+	// The handler owns the request it is handed, so the copy is what a later decision reads.
+	sess.upgrade = r.Clone(r.Context())
 
 	if !p.srv.tryTrack(pipe) {
 		return nil
 	}
 	defer p.srv.untrack(pipe)
 
-	// The 101 has not reached the client yet, so a connection no entry admits any more is
-	// refused with an ordinary status.
+	// The 101 has not reached the client yet, so a connection the entries would now decide
+	// differently is refused with an ordinary status.
 	if !p.srv.admitSession(sess) {
-		return writeRawStatus(brw, http.StatusForbidden, "no entry admits this authority any more")
+		p.logf(r.Context(), slog.LevelDebug, "upgrade refused, the entries changed while it was admitted", sess, nil)
+		return writeRawStatus(brw, http.StatusForbidden)
 	}
 	defer p.srv.trackSession(sess, false)
 
@@ -124,9 +126,7 @@ func (p *Proxy) serveUpgradedStream(c *routeCtx, w http.ResponseWriter, r *http.
 		if resp.Body != nil {
 			_ = resp.Body.Close()
 		}
-		p.logf(r.Context(), slog.LevelWarn, "upgrade refused, nothing serves the stream it switches to", sess, nil)
-		http.Error(w, "edge: nothing is registered to serve the stream this upgrade switches to",
-			http.StatusForbidden)
+		p.writeStatus(w, r, http.StatusForbidden, "upgrade refused, nothing serves the stream it switches to")
 		return nil
 	}
 
@@ -152,7 +152,7 @@ func (p *Proxy) serveUpgradedStream(c *routeCtx, w http.ResponseWriter, r *http.
 	defer func() { _ = client.Close() }()
 
 	pipe := &upgradedPipe{client: client, backend: backend}
-	upSess := pipeSession(c, r, KindTCP, pipe)
+	upSess := p.pipeSession(c, r, KindTCP, e, pipe)
 
 	if !p.srv.tryTrack(pipe) {
 		return nil
@@ -160,7 +160,8 @@ func (p *Proxy) serveUpgradedStream(c *routeCtx, w http.ResponseWriter, r *http.
 	defer p.srv.untrack(pipe)
 
 	if !p.srv.admitSession(upSess) {
-		return writeRawStatus(brw, http.StatusForbidden, "no entry admits this authority any more")
+		p.logf(r.Context(), slog.LevelDebug, "upgrade refused, the entries changed while it was admitted", upSess, nil)
+		return writeRawStatus(brw, http.StatusForbidden)
 	}
 	defer p.srv.trackSession(upSess, false)
 
@@ -249,15 +250,16 @@ func (u *upgradedPipe) Close() error {
 	return errors.Join(cerr, berr)
 }
 
-// pipeSession describes the connection an upgrade leaves behind.
+// pipeSession describes the connection an upgrade leaves behind, served by e.
 //
 // It gets a session of its own because a request routes on its Host header, which can differ
 // from the CONNECT authority. Reusing the connection's would report an authority the pipe does
 // not talk to, and a sweep would keep the wrong one.
-func pipeSession(c *routeCtx, r *http.Request, kind Kind, pipe io.Closer) *Session {
+func (p *Proxy) pipeSession(c *routeCtx, r *http.Request, kind Kind, e *entry, pipe io.Closer) *Session {
 	target := Target{Scheme: c.scheme, Host: c.host, Port: c.port}
-	sess := newSession(r.Context(), nil, target, kind, protoOfRequest(r))
+	sess := newSession(p, r.Context(), nil, target, kind, protoOfRequest(r))
 	sess.closer = pipe
+	sess.entry.Store(e)
 	// An upgrade outlives the request that established it, so a revocation can only reach it
 	// through the identity that request carried.
 	sess.identity = c.identity

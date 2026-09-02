@@ -173,7 +173,7 @@ func TestSession_Accessors(t *testing.T) {
 	remote := &net.TCPAddr{IP: net.ParseIP("192.0.2.10"), Port: 4242}
 	local := &net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 8080}
 
-	sess := newSession(t.Context(), nil, Target{Scheme: "https", Host: "api.test", Port: "443"}, KindHTTP, HTTP2)
+	sess := newSession(nil, t.Context(), nil, Target{Scheme: "https", Host: "api.test", Port: "443"}, KindHTTP, HTTP2)
 	sess.remoteAddr = remote
 	sess.localAddr = local
 

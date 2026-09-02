@@ -6,14 +6,8 @@ package edge
 
 // Admits reports whether the proxy admits a connection to target carrying the traffic of the
 // given kind. It is the same lookup the proxy runs when a connection arrives, exported so a
-// caller can reason about a configuration, or sweep the sessions a change no longer covers.
-//
-//	p.Delete[edge.HTTP]("api.test/*{any}")
-//	for s := range p.Sessions() {
-//		if !p.Admits(s.Target(), s.Kind()) {
-//			s.Close()
-//		}
-//	}
+// caller can reason about a configuration. [Session.Stale] reports the connections that would
+// be served differently now.
 //
 // The kind is what the traffic itself named, which is why a session reports it. An authority
 // admitted for one kind is not admitted for another: a QUIC entry does not admit HTTP/3, and an
@@ -21,6 +15,47 @@ package edge
 // carries it, so a WebSocket connection and a gRPC call both ask about HTTP.
 func (p *Proxy) Admits(target Target, kind Kind) bool {
 	return p.admission(target, kind) != nil
+}
+
+// stale replays the decision taken when s arrived on the tree as it stands, on one snapshot,
+// and reports whether it differs. It compares the kind first, then the entry for a connection
+// whose handler owns it.
+func (p *Proxy) stale(s *Session) bool {
+	tree := p.getTree()
+	c := tree.pool.Get().(*routeCtx)
+	defer tree.pool.Put(c)
+
+	kinds := s.servableAs
+	if len(kinds) == 0 {
+		kinds = []Kind{s.kind}
+	}
+	var now *entry
+	for _, k := range kinds {
+		if now = tree.admission(c, s.target, k); now != nil {
+			if k != s.kind {
+				return true
+			}
+			break
+		}
+	}
+	if now == nil {
+		return true
+	}
+
+	decided := s.entry.Load()
+	if decided == nil {
+		return false
+	}
+	if s.kind != KindWebSocket {
+		return now != decided
+	}
+	// A WebSocket session was decided by the request lookup on its upgrade, on the path and
+	// the matchers, and that is the lookup to replay.
+	r := s.upgrade
+	c.reset(s, r, s.target.Scheme, s.target.Host, s.target.Port)
+	c.identity = s.identity
+	idx, n := tree.lookup(s.target.Host, routingPath(r), c, true)
+	return n == nil || n.entries[idx] != decided
 }
 
 func (p *Proxy) admission(target Target, kind Kind) *entry {

@@ -186,6 +186,16 @@ p.MustAddInterceptor([]string{"GET"}, "api.stripe.com/v1/charges", func(c *edge.
 })
 ```
 
+A change to the entries reaches the next request or datagram and leaves a connection already open as it was. `Stale()` reports a session whose client would be served differently if it connected again now, once an Add, an Update or a Delete leaves its authority admitted by nothing, by a handler of a more specific kind, or by another handler of the same kind. Closing it makes the client connect again, and the current handlers serve it.
+
+```go
+for s := range p.Sessions() {
+    if s.Stale() {
+        s.Close()
+    }
+}
+```
+
 ## Proxy authentication
 
 Clients of the explicit proxy can be made to authenticate. A request the authenticator refuses is answered with `407 Proxy Authentication Required` carrying the challenges it offers, or with `403 Forbidden` when it offers none.

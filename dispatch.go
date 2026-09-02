@@ -25,8 +25,7 @@ func (p *Proxy) dispatchRequest(w http.ResponseWriter, r *http.Request, sess *Se
 		// RFC 8441 turns a stream into something that is no longer HTTP, the way a 101 does,
 		// and there is no hijack on an HTTP/2 stream. The proxy refuses it here, before the
 		// exchange fails further in.
-		http.Error(w, "edge: extended CONNECT is not served, WebSocket goes over HTTP/1.1",
-			http.StatusNotImplemented)
+		p.writeStatus(w, r, http.StatusNotImplemented, "extended CONNECT is not served, WebSocket goes over HTTP/1.1")
 		return
 	}
 
@@ -38,7 +37,7 @@ func (p *Proxy) dispatchRequest(w http.ResponseWriter, r *http.Request, sess *Se
 		// A lookup that failed may have left captures behind from a branch it backtracked
 		// out of, and no entry means no names to read them under.
 		*c.params = (*c.params)[:0]
-		http.Error(w, "edge: no entry matches this request", http.StatusForbidden)
+		p.writeStatus(w, r, http.StatusForbidden, "no entry matches this request")
 		return
 	}
 	c.entry = n.entries[idx]
@@ -57,7 +56,7 @@ func (p *Proxy) dispatchRequest(w http.ResponseWriter, r *http.Request, sess *Se
 func (p *Proxy) serveHTTPEntry(c *routeCtx, w http.ResponseWriter, r *http.Request, sess *Session) {
 	handler, _ := c.entry.serve.(HTTP)
 	if handler == nil {
-		http.Error(w, "edge: entry has no HTTP handler", http.StatusInternalServerError)
+		p.writeStatus(w, r, http.StatusInternalServerError, "entry has no HTTP handler")
 		return
 	}
 
@@ -90,7 +89,7 @@ func (p *Proxy) serveHTTPEntry(c *routeCtx, w http.ResponseWriter, r *http.Reque
 func (p *Proxy) serveGRPC(c *routeCtx, w http.ResponseWriter, r *http.Request, sess *Session) {
 	handler, _ := c.entry.serve.(GRPC)
 	if handler == nil {
-		http.Error(w, "edge: entry has no gRPC handler", http.StatusInternalServerError)
+		p.writeStatus(w, r, http.StatusInternalServerError, "entry has no gRPC handler")
 		return
 	}
 
@@ -120,7 +119,9 @@ func (p *Proxy) serveGRPC(c *routeCtx, w http.ResponseWriter, r *http.Request, s
 
 	// A failed call is still a 200 carrying a status, which is how a gRPC client reads an
 	// error at all.
-	resp := grpcStatusResponse(statusOf(err), err.Error())
+	p.logf(r.Context(), slog.LevelDebug, "grpc call failed", sess, err)
+	code := statusOf(err)
+	resp := grpcStatusResponse(code, code.String())
 	if werr := writeResponse(w, r, resp); werr != nil {
 		p.logf(r.Context(), slog.LevelDebug, "write gRPC status", sess, werr)
 	}

@@ -27,12 +27,12 @@ import (
 func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request, identity string) {
 	target, err := targetFromConnect(r)
 	if err != nil {
-		http.Error(w, "edge: "+err.Error(), http.StatusBadRequest)
+		p.writeStatus(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	if !p.admitsAny(target, KindHTTP, KindTCP) {
-		http.Error(w, "edge: connection rejected, no entry admits this authority", http.StatusForbidden)
+		p.writeStatus(w, r, http.StatusForbidden, "no entry admits this authority")
 		return
 	}
 
@@ -48,7 +48,7 @@ func (p *Proxy) connectHijack(w http.ResponseWriter, r *http.Request, target Tar
 	rc := http.NewResponseController(w)
 	client, brw, err := rc.Hijack()
 	if err != nil {
-		http.Error(w, "edge: cannot hijack the connection for CONNECT", http.StatusInternalServerError)
+		p.writeStatus(w, r, http.StatusInternalServerError, "cannot hijack the connection for CONNECT")
 		return
 	}
 
@@ -84,7 +84,7 @@ func (p *Proxy) connectHijack(w http.ResponseWriter, r *http.Request, target Tar
 	// The hijacked connection is the front one, so its handshake describes the proxy and not
 	// the tunnel. The session takes the addresses alone and the tunnel's own termination
 	// fills in the TLS state.
-	sess := newSession(ctx, nil, target, 0, 0)
+	sess := newSession(p, ctx, nil, target, 0, 0)
 	sess.remoteAddr = client.RemoteAddr()
 	sess.localAddr = client.LocalAddr()
 	sess.identity = identity
@@ -106,7 +106,7 @@ func (p *Proxy) connectHijack(w http.ResponseWriter, r *http.Request, target Tar
 
 	// Termination answers before reaching the upstream: a handler may serve the whole
 	// exchange locally, and the client needs the connection open to send its ClientHello.
-	if werr := writeRawStatus(brw, http.StatusOK, ""); werr != nil {
+	if werr := writeRawStatus(brw, http.StatusOK); werr != nil {
 		return
 	}
 	if ierr := p.terminate(ctx, conn, sess); ierr != nil {
@@ -124,7 +124,7 @@ func (p *Proxy) connectStream(w http.ResponseWriter, r *http.Request, target Tar
 	}
 
 	stream := newH2Stream(w, r, local, remote)
-	sess := newSession(r.Context(), nil, target, 0, 0)
+	sess := newSession(p, r.Context(), nil, target, 0, 0)
 	sess.localAddr, sess.remoteAddr = local, remote
 	sess.identity = identity
 	sess.setDestination(target)
@@ -172,17 +172,17 @@ func targetFromConnect(r *http.Request) (Target, error) {
 	}, nil
 }
 
-// writeRawStatus writes a bare status line on a hijacked connection, where the http.Server
-// response machinery is no longer available.
-func writeRawStatus(brw *bufio.ReadWriter, code int, detail string) error {
+// writeRawStatus writes a status line on a hijacked connection, where the http.Server
+// response machinery is no longer available, with the status text as the body of an error.
+func writeRawStatus(brw *bufio.ReadWriter, code int) error {
 	reason := http.StatusText(code)
 	if code == http.StatusOK {
 		reason = "Connection established"
 	}
 
 	var body string
-	if detail != "" {
-		body = "edge: " + detail
+	if code >= http.StatusBadRequest {
+		body = reason + "\n"
 	}
 
 	sb := make([]byte, 0, 128+len(body))

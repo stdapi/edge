@@ -48,12 +48,12 @@ func (p *Proxy) serveConnectUDP(w http.ResponseWriter, r *http.Request, identity
 	if r.ProtoMajor < 3 {
 		// Over HTTP/2 the datagrams travel as capsules on the stream, which is not
 		// implemented.
-		http.Error(w, "edge: CONNECT-UDP is served over HTTP/3", http.StatusNotImplemented)
+		p.writeStatus(w, r, http.StatusNotImplemented, "CONNECT-UDP is served over HTTP/3")
 		return
 	}
 	target, err := targetFromConnectUDP(r)
 	if err != nil {
-		http.Error(w, "edge: "+err.Error(), http.StatusBadRequest)
+		p.writeStatus(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -62,26 +62,26 @@ func (p *Proxy) serveConnectUDP(w http.ResponseWriter, r *http.Request, identity
 	candidates := []Kind{KindHTTP, KindQUIC, KindUDP}
 	kind := p.firstAdmitted(target, candidates...)
 	if kind == 0 {
-		http.Error(w, "edge: connection rejected, no entry admits this authority", http.StatusForbidden)
+		p.writeStatus(w, r, http.StatusForbidden, "no entry admits this authority")
 		return
 	}
 	// RFC 9298 section 3.1 has the proxy resolve the target before answering, and answer
 	// 502 when it cannot.
 	upstream, err := p.resolveTarget(r.Context(), target)
 	if err != nil {
-		http.Error(w, "edge: cannot resolve the target: "+err.Error(), http.StatusBadGateway)
+		p.writeStatus(w, r, http.StatusBadGateway, "cannot resolve the target: "+err.Error())
 		return
 	}
 
 	d, err := p.srv.tunnelDemux()
 	if err != nil {
-		http.Error(w, "edge: the proxy is shutting down", http.StatusServiceUnavailable)
+		p.writeStatus(w, r, http.StatusServiceUnavailable, "the proxy is shutting down")
 		return
 	}
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
-	sess := newSession(ctx, nil, target, kind, HTTP3)
+	sess := newSession(p, ctx, nil, target, kind, HTTP3)
 	sess.servableAs = candidates
 	sess.setUpstream(upstream)
 	sess.identity = identity
@@ -96,7 +96,7 @@ func (p *Proxy) serveConnectUDP(w http.ResponseWriter, r *http.Request, identity
 	tun := newConnectUDPTunnel(d, sess, target, upstream, cancel)
 	sess.closer = tun
 	if !d.publishTunnel(tun) {
-		http.Error(w, "edge: the proxy is at capacity or shutting down", http.StatusServiceUnavailable)
+		p.writeStatus(w, r, http.StatusServiceUnavailable, "the proxy is at capacity or shutting down")
 		return
 	}
 	defer tun.close()
@@ -109,14 +109,14 @@ func (p *Proxy) serveConnectUDP(w http.ResponseWriter, r *http.Request, identity
 	defer p.srv.untrack(tun)
 
 	if !p.srv.admitSession(sess) {
-		http.Error(w, "edge: connection rejected, no entry admits this authority any more", http.StatusForbidden)
+		p.writeStatus(w, r, http.StatusForbidden, "the entries changed while the tunnel was admitted")
 		return
 	}
 	defer p.srv.trackSession(sess, false)
 
 	streamer, ok := w.(http3.HTTPStreamer)
 	if !ok {
-		http.Error(w, "edge: the stream cannot carry datagrams", http.StatusInternalServerError)
+		p.writeStatus(w, r, http.StatusInternalServerError, "the stream has no datagram support")
 		return
 	}
 	w.Header().Set(http3.CapsuleProtocolHeader, "?1")

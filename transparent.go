@@ -138,7 +138,7 @@ func (p *Proxy) serveTransparentTLS(ctx context.Context, conn *peekConn, origin 
 		target.Host = origin.Addr().Unmap().String()
 	}
 
-	sess := newSession(ctx, conn, target, 0, 0)
+	sess := newSession(p, ctx, conn, target, 0, 0)
 	sess.transparent = true
 	sess.setUpstream(origin)
 	return p.terminate(ctx, conn, sess)
@@ -160,7 +160,7 @@ func (p *Proxy) serveTransparentPlain(ctx context.Context, conn *peekConn, origi
 		}
 	}
 
-	sess := newSession(ctx, conn, target, 0, 0)
+	sess := newSession(p, ctx, conn, target, 0, 0)
 	sess.transparent = true
 	sess.setUpstream(origin)
 	sess.perRequest = true

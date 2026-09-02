@@ -155,6 +155,7 @@ func (p *Proxy) serveTerminatedStream(ctx context.Context, conn net.Conn, sess *
 	state *tls.ConnectionState, e *entry, params []Param,
 ) error {
 	sess.closer = conn
+	sess.entry.Store(e)
 	if sess.remoteAddr == nil {
 		sess.remoteAddr = conn.RemoteAddr()
 	}
@@ -256,7 +257,7 @@ func (p *Proxy) serveTerminatedHTTP(conn net.Conn, sess *Session) error {
 func (p *Proxy) serveTerminatedRequest(w http.ResponseWriter, r *http.Request) {
 	sess := sessionFromRequest(r)
 	if sess == nil {
-		sess = newSession(r.Context(), nil, Target{}, KindHTTP, protoOfRequest(r))
+		sess = newSession(p, r.Context(), nil, Target{}, KindHTTP, protoOfRequest(r))
 	}
 	// A plaintext connection is announced as HTTP/1.1 before http.Server has had a chance to
 	// read a connection preface. The request knows what was negotiated.
@@ -270,14 +271,13 @@ func (p *Proxy) serveTerminatedRequest(w http.ResponseWriter, r *http.Request) {
 
 	target, ok := terminatedTarget(r, sess)
 	if !ok {
-		http.Error(w, "edge: "+errRequestTargetPort.Error(), http.StatusBadRequest)
+		p.writeStatus(w, r, http.StatusBadRequest, errRequestTargetPort.Error())
 		return
 	}
 	if sess.upstream.IsValid() && sess.TLS() == nil {
 		// The server name of a TLS connection was checked in placeTLS.
 		if target, ok = p.verifyRequestHost(r.Context(), sess, target); !ok {
-			http.Error(w, "edge: connection rejected, the host does not resolve to the destination",
-				http.StatusForbidden)
+			p.writeStatus(w, r, http.StatusForbidden, "the host does not resolve to the destination")
 			return
 		}
 	}

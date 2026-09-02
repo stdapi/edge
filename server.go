@@ -137,7 +137,7 @@ func newServer(p *Proxy) (*server, error) {
 				ctx, cancel = context.WithCancel(ctx)
 				cc.arm(cancel)
 			}
-			return context.WithValue(ctx, sessionKey{}, newSession(ctx, c, Target{}, KindHTTP, HTTP11))
+			return context.WithValue(ctx, sessionKey{}, newSession(p, ctx, c, Target{}, KindHTTP, HTTP11))
 		},
 	}
 
@@ -150,7 +150,7 @@ func newServer(p *Proxy) (*server, error) {
 		ConnContext: func(ctx context.Context, c *quic.Conn) context.Context {
 			// The handshake is over by the time a connection is handed here, so the session
 			// has its TLS state from the start.
-			sess := newSession(ctx, nil, Target{}, KindHTTP, HTTP3)
+			sess := newSession(p, ctx, nil, Target{}, KindHTTP, HTTP3)
 			sess.remoteAddr, sess.localAddr = c.RemoteAddr(), c.LocalAddr()
 			state := c.ConnectionState().TLS
 			sess.tlsState.Store(&state)
@@ -374,12 +374,12 @@ func (p *Proxy) Close() error {
 // not reported, and neither is a redirected plaintext connection decided on the Host header
 // of each request.
 //
-// Deleting an entry does not close the connections already open. Use Sessions with
-// [Session.Close] to end them.
+// Changing an entry does not close the connections already open. Use Sessions with
+// [Session.Stale] and [Session.Close] to end the ones that would be served differently now.
 //
 //	p.Delete[edge.TCP]("example.com")
 //	for s := range p.Sessions() {
-//		if !p.Admits(s.Target(), s.Kind()) {
+//		if s.Stale() {
 //			s.Close()
 //		}
 //	}
@@ -437,21 +437,20 @@ func (p *Proxy) serveProxyRequest(w http.ResponseWriter, r *http.Request) {
 		case "connect-udp":
 			p.serveConnectUDP(w, r, identity)
 		default:
-			http.Error(w, "edge: extended CONNECT is not served, WebSocket goes over HTTP/1.1",
-				http.StatusNotImplemented)
+			p.writeStatus(w, r, http.StatusNotImplemented, "extended CONNECT is not served, WebSocket goes over HTTP/1.1")
 		}
 		return
 	}
 
 	target, err := proxyTarget(r)
 	if err != nil {
-		http.Error(w, "edge: "+err.Error(), http.StatusBadRequest)
+		p.writeStatus(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	sess := sessionFromRequest(r)
 	if sess == nil {
-		sess = newSession(r.Context(), nil, target, KindHTTP, protoOfRequest(r))
+		sess = newSession(p, r.Context(), nil, target, KindHTTP, protoOfRequest(r))
 	}
 
 	p.dispatchRequest(w, r, sess, target, identity)
@@ -473,7 +472,7 @@ func (p *Proxy) authenticate(w http.ResponseWriter, r *http.Request) (string, bo
 	if len(challenges) == 0 {
 		// Nothing the client could present would change the answer, so asking it to
 		// authenticate would be a lie, and a 407 carrying no challenge is malformed.
-		http.Error(w, "edge: proxy access denied", http.StatusForbidden)
+		p.writeStatus(w, r, http.StatusForbidden, "proxy access denied")
 		return "", false
 	}
 
@@ -481,8 +480,23 @@ func (p *Proxy) authenticate(w http.ResponseWriter, r *http.Request) (string, bo
 	for _, challenge := range challenges {
 		header.Add(HeaderProxyAuthenticate, challenge)
 	}
-	http.Error(w, "edge: proxy authentication required", http.StatusProxyAuthRequired)
+	p.writeStatus(w, r, http.StatusProxyAuthRequired, "proxy authentication required")
 	return "", false
+}
+
+// writeStatus answers the client with the status text of code and logs reason with the
+// request, so the client reads the status and nothing else.
+func (p *Proxy) writeStatus(w http.ResponseWriter, r *http.Request, code int, reason string) {
+	if p.cfg.logger.Enabled(r.Context(), slog.LevelDebug) {
+		p.cfg.logger.LogAttrs(r.Context(), slog.LevelDebug, "edge: "+reason,
+			slog.Int("status", code),
+			slog.String("method", r.Method),
+			slog.String("host", r.Host),
+			slog.String("request", r.RequestURI),
+			slog.String("client", r.RemoteAddr),
+		)
+	}
+	http.Error(w, http.StatusText(code), code)
 }
 
 func (p *Proxy) logf(ctx context.Context, level slog.Level, msg string, sess *Session, err error) {
@@ -612,13 +626,14 @@ func (s *server) trackSession(sess *Session, add bool) {
 	delete(s.sessions, sess)
 }
 
-// admitSession registers a session and reports whether the tree still accepts it.
+// admitSession registers a session and reports whether the tree still decides it the way it
+// was decided.
 //
 // The decision that let the connection in was read from the tree as it stood then, and a
-// delete may have committed since. Reading it again, after the session is registered, leaves
-// no window. A sweep that missed this session missed it because the registration came after
-// the snapshot, so it also came after the delete, and this read sees that delete. Registering
-// after the read would reopen the window.
+// commit may have landed since. A replay after the session is registered leaves no window. A
+// sweep that missed this session missed it because the registration came after the snapshot,
+// so it also came after the commit, and this replay sees that commit. A registration after
+// the replay would reopen the window.
 func (s *server) admitSession(sess *Session) bool {
 	// A connection served request by request is not decided as a connection at all, so there
 	// is nothing to register and nothing a sweep could act on. Only the kind actually serving
@@ -628,7 +643,7 @@ func (s *server) admitSession(sess *Session) bool {
 	}
 
 	s.trackSession(sess, true)
-	if s.p.Admits(sess.target, sess.kind) {
+	if !sess.Stale() {
 		return true
 	}
 	s.trackSession(sess, false)

@@ -1097,3 +1097,130 @@ func TestQUIC_AcceptInspectsAndRelaysStreams(t *testing.T) {
 	assert.Contains(t, string(body), "path=/inspected", "the inspected bytes were not lost")
 	assert.Greater(t, streams.Load(), int64(0), "the handler saw the streams it carried")
 }
+
+// A QUIC connection keeps the entry it was decided on, and Stale reports when the entries as
+// they stand would pick another one.
+func TestQUIC_StaleFollowsTheEntry(t *testing.T) {
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(proxyCA))
+	require.NoError(t, err)
+	started := make(chan struct{}, 1)
+	block := func(c *QUICCtx) error {
+		started <- struct{}{}
+		<-c.Context().Done()
+		return nil
+	}
+	p.MustAdd[QUIC]("+{any}", block)
+	proxyAddr := startQUIC(t, p)
+
+	pc, err := loopbackUDP()
+	require.NoError(t, err)
+	defer func() { _ = pc.Close() }()
+	conn, err := quic.Dial(t.Context(), pc, net.UDPAddrFromAddrPort(proxyAddr),
+		&tls.Config{ServerName: h3Authority, RootCAs: poolOf(proxyCA), NextProtos: []string{"doq"}, MinVersion: tls.VersionTLS13},
+		&quic.Config{MaxIdleTimeout: 10 * time.Second, HandshakeIdleTimeout: 3 * time.Second},
+	)
+	require.NoError(t, err)
+	defer func() { _ = conn.CloseWithError(0, "") }()
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the handler did not start")
+	}
+
+	sess := waitForSessions(t, p, 1)[0]
+	require.Equal(t, KindQUIC, sess.Kind())
+	assert.False(t, sess.Stale(), "decided on the only entry there is")
+
+	p.MustAdd[QUIC](h3Authority, block)
+	assert.True(t, sess.Stale(), "a more specific entry would serve it now")
+
+	_, err = p.Delete[QUIC](h3Authority)
+	require.NoError(t, err)
+	assert.False(t, sess.Stale(), "back on the entry it was decided on")
+
+	_, err = p.Update[QUIC]("+{any}", block)
+	require.NoError(t, err)
+	assert.True(t, sess.Stale(), "the entry serving it was replaced")
+
+	_, err = p.Delete[QUIC]("+{any}")
+	require.NoError(t, err)
+	assert.True(t, sess.Stale(), "nothing admits it any more")
+}
+
+// An h3 connection served stream by stream, for want of an HTTP entry, goes stale once one
+// admits its authority, since the traffic allowed HTTP from the start.
+func TestQUIC_StaleWhenHTTPAdmitsAnH3Connection(t *testing.T) {
+	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
+	require.NoError(t, err)
+	origin := h3Origin(t, originCA)
+
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	upstream := DefaultTransport()
+	upstream.RootCAs = poolOf(originCA)
+	p, err := New(WithCA(proxyCA), WithTransport(upstream))
+	require.NoError(t, err)
+	p.MustAdd[QUIC](h3Authority, relayQUIC)
+
+	proxyAddr := startQUICRedirected(t, p, origin)
+	tr := dialQUICTo(proxyAddr, poolOf(proxyCA))
+	defer func() { _ = tr.Close() }()
+
+	req, err := http.NewRequest(http.MethodGet,
+		fmt.Sprintf("https://%s:%d/echo", h3Authority, proxyAddr.Port()), nil)
+	require.NoError(t, err)
+	resp, err := tr.RoundTrip(req)
+	require.NoError(t, err)
+	_, _ = io.Copy(io.Discard, resp.Body)
+	require.NoError(t, resp.Body.Close())
+
+	sess := waitForSessions(t, p, 1)[0]
+	require.Equal(t, KindQUIC, sess.Kind())
+	assert.False(t, sess.Stale())
+
+	p.MustAdd(h3Authority+"/+{any}", forwardHandler)
+	assert.True(t, sess.Stale(), "HTTP admits the traffic of this connection")
+}
+
+// An h3 connection served as HTTP stays HTTP when its last HTTP entry goes, and Stale reports
+// that a new connection would be served stream by stream.
+func TestQUIC_StaleWhenTheLastHTTPEntryGoes(t *testing.T) {
+	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
+	require.NoError(t, err)
+	origin := h3Origin(t, originCA)
+
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	upstream := DefaultTransport()
+	upstream.AllowHTTP3 = true
+	upstream.RootCAs = poolOf(originCA)
+	p, err := New(WithCA(proxyCA), WithTransport(upstream))
+	require.NoError(t, err)
+	p.MustAdd(h3Authority+"/+{any}", forwardHandler)
+	p.MustAdd[QUIC](h3Authority, relayQUIC)
+
+	proxyAddr := startQUICRedirected(t, p, origin)
+	tr := dialQUICTo(proxyAddr, poolOf(proxyCA))
+	defer func() { _ = tr.Close() }()
+
+	req, err := http.NewRequest(http.MethodGet,
+		fmt.Sprintf("https://%s:%d/echo", h3Authority, proxyAddr.Port()), nil)
+	require.NoError(t, err)
+	resp, err := tr.RoundTrip(req)
+	require.NoError(t, err)
+	_, _ = io.Copy(io.Discard, resp.Body)
+	require.NoError(t, resp.Body.Close())
+
+	sess := waitForSessions(t, p, 1)[0]
+	require.Equal(t, KindHTTP, sess.Kind())
+	assert.False(t, sess.Stale())
+
+	_, err = p.Delete[HTTP](h3Authority + "/+{any}")
+	require.NoError(t, err)
+	assert.True(t, sess.Stale(), "a new connection would be served stream by stream")
+
+	p.MustAdd(h3Authority+"/+{any}", forwardHandler)
+	assert.False(t, sess.Stale(), "HTTP admits it again, and each request is routed on its own")
+}

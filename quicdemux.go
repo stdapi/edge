@@ -711,6 +711,11 @@ func (d *quicDemux) serveRawQUIC(qc *quic.Conn, sess *Session) {
 		// The entry went away between the decision and the handshake completing.
 		return
 	}
+	sess.entry.Store(e)
+	// Replayed once stored, so a commit in between is seen here and by every later sweep.
+	if sess.Stale() {
+		return
+	}
 
 	handler, _ := e.serve.(QUIC)
 	if handler == nil {
@@ -1093,7 +1098,7 @@ func (d *quicDemux) openUDPFlow(client net.Addr, from flowKey, origin netip.Addr
 	}
 
 	ctx, cancel := context.WithCancel(d.ctx)
-	sess := newSession(ctx, nil, target, KindUDP, 0)
+	sess := newSession(d.p, ctx, nil, target, KindUDP, 0)
 	d.fillSession(sess, client)
 	sess.setUpstream(origin)
 	u := &udpFlow{
@@ -1631,7 +1636,7 @@ func (d *quicDemux) beginTermination(from flowKey, client net.Addr, conn *quicCo
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	sess := newSession(ctx, nil, target, kind, 0)
+	sess := newSession(d.p, ctx, nil, target, kind, 0)
 	d.fillSession(sess, client)
 	sess.setUpstream(conn.origin)
 	sess.clientHello = hello

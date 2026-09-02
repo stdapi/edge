@@ -195,8 +195,8 @@ func (p *Proxy) MustAdd[H Handler](pattern string, handler H, opts ...EntryOptio
 // else. An authority no entry names is refused, and so is a unit no entry matches.
 //
 // The entry takes effect on the next request or datagram routed, and a connection already
-// open keeps the kind it was decided as. See [Session.ServableAs] to close the connections a
-// new entry would serve at a more specific kind.
+// open is served as before. See [Session.Stale] to find the connections the entry would now
+// serve, and close them so their clients connect again.
 //
 // If an error occurs, it returns one of the following:
 //   - [*PatternError]: the pattern syntax is invalid.
@@ -411,18 +411,29 @@ func chain[H Handler](mws []middleware, base H) H {
 	return h
 }
 
-// DefaultErrorHandler answers 502 Bad Gateway with the error text, and 500 for a
-// [PanicError], which it logs with its stack. A replacement takes over that logging.
+// DefaultErrorHandler answers 502 Bad Gateway, and 500 Internal Server Error for a
+// [PanicError]. The response body is the status text alone. The error is logged, a panic with
+// its stack, and a replacement takes over that logging.
 func DefaultErrorHandler(c *HTTPCtx, err error) *http.Response {
-	if pe, ok := errors.AsType[*PanicError](err); ok {
-		if c != nil && c.r != nil && c.r.p != nil {
-			c.r.p.cfg.logger.Error("edge: handler panic",
+	code := http.StatusBadGateway
+	pe, panicked := errors.AsType[*PanicError](err)
+	if panicked {
+		code = http.StatusInternalServerError
+	}
+	if c != nil && c.r != nil && c.r.p != nil {
+		logger := c.r.p.cfg.logger
+		if panicked {
+			logger.Error("edge: handler panic",
 				slog.String("pattern", c.Pattern()),
 				slog.Any("panic", pe.Value),
 				slog.String("stack", pe.Stack),
 			)
+		} else {
+			logger.Debug("edge: handler error",
+				slog.String("pattern", c.Pattern()),
+				slog.String("error", err.Error()),
+			)
 		}
-		return Text(http.StatusInternalServerError, pe.Error())
 	}
-	return Text(http.StatusBadGateway, err.Error())
+	return Text(code, http.StatusText(code))
 }

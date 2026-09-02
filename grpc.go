@@ -10,6 +10,7 @@ import (
 	"errors"
 	"io"
 	"iter"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -20,8 +21,6 @@ import (
 // errCallRefused ends a call whose method no entry matches any more. The message that
 // arrived is refused before it is delivered, and the client is answered with Unavailable.
 var errCallRefused = errors.New("edge: no entry matches this call any more")
-
-const callRefusedMessage = "no entry matches this call any more"
 
 // maxGRPCMessage bounds one message the proxy will buffer to hand a handler. The gRPC
 // protocol puts a 4 byte length on the wire, so a peer can announce 4 GiB.
@@ -242,7 +241,7 @@ func markRefused(resp *http.Response) {
 		resp.Trailer = make(http.Header, 2)
 	}
 	resp.Trailer.Set("Grpc-Status", strconv.FormatUint(uint64(Unavailable), 10))
-	resp.Trailer.Set("Grpc-Message", grpcPercentEncode(callRefusedMessage))
+	resp.Trailer.Set("Grpc-Message", grpcPercentEncode(Unavailable.String()))
 }
 
 // messageGate passes a stream of length-prefixed messages through and asks, once the header
@@ -590,6 +589,7 @@ func (k *grpcCall) open(h *HTTPCtx, req *http.Request, w http.ResponseWriter) er
 		resp, err := h.ForwardRequest(out)
 		if err != nil {
 			k.upErr = err
+			h.r.p.logf(ctx, slog.LevelDebug, "grpc call failed", h.r.sess, err)
 			// Nothing else ends a write into the pipe once the transport gave up on it.
 			_ = outPr.CloseWithError(err)
 		} else {
@@ -743,11 +743,11 @@ func (k *grpcCall) serveResponse() {
 	<-k.respCh
 
 	if k.upErr != nil {
-		resp := grpcStatusResponse(statusOf(k.upErr), k.upErr.Error())
+		code := statusOf(k.upErr)
 		if k.isRefused() {
-			resp = grpcStatusResponse(Unavailable, callRefusedMessage)
+			code = Unavailable
 		}
-		_ = writeResponse(k.w, k.req, resp)
+		_ = writeResponse(k.w, k.req, grpcStatusResponse(code, code.String()))
 		// Drain the pipe, so a handler still sending toward the client does not block.
 		_, _ = io.Copy(io.Discard, k.inPr)
 		return
@@ -776,7 +776,7 @@ func (k *grpcCall) serveResponse() {
 		// The origin's trailers never arrived or no longer apply, and the client reads the
 		// refusal instead.
 		dst.Set(http.TrailerPrefix+"Grpc-Status", strconv.FormatUint(uint64(Unavailable), 10))
-		dst.Set(http.TrailerPrefix+"Grpc-Message", grpcPercentEncode(callRefusedMessage))
+		dst.Set(http.TrailerPrefix+"Grpc-Message", grpcPercentEncode(Unavailable.String()))
 		return
 	}
 	if !k.inDone {

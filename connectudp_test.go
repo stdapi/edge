@@ -411,7 +411,7 @@ func TestConnectUDP_ClosedTunnelOwnsNoFlow(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(t.Context())
 	target := Target{Scheme: "https", Host: h3Authority, Port: "443"}
-	sess := newSession(ctx, nil, target, KindHTTP, HTTP3)
+	sess := newSession(p, ctx, nil, target, KindHTTP, HTTP3)
 	sess.remoteAddr = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 4242}
 	tun := newConnectUDPTunnel(d, sess, target, netip.MustParseAddrPort("127.0.0.1:443"), cancel)
 	require.True(t, d.publishTunnel(tun))
@@ -599,4 +599,29 @@ func TestConnectUDP_NoServerNameGetsTheTargetsCertificate(t *testing.T) {
 	leaf := qconn.ConnectionState().TLS.PeerCertificates[0]
 	require.Len(t, leaf.IPAddresses, 1)
 	assert.True(t, leaf.IPAddresses[0].Equal(net.ParseIP("::1")), "the certificate is for the declared target")
+}
+
+// A tunnel is decided on its kind alone, so it goes stale when its target would now be
+// admitted under another kind, and not when the entries within that kind change.
+func TestConnectUDP_TunnelStaleOnTheKind(t *testing.T) {
+	p, ca, front, origin := masqueProxy(t)
+	cc := masqueClient(t, front, ca)
+	target := fmt.Sprintf("%s:%d", h3Authority, origin.Port())
+	_, _, err := openTunnel(t, cc, front, target, nil)
+	require.NoError(t, err)
+
+	tunnel := waitForSessions(t, p, 1)[0]
+	require.True(t, tunnel.Tunnel())
+	require.Equal(t, KindHTTP, tunnel.Kind())
+	assert.False(t, tunnel.Stale())
+
+	p.MustAdd(h3Authority+"/echo", forwardHandler)
+	assert.False(t, tunnel.Stale(), "still admitted under HTTP")
+
+	p.MustAdd[QUIC](h3Authority, relayQUIC)
+	_, err = p.Delete[HTTP](h3Authority + "/+{any}")
+	require.NoError(t, err)
+	_, err = p.Delete[HTTP](h3Authority + "/echo")
+	require.NoError(t, err)
+	assert.True(t, tunnel.Stale(), "a new tunnel would be admitted under QUIC")
 }

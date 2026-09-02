@@ -246,7 +246,7 @@ func TestSemantics_HandlerPanicBecomesAnError(t *testing.T) {
 	_ = resp.Body.Close()
 	assert.Equal(t, http.StatusInternalServerError, resp.StatusCode,
 		"a panic is a failure of the proxy, not an answer from the upstream")
-	assert.Contains(t, string(body), "handler panic")
+	assert.Equal(t, http.StatusText(http.StatusInternalServerError), string(body), "the client learns the status and nothing else")
 
 	// The connection must survive: an application under test should not see a transport
 	// failure because a handler had a bug.

@@ -986,3 +986,50 @@ func TestKindUDP_SendToIsBounded(t *testing.T) {
 	}
 	assert.Equal(t, 1, failed, "exactly the origin past the bound was refused")
 }
+
+// A datagram flow routes each datagram on the entries as they stand, so a more specific entry
+// serves its next datagram and leaves it in place. It is stale once nothing admits it.
+func TestKindUDP_StaleOnTheKindAlone(t *testing.T) {
+	origin := udpEchoOrigin(t)
+	port := fmt.Sprint(origin.Port())
+	specific := origin.Addr().String() + ":" + port
+
+	var viaSpecific atomic.Int64
+	p, err := New()
+	require.NoError(t, err)
+	p.MustAdd("[0.0.0.0/0]:"+port, forwardDatagram)
+	_, proxyAddr := startTProxyQUIC(t, p, origin)
+
+	client, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
+	buf := make([]byte, 64)
+	echo := func(msg string) {
+		t.Helper()
+		_, werr := client.WriteTo([]byte(msg), net.UDPAddrFromAddrPort(proxyAddr))
+		require.NoError(t, werr)
+		n, _, rerr := client.ReadFrom(buf)
+		require.NoError(t, rerr)
+		assert.Equal(t, msg, string(buf[:n]))
+	}
+
+	echo("one")
+	sess := waitForSessions(t, p, 1)[0]
+	require.Equal(t, KindUDP, sess.Kind())
+	assert.False(t, sess.Stale())
+
+	p.MustAdd(specific, func(d *DatagramCtx) error {
+		viaSpecific.Add(1)
+		return d.Forward()
+	})
+	assert.False(t, sess.Stale(), "the next datagram is routed on its own")
+	echo("two")
+	assert.Equal(t, int64(2), viaSpecific.Load(), "both directions of the second exchange took the specific entry")
+
+	_, err = p.Delete[UDP](specific)
+	require.NoError(t, err)
+	_, err = p.Delete[UDP]("[0.0.0.0/0]:" + port)
+	require.NoError(t, err)
+	assert.True(t, sess.Stale(), "nothing admits the flow any more")
+}

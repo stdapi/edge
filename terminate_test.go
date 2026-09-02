@@ -13,7 +13,7 @@ import (
 )
 
 func TestTerminatedTarget_PortIsCanonical(t *testing.T) {
-	sess := newSession(t.Context(), nil, Target{Scheme: "https", Host: "example.test", Port: "443"}, KindHTTP, HTTP11)
+	sess := newSession(nil, t.Context(), nil, Target{Scheme: "https", Host: "example.test", Port: "443"}, KindHTTP, HTTP11)
 	target, ok := terminatedTarget(&http.Request{Host: "example.test:08443"}, sess)
 	require.True(t, ok)
 	assert.Equal(t, "8443", target.Port)
