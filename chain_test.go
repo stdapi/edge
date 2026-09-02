@@ -731,3 +731,27 @@ func TestChain_H3UpstreamThroughCONNECTUDPOverHTTP2(t *testing.T) {
 		}
 	}
 }
+
+// A tunnel refused on the HTTP/2 connection the dial just opened leaves that connection
+// shared for the next tunnel.
+func TestChain_RefusedCONNECTUDPLeavesTheHTTP2ConnectionShared(t *testing.T) {
+	if !extendedConnectEnabled() {
+		t.Skip("run with GODEBUG=http2xconnect=1, Go's HTTP/2 server refuses extended CONNECT without it")
+	}
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	back, err := New(WithCA(ca))
+	require.NoError(t, err)
+	back.MustAdd[UDP]("127.0.0.1", forwardDatagram)
+	backFront := startTLSFront(t, back, ca, "h2", "http/1.1")
+
+	front, dialer := chainedFront(t, ca, "https://"+backFront.String())
+	up := front.srv.fwd.up
+	_, err = up.dial(t.Context(), "udp", "127.0.0.2:53", "https")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "CONNECT-UDP refused with 403")
+	conn, err := up.dial(t.Context(), "udp", "127.0.0.1:53", "https")
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+	assert.EqualValues(t, 1, dialer.tcp.Load(), "the refusal did not cost the connection")
+}

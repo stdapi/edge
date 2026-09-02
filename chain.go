@@ -363,7 +363,36 @@ func (u *upstreamDialer) dialTunnel(ctx context.Context, proxy *url.URL, host, p
 	}
 	_ = conn.SetDeadline(time.Now().Add(proxyConnectTimeout))
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
-	pipe, err := u.tunnelOn(ctx, conn, proxy, host, port, h2)
+	if proxy.Scheme == "https" {
+		cfg := u.t.upstreamTLSConfig()
+		cfg.ServerName = proxy.Hostname()
+		cfg.NextProtos = []string{"http/1.1"}
+		if h2 {
+			cfg.NextProtos = []string{"h2", "http/1.1"}
+		}
+		tc := tls.Client(conn, cfg)
+		if herr := tc.HandshakeContext(ctx); herr != nil {
+			stop()
+			_ = conn.Close()
+			return nil, fmt.Errorf("tls handshake: %w", herr)
+		}
+		if tc.ConnectionState().NegotiatedProtocol == "h2" {
+			// The connection outlives this tunnel, so the dial's cancellation and deadline
+			// come off it here, and a tunnel refused on it leaves it shared.
+			if !stop() {
+				_ = conn.Close()
+				return nil, ctx.Err()
+			}
+			_ = conn.SetDeadline(time.Time{})
+			cc, serr := u.shareH2Conn(proxy, tc)
+			if serr != nil {
+				return nil, serr
+			}
+			return openTunnelOnH2(ctx, cc, proxy, host, port)
+		}
+		conn = tc
+	}
+	pipe, err := upgradeOn(conn, proxy, host, port)
 	if !stop() {
 		_ = conn.Close()
 		return nil, ctx.Err()
@@ -373,33 +402,6 @@ func (u *upstreamDialer) dialTunnel(ctx context.Context, proxy *url.URL, host, p
 		return nil, err
 	}
 	return pipe, nil
-}
-
-func (u *upstreamDialer) tunnelOn(ctx context.Context, conn net.Conn, proxy *url.URL, host, port string, h2 bool) (tunnelPipe, error) {
-	if proxy.Scheme == "https" {
-		cfg := u.t.upstreamTLSConfig()
-		cfg.ServerName = proxy.Hostname()
-		cfg.NextProtos = []string{"http/1.1"}
-		if h2 {
-			cfg.NextProtos = []string{"h2", "http/1.1"}
-		}
-		tc := tls.Client(conn, cfg)
-		if err := tc.HandshakeContext(ctx); err != nil {
-			return nil, fmt.Errorf("tls handshake: %w", err)
-		}
-		if tc.ConnectionState().NegotiatedProtocol == "h2" {
-			// The dial deadline comes off before the read loop starts, the connection
-			// outlives this tunnel.
-			_ = conn.SetDeadline(time.Time{})
-			cc, err := u.shareH2Conn(proxy, tc)
-			if err != nil {
-				return nil, err
-			}
-			return openTunnelOnH2(ctx, cc, proxy, host, port)
-		}
-		conn = tc
-	}
-	return upgradeOn(conn, proxy, host, port)
 }
 
 func (u *upstreamDialer) dropH2Conn(proxy *url.URL) {

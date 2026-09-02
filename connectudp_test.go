@@ -17,6 +17,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -644,16 +645,20 @@ type capsuleClient struct {
 	rw       io.ReadWriteCloser
 	in       chan []byte
 	done     chan struct{}
+	stalled  chan struct{}
 	err      error
 	deadline atomic.Pointer[time.Time]
 	wmu      sync.Mutex
 }
 
 func newCapsuleClient(rw io.ReadWriteCloser) *capsuleClient {
-	c := &capsuleClient{rw: rw, in: make(chan []byte, 64), done: make(chan struct{})}
+	c := &capsuleClient{rw: rw, in: make(chan []byte), done: make(chan struct{}), stalled: make(chan struct{})}
 	go c.read()
 	return c
 }
+
+// stopReading parks the reader, so the proxy's writes fill the buffers and then block.
+func (c *capsuleClient) stopReading() { close(c.stalled) }
 
 // read parses the capsules the proxy sends. The error ending the stream is sticky, every
 // reader of the tunnel sees it.
@@ -681,7 +686,11 @@ func (c *capsuleClient) read() {
 		if typ != 0 {
 			continue
 		}
-		c.in <- value
+		select {
+		case c.in <- value:
+		case <-c.stalled:
+			<-make(chan struct{})
+		}
 	}
 }
 
@@ -1086,6 +1095,72 @@ func TestConnectUDP_Capsules_SkipsWhatIsNotADatagram(t *testing.T) {
 			n, _, err := pconn.ReadFrom(buf)
 			require.NoError(t, err)
 			assert.Equal(t, "still here", string(buf[:n]))
+		})
+	}
+}
+
+// udpFlood answers every datagram with a burst of large ones, enough to fill every buffer
+// between the proxy and a client that stopped reading.
+func udpFlood(t *testing.T, bursts, size int) netip.AddrPort {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = pc.Close() })
+	go func() {
+		buf := make([]byte, 2048)
+		payload := make([]byte, size)
+		for {
+			_, addr, rerr := pc.ReadFrom(buf)
+			if rerr != nil {
+				return
+			}
+			for range bursts {
+				if _, werr := pc.WriteTo(payload, addr); werr != nil {
+					return
+				}
+			}
+		}
+	}()
+	return netip.MustParseAddrPort(pc.LocalAddr().String())
+}
+
+// A client that stops reading its tunnel leaves the proxy's writes stuck. Closing the tunnel
+// still ends it, within the drain timeout, and a shutdown reaches it.
+func TestConnectUDP_Capsules_CloseEndsAStalledClient(t *testing.T) {
+	for _, f := range capsuleFronts {
+		t.Run(f.name, func(t *testing.T) {
+			skipWithoutExtendedConnect(t, f)
+			flood := udpFlood(t, 20000, 1400)
+			ca, err := GenerateCA()
+			require.NoError(t, err)
+			p, err := New(WithCA(ca))
+			require.NoError(t, err)
+			p.MustAdd[UDP]("127.0.0.1", forwardDatagram)
+			front := startTLSFront(t, p, ca, f.alpn)
+			open := f.open(t, front, ca)
+
+			pconn, _, err := open(flood.String(), nil)
+			require.NoError(t, err)
+			// Nothing reads the tunnel past this point, the burst fills what it can.
+			pconn.stopReading()
+			for range 3 {
+				_, err = pconn.WriteTo([]byte("go"), nil)
+				require.NoError(t, err)
+				time.Sleep(200 * time.Millisecond)
+			}
+			var tunnel *Session
+			for _, s := range waitForSessions(t, p, 2) {
+				if s.Tunnel() {
+					tunnel = s
+				}
+			}
+			require.NotNil(t, tunnel)
+
+			start := time.Now()
+			require.NoError(t, tunnel.Close())
+			assert.Less(t, time.Since(start), time.Second, "Close waited on the client")
+			assert.Eventually(t, func() bool { return len(slices.Collect(p.Sessions())) == 0 },
+				3*time.Second, 20*time.Millisecond, "the tunnel outlived its close")
 		})
 	}
 }

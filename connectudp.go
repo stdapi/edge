@@ -251,7 +251,7 @@ type connectUDPTunnel struct {
 	key       flowKey
 	d         *quicDemux
 	sess      *Session
-	pipe      tunnelPipe
+	pipe      atomic.Pointer[tunnelPipe]
 	addr      *tunnelAddr
 	cancel    context.CancelFunc
 	sendCh    chan []byte
@@ -300,12 +300,12 @@ func (a *tunnelAddr) String() string  { return a.name }
 
 // serve reads the datagrams off the pipe and places each, until the tunnel ends.
 func (t *connectUDPTunnel) serve(ctx context.Context, pipe tunnelPipe) {
-	t.pipe = pipe
+	t.pipe.Store(&pipe)
 	// A reset or the loss of the front connection cancels the context. A FIN alone does
 	// not, which the pipe reports as the end of its reads.
 	stop := context.AfterFunc(ctx, t.close)
 	defer stop()
-	go t.sender()
+	go t.sender(pipe)
 
 	for {
 		b, err := pipe.recv(ctx)
@@ -350,33 +350,33 @@ func putTunnelBuf(b []byte) {
 }
 
 // sender is the one goroutine writing the pipe. Once the tunnel is done it drains the queue,
-// the CONNECTION_CLOSE of every inner connection among it, then ends the pipe.
-func (t *connectUDPTunnel) sender() {
+// the CONNECTION_CLOSE of every inner connection among it, then ends the pipe. The deadline
+// close armed bounds the drain, and a send to a client that stopped reading with it.
+func (t *connectUDPTunnel) sender(pipe tunnelPipe) {
 	defer close(t.sent)
 	for {
 		select {
 		case b := <-t.sendCh:
-			t.sendDatagram(b)
+			t.sendDatagram(pipe, b)
 			continue
 		case <-t.done:
 		}
 		break
 	}
-	_ = t.pipe.setWriteDeadline(time.Now().Add(tunnelDrainTimeout))
 	for {
 		select {
 		case b := <-t.sendCh:
-			t.sendDatagram(b)
+			t.sendDatagram(pipe, b)
 			continue
 		default:
 		}
 		break
 	}
-	_ = t.pipe.close()
+	_ = pipe.close()
 }
 
-func (t *connectUDPTunnel) sendDatagram(b []byte) {
-	err := t.pipe.send(b)
+func (t *connectUDPTunnel) sendDatagram(pipe tunnelPipe, b []byte) {
+	err := pipe.send(b)
 	putTunnelBuf(b)
 	if err != nil {
 		if tooLarge, ok := errors.AsType[*quic.DatagramTooLargeError](err); ok {
@@ -437,6 +437,9 @@ func (t *connectUDPTunnel) close() {
 		}
 		if stack != nil {
 			d.closeIntercept(stack)
+		}
+		if pipe := t.pipe.Load(); pipe != nil {
+			_ = (*pipe).setWriteDeadline(time.Now().Add(tunnelDrainTimeout))
 		}
 		close(t.done)
 		if t.cancel != nil {

@@ -39,6 +39,13 @@ const (
 	maxHeaderBytes = 64 << 10
 	// hpackTableSize is the decoding table size of RFC 9113 section 6.5.2.
 	hpackTableSize = 4096
+	// writeTimeout bounds one frame on the socket. A peer that reads nothing for that long
+	// ends the connection.
+	writeTimeout = 30 * time.Second
+	// closeTimeout bounds the GOAWAY a close sends.
+	closeTimeout = time.Second
+	// writeQueue bounds the frames waiting for the writer.
+	writeQueue = 256
 )
 
 var (
@@ -80,20 +87,22 @@ type Conn struct {
 	settingsSeen chan struct{}
 
 	done chan struct{}
-	// encBuf is what enc writes to, reused under wmu.
+	// writes feeds the one goroutine writing frames, and the encoder with them, so a socket
+	// that stopped taking bytes blocks nothing but that goroutine. writerDone is closed
+	// when it returns.
+	writes     chan writeRequest
+	writerDone chan struct{}
+	// encBuf is what enc writes to, reused by the writer.
 	encBuf bytes.Buffer
 	// sendWindow is what the peer lets the connection send, and recvUnacked what the peer
 	// sent and the streams consumed since the last WINDOW_UPDATE on the connection.
 	sendWindow  int64
 	recvUnacked int64
 	// peer settings, read once under mu when a stream is opened.
-	initialWindow int64
-	maxStreams    int64
-	settingsOnce  sync.Once
-	doneOnce      sync.Once
-	// wmu serializes the frames written and the encoder with them.
-	wmu sync.Mutex
-
+	initialWindow   int64
+	maxStreams      int64
+	settingsOnce    sync.Once
+	doneOnce        sync.Once
 	mu              sync.Mutex
 	nextID          uint32
 	maxFrameSize    uint32
@@ -117,12 +126,15 @@ func Client(nc net.Conn) (*Conn, error) {
 		maxStreams:    1<<32 - 1,
 		settingsSeen:  make(chan struct{}),
 		done:          make(chan struct{}),
+		writes:        make(chan writeRequest, writeQueue),
+		writerDone:    make(chan struct{}),
 	}
 	c.enc = hpack.NewEncoder(&c.encBuf)
 	c.fr.ReadMetaHeaders = hpack.NewDecoder(hpackTableSize, nil)
 	c.fr.MaxHeaderListSize = maxHeaderBytes
 
-	err := c.write(func(fr *http2.Framer) error {
+	_ = nc.SetWriteDeadline(time.Now().Add(writeTimeout))
+	err := c.writeNow(func(fr *http2.Framer) error {
 		if _, err := bw.WriteString(http2.ClientPreface); err != nil {
 			return err
 		}
@@ -139,14 +151,67 @@ func Client(nc net.Conn) (*Conn, error) {
 		_ = nc.Close()
 		return nil, err
 	}
+	go c.writeLoop()
 	go c.readLoop()
 	return c, nil
 }
 
-// write runs f with the framer and flushes what it wrote, one writer at a time.
+type writeRequest struct {
+	f func(*http2.Framer) error
+	// res receives the outcome, nil when the caller does not wait for it.
+	res chan error
+}
+
+// write has the writer run f and flush, and returns its outcome, or the connection's error
+// once it ended.
 func (c *Conn) write(f func(*http2.Framer) error) error {
-	c.wmu.Lock()
-	defer c.wmu.Unlock()
+	req := writeRequest{f: f, res: make(chan error, 1)}
+	select {
+	case c.writes <- req:
+	case <-c.done:
+		return c.Err()
+	}
+	select {
+	case err := <-req.res:
+		return err
+	case <-c.done:
+		return c.Err()
+	}
+}
+
+// tryWrite queues f without waiting for it and drops it when the queue is full.
+func (c *Conn) tryWrite(f func(*http2.Framer) error) {
+	select {
+	case c.writes <- writeRequest{f: f}:
+	default:
+	}
+}
+
+func (c *Conn) writeLoop() {
+	for {
+		select {
+		case req := <-c.writes:
+			_ = c.nc.SetWriteDeadline(time.Now().Add(writeTimeout))
+			err := c.writeNow(req.f)
+			if req.res != nil {
+				req.res <- err
+			}
+			if err != nil {
+				// fail waits for writerDone, so it is closed first.
+				close(c.writerDone)
+				c.fail(err, false)
+				return
+			}
+		case <-c.done:
+			close(c.writerDone)
+			return
+		}
+	}
+}
+
+// writeNow runs f with the framer and flushes what it wrote, on the writer's goroutine or
+// before it starts.
+func (c *Conn) writeNow(f func(*http2.Framer) error) error {
 	if err := f(c.fr); err != nil {
 		return err
 	}
@@ -177,7 +242,8 @@ func (c *Conn) Close() error {
 	return nil
 }
 
-// fail ends the connection with err. goAway says whether the peer is told.
+// fail ends the connection with err. goAway says whether the peer is told, on a best
+// effort bounded by closeTimeout.
 func (c *Conn) fail(err error, goAway bool) {
 	c.doneOnce.Do(func() {
 		c.mu.Lock()
@@ -185,8 +251,12 @@ func (c *Conn) fail(err error, goAway bool) {
 		streams := c.streams
 		c.streams = nil
 		c.mu.Unlock()
+		close(c.done)
+		// A frame the writer is stuck on returns at the deadline, and the writer with it.
+		_ = c.nc.SetWriteDeadline(time.Now().Add(closeTimeout))
+		<-c.writerDone
 		if goAway {
-			_ = c.write(func(fr *http2.Framer) error {
+			_ = c.writeNow(func(fr *http2.Framer) error {
 				return fr.WriteGoAway(0, http2.ErrCodeNo, nil)
 			})
 		}
@@ -194,7 +264,6 @@ func (c *Conn) fail(err error, goAway bool) {
 		for _, s := range streams {
 			s.end(err)
 		}
-		close(c.done)
 	})
 }
 
@@ -538,7 +607,7 @@ func (c *Conn) resetStream(id uint32, code http2.ErrCode, fromPeer bool) {
 	if fromPeer {
 		s.fromPeer.Store(true)
 	} else {
-		_ = c.write(func(fr *http2.Framer) error { return fr.WriteRSTStream(id, code) })
+		c.tryWrite(func(fr *http2.Framer) error { return fr.WriteRSTStream(id, code) })
 	}
 	s.end(http2.StreamError{StreamID: id, Code: code})
 }
@@ -571,6 +640,8 @@ type Stream struct {
 
 	fromPeer atomic.Bool
 	closed   bool
+	// windowReturned says end gave the connection window back for what was buffered.
+	windowReturned bool
 }
 
 func (s *Stream) signal(ch chan struct{}) {
@@ -597,7 +668,8 @@ func (s *Stream) endRead(err error) {
 	s.signal(s.readReady)
 }
 
-// end ends the stream in both directions with err. Reads drain what was buffered first.
+// end ends the stream in both directions with err. What was buffered and never read goes
+// back to the connection window.
 func (s *Stream) end(err error) {
 	s.doneOnce.Do(func() {
 		s.mu.Lock()
@@ -605,10 +677,19 @@ func (s *Stream) end(err error) {
 		if s.readErr == nil {
 			s.readErr = err
 		}
+		// The reads still deliver what was buffered, accounted on the connection now.
+		var buffered int64
+		for _, chunk := range s.chunks {
+			buffered += int64(len(chunk))
+		}
+		s.windowReturned = true
 		s.mu.Unlock()
 		close(s.done)
 		s.signal(s.readReady)
 		s.signal(s.writeReady)
+		if buffered > 0 {
+			_ = s.c.consumed(nil, buffered)
+		}
 	})
 }
 
@@ -623,9 +704,10 @@ func (s *Stream) Read(b []byte) (int, error) {
 			} else {
 				s.chunks[0] = s.chunks[0][n:]
 			}
+			returned := s.windowReturned
 			s.mu.Unlock()
-			if err := s.c.consumed(s, int64(n)); err != nil {
-				s.c.fail(err, false)
+			if !returned {
+				_ = s.c.consumed(s, int64(n))
 			}
 			return n, nil
 		}
@@ -636,20 +718,28 @@ func (s *Stream) Read(b []byte) (int, error) {
 		}
 		s.mu.Unlock()
 
-		var timeout <-chan time.Time
-		if dl := s.readDeadline.Load(); dl != nil && !dl.IsZero() {
-			if !time.Now().Before(*dl) {
-				return 0, os.ErrDeadlineExceeded
-			}
-			timer := time.NewTimer(time.Until(*dl))
-			defer timer.Stop()
-			timeout = timer.C
+		if err := s.wait(s.readReady, &s.readDeadline); err != nil {
+			return 0, err
 		}
-		select {
-		case <-s.readReady:
-		case <-timeout:
-			return 0, os.ErrDeadlineExceeded
+	}
+}
+
+// wait blocks until ready is signalled or the deadline passes.
+func (s *Stream) wait(ready <-chan struct{}, deadline *atomic.Pointer[time.Time]) error {
+	var timeout <-chan time.Time
+	if dl := deadline.Load(); dl != nil && !dl.IsZero() {
+		if !time.Now().Before(*dl) {
+			return os.ErrDeadlineExceeded
 		}
+		timer := time.NewTimer(time.Until(*dl))
+		defer timer.Stop()
+		timeout = timer.C
+	}
+	select {
+	case <-ready:
+		return nil
+	case <-timeout:
+		return os.ErrDeadlineExceeded
 	}
 }
 
@@ -692,27 +782,13 @@ func (s *Stream) writeFrame(b []byte) (int, error) {
 		s.mu.Unlock()
 		s.c.mu.Unlock()
 		if n > 0 {
-			err := s.c.write(func(fr *http2.Framer) error { return fr.WriteData(s.id, false, b[:n]) })
-			if err != nil {
-				s.c.fail(err, false)
+			if err := s.c.write(func(fr *http2.Framer) error { return fr.WriteData(s.id, false, b[:n]) }); err != nil {
 				return 0, err
 			}
 			return int(n), nil
 		}
-
-		var timeout <-chan time.Time
-		if dl := s.writeDeadline.Load(); dl != nil && !dl.IsZero() {
-			if !time.Now().Before(*dl) {
-				return 0, os.ErrDeadlineExceeded
-			}
-			timer := time.NewTimer(time.Until(*dl))
-			defer timer.Stop()
-			timeout = timer.C
-		}
-		select {
-		case <-s.writeReady:
-		case <-timeout:
-			return 0, os.ErrDeadlineExceeded
+		if err := s.wait(s.writeReady, &s.writeDeadline); err != nil {
+			return 0, err
 		}
 	}
 }
@@ -748,7 +824,7 @@ func (s *Stream) reset(code http2.ErrCode) {
 	delete(c.streams, s.id)
 	c.mu.Unlock()
 	if !s.fromPeer.Load() {
-		_ = c.write(func(fr *http2.Framer) error { return fr.WriteRSTStream(s.id, code) })
+		c.tryWrite(func(fr *http2.Framer) error { return fr.WriteRSTStream(s.id, code) })
 	}
 	s.end(errStreamClosed)
 }

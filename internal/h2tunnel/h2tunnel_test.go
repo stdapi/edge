@@ -22,6 +22,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
 )
 
 // echoServer serves CONNECT by echoing the stream, and hands each request to seen.
@@ -283,4 +285,180 @@ func TestConn_NotHTTP2(t *testing.T) {
 	_, _, err = c.Open(ctx, Request{Authority: "origin.test:443"})
 	require.Error(t, err)
 	require.False(t, errors.Is(err, context.DeadlineExceeded))
+}
+
+// fakePeer is the server end of a TCP connection, reading the client preface, sending the
+// settings the test asks for and answering every HEADERS with 200. What it does past that
+// is the test's.
+type fakePeer struct {
+	fr     *http2.Framer
+	enc    *hpack.Encoder
+	encBuf bytes.Buffer
+	wmu    sync.Mutex
+	mu     sync.Mutex
+	// connWindow is what the client lets the peer send on the connection.
+	connWindow int64
+}
+
+func startFakePeer(nc net.Conn, settings ...http2.Setting) (*fakePeer, error) {
+	p := &fakePeer{fr: http2.NewFramer(nc, nc), connWindow: defaultWindow}
+	p.fr.ReadMetaHeaders = hpack.NewDecoder(hpackTableSize, nil)
+	p.enc = hpack.NewEncoder(&p.encBuf)
+	preface := make([]byte, len(http2.ClientPreface))
+	if _, err := io.ReadFull(nc, preface); err != nil {
+		return nil, err
+	}
+	return p, p.fr.WriteSettings(settings...)
+}
+
+func (p *fakePeer) answer(id uint32) error {
+	p.wmu.Lock()
+	defer p.wmu.Unlock()
+	p.encBuf.Reset()
+	_ = p.enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+	return p.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: p.encBuf.Bytes(), EndHeaders: true})
+}
+
+func (p *fakePeer) writeData(id uint32, b []byte) error {
+	p.wmu.Lock()
+	defer p.wmu.Unlock()
+	p.mu.Lock()
+	p.connWindow -= int64(len(b))
+	p.mu.Unlock()
+	return p.fr.WriteData(id, false, b)
+}
+
+func (p *fakePeer) window() int64 {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.connWindow
+}
+
+func tcpPair(t *testing.T) (client, server net.Conn) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = ln.Close() }()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		c, _ := ln.Accept()
+		accepted <- c
+	}()
+	client, err = net.Dial("tcp", ln.Addr().String())
+	require.NoError(t, err)
+	server = <-accepted
+	require.NotNil(t, server)
+	t.Cleanup(func() { _ = client.Close(); _ = server.Close() })
+	return client, server
+}
+
+// A peer that stops reading leaves a write stuck on the socket. Close still returns at
+// once, and the stuck write with it.
+func TestConn_CloseBehindAStuckWrite(t *testing.T) {
+	cli, srv := tcpPair(t)
+	answered := make(chan struct{})
+	go func() {
+		peer, err := startFakePeer(srv, http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1 << 24})
+		if err != nil {
+			return
+		}
+		_ = peer.fr.WriteWindowUpdate(0, 1<<24)
+		for {
+			f, rerr := peer.fr.ReadFrame()
+			if rerr != nil {
+				return
+			}
+			if mh, ok := f.(*http2.MetaHeadersFrame); ok {
+				_ = peer.answer(mh.StreamID)
+				close(answered)
+				return
+			}
+		}
+	}()
+
+	c, err := Client(cli)
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	s, resp, err := c.Open(ctx, Request{Authority: "origin.test:443"})
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	<-answered
+
+	wrote := make(chan error, 1)
+	go func() {
+		_, werr := s.Write(make([]byte, 32<<20))
+		wrote <- werr
+	}()
+	select {
+	case <-wrote:
+		t.Fatal("the write did not stall, the peer is still reading")
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	start := time.Now()
+	require.NoError(t, c.Close())
+	assert.Less(t, time.Since(start), 3*time.Second, "Close waited on the stuck write")
+	select {
+	case werr := <-wrote:
+		require.Error(t, werr)
+	case <-time.After(3 * time.Second):
+		t.Fatal("the stuck write outlived the connection")
+	}
+}
+
+// Bytes buffered on a stream the caller closes without reading go back to the connection
+// window, so the streams that follow on the connection are not starved.
+func TestConn_AbandonedStreamsReturnTheWindow(t *testing.T) {
+	cli, srv := tcpPair(t)
+	answered := make(chan uint32, 8)
+	ready := make(chan *fakePeer, 1)
+	go func() {
+		peer, err := startFakePeer(srv, http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1 << 20})
+		if err != nil {
+			close(ready)
+			return
+		}
+		ready <- peer
+		for {
+			f, rerr := peer.fr.ReadFrame()
+			if rerr != nil {
+				return
+			}
+			switch f := f.(type) {
+			case *http2.MetaHeadersFrame:
+				_ = peer.answer(f.StreamID)
+				answered <- f.StreamID
+			case *http2.WindowUpdateFrame:
+				if f.StreamID == 0 {
+					peer.mu.Lock()
+					peer.connWindow += int64(f.Increment)
+					peer.mu.Unlock()
+				}
+			}
+		}
+	}()
+
+	c, err := Client(cli)
+	require.NoError(t, err)
+	defer func() { _ = c.Close() }()
+	peer := <-ready
+	require.NotNil(t, peer)
+	require.Eventually(t, func() bool { return peer.window() == window }, 5*time.Second, 5*time.Millisecond,
+		"the client raises the connection window at startup")
+
+	const chunk = 256 << 10
+	for range 4 {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		s, _, oerr := c.Open(ctx, Request{Authority: "origin.test:443"})
+		cancel()
+		require.NoError(t, oerr)
+		id := <-answered
+		for sent := 0; sent < chunk; sent += 16384 {
+			require.NoError(t, peer.writeData(id, make([]byte, 16384)))
+		}
+		require.NoError(t, s.Close())
+	}
+	assert.Eventually(t, func() bool { return peer.window() == window }, 5*time.Second, 10*time.Millisecond,
+		"the window was not returned for the bytes the abandoned streams held")
 }
