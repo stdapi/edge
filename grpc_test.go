@@ -5,6 +5,7 @@
 package edge
 
 import (
+	"context"
 	"errors"
 	"io"
 	"math"
@@ -301,6 +302,143 @@ func TestKindGRPC_FailBeforeTheOriginAnsweredIsTrailersOnly(t *testing.T) {
 		"the origin was canceled")
 }
 
+// A status the handler sets after the origin failed on its own is the one the client reads,
+// and a send toward the client reports the failure.
+func TestKindGRPC_FailAfterTheOriginFailedReadsAsTheStatus(t *testing.T) {
+	origin, _ := grpcEchoOrigin(t)
+	p, host, client := grpcProxy(t, origin)
+	origin.Close()
+
+	var readErr, replyErr error
+	p.MustAdd(host+"/pkg.Svc/Method", func(c *GRPCCtx) error {
+		if oerr := c.Open(); oerr != nil {
+			return oerr
+		}
+		m, rerr := c.Outbound().ReadMessage()
+		if rerr != nil {
+			return rerr
+		}
+		_, readErr = c.Inbound().ReadMessage()
+		replyErr = m.Reply([]byte("answer"))
+		return c.Fail(PermissionDenied, "policy")
+	})
+
+	resp := grpcDo(t, client, origin.URL+"/pkg.Svc/Method", grpcPayload("hello"))
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+
+	require.Error(t, readErr)
+	assert.ErrorIs(t, replyErr, readErr, "the send toward the client reports the origin failure")
+	assert.Empty(t, body)
+	assert.Equal(t, "7", resp.Header.Get("Grpc-Status"))
+	assert.Equal(t, "policy", resp.Header.Get("Grpc-Message"))
+}
+
+// A status the handler sets after a failed Forward is the one the client reads.
+func TestKindGRPC_FailAfterAFailedForwardReadsAsTheStatus(t *testing.T) {
+	origin, _ := grpcEchoOrigin(t)
+	p, host, client := grpcProxy(t, origin)
+	origin.Close()
+
+	p.MustAdd(host+"/pkg.Svc/Method", func(c *GRPCCtx) error {
+		if ferr := c.Forward(); ferr != nil {
+			return c.Fail(PermissionDenied, "origin down")
+		}
+		return nil
+	})
+
+	resp := grpcDo(t, client, origin.URL+"/pkg.Svc/Method", grpcPayload("hello"))
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+	assert.Equal(t, "7", resp.Header.Get("Grpc-Status"))
+	assert.Equal(t, "origin down", resp.Header.Get("Grpc-Message"))
+}
+
+// A client that leaves mid-response ends the copy toward it early. The handler still runs
+// and may write the trailers of the response, which the proxy then leaves alone.
+func TestKindGRPC_ClientGoneMidResponseLeavesTheTrailersToTheHandler(t *testing.T) {
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/grpc")
+		w.Header().Set("Trailer", "Grpc-Status")
+		w.WriteHeader(http.StatusOK)
+		rc := http.NewResponseController(w)
+		blob := strings.Repeat("x", 4<<10)
+		for range 16 {
+			_, _ = w.Write(grpcPayload(blob))
+			_ = rc.Flush()
+		}
+		w.Header().Set(http.TrailerPrefix+"Grpc-Status", "0")
+	}))
+	t.Cleanup(origin.Close)
+	p, host, client := grpcProxy(t, origin)
+
+	done, gone, drained := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	p.MustAdd(host+"/pkg.Svc/Get", func(c *GRPCCtx) error {
+		defer close(done)
+		if oerr := c.Open(); oerr != nil {
+			return oerr
+		}
+		first, rerr := c.Outbound().ReadMessage()
+		if rerr != nil {
+			return rerr
+		}
+		if ferr := first.Forward(); ferr != nil {
+			return ferr
+		}
+		_ = c.CloseSend()
+		in := c.Inbound()
+		for n := 0; ; n++ {
+			m, merr := in.ReadMessage()
+			if merr != nil {
+				break
+			}
+			if n == 0 {
+				if ferr := m.Forward(); ferr != nil {
+					return ferr
+				}
+			}
+		}
+		close(drained)
+		<-gone
+		// The sends fail once the client is gone, which is what ends the copy early.
+		tail := make([]byte, 32<<10)
+		for range 100 {
+			if serr := first.Reply(tail); serr != nil {
+				break
+			}
+		}
+		resp, rerr := c.Response()
+		if rerr != nil {
+			return rerr
+		}
+		for range 10000 {
+			resp.Trailer.Set("X-Trail", "edited")
+		}
+		return nil
+	})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, origin.URL+"/pkg.Svc/Get",
+		strings.NewReader(string(grpcPayload("hello"))))
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/grpc")
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	_, err = io.ReadFull(resp.Body, make([]byte, 10))
+	require.NoError(t, err)
+	<-drained
+	cancel()
+	_ = resp.Body.Close()
+	close(gone)
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("handler stuck")
+	}
+}
+
 // Once Inbound ended, the origin's status is readable on the response and Fail replaces it.
 func TestKindGRPC_FailAfterInboundEndedRewritesTheStatus(t *testing.T) {
 	origin, _ := grpcEchoOrigin(t)
@@ -453,6 +591,7 @@ func TestKindGRPC_ResponseGivesTheOriginHeadersAndTrailers(t *testing.T) {
 		originTrail  string
 	)
 	p.MustAdd(host+"/pkg.Svc/Get", func(c *GRPCCtx) error {
+		_ = c.Outbound()
 		_, beforeOpen = c.Response()
 		if oerr := c.Open(); oerr != nil {
 			return oerr
@@ -504,17 +643,17 @@ func TestKindGRPC_SendSaysTheCompressedFlag(t *testing.T) {
 		if oerr := c.Open(); oerr != nil {
 			return oerr
 		}
-		out := c.Outbound()
+		src := MergeMessages(c.Outbound(), c.Inbound())
 		for {
-			m, rerr := out.ReadMessage()
+			m, rerr := src.ReadMessage()
 			if rerr != nil {
 				return nil
 			}
 			var serr error
-			switch string(m.Bytes()) {
-			case "zip":
+			switch {
+			case string(m.Bytes()) == "zip" && !m.Inbound(), string(m.Bytes()) == "raw" && m.Inbound():
 				serr = m.Send(m.Bytes())
-			case "raw":
+			case string(m.Bytes()) == "raw" && !m.Inbound(), string(m.Bytes()) == "zip" && m.Inbound():
 				serr = m.SendCompressed(m.Bytes())
 			default:
 				serr = m.Forward()
@@ -534,9 +673,11 @@ func TestKindGRPC_SendSaysTheCompressedFlag(t *testing.T) {
 	require.NoError(t, err)
 	_ = resp.Body.Close()
 
+	// The origin echoes what the handler sent, and the handler flips each flag again on the
+	// way back.
 	var want []byte
-	want = appendGRPCMessage(want, false, []byte("zip"))
-	want = appendGRPCMessage(want, true, []byte("raw"))
+	want = appendGRPCMessage(want, true, []byte("zip"))
+	want = appendGRPCMessage(want, false, []byte("raw"))
 	want = appendGRPCMessage(want, true, []byte("kept"))
 	assert.Equal(t, want, body)
 	assert.Equal(t, int64(3), received.Load())

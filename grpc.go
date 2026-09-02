@@ -829,6 +829,9 @@ func (k *grpcCall) writeMessage(inbound, compressed bool, b []byte) error {
 		default:
 			return errors.New("edge: no response to write into before the origin answered")
 		}
+		if k.upErr != nil {
+			return k.upErr
+		}
 		w, mu, buf = k.inPw, &k.inMu, &k.inBuf
 	}
 
@@ -846,14 +849,14 @@ func (k *grpcCall) serveResponse() {
 	<-k.respCh
 
 	if k.upErr != nil {
+		// The pipe ends when the handler has ended the call, and the status is read after.
+		_, _ = io.Copy(io.Discard, k.inPr)
 		code, msg, ended := k.status()
 		if !ended {
 			code = statusOf(k.upErr)
 			msg = code.String()
 		}
 		_ = writeResponse(k.w, k.req, grpcStatusResponse(code, msg))
-		// Drain the pipe, so a handler still sending toward the client does not block.
-		_, _ = io.Copy(io.Discard, k.inPr)
 		return
 	}
 
@@ -871,12 +874,14 @@ func (k *grpcCall) serveResponse() {
 
 	rc := http.NewResponseController(k.w)
 	buf := getCopyBuf()
-	if _, err := io.CopyBuffer(flushWriter{w: k.w, rc: rc}, k.inPr, buf); err != nil {
-		// Nothing reads the pipe once the client is gone, and a handler still sending toward
-		// it must not block.
-		_ = k.inPr.CloseWithError(err)
-	}
+	_, cerr := io.CopyBuffer(flushWriter{w: k.w, rc: rc}, k.inPr, buf)
 	putCopyBuf(buf)
+	if cerr != nil {
+		// Nothing reads the pipe once the client is gone, and a handler still sending toward
+		// it must not block. The handler may still be running and writing the trailers.
+		_ = k.inPr.CloseWithError(cerr)
+		return
+	}
 
 	k.bodyMu.Lock()
 	defer k.bodyMu.Unlock()
@@ -991,6 +996,7 @@ func (c *GRPCCtx) setResponse(resp *http.Response) {
 		_ = c.resp.Body.Close()
 	}
 	c.resp = resp
+	c.err = nil
 }
 
 // discard closes whatever the handler left behind, for a call that ends without its response
