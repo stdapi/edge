@@ -38,8 +38,13 @@ const h3Authority = "h3.example.test"
 // h3Authority when none is given, and returns its address.
 func h3Origin(t *testing.T, ca *CA, names ...string) netip.AddrPort {
 	t.Helper()
+	return h3OriginAt(t, ca, "127.0.0.1:0", names...)
+}
 
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+func h3OriginAt(t *testing.T, ca *CA, listen string, names ...string) netip.AddrPort {
+	t.Helper()
+
+	pc, err := net.ListenPacket("udp", listen)
 	require.NoError(t, err)
 
 	if len(names) == 0 {

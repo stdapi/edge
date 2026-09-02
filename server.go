@@ -443,11 +443,9 @@ func (p *Proxy) serveProxyRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	target, ok := proxyTarget(r)
-	if !ok {
-		// An origin-form target on the proxy port means the client is not configured to use
-		// a proxy. Answering with the target it should have sent is the only useful reply.
-		http.Error(w, "edge: expected an absolute request target or CONNECT, this is a forward proxy", http.StatusBadRequest)
+	target, err := proxyTarget(r)
+	if err != nil {
+		http.Error(w, "edge: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -681,12 +679,14 @@ func (s *server) closeActive() {
 // relative URL, Host, and a TLS state net/http fills in only when :scheme is https. So an
 // HTTP/2 request is indistinguishable from an origin-form one, and since a proxy connection
 // carries nothing but proxy requests, it is read as one rather than refused.
-func proxyTarget(r *http.Request) (Target, bool) {
+func proxyTarget(r *http.Request) (Target, error) {
 	if r.URL != nil && r.URL.IsAbs() {
-		return targetFromURL(r.URL), true
+		return targetFromURL(r.URL)
 	}
 	if r.ProtoMajor < 2 || r.Host == "" {
-		return Target{}, false
+		// An origin-form target on the proxy port means the client is not configured to use
+		// a proxy. Answering with the target it should have sent is the only useful reply.
+		return Target{}, errors.New("expected an absolute request target or CONNECT, this is a forward proxy")
 	}
 
 	scheme := "http"
@@ -694,15 +694,25 @@ func proxyTarget(r *http.Request) (Target, bool) {
 		scheme = "https"
 	}
 	host, port := splitHostPort(r.Host)
+	port, ok := canonicalPort(port)
+	if !ok {
+		return Target{}, errRequestTargetPort
+	}
 	port = cmp.Or(port, defaultPort(scheme))
-	return Target{Scheme: scheme, Host: stringsutil.ToLowerASCIIString(host), Port: port}, true
+	return Target{Scheme: scheme, Host: stringsutil.ToLowerASCIIString(host), Port: port}, nil
 }
 
-func targetFromURL(u *url.URL) Target {
+var errRequestTargetPort = errors.New("request target port is not a port")
+
+func targetFromURL(u *url.URL) (Target, error) {
 	scheme := cmp.Or(u.Scheme, "http")
 	host, port := splitHostPort(u.Host)
+	port, ok := canonicalPort(port)
+	if !ok {
+		return Target{}, errRequestTargetPort
+	}
 	port = cmp.Or(port, defaultPort(scheme))
-	return Target{Scheme: scheme, Host: stringsutil.ToLowerASCIIString(host), Port: port}
+	return Target{Scheme: scheme, Host: stringsutil.ToLowerASCIIString(host), Port: port}, nil
 }
 
 func protoOfRequest(r *http.Request) Protocol {

@@ -812,9 +812,7 @@ func (d *quicDemux) quicTLSConfig() *tls.Config {
 		GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
 			name := chi.ServerName
 			if name == "" {
-				// QUIC clients send a server name in practice; falling back to the peer
-				// address keeps a handshake from failing outright when one does not.
-				name, _ = splitHostPort(chi.Conn.RemoteAddr().String())
+				name = d.routedHost(chi.Context())
 			}
 			leaf, err := d.p.cfg.ca.Leaf(name)
 			if err != nil {
@@ -827,6 +825,23 @@ func (d *quicDemux) quicTLSConfig() *tls.Config {
 			}, nil
 		},
 	}
+}
+
+// quic-go derives the handshake context from ConnContext, and the connection is recorded
+// before its datagrams reach the stack.
+func (d *quicDemux) routedHost(ctx context.Context) string {
+	carrier, _ := ctx.Value(quicCarrierKey{}).(*quicCarrier)
+	if carrier == nil {
+		return ""
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if flow := d.flows[flowKeyOf(carrier.client)]; flow != nil {
+		if conn := flow.conns[carrier.odcid]; conn != nil && conn.sess != nil {
+			return conn.sess.target.Host
+		}
+	}
+	return ""
 }
 
 func (d *quicDemux) quicConfig() *quic.Config {
@@ -1442,13 +1457,7 @@ func (d *quicDemux) sniff(from flowKey, conn *quicConn, datagram []byte) {
 		return
 	}
 
-	kind := Kind(0)
-	for _, k := range candidates {
-		if d.p.Admits(target, k) {
-			kind = k
-			break
-		}
-	}
+	kind := d.p.firstAdmitted(target, candidates...)
 	if kind == 0 {
 		d.rejectConn(from, conn, "no entry admits this authority")
 		return

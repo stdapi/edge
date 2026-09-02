@@ -92,7 +92,6 @@ func newForwarder(p *Proxy) (*forwarder, error) {
 func (f *forwarder) close() {
 	f.mu.Lock()
 	pools := f.fixed.Values()
-	f.fixed.Purge()
 	f.mu.Unlock()
 	f.shared.close()
 	for _, pool := range pools {

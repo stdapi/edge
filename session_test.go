@@ -445,3 +445,26 @@ func FuzzSplitHostPort(f *testing.F) {
 		}
 	})
 }
+
+func TestCanonicalPort(t *testing.T) {
+	for in, want := range map[string]struct {
+		port string
+		ok   bool
+	}{
+		"":            {"", true},
+		"443":         {"443", true},
+		"0443":        {"443", true},
+		"00000000443": {"443", true},
+		"65535":       {"65535", true},
+		"65536":       {"", false},
+		"123456":      {"", false},
+		"0":           {"", false},
+		"000":         {"", false},
+		"4a3":         {"", false},
+		"-1":          {"", false},
+	} {
+		got, ok := canonicalPort(in)
+		assert.Equal(t, want.ok, ok, in)
+		assert.Equal(t, want.port, got, in)
+	}
+}

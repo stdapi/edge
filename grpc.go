@@ -470,11 +470,7 @@ func (c *GRPCCtx) Forward() error {
 		return err
 	}
 	if resp.Body != nil && resp.Body != http.NoBody {
-		gate := &messageGate{r: resp.Body, admit: route.admitted}
-		gate.refuse = func() {
-			refused.Store(true)
-			markRefused(resp)
-		}
+		gate := &messageGate{r: resp.Body, admit: route.admitted, refuse: refuse}
 		resp.Body = &refusedBody{gate: gate, resp: resp, refused: &refused}
 	}
 	c.setResponse(resp)

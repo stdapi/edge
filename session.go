@@ -436,6 +436,33 @@ func needsBrackets(host string) bool {
 	return strings.IndexByte(host, ':') >= 0 || strings.HasPrefix(host, "[")
 }
 
+// RFC 3986 allows leading zeros in a port, and a pattern spells none.
+func canonicalPort(port string) (string, bool) {
+	if port == "" {
+		return "", true
+	}
+	i := 0
+	for i < len(port)-1 && port[i] == '0' {
+		i++
+	}
+	port = port[i:]
+	if len(port) > 5 {
+		return "", false
+	}
+	n := 0
+	for j := range len(port) {
+		c := port[j]
+		if c < '0' || c > '9' {
+			return "", false
+		}
+		n = n*10 + int(c-'0')
+	}
+	if n == 0 || n > 65535 {
+		return "", false
+	}
+	return port, true
+}
+
 // splitHostPort splits an authority into its host and port. The host of an IPv6 literal is
 // returned without its brackets. When the authority carries no port, port is empty.
 func splitHostPort(authority string) (host, port string) {

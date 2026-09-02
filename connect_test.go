@@ -327,3 +327,42 @@ func twoOriginsOnOnePort(t *testing.T, serve func(ln net.Listener, id string)) (
 	serve(lnB, "B")
 	return netip.MustParseAddrPort(lnA.Addr().String()), netip.MustParseAddrPort(lnB.Addr().String())
 }
+
+// A CONNECT to a port spelled with a leading zero reaches the entry written without it, and
+// the session reports the decimal form.
+func TestConnect_PortIsCanonical(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	origin := namedOrigin(t, ca, "example.test")
+	host, port, err := net.SplitHostPort(origin.Host)
+	require.NoError(t, err)
+
+	tr := DefaultTransport()
+	tr.RootCAs = poolOf(ca)
+	p, err := New(WithCA(ca), WithTransport(tr))
+	require.NoError(t, err)
+	p.MustAdd("example.test/", forwardHandler)
+	p.MustAdd[TCP]("[127.0.0.0/8]:"+port, relayStream)
+	addr := startProxy(t, p)
+
+	client := tunnelClient(t, addr, host+":0"+port, "example.test", ca)
+	resp, err := client.Get("https://example.test/")
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	sess := waitForSessions(t, p, 1)[0]
+	assert.Equal(t, port, sess.Target().Port)
+	assert.Equal(t, netip.MustParseAddrPort(origin.Host), sess.Upstream())
+}
+
+func TestTargetFromConnect_PortIsCanonical(t *testing.T) {
+	r := &http.Request{Method: http.MethodConnect, URL: &url.URL{Host: "example.test:0443"}, Host: "example.test:0443"}
+	target, err := targetFromConnect(r)
+	require.NoError(t, err)
+	assert.Equal(t, "443", target.Port)
+
+	r.URL.Host, r.Host = "example.test:65536", "example.test:65536"
+	_, err = targetFromConnect(r)
+	require.Error(t, err)
+}

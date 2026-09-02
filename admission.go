@@ -92,16 +92,20 @@ func (p *Proxy) admitInto(target Target, kind Kind, buf []Param) (*entry, []Para
 // question a connection raises before it has said what it carries: an authority nothing admits
 // at all is refused there and then, rather than after a handshake that could never be served.
 func (p *Proxy) admitsAny(target Target, kinds ...Kind) bool {
+	return p.firstAdmitted(target, kinds...) != 0
+}
+
+func (p *Proxy) firstAdmitted(target Target, kinds ...Kind) Kind {
 	tree := p.getTree()
 	c := tree.pool.Get().(*routeCtx)
 	defer tree.pool.Put(c)
 
 	for _, k := range kinds {
 		if tree.admission(c, target, k) != nil {
-			return true
+			return k
 		}
 	}
-	return false
+	return 0
 }
 
 // admitsAny is [Proxy.admitsAny] on one tree snapshot and one borrowed context, for a caller

@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"cmp"
 	"context"
+	"errors"
 	"log/slog"
 	"net"
 	"net/http"
@@ -24,9 +25,9 @@ import (
 // says so, past the handshake, and an authority that admits no kind the connection turns
 // out to speak is refused there instead.
 func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request, identity string) {
-	target, ok := targetFromConnect(r)
-	if !ok {
-		http.Error(w, "edge: CONNECT requires an authority target", http.StatusBadRequest)
+	target, err := targetFromConnect(r)
+	if err != nil {
+		http.Error(w, "edge: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 
@@ -148,18 +149,18 @@ func (p *Proxy) connectStream(w http.ResponseWriter, r *http.Request, target Tar
 
 // targetFromConnect reads the authority out of a CONNECT request. A CONNECT target must
 // carry a port, but a client that omits it clearly means the default for a secure connection.
-func targetFromConnect(r *http.Request) (Target, bool) {
+func targetFromConnect(r *http.Request) (Target, error) {
 	authority := r.Host
 	if r.URL != nil && r.URL.Host != "" {
 		authority = r.URL.Host
 	}
-	if authority == "" {
-		return Target{}, false
-	}
-
 	host, port := splitHostPort(authority)
 	if host == "" {
-		return Target{}, false
+		return Target{}, errors.New("CONNECT requires an authority target")
+	}
+	port, ok := canonicalPort(port)
+	if !ok {
+		return Target{}, errors.New("CONNECT target port is not a port")
 	}
 	port = cmp.Or(port, "443")
 
@@ -167,7 +168,7 @@ func targetFromConnect(r *http.Request) (Target, bool) {
 		Scheme: schemeForPort(port),
 		Host:   stringsutil.ToLowerASCIIString(host),
 		Port:   port,
-	}, true
+	}, nil
 }
 
 // writeRawStatus writes a bare status line on a hijacked connection, where the http.Server

@@ -54,13 +54,7 @@ func (p *Proxy) serveConnectUDP(w http.ResponseWriter, r *http.Request, identity
 	// The tunnel is recorded under the most specific kind admitted. Admission comes before
 	// resolution, and a refused target is not resolved.
 	candidates := []Kind{KindHTTP, KindQUIC, KindUDP}
-	var kind Kind
-	for _, k := range candidates {
-		if p.Admits(target, k) {
-			kind = k
-			break
-		}
-	}
+	kind := p.firstAdmitted(target, candidates...)
 	if kind == 0 {
 		http.Error(w, "edge: connection rejected, no entry admits this authority", http.StatusForbidden)
 		return
@@ -153,16 +147,16 @@ func targetFromConnectUDP(r *http.Request) (Target, error) {
 			return Target{}, errors.New("CONNECT-UDP target host is not an IPv6 address")
 		}
 	}
-	port, err := strconv.ParseUint(segments[1], 10, 16)
-	if err != nil || port == 0 {
+	port, ok := canonicalPort(segments[1])
+	if !ok {
 		return Target{}, errors.New("CONNECT-UDP target port is not a port")
 	}
 	// The pair must survive a rejoin, or the authority written back would not be the one
 	// routed on.
-	if h, p := splitHostPort(joinHostPort(host, segments[1])); h != host || p != segments[1] {
+	if h, p := splitHostPort(joinHostPort(host, port)); h != host || p != port {
 		return Target{}, errors.New("CONNECT-UDP target host is not a hostname or an address")
 	}
-	return Target{Scheme: schemeForPort(segments[1]), Host: host, Port: segments[1]}, nil
+	return Target{Scheme: schemeForPort(port), Host: host, Port: port}, nil
 }
 
 // resolveTarget resolves the address a tunnel sends to, once for its life.

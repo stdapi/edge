@@ -557,3 +557,46 @@ func FuzzTargetFromConnectUDP(f *testing.F) {
 		}
 	})
 }
+
+func TestTargetFromConnectUDP_PortIsCanonical(t *testing.T) {
+	u, err := url.ParseRequestURI(connectUDPPath + "example.test/0443/")
+	require.NoError(t, err)
+	target, err := targetFromConnectUDP(&http.Request{Method: http.MethodConnect, URL: u})
+	require.NoError(t, err)
+	assert.Equal(t, "443", target.Port)
+}
+
+// A client that sends no server name gets a certificate for the target its tunnel declared.
+func TestConnectUDP_NoServerNameGetsTheTargetsCertificate(t *testing.T) {
+	probe, err := net.ListenPacket("udp", "[::1]:0")
+	if err != nil {
+		t.Skipf("no IPv6 loopback: %v", err)
+	}
+	_ = probe.Close()
+
+	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
+	require.NoError(t, err)
+	origin := h3OriginAt(t, originCA, "[::1]:0", "::1")
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	upstream := DefaultTransport()
+	upstream.AllowHTTP3 = true
+	upstream.RootCAs = poolOf(originCA)
+	p, err := New(WithCA(proxyCA), WithTransport(upstream))
+	require.NoError(t, err)
+	p.MustAdd("[::1]/+{any}", forwardHandler)
+	front, _ := startQUICFront(t, p, proxyCA)
+	cc := masqueClient(t, front, proxyCA)
+
+	target := origin.String()
+	pconn, _, err := openTunnel(t, cc, front, target, nil)
+	require.NoError(t, err)
+	inner, qconn := innerH3(t, pconn, origin, "::1", proxyCA)
+	body, err := getThrough(inner, fmt.Sprintf("https://%s/echo", target))
+	require.NoError(t, err)
+	assert.Contains(t, body, "host="+target)
+
+	leaf := qconn.ConnectionState().TLS.PeerCertificates[0]
+	require.Len(t, leaf.IPAddresses, 1)
+	assert.True(t, leaf.IPAddresses[0].Equal(net.ParseIP("::1")), "the certificate is for the declared target")
+}

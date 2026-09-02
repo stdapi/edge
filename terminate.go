@@ -272,10 +272,13 @@ func (p *Proxy) serveTerminatedRequest(w http.ResponseWriter, r *http.Request) {
 		r.TLS = state
 	}
 
-	target := terminatedTarget(r, sess)
+	target, ok := terminatedTarget(r, sess)
+	if !ok {
+		http.Error(w, "edge: "+errRequestTargetPort.Error(), http.StatusBadRequest)
+		return
+	}
 	if sess.upstream.IsValid() && sess.TLS() == nil {
 		// The server name of a TLS connection was checked in placeTLS.
-		var ok bool
 		if target, ok = p.verifyRequestHost(r.Context(), sess, target); !ok {
 			http.Error(w, "edge: connection rejected, the host does not resolve to the destination",
 				http.StatusForbidden)
@@ -293,7 +296,7 @@ func (p *Proxy) serveTerminatedRequest(w http.ResponseWriter, r *http.Request) {
 // header is what the client addressed the request to and is what an origin would route on, so
 // it wins over the authority of the connection. The port comes from the connection, since an
 // origin-form request has none of its own.
-func terminatedTarget(r *http.Request, sess *Session) Target {
+func terminatedTarget(r *http.Request, sess *Session) (Target, bool) {
 	scheme := sess.target.Scheme
 	if scheme == "" {
 		if r.TLS != nil {
@@ -304,6 +307,10 @@ func terminatedTarget(r *http.Request, sess *Session) Target {
 	}
 
 	host, port := splitHostPort(r.Host)
+	port, ok := canonicalPort(port)
+	if !ok {
+		return Target{}, false
+	}
 	if host == "" {
 		host = sess.target.Host
 	}
@@ -314,5 +321,5 @@ func terminatedTarget(r *http.Request, sess *Session) Target {
 		port = defaultPort(scheme)
 	}
 
-	return Target{Scheme: scheme, Host: stringsutil.ToLowerASCIIString(host), Port: port}
+	return Target{Scheme: scheme, Host: stringsutil.ToLowerASCIIString(host), Port: port}, true
 }

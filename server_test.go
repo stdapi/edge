@@ -46,7 +46,6 @@ func startQUICFront(t *testing.T, p *Proxy, ca *CA) (netip.AddrPort, <-chan erro
 		case <-time.After(5 * time.Second):
 			t.Error("ServeQUIC did not return after Close")
 		}
-		// The caller may have read the result already.
 		select {
 		case err := <-served:
 			assert.ErrorIs(t, err, ErrProxyClosed)
@@ -205,4 +204,19 @@ func TestServeQUIC_ConnectStream(t *testing.T) {
 	assert.Equal(t, netip.MustParseAddrPort(originURL.Host), sess.Upstream())
 	_ = tunnel.Close()
 	waitForSessions(t, p, 0)
+}
+
+func TestProxyTarget_PortIsCanonical(t *testing.T) {
+	u, err := url.Parse("http://example.test:0080/x")
+	require.NoError(t, err)
+	target, err := proxyTarget(&http.Request{URL: u, Host: u.Host, ProtoMajor: 1})
+	require.NoError(t, err)
+	assert.Equal(t, "80", target.Port)
+
+	target, err = proxyTarget(&http.Request{URL: &url.URL{Path: "/x"}, Host: "example.test:08080", ProtoMajor: 2})
+	require.NoError(t, err)
+	assert.Equal(t, "8080", target.Port)
+
+	_, err = proxyTarget(&http.Request{URL: &url.URL{Path: "/x"}, Host: "example.test:70000", ProtoMajor: 2})
+	require.Error(t, err)
 }
