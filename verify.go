@@ -102,28 +102,34 @@ func (p *Proxy) targetForTransparent(ctx context.Context, target Target, origin 
 		return nameless, true, nameDropped
 	}
 
-	rctx, cancel := context.WithTimeout(ctx, nameVerifyTimeout)
-	defer cancel()
-	addrs, err := p.cfg.resolver.LookupNetIP(rctx, "ip", target.Host)
-	if err != nil {
-		p.cfg.logger.Debug("edge: server name cannot be resolved",
-			slog.String("name", target.Host), slog.String("error", err.Error()))
-		if mode == VerifyReject {
-			return target, false, nameUnresolved
-		}
-		return nameless, fallback, nameDropped
-	}
-
-	want := origin.Addr().Unmap()
-	if slices.ContainsFunc(addrs, func(a netip.Addr) bool { return a.Unmap() == want }) {
+	verdict := p.nameResolvesTo(ctx, target.Host, origin)
+	if verdict == nameTrusted {
 		return target, true, nameTrusted
 	}
 	if mode == VerifyReject {
-		return target, false, nameMismatch
+		return target, false, verdict
+	}
+	return nameless, fallback, nameDropped
+}
+
+// nameResolvesTo reports whether name resolves to the address of origin: nameTrusted when it
+// does, nameUnresolved when the lookup fails, nameMismatch otherwise.
+func (p *Proxy) nameResolvesTo(ctx context.Context, name string, origin netip.AddrPort) nameVerdict {
+	rctx, cancel := context.WithTimeout(ctx, nameVerifyTimeout)
+	defer cancel()
+	addrs, err := p.cfg.resolver.LookupNetIP(rctx, "ip", name)
+	if err != nil {
+		p.cfg.logger.Debug("edge: server name cannot be resolved",
+			slog.String("name", name), slog.String("error", err.Error()))
+		return nameUnresolved
+	}
+	want := origin.Addr().Unmap()
+	if slices.ContainsFunc(addrs, func(a netip.Addr) bool { return a.Unmap() == want }) {
+		return nameTrusted
 	}
 	p.cfg.logger.Debug("edge: server name does not resolve to the destination",
-		slog.String("name", target.Host), slog.String("destination", origin.String()))
-	return nameless, fallback, nameDropped
+		slog.String("name", name), slog.String("destination", origin.String()))
+	return nameMismatch
 }
 
 // verifyRequestHost checks the Host of a plaintext request against the destination its

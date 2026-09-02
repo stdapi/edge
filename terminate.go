@@ -71,18 +71,9 @@ func (p *Proxy) terminate(ctx context.Context, conn *peekConn, sess *Session) er
 // the connection was headed to is what the proxy dials, and name verification stands between
 // the two. Nothing is consumed, the handshake reads the same bytes after.
 func (p *Proxy) placeTLS(ctx context.Context, conn *peekConn, sess *Session) error {
-	raw, rerr := peekHandshakeRecords(conn)
-	if p.cfg.rejectECH {
-		if rerr != nil {
-			return errECHUnverifiable
-		}
-		if err := checkECH(raw); err != nil {
-			return err
-		}
-	}
-	var hello *ClientHello
-	if rerr == nil {
-		hello = clientHelloFromRecords(raw)
+	hello, err := p.peekClientHello(conn)
+	if err != nil {
+		return err
 	}
 
 	target := sess.target
@@ -110,9 +101,28 @@ func (p *Proxy) placeTLS(ctx context.Context, conn *peekConn, sess *Session) err
 	}
 	sess.target = target
 	if hello != nil {
-		sess.clientHello = hello
+		sess.clientHello.Store(hello)
 	}
 	return nil
+}
+
+// peekClientHello reads the ClientHello waiting on conn without consuming it, nil when there
+// is none it can read, and refuses the connection when the hello offers Encrypted Client
+// Hello and the proxy rejects that.
+func (p *Proxy) peekClientHello(conn *peekConn) (*ClientHello, error) {
+	raw, err := peekHandshakeRecords(conn)
+	if p.cfg.rejectECH {
+		if err != nil {
+			return nil, errECHUnverifiable
+		}
+		if cerr := checkECH(raw); cerr != nil {
+			return nil, cerr
+		}
+	}
+	if err != nil {
+		return nil, nil
+	}
+	return clientHelloFromRecords(raw), nil
 }
 
 // serveCandidates serves the connection at the finest granularity its authority admits, and
@@ -172,7 +182,7 @@ func (p *Proxy) serveTerminatedStream(ctx context.Context, conn net.Conn, sess *
 		p:        p,
 		sess:     sess,
 		entry:    e,
-		conn:     conn,
+		client:   heldConn{Conn: conn},
 		params:   params,
 		target:   sess.target,
 		identity: sess.identity,
@@ -197,12 +207,12 @@ func (p *Proxy) serverTLSConfig(sess *Session) *tls.Config {
 	return &tls.Config{
 		MinVersion: tls.VersionTLS12,
 		GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
-			sess.clientHello = &ClientHello{
+			sess.clientHello.Store(&ClientHello{
 				ServerName:        chi.ServerName,
 				ALPN:              slices.Clone(chi.SupportedProtos),
 				SupportedVersions: slices.Clone(chi.SupportedVersions),
 				CipherSuites:      slices.Clone(chi.CipherSuites),
-			}
+			})
 
 			name := chi.ServerName
 			if name == "" {

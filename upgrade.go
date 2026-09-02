@@ -178,14 +178,15 @@ func (p *Proxy) serveUpgradedStream(c *routeCtx, w http.ResponseWriter, r *http.
 		p:        p,
 		sess:     upSess,
 		entry:    e,
-		conn:     bufferedConn{Conn: client, r: brw},
+		client:   heldConn{Conn: bufferedConn{Conn: client, r: brw}},
 		params:   params,
 		target:   target,
 		identity: c.identity,
+		tlsState: upSess.TLS(),
 	}
 	// The far side is the connection the 101 left behind. Marking the dial done makes Relay
 	// use it instead of opening another.
-	sc.dialed = pipeConn{ReadWriteCloser: backend}
+	sc.up.Conn = pipeConn{ReadWriteCloser: backend}
 	sc.dialOnce.Do(func() {})
 	defer sc.close()
 
@@ -270,7 +271,7 @@ func (p *Proxy) pipeSession(c *routeCtx, r *http.Request, kind Kind, e *entry, p
 	}
 	sess.remoteAddr = front.remoteAddr
 	sess.localAddr = front.localAddr
-	sess.clientHello = front.clientHello
+	sess.clientHello.Store(front.clientHello.Load())
 	sess.upstream, sess.dial = front.upstream, front.dial
 	sess.transparent = front.transparent
 	if state := front.tlsState.Load(); state != nil {

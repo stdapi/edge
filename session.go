@@ -139,7 +139,7 @@ type Session struct {
 	// tlsConn is set instead of tlsState when the session is created before the handshake,
 	// so TLS() can read the state once it exists.
 	tlsConn     *tls.Conn
-	clientHello *ClientHello
+	clientHello atomic.Pointer[ClientHello]
 	// upgrade is a copy of the request that switched the connection to the frames a WebSocket
 	// session serves.
 	upgrade *http.Request
@@ -259,7 +259,7 @@ func (s *Session) TLS() *tls.ConnectionState {
 
 // ClientHello returns what the client offered in its TLS handshake, or nil for a plaintext
 // session. It is the ground truth for mirroring a client's capabilities upstream.
-func (s *Session) ClientHello() *ClientHello { return s.clientHello }
+func (s *Session) ClientHello() *ClientHello { return s.clientHello.Load() }
 
 // Upstream returns the address the proxy sends to, the destination a redirected connection was
 // headed to, the address literal a CONNECT named, or the address a CONNECT-UDP target

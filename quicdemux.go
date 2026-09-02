@@ -1635,7 +1635,7 @@ func (d *quicDemux) beginTermination(from flowKey, client net.Addr, conn *quicCo
 	sess := newSession(d.p, ctx, nil, target, kind, 0)
 	d.fillSession(sess, client)
 	sess.setUpstream(conn.origin)
-	sess.clientHello = hello
+	sess.clientHello.Store(hello)
 	sess.servableAs = candidates
 	sess.closer = &quicConnCloser{d: d, flow: from, odcid: conn.odcid}
 

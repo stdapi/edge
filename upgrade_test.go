@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -75,8 +76,12 @@ func TestProxy_ProtocolUpgrade(t *testing.T) {
 	require.NoError(t, err)
 
 	var sawUpgrade string
+	var pipeTLS atomic.Bool
 	// Past the 101 the connection is a byte stream, and a stream entry is what serves it.
-	p.MustAdd[TCP](originHost(originURL), relayStream)
+	p.MustAdd[TCP](originHost(originURL), func(c *TCPCtx) error {
+		pipeTLS.Store(c.TLS() != nil)
+		return c.Relay()
+	})
 	p.MustAdd(originHost(originURL)+"/ws", func(c *HTTPCtx) (*http.Response, error) {
 		sawUpgrade = c.Request().Header.Get("Upgrade")
 		return c.Forward()
@@ -105,6 +110,7 @@ func TestProxy_ProtocolUpgrade(t *testing.T) {
 	line, err := br.ReadString('\n')
 	require.NoError(t, err)
 	assert.Equal(t, "ping\n", line, "bytes must flow both ways once upgraded")
+	assert.True(t, pipeTLS.Load(), "the pipe reports the handshake of the connection it was cut from")
 }
 
 // dialThroughProxy opens a CONNECT tunnel to authority and completes the TLS handshake the

@@ -6,6 +6,7 @@ package edge_test
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"time"
@@ -57,6 +58,43 @@ func ExampleProxy_Add_stream() {
 	})
 
 	fmt.Println(p.Admits(edge.Target{Scheme: "https", Host: "smtp.test", Port: "465"}, edge.KindTCP))
+	// Output: true
+}
+
+func ExampleTCPCtx_StartTLS() {
+	ca, _ := edge.GenerateCA()
+	p := edge.Must(edge.WithCA(ca))
+
+	// Postgres starts in the clear: the client sends an 8-byte SSLRequest and the server
+	// answers 'S' before the handshake. The handler relays that exchange, then terminates.
+	p.MustAdd[edge.TCP]("db.test:5432", func(c *edge.TCPCtx) error {
+		up, err := c.Dial()
+		if err != nil {
+			return err
+		}
+		var req [8]byte
+		if _, err := io.ReadFull(c.Client(), req[:]); err != nil {
+			return err
+		}
+		if _, err := up.Write(req[:]); err != nil {
+			return err
+		}
+		var answer [1]byte
+		if _, err := io.ReadFull(up, answer[:]); err != nil {
+			return err
+		}
+		if _, err := c.Client().Write(answer[:]); err != nil {
+			return err
+		}
+		if answer[0] == 'S' {
+			if err := c.StartTLS(); err != nil {
+				return err
+			}
+		}
+		return c.Relay()
+	})
+
+	fmt.Println(p.Admits(edge.Target{Scheme: "http", Host: "db.test", Port: "5432"}, edge.KindTCP))
 	// Output: true
 }
 
