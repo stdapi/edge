@@ -72,7 +72,7 @@ func dial(t *testing.T, srv *httptest.Server) *Conn {
 	tc, err := tls.Dial("tcp", srv.Listener.Addr().String(), cfg)
 	require.NoError(t, err)
 	require.Equal(t, "h2", tc.ConnectionState().NegotiatedProtocol)
-	c, err := Client(tc)
+	c, err := Client(tc, 0)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Close() })
 	return c
@@ -279,7 +279,7 @@ func TestConn_NotHTTP2(t *testing.T) {
 	}()
 	nc, err := net.Dial("tcp", ln.Addr().String())
 	require.NoError(t, err)
-	c, err := Client(nc)
+	c, err := Client(nc, 0)
 	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -377,7 +377,7 @@ func TestConn_CloseBehindAStuckWrite(t *testing.T) {
 		}
 	}()
 
-	c, err := Client(cli)
+	c, err := Client(cli, 0)
 	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -440,7 +440,7 @@ func TestConn_AbandonedStreamsReturnTheWindow(t *testing.T) {
 		}
 	}()
 
-	c, err := Client(cli)
+	c, err := Client(cli, 0)
 	require.NoError(t, err)
 	defer func() { _ = c.Close() }()
 	peer := <-ready
@@ -498,7 +498,7 @@ func TestConn_SettingsWhileOpening(t *testing.T) {
 		}
 	}()
 
-	c, err := Client(cli)
+	c, err := Client(cli, 0)
 	require.NoError(t, err)
 	defer func() { close(stop); _ = c.Close() }()
 	for range 200 {
@@ -538,7 +538,7 @@ func TestStream_ReadDeadlineBehindAStuckWriter(t *testing.T) {
 		}
 	}()
 
-	c, err := Client(cli)
+	c, err := Client(cli, 0)
 	require.NoError(t, err)
 	defer func() { _ = c.Close() }()
 	peer := <-ready
@@ -599,7 +599,7 @@ func TestConn_GoAwayEndsWhenDrained(t *testing.T) {
 			}
 		}
 	}()
-	c, err := Client(cli)
+	c, err := Client(cli, 0)
 	require.NoError(t, err)
 	defer func() { _ = c.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -654,7 +654,7 @@ func TestConn_StreamWindowOverflow(t *testing.T) {
 			}
 		}
 	}()
-	c, err := Client(cli)
+	c, err := Client(cli, 0)
 	require.NoError(t, err)
 	defer func() { _ = c.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -726,7 +726,7 @@ func TestConn_OwedFramesSurviveAStuckWriter(t *testing.T) {
 		}
 	}()
 
-	c, err := Client(cli)
+	c, err := Client(cli, 0)
 	require.NoError(t, err)
 	defer func() { _ = c.Close() }()
 	peer := <-ready
@@ -780,7 +780,7 @@ func TestConn_HeaderTableSizeChange(t *testing.T) {
 			}
 		}
 	}()
-	c, err := Client(cli)
+	c, err := Client(cli, 0)
 	require.NoError(t, err)
 	defer func() { _ = c.Close() }()
 	for range 3 {
@@ -810,7 +810,7 @@ func TestConn_StreamLimit(t *testing.T) {
 			}
 		}
 	}()
-	c, err := Client(cli)
+	c, err := Client(cli, 0)
 	require.NoError(t, err)
 	defer func() { _ = c.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -846,7 +846,7 @@ func TestConn_OversizeFrameEndsTheConnection(t *testing.T) {
 			}
 		}
 	}()
-	c, err := Client(cli)
+	c, err := Client(cli, 0)
 	require.NoError(t, err)
 	defer func() { _ = c.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -943,7 +943,7 @@ func FuzzPeerFrames(f *testing.F) {
 			}
 		}()
 
-		c, err := Client(cli)
+		c, err := Client(cli, 0)
 		require.NoError(t, err)
 		defer func() { _ = c.Close() }()
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -1138,7 +1138,7 @@ func TestStream_DataAfterEndStreamIsAnError(t *testing.T) {
 			}
 		}
 	}()
-	c, err := Client(cli)
+	c, err := Client(cli, 0)
 	require.NoError(t, err)
 	defer func() { _ = c.Close() }()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -1183,7 +1183,7 @@ func stuckPeer(t *testing.T, n int) (*Conn, []*Stream) {
 		}
 		// Nothing reads the socket from here on.
 	}()
-	conn, err := Client(cli)
+	conn, err := Client(cli, 0)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = conn.Close() })
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -1247,7 +1247,7 @@ func TestConn_ConnectionWindowIsEnforced(t *testing.T) {
 			}
 		}
 	}()
-	c, err := Client(cli)
+	c, err := Client(cli, 0)
 	require.NoError(t, err)
 	defer func() { _ = c.Close() }()
 	peer := <-ready
@@ -1275,4 +1275,56 @@ func TestConn_ConnectionWindowIsEnforced(t *testing.T) {
 	var ce http2.ConnectionError
 	require.ErrorAs(t, c.Err(), &ce)
 	assert.Equal(t, http2.ErrCodeFlowControl, http2.ErrCode(ce))
+}
+
+// A peer that stops answering is found out by the keepalive PING, and one that answers
+// keeps the connection.
+func TestConn_KeepAlive(t *testing.T) {
+	for _, answers := range []bool{false, true} {
+		t.Run(map[bool]string{false: "silent", true: "answering"}[answers], func(t *testing.T) {
+			cli, srv := tcpPair(t)
+			var pings atomic.Int32
+			go func() {
+				peer, err := startFakePeer(srv)
+				if err != nil {
+					return
+				}
+				for {
+					f, rerr := peer.fr.ReadFrame()
+					if rerr != nil {
+						return
+					}
+					if p, ok := f.(*http2.PingFrame); ok && !p.IsAck() {
+						pings.Add(1)
+						if answers {
+							peer.wmu.Lock()
+							_ = peer.fr.WritePing(true, p.Data)
+							peer.wmu.Unlock()
+						}
+					}
+				}
+			}()
+			c, err := Client(cli, 100*time.Millisecond)
+			require.NoError(t, err)
+			defer func() { _ = c.Close() }()
+			select {
+			case <-c.settingsSeen:
+			case <-time.After(5 * time.Second):
+				t.Fatal("no SETTINGS")
+			}
+			if !answers {
+				select {
+				case <-c.Done():
+					require.ErrorIs(t, c.Err(), errKeepAlive)
+				case <-time.After(5 * time.Second):
+					t.Fatal("the silent peer was not found out")
+				}
+				assert.EqualValues(t, 1, pings.Load(), "one PING, then the connection ends")
+				return
+			}
+			time.Sleep(600 * time.Millisecond)
+			require.NoError(t, c.Err(), "an answering peer keeps the connection")
+			assert.GreaterOrEqual(t, pings.Load(), int32(3))
+		})
+	}
 }

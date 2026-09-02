@@ -821,7 +821,7 @@ func dialFront(t *testing.T, front netip.AddrPort, ca *CA, alpn string) *tls.Con
 func openTunnelsH2(t *testing.T, front netip.AddrPort, ca *CA) tunnelOpener {
 	t.Helper()
 	tc := dialFront(t, front, ca, "h2")
-	cc, err := h2tunnel.Client(tc)
+	cc, err := h2tunnel.Client(tc, 0)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = cc.Close() })
 	return func(target string, header http.Header) (*capsuleClient, *http.Response, error) {

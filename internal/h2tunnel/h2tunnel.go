@@ -62,6 +62,7 @@ var (
 	errStreamClosed    = errors.New("h2tunnel: stream closed")
 	errHeadersTooLarge = errors.New("h2tunnel: request headers exceed a frame")
 	errCancelled       = errors.New("h2tunnel: write cancelled")
+	errKeepAlive       = errors.New("h2tunnel: the peer stopped answering")
 )
 
 // Request describes one CONNECT. Protocol is the :protocol of an extended CONNECT and empty
@@ -82,6 +83,7 @@ type Response struct {
 
 // Conn is a client HTTP/2 connection carrying CONNECT streams.
 type Conn struct {
+	pingSent     time.Time
 	nc           net.Conn
 	err          error
 	fr           *http2.Framer
@@ -103,7 +105,11 @@ type Conn struct {
 	pingAcks      [][8]byte
 	resets        []resetFrame
 	// encBuf is what enc writes to, reused by the writer.
-	encBuf       bytes.Buffer
+	encBuf bytes.Buffer
+	// keepAlive is the silence after which a PING goes out, and the wait for its ack. The
+	// peer's last frame is timed in lastRead, and pingSent is zero while no PING is out.
+	keepAlive    time.Duration
+	lastRead     atomic.Int64
 	settingsAcks int
 	// sendWindow is what the peer lets the connection send, and recvUnacked what the peer
 	// sent and the streams consumed since the last WINDOW_UPDATE on the connection.
@@ -121,6 +127,7 @@ type Conn struct {
 	nextID          uint32
 	maxFrameSize    uint32
 	creditOwed      bool
+	pingDue         bool
 	encTableChanged bool
 	extendedConnect bool
 	// retired refuses new streams, the peer sent GOAWAY or the owner retired the
@@ -129,12 +136,15 @@ type Conn struct {
 }
 
 // Client starts an HTTP/2 connection on nc, the client preface and SETTINGS written, and
-// reads it until it ends. nc is closed when the connection ends.
-func Client(nc net.Conn) (*Conn, error) {
+// reads it until it ends. nc is closed when the connection ends. With a keepAlive, a PING
+// goes out after that much silence from the peer, and the connection ends when the ack
+// takes longer than that.
+func Client(nc net.Conn, keepAlive time.Duration) (*Conn, error) {
 	bw := bufio.NewWriter(nc)
 	c := &Conn{
 		nc:            nc,
 		bw:            bw,
+		keepAlive:     keepAlive,
 		fr:            http2.NewFramer(bw, bufio.NewReader(nc)),
 		streams:       make(map[uint32]*Stream),
 		nextID:        1,
@@ -174,9 +184,40 @@ func Client(nc net.Conn) (*Conn, error) {
 		_ = nc.Close()
 		return nil, err
 	}
+	c.lastRead.Store(time.Now().UnixNano())
 	go c.writeLoop()
 	go c.readLoop()
+	if keepAlive > 0 {
+		go c.keepAliveLoop()
+	}
 	return c, nil
+}
+
+func (c *Conn) keepAliveLoop() {
+	ticker := time.NewTicker(c.keepAlive)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+		case <-c.done:
+			return
+		}
+		now := time.Now()
+		c.mu.Lock()
+		switch {
+		case !c.pingSent.IsZero():
+			if now.Sub(c.pingSent) >= c.keepAlive {
+				c.mu.Unlock()
+				c.fail(errKeepAlive, false)
+				return
+			}
+		case now.Sub(time.Unix(0, c.lastRead.Load())) >= c.keepAlive:
+			c.pingSent = now
+			c.pingDue = true
+		}
+		c.mu.Unlock()
+		c.signalControl()
+	}
 }
 
 type writeRequest struct {
@@ -271,8 +312,8 @@ func (c *Conn) writeLoop() {
 // what the streams consumed since the last.
 func (c *Conn) writeControl(fr *http2.Framer) error {
 	c.mu.Lock()
-	acks, pings, resets := c.settingsAcks, c.pingAcks, c.resets
-	c.settingsAcks, c.pingAcks, c.resets = 0, nil, nil
+	acks, pings, resets, ping := c.settingsAcks, c.pingAcks, c.resets, c.pingDue
+	c.settingsAcks, c.pingAcks, c.resets, c.pingDue = 0, nil, nil, false
 	updates := make([]windowUpdate, 0, len(c.creditStreams)+1)
 	for id, s := range c.creditStreams {
 		delete(c.creditStreams, id)
@@ -299,6 +340,11 @@ func (c *Conn) writeControl(fr *http2.Framer) error {
 	}
 	for _, data := range pings {
 		if err := fr.WritePing(true, data); err != nil {
+			return err
+		}
+	}
+	if ping {
+		if err := fr.WritePing(false, [8]byte{}); err != nil {
 			return err
 		}
 	}
@@ -562,6 +608,7 @@ func (c *Conn) readLoop() {
 			c.fail(err, isConnectionError(err))
 			return
 		}
+		c.lastRead.Store(time.Now().UnixNano())
 		if err := c.handle(f); err != nil {
 			c.fail(err, isConnectionError(err))
 			return
@@ -587,6 +634,9 @@ func (c *Conn) handle(f http2.Frame) error {
 		return c.handleWindowUpdate(f)
 	case *http2.PingFrame:
 		if f.IsAck() {
+			c.mu.Lock()
+			c.pingSent = time.Time{}
+			c.mu.Unlock()
 			return nil
 		}
 		c.mu.Lock()

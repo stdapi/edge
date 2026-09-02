@@ -439,7 +439,7 @@ func (u *upstreamDialer) h2Conn(proxy *url.URL) *h2tunnel.Conn {
 // shareH2Conn records the HTTP/2 connection on tc for the next tunnels. When another tunnel
 // recorded one first, that one is returned and tc closed.
 func (u *upstreamDialer) shareH2Conn(proxy *url.URL, tc net.Conn) (*h2tunnel.Conn, error) {
-	cc, err := h2tunnel.Client(tc)
+	cc, err := h2tunnel.Client(tc, proxyKeepAlive)
 	if err != nil {
 		return nil, fmt.Errorf("dial proxy %s: %w", proxy.Redacted(), err)
 	}
