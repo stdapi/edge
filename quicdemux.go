@@ -54,6 +54,8 @@ const (
 	// udpFlowIdle reaps a datagram flow neither side has used for a while. A flow has no
 	// handshake to end, so idleness is the only signal it is over.
 	udpFlowIdle = 2 * time.Minute
+	// maxUDPAlternates bounds the origins one datagram flow may reach through SendTo.
+	maxUDPAlternates = 8
 	// The state caps. Everything below is allocated for an unauthenticated peer on a
 	// spoofable transport, so the worst case is the product of these bounds.
 	maxQUICFlows     = 4096
@@ -302,6 +304,9 @@ type udpFlow struct {
 	cancel context.CancelFunc
 	target Target
 	key    netip.AddrPort
+	// alts are the origins reached through SendTo, keyed on the address as the handler wrote
+	// it. Guarded by the demux mutex.
+	alts map[string]*udpAlt
 	// out and in are the per direction contexts. A single goroutine serves each direction,
 	// so at most one datagram is ever in flight on a context.
 	out DatagramCtx
@@ -313,6 +318,13 @@ type udpFlow struct {
 	inSeq        atomic.Uint64
 	closed       bool
 	started      bool
+}
+
+// udpAlt is one origin a datagram flow reaches through SendTo. Its reader serves the replies
+// on a context of its own.
+type udpAlt struct {
+	conn net.Conn
+	in   DatagramCtx
 }
 
 // quicIntercept terminates the QUIC connections of one origin. Under TPROXY its replies leave
@@ -1073,7 +1085,7 @@ func (d *quicDemux) openUDPFlow(client net.Addr, from flowKey, origin netip.Addr
 		return
 	}
 
-	upstream, err := d.dialUDP(origin)
+	upstream, err := d.dialUDP(origin.String())
 	if err != nil {
 		d.p.cfg.logger.Debug("edge: cannot reach the origin",
 			slog.String("origin", origin.String()), slog.String("error", err.Error()))
@@ -1094,16 +1106,8 @@ func (d *quicDemux) openUDPFlow(client net.Addr, from flowKey, origin netip.Addr
 	}
 	sess.closer = &udpFlowCloser{d: d, flow: from, key: origin}
 	u.sink = &udpSink{d: d, u: u}
-	u.out = DatagramCtx{
-		ctx:    sess.Context(),
-		sink:   u.sink,
-		p:      d.p,
-		sess:   sess,
-		target: target,
-		client: addrPort(sess.remoteAddr),
-	}
-	u.in = u.out
-	u.in.inbound = true
+	u.out = u.newCtx(false, origin)
+	u.in = u.newCtx(true, origin)
 	u.touch(time.Now())
 
 	d.mu.Lock()
@@ -1122,15 +1126,29 @@ func (d *quicDemux) openUDPFlow(client net.Addr, from flowKey, origin netip.Addr
 	d.serveDatagram(u, datagram, false)
 }
 
+// newCtx builds the context of one direction of the flow, for datagrams exchanged with origin.
+func (u *udpFlow) newCtx(inbound bool, origin netip.AddrPort) DatagramCtx {
+	return DatagramCtx{
+		ctx:     u.sess.Context(),
+		sink:    u.sink,
+		p:       u.sink.d.p,
+		sess:    u.sess,
+		target:  u.target,
+		client:  addrPort(u.sess.remoteAddr),
+		origin:  origin,
+		inbound: inbound,
+	}
+}
+
 // dialUDP opens the socket a datagram flow sends through, with the transport's dialer.
-func (d *quicDemux) dialUDP(origin netip.AddrPort) (net.Conn, error) {
+func (d *quicDemux) dialUDP(addr string) (net.Conn, error) {
 	dial := d.p.cfg.transport.DialContext
 	if dial == nil {
 		dial = (&net.Dialer{}).DialContext
 	}
 	ctx, cancel := context.WithTimeout(d.ctx, 10*time.Second)
 	defer cancel()
-	return dial(ctx, "udp", origin.String())
+	return dial(ctx, "udp", addr)
 }
 
 // declaredTarget is the authority a datagram flow is routed on, the target a CONNECT-UDP named
@@ -1190,6 +1208,16 @@ func (d *quicDemux) publishUDPLocked(from flowKey, client net.Addr, u *udpFlow) 
 // on the tree as it stands, so an entry removed while the flow is open stops it here rather
 // than at the next flow.
 func (d *quicDemux) serveDatagram(u *udpFlow, payload []byte, inbound bool) {
+	if inbound {
+		d.serveDatagramOn(u, &u.in, payload)
+		return
+	}
+	d.serveDatagramOn(u, &u.out, payload)
+}
+
+// serveDatagramOn routes one datagram of the flow through c, the context of the direction and
+// the origin it arrived on.
+func (d *quicDemux) serveDatagramOn(u *udpFlow, c *DatagramCtx, payload []byte) {
 	d.mu.Lock()
 	closed := u.closed
 	d.mu.Unlock()
@@ -1198,13 +1226,13 @@ func (d *quicDemux) serveDatagram(u *udpFlow, payload []byte, inbound bool) {
 	}
 	u.touch(time.Now())
 
-	c, seq := &u.out, &u.outSeq
-	if inbound {
-		c, seq = &u.in, &u.inSeq
+	seq := &u.outSeq
+	if c.inbound {
+		seq = &u.inSeq
 	}
 
 	// Routed on the tree as it stands, per datagram. Nothing is remembered between two of
-	// them: a datagram is its own unit, and what serves it is whatever the tree says now.
+	// them, and what serves one is whatever the tree says now.
 	e, params := d.p.admitInto(u.target, KindUDP, c.params)
 	if e == nil {
 		return
@@ -1244,6 +1272,88 @@ func (s *udpSink) toClient(b []byte) error {
 	}
 	_, err := s.d.pc.WriteTo(b, s.u.client)
 	return err
+}
+
+func (s *udpSink) toAddr(addr string, b []byte) error {
+	alt, err := s.d.alternate(s.u, addr)
+	if err != nil {
+		return err
+	}
+	_, err = alt.conn.Write(b)
+	return err
+}
+
+// alternate returns the socket of the flow toward addr, opening it and starting its reader on
+// first use.
+func (d *quicDemux) alternate(u *udpFlow, addr string) (*udpAlt, error) {
+	d.mu.Lock()
+	alt, err := u.alternateLocked(addr)
+	d.mu.Unlock()
+	if alt != nil || err != nil {
+		return alt, err
+	}
+
+	conn, err := d.dialUDP(addr)
+	if err != nil {
+		return nil, err
+	}
+	alt = &udpAlt{conn: conn, in: u.newCtx(true, addrPort(conn.RemoteAddr()))}
+
+	d.mu.Lock()
+	existing, err := u.alternateLocked(addr)
+	if existing == nil && err == nil {
+		if u.alts == nil {
+			u.alts = make(map[string]*udpAlt)
+		}
+		u.alts[addr] = alt
+	}
+	d.mu.Unlock()
+	if existing != nil || err != nil {
+		_ = conn.Close()
+		return existing, err
+	}
+
+	go d.runUDPAlternate(u, addr, alt)
+	return alt, nil
+}
+
+// alternateLocked returns the flow's socket toward addr when it exists, or the reason one
+// cannot be opened.
+func (u *udpFlow) alternateLocked(addr string) (*udpAlt, error) {
+	if u.closed {
+		return nil, net.ErrClosed
+	}
+	if alt := u.alts[addr]; alt != nil {
+		return alt, nil
+	}
+	if len(u.alts) >= maxUDPAlternates {
+		return nil, ErrTooManyOrigins
+	}
+	return nil, nil
+}
+
+// runUDPAlternate reads what one alternate origin sends back and routes each datagram on the
+// flow. The flow's own reader decides when the flow falls idle, so a silent alternate never
+// keeps it alive and never ends it.
+func (d *quicDemux) runUDPAlternate(u *udpFlow, addr string, alt *udpAlt) {
+	buf := make([]byte, maxUDPPayload)
+	for {
+		_ = alt.conn.SetReadDeadline(u.idleDeadline())
+		n, err := alt.conn.Read(buf)
+		if n > 0 {
+			d.serveDatagramOn(u, &alt.in, buf[:n])
+		}
+		if err == nil || isTimeout(err) {
+			continue
+		}
+		d.mu.Lock()
+		if u.alts[addr] == alt {
+			delete(u.alts, addr)
+		}
+		d.mu.Unlock()
+		_ = alt.conn.Close()
+		return
+	}
 }
 
 // runUDPFlow reads what the origin sends back and routes each datagram the same way the
@@ -1293,8 +1403,13 @@ func (d *quicDemux) closeUDPFlow(from flowKey, u *udpFlow) {
 	if u.cancel != nil {
 		u.cancel()
 	}
+	alts := u.alts
+	u.alts = nil
 	d.mu.Unlock()
 	_ = u.upstream.Close()
+	for _, alt := range alts {
+		_ = alt.conn.Close()
+	}
 }
 
 // flowLocked returns the flow of one client socket, created on first sight, or nil at the flow

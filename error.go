@@ -36,9 +36,9 @@ var (
 	ErrProxyClosed = errors.New("proxy closed")
 	// ErrConnectionRejected is returned when the proxy refuses a connection.
 	ErrConnectionRejected = errors.New("connection rejected")
-	// ErrAuthorityConflict is returned when two registrations on one authority disagree on
-	// what should happen to its connections.
-	ErrAuthorityConflict = errors.New("authority conflict")
+	// ErrTooManyOrigins is returned by [DatagramCtx.SendTo] when the flow has reached its
+	// limit of origins.
+	ErrTooManyOrigins = errors.New("too many origins for one datagram flow")
 )
 
 // EntryConflictError represents a conflict that occurred during interceptor registration.

@@ -32,6 +32,7 @@ func (d delayOption) applyDatagram(c *datagramConfig) { c.delay = time.Duration(
 type datagramSink interface {
 	toOrigin(b []byte) error
 	toClient(b []byte) error
+	toAddr(addr string, b []byte) error
 }
 
 // DatagramCtx is one datagram, handed to a [UDP] handler. A handler receives the datagrams of
@@ -47,6 +48,7 @@ type DatagramCtx struct {
 	entry    *entry
 	target   Target
 	client   netip.AddrPort
+	origin   netip.AddrPort
 	identity string
 	payload  []byte
 	params   []Param
@@ -72,6 +74,10 @@ func (c *DatagramCtx) Target() Target { return c.target }
 
 // Client returns the address the client is sending from.
 func (c *DatagramCtx) Client() netip.AddrPort { return c.client }
+
+// Origin returns the address of the origin the datagram was received from, or is headed to.
+// A reply to a datagram sent with [DatagramCtx.SendTo] reports the address it was sent to.
+func (c *DatagramCtx) Origin() netip.AddrPort { return c.origin }
 
 // Session returns the flow this datagram belongs to.
 func (c *DatagramCtx) Session() *Session { return c.sess }
@@ -121,6 +127,28 @@ func (c *DatagramCtx) Send(b []byte, opts ...DatagramOption) error {
 // Reply sends b to the peer the datagram came from. The other peer receives nothing.
 func (c *DatagramCtx) Reply(b []byte, opts ...DatagramOption) error {
 	return c.write(!c.inbound, b, opts)
+}
+
+// SendTo sends b to addr, given as host:port, in place of the origin the client addressed. The
+// replies of addr arrive on this flow as inbound datagrams with [DatagramCtx.Origin] set to its
+// address, and reach the client from the origin it addressed. It returns [ErrTooManyOrigins]
+// once the flow has reached its limit of origins.
+func (c *DatagramCtx) SendTo(addr string, b []byte, opts ...DatagramOption) error {
+	cfg := &datagramConfig{}
+	for _, o := range opts {
+		o.applyDatagram(cfg)
+	}
+	if cfg.delay > 0 {
+		kept := slices.Clone(b)
+		ctx, sink := c.ctx, c.sink
+		go func() {
+			if sleepCtx(ctx, cfg.delay) {
+				_ = sink.toAddr(addr, kept)
+			}
+		}()
+		return nil
+	}
+	return c.sink.toAddr(addr, b)
 }
 
 func (c *DatagramCtx) write(inbound bool, b []byte, opts []DatagramOption) error {

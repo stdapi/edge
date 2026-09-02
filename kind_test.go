@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"strings"
 	"sync/atomic"
@@ -891,4 +892,97 @@ func TestKindGRPC_MessageGateIsTransparentForAnyReadSize(t *testing.T) {
 			assert.Equal(t, []byte{0, 0, 1}, out, "size=%d", size)
 		}
 	})
+}
+
+// A datagram sent to another origin gets its reply on the same flow, served with the address
+// it came from, and the client reads it from the origin it addressed.
+func TestKindUDP_SendToRepliesOnTheSameFlow(t *testing.T) {
+	origin := udpEchoOrigin(t)
+	other := udpEchoOrigin(t)
+
+	var fromOther, fromOrigin atomic.Int64
+	p, err := New()
+	require.NoError(t, err)
+	p.MustAdd("[0.0.0.0/0]:"+fmt.Sprint(origin.Port()), func(d *DatagramCtx) error {
+		if !d.Inbound() {
+			assert.Equal(t, origin, d.Origin())
+			if string(d.Bytes()) == "reroute" {
+				return d.SendTo(other.String(), []byte("via-other"))
+			}
+			return d.Forward()
+		}
+		switch d.Origin() {
+		case other:
+			fromOther.Add(1)
+		case origin:
+			fromOrigin.Add(1)
+		}
+		return d.Forward()
+	})
+
+	_, proxyAddr := startTProxyQUIC(t, p, origin)
+
+	client, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
+
+	buf := make([]byte, 256)
+	_, err = client.WriteTo([]byte("reroute"), net.UDPAddrFromAddrPort(proxyAddr))
+	require.NoError(t, err)
+	n, _, err := client.ReadFrom(buf)
+	require.NoError(t, err)
+	assert.Equal(t, "via-other", string(buf[:n]), "the reply of the other origin reached the client")
+
+	_, err = client.WriteTo([]byte("plain"), net.UDPAddrFromAddrPort(proxyAddr))
+	require.NoError(t, err)
+	n, _, err = client.ReadFrom(buf)
+	require.NoError(t, err)
+	assert.Equal(t, "plain", string(buf[:n]))
+
+	assert.Equal(t, int64(1), fromOther.Load(), "the handler saw the reply with the other origin's address")
+	assert.Equal(t, int64(1), fromOrigin.Load())
+}
+
+// A flow reaches a bounded number of origins through SendTo, and the next one is refused.
+func TestKindUDP_SendToIsBounded(t *testing.T) {
+	origin := udpEchoOrigin(t)
+	others := make([]netip.AddrPort, 0, maxUDPAlternates+1)
+	for range maxUDPAlternates + 1 {
+		others = append(others, udpEchoOrigin(t))
+	}
+
+	errs := make(chan error, len(others))
+	p, err := New()
+	require.NoError(t, err)
+	p.MustAdd("[0.0.0.0/0]:"+fmt.Sprint(origin.Port()), func(d *DatagramCtx) error {
+		if d.Inbound() {
+			return d.Forward()
+		}
+		for _, o := range others {
+			errs <- d.SendTo(o.String(), d.Bytes())
+		}
+		return nil
+	})
+
+	_, proxyAddr := startTProxyQUIC(t, p, origin)
+	client, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+	_, err = client.WriteTo([]byte("spray"), net.UDPAddrFromAddrPort(proxyAddr))
+	require.NoError(t, err)
+
+	var failed int
+	for range others {
+		select {
+		case serr := <-errs:
+			if serr != nil {
+				require.ErrorIs(t, serr, ErrTooManyOrigins)
+				failed++
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("the handler did not run for every origin")
+		}
+	}
+	assert.Equal(t, 1, failed, "exactly the origin past the bound was refused")
 }
