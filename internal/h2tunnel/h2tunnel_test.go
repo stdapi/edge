@@ -17,6 +17,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -676,4 +677,207 @@ func TestConn_StreamWindowOverflow(t *testing.T) {
 	again, _, err := c.Open(ctx, Request{Authority: "origin.test:443"})
 	require.NoError(t, err)
 	_ = again.Close()
+}
+
+// The frames the read loop owes, WINDOW_UPDATEs, PING acks and SETTINGS acks, go out once
+// the writer is free again, however long a peer that stopped reading kept it stuck.
+func TestConn_OwedFramesSurviveAStuckWriter(t *testing.T) {
+	cli, srv := tcpPair(t)
+	answered := make(chan uint32, 1)
+	ready := make(chan *fakePeer, 1)
+	resume := make(chan struct{})
+	var pingAcks, connCredit atomic.Int64
+	go func() {
+		peer, err := startFakePeer(srv, http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1 << 24})
+		if err != nil {
+			close(ready)
+			return
+		}
+		_ = peer.fr.WriteWindowUpdate(0, 1<<28)
+		ready <- peer
+		for {
+			f, rerr := peer.fr.ReadFrame()
+			if rerr != nil {
+				return
+			}
+			if mh, ok := f.(*http2.MetaHeadersFrame); ok {
+				_ = peer.answer(mh.StreamID)
+				answered <- mh.StreamID
+				break
+			}
+		}
+		// Nothing reads the socket until resume.
+		<-resume
+		for {
+			f, rerr := peer.fr.ReadFrame()
+			if rerr != nil {
+				return
+			}
+			switch f := f.(type) {
+			case *http2.PingFrame:
+				if f.IsAck() {
+					pingAcks.Add(1)
+				}
+			case *http2.WindowUpdateFrame:
+				if f.StreamID == 0 {
+					connCredit.Add(int64(f.Increment))
+				}
+			}
+		}
+	}()
+
+	c, err := Client(cli)
+	require.NoError(t, err)
+	defer func() { _ = c.Close() }()
+	peer := <-ready
+	require.NotNil(t, peer)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	s, _, err := c.Open(ctx, Request{Authority: "origin.test:443"})
+	cancel()
+	require.NoError(t, err)
+	id := <-answered
+
+	// The writer sticks on the socket, and the peer asks for more than the queue holds.
+	go func() { _, _ = s.Write(make([]byte, 64<<20)) }()
+	time.Sleep(300 * time.Millisecond)
+	for range writeQueue + 64 {
+		peer.wmu.Lock()
+		_ = peer.fr.WritePing(false, [8]byte{1})
+		peer.wmu.Unlock()
+	}
+	for sent := 0; sent < window; sent += 16384 {
+		require.NoError(t, peer.writeData(id, make([]byte, 16384)))
+	}
+	buf := make([]byte, 64<<10)
+	for got := 0; got < window; {
+		n, rerr := s.Read(buf)
+		require.NoError(t, rerr)
+		got += n
+	}
+
+	close(resume)
+	assert.Eventually(t, func() bool { return connCredit.Load() >= window }, 10*time.Second, 10*time.Millisecond,
+		"the connection credit for what was read never reached the peer")
+	assert.Eventually(t, func() bool { return pingAcks.Load() > 0 }, 5*time.Second, 10*time.Millisecond)
+}
+
+// A peer that shrinks the header table decodes every CONNECT after the change.
+func TestConn_HeaderTableSizeChange(t *testing.T) {
+	cli, srv := tcpPair(t)
+	go func() {
+		peer, err := startFakePeer(srv, http2.Setting{ID: http2.SettingHeaderTableSize, Val: 0})
+		if err != nil {
+			return
+		}
+		peer.fr.ReadMetaHeaders = hpack.NewDecoder(0, nil)
+		for {
+			f, rerr := peer.fr.ReadFrame()
+			if rerr != nil {
+				return
+			}
+			if mh, ok := f.(*http2.MetaHeadersFrame); ok {
+				_ = peer.answer(mh.StreamID)
+			}
+		}
+	}()
+	c, err := Client(cli)
+	require.NoError(t, err)
+	defer func() { _ = c.Close() }()
+	for range 3 {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		s, _, oerr := c.Open(ctx, Request{Authority: "origin.test:443", Header: http.Header{"Capsule-Protocol": {"?1"}}})
+		cancel()
+		require.NoError(t, oerr)
+		require.NoError(t, s.Close())
+	}
+}
+
+// The peer's concurrent stream limit closes the connection to new streams until one ends.
+func TestConn_StreamLimit(t *testing.T) {
+	cli, srv := tcpPair(t)
+	go func() {
+		peer, err := startFakePeer(srv, http2.Setting{ID: http2.SettingMaxConcurrentStreams, Val: 1})
+		if err != nil {
+			return
+		}
+		for {
+			f, rerr := peer.fr.ReadFrame()
+			if rerr != nil {
+				return
+			}
+			if mh, ok := f.(*http2.MetaHeadersFrame); ok {
+				_ = peer.answer(mh.StreamID)
+			}
+		}
+	}()
+	c, err := Client(cli)
+	require.NoError(t, err)
+	defer func() { _ = c.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	s, _, err := c.Open(ctx, Request{Authority: "origin.test:443"})
+	require.NoError(t, err)
+	assert.False(t, c.CanOpen())
+	_, _, err = c.Open(ctx, Request{Authority: "origin.test:443"})
+	require.ErrorIs(t, err, errTooManyStreams)
+	require.NoError(t, s.Close())
+	assert.True(t, c.CanOpen())
+	again, _, err := c.Open(ctx, Request{Authority: "origin.test:443"})
+	require.NoError(t, err)
+	_ = again.Close()
+}
+
+// A frame larger than the size the client lets the peer send ends the connection.
+func TestConn_OversizeFrameEndsTheConnection(t *testing.T) {
+	cli, srv := tcpPair(t)
+	go func() {
+		peer, err := startFakePeer(srv, http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1 << 20})
+		if err != nil {
+			return
+		}
+		for {
+			f, rerr := peer.fr.ReadFrame()
+			if rerr != nil {
+				return
+			}
+			if mh, ok := f.(*http2.MetaHeadersFrame); ok {
+				_ = peer.answer(mh.StreamID)
+				_ = peer.writeData(mh.StreamID, make([]byte, 64<<10))
+			}
+		}
+	}()
+	c, err := Client(cli)
+	require.NoError(t, err)
+	defer func() { _ = c.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	s, _, err := c.Open(ctx, Request{Authority: "origin.test:443"})
+	require.NoError(t, err)
+	select {
+	case <-c.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the oversize frame was taken")
+	}
+	_, err = s.Read(make([]byte, 1))
+	require.Error(t, err)
+	require.NotErrorIs(t, err, io.EOF)
+}
+
+// A CONNECT whose headers do not fit a frame fails alone, the connection and its other
+// streams go on.
+func TestConn_HeadersTooLargeFailAlone(t *testing.T) {
+	srv := echoServer(t, nil)
+	c := dial(t, srv)
+	s, _ := open(t, c, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, _, err := c.Open(ctx, Request{Authority: "origin.test:443", Header: http.Header{"X-Big": {strings.Repeat("x", 2<<20)}}})
+	require.ErrorIs(t, err, errHeadersTooLarge)
+	require.True(t, c.CanOpen())
+	_, err = s.Write([]byte("still here"))
+	require.NoError(t, err)
+	buf := make([]byte, 16)
+	n, err := s.Read(buf)
+	require.NoError(t, err)
+	assert.Equal(t, "still here", string(buf[:n]))
 }

@@ -41,7 +41,10 @@ const (
 
 // errTunnelEnded ends the reads of a tunnel once its stream or the connection to the proxy
 // has ended.
-var errTunnelEnded = errors.New("edge: CONNECT-UDP tunnel ended")
+var (
+	errTunnelEnded   = errors.New("edge: CONNECT-UDP tunnel ended")
+	errTunnelRefused = errors.New("CONNECT-UDP refused")
+)
 
 // upstreamDialer opens every connection the proxy makes upstream, through the proxy
 // [Transport.Proxy] selects when it selects one.
@@ -340,7 +343,9 @@ func (u *upstreamDialer) connectUDPStream(ctx context.Context, proxy *url.URL, h
 		h2 := proxy.Scheme == "https" && !u.deferred(u.noH2, proxy)
 		var pipe tunnelPipe
 		var err error
+		pooled := false
 		if cc := u.h2Conn(proxy); h2 && cc != nil {
+			pooled = true
 			pipe, err = openTunnelOnH2(ctx, cc, proxy, host, port)
 		} else {
 			pipe, err = u.dialTunnel(ctx, proxy, host, port, h2)
@@ -352,9 +357,10 @@ func (u *upstreamDialer) connectUDPStream(ctx context.Context, proxy *url.URL, h
 			u.deferVersion(u.noH2, proxy)
 			u.dropH2Conn(proxy)
 			continue
-		case errors.Is(err, h2tunnel.ErrGoAway) && !retried:
-			// The shared connection was going away as the tunnel was opened on it. The
-			// next round finds it unusable and opens another.
+		case err != nil && pooled && !retried && ctx.Err() == nil && !errors.Is(err, errTunnelRefused):
+			// The pooled connection was gone, going away or full as the tunnel was opened
+			// on it, and the proxy saw nothing of the tunnel. The next round finds the
+			// connection unusable and opens another.
 			retried = true
 			continue
 		}
@@ -449,6 +455,7 @@ func (u *upstreamDialer) shareH2Conn(proxy *url.URL, tc net.Conn) (*h2tunnel.Con
 			_ = cc.Close()
 			return other, nil
 		}
+		other.Retire()
 		u.draining = slices.DeleteFunc(u.draining, func(d *h2tunnel.Conn) bool { return d.Err() != nil })
 		u.draining = append(u.draining, other)
 	}
@@ -475,7 +482,7 @@ func openTunnelOnH2(ctx context.Context, cc *h2tunnel.Conn, proxy *url.URL, host
 	}
 	if resp.StatusCode != http.StatusOK {
 		_ = str.Close()
-		return nil, fmt.Errorf("CONNECT-UDP refused with %d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
+		return nil, fmt.Errorf("%w with %d %s", errTunnelRefused, resp.StatusCode, http.StatusText(resp.StatusCode))
 	}
 	return newCapsulePipe(str, bufio.NewReader(str)), nil
 }

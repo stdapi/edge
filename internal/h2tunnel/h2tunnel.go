@@ -46,6 +46,8 @@ const (
 	closeTimeout = time.Second
 	// writeQueue bounds the frames waiting for the writer.
 	writeQueue = 256
+	// maxPingAcks bounds the PING acks owed to a peer while the writer is busy.
+	maxPingAcks = 16
 )
 
 var (
@@ -58,6 +60,7 @@ var (
 	errTooManyStreams  = errors.New("h2tunnel: the peer's concurrent stream limit is reached")
 	errClosed          = errors.New("h2tunnel: connection closed")
 	errStreamClosed    = errors.New("h2tunnel: stream closed")
+	errHeadersTooLarge = errors.New("h2tunnel: request headers exceed a frame")
 )
 
 // Request describes one CONNECT. Protocol is the :protocol of an extended CONNECT and empty
@@ -92,22 +95,35 @@ type Conn struct {
 	// when it returns.
 	writes     chan writeRequest
 	writerDone chan struct{}
+	// The frames the read loop owes the peer, written by the writer when control is
+	// signalled. The read loop never waits on the socket.
+	control       chan struct{}
+	creditStreams map[uint32]*Stream
+	pingAcks      [][8]byte
+	resets        []resetFrame
 	// encBuf is what enc writes to, reused by the writer.
-	encBuf bytes.Buffer
+	encBuf       bytes.Buffer
+	settingsAcks int
 	// sendWindow is what the peer lets the connection send, and recvUnacked what the peer
 	// sent and the streams consumed since the last WINDOW_UPDATE on the connection.
 	sendWindow  int64
 	recvUnacked int64
 	// peer settings, read once under mu when a stream is opened.
-	initialWindow   int64
-	maxStreams      int64
-	settingsOnce    sync.Once
-	doneOnce        sync.Once
-	mu              sync.Mutex
+	initialWindow int64
+	maxStreams    int64
+	settingsOnce  sync.Once
+	doneOnce      sync.Once
+	mu            sync.Mutex
+	// encTableSize is the header table size the peer asked for, applied by the writer.
+	encTableSize    uint32
 	nextID          uint32
 	maxFrameSize    uint32
+	creditOwed      bool
+	encTableChanged bool
 	extendedConnect bool
-	goAway          bool
+	// retired refuses new streams, the peer sent GOAWAY or the owner retired the
+	// connection, and the connection ends with its last stream.
+	retired bool
 }
 
 // Client starts an HTTP/2 connection on nc, the client preface and SETTINGS written, and
@@ -128,10 +144,14 @@ func Client(nc net.Conn) (*Conn, error) {
 		done:          make(chan struct{}),
 		writes:        make(chan writeRequest, writeQueue),
 		writerDone:    make(chan struct{}),
+		control:       make(chan struct{}, 1),
+		creditStreams: make(map[uint32]*Stream),
 	}
 	c.enc = hpack.NewEncoder(&c.encBuf)
 	c.fr.ReadMetaHeaders = hpack.NewDecoder(hpackTableSize, nil)
 	c.fr.MaxHeaderListSize = maxHeaderBytes
+	// Nothing raises SETTINGS_MAX_FRAME_SIZE, so that is the largest frame the peer may send.
+	c.fr.SetMaxReadFrameSize(16384)
 
 	_ = nc.SetWriteDeadline(time.Now().Add(writeTimeout))
 	err := c.writeNow(func(fr *http2.Framer) error {
@@ -179,36 +199,105 @@ func (c *Conn) write(f func(*http2.Framer) error) error {
 	}
 }
 
-// tryWrite queues f without waiting for it, and reports false when the queue is full.
-func (c *Conn) tryWrite(f func(*http2.Framer) error) bool {
+type resetFrame struct {
+	id   uint32
+	code http2.ErrCode
+}
+
+// signalControl wakes the writer for the frames the read loop owes.
+func (c *Conn) signalControl() {
 	select {
-	case c.writes <- writeRequest{f: f}:
-		return true
+	case c.control <- struct{}{}:
 	default:
-		return false
 	}
 }
 
 func (c *Conn) writeLoop() {
+	defer close(c.writerDone)
 	for {
+		var err error
 		select {
 		case req := <-c.writes:
+			select {
+			case <-c.done:
+				// fail armed the closing deadline, which a longer one must not replace.
+				return
+			default:
+			}
 			_ = c.nc.SetWriteDeadline(time.Now().Add(writeTimeout))
-			err := c.writeNow(req.f)
+			err = c.writeNow(req.f)
 			if req.res != nil {
 				req.res <- err
 			}
-			if err != nil {
-				// fail waits for writerDone, so it is closed first.
-				close(c.writerDone)
-				c.fail(err, false)
+		case <-c.control:
+			select {
+			case <-c.done:
 				return
+			default:
 			}
+			_ = c.nc.SetWriteDeadline(time.Now().Add(writeTimeout))
+			err = c.writeNow(c.writeControl)
 		case <-c.done:
-			close(c.writerDone)
+			return
+		}
+		if err != nil {
+			// fail waits for writerDone, closed on return.
+			go c.fail(err, false)
 			return
 		}
 	}
+}
+
+// writeControl writes every frame the read loop owes, the WINDOW_UPDATEs among them for
+// what the streams consumed since the last.
+func (c *Conn) writeControl(fr *http2.Framer) error {
+	c.mu.Lock()
+	acks, pings, resets := c.settingsAcks, c.pingAcks, c.resets
+	c.settingsAcks, c.pingAcks, c.resets = 0, nil, nil
+	updates := make([]windowUpdate, 0, len(c.creditStreams)+1)
+	for id, s := range c.creditStreams {
+		delete(c.creditStreams, id)
+		s.mu.Lock()
+		if s.readErr == nil && s.recvUnacked > 0 {
+			updates = append(updates, windowUpdate{id: id, incr: uint32(s.recvUnacked)}) //nolint:gosec // at most a window
+			s.recvWindow += s.recvUnacked
+			s.recvUnacked = 0
+		}
+		s.mu.Unlock()
+	}
+	if c.creditOwed && c.recvUnacked > 0 {
+		updates = append(updates, windowUpdate{incr: uint32(c.recvUnacked)}) //nolint:gosec // at most a window per stream
+		c.recvUnacked = 0
+	}
+	c.creditOwed = false
+	c.mu.Unlock()
+
+	for range acks {
+		if err := fr.WriteSettingsAck(); err != nil {
+			return err
+		}
+	}
+	for _, data := range pings {
+		if err := fr.WritePing(true, data); err != nil {
+			return err
+		}
+	}
+	for _, r := range resets {
+		if err := fr.WriteRSTStream(r.id, r.code); err != nil {
+			return err
+		}
+	}
+	for _, u := range updates {
+		if err := fr.WriteWindowUpdate(u.id, u.incr); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type windowUpdate struct {
+	id   uint32
+	incr uint32
 }
 
 // writeNow runs f with the framer and flushes what it wrote, on the writer's goroutine or
@@ -220,12 +309,20 @@ func (c *Conn) writeNow(f func(*http2.Framer) error) error {
 	return c.bw.Flush()
 }
 
-// CanOpen reports whether the connection takes a new stream, which it does until it ends or
-// the peer sends GOAWAY.
+// CanOpen reports whether the connection takes a new stream, which it does until it ends,
+// the peer sends GOAWAY, the peer's concurrent stream limit is reached, or Retire is called.
 func (c *Conn) CanOpen() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.err == nil && !c.goAway
+	return c.err == nil && !c.retired && int64(len(c.streams)) < c.maxStreams
+}
+
+// Retire refuses new streams and ends the connection once the last open one ends.
+func (c *Conn) Retire() {
+	c.mu.Lock()
+	c.retired = true
+	c.mu.Unlock()
+	c.closeIfDrained()
 }
 
 // Err returns the error that ended the connection, nil while it lives.
@@ -257,6 +354,7 @@ func (c *Conn) fail(err error, goAway bool) {
 		// A frame the writer is stuck on returns at the deadline, and the writer with it.
 		_ = c.nc.SetWriteDeadline(time.Now().Add(closeTimeout))
 		<-c.writerDone
+		_ = c.nc.SetWriteDeadline(time.Now().Add(closeTimeout))
 		if goAway {
 			_ = c.writeNow(func(fr *http2.Framer) error {
 				return fr.WriteGoAway(0, http2.ErrCodeNo, nil)
@@ -292,7 +390,7 @@ func (c *Conn) Open(ctx context.Context, req Request) (*Stream, *Response, error
 	case c.err != nil:
 		c.mu.Unlock()
 		return nil, nil, c.err
-	case c.goAway:
+	case c.retired:
 		c.mu.Unlock()
 		return nil, nil, ErrGoAway
 	case req.Protocol != "" && !c.extendedConnect:
@@ -310,7 +408,16 @@ func (c *Conn) Open(ctx context.Context, req Request) (*Stream, *Response, error
 	maxFrame := int(c.maxFrameSize)
 	c.mu.Unlock()
 
+	// An error from the writer ends the connection, and headers that do not fit have not
+	// reached it, so they are reported apart.
+	tooLarge := false
 	err := c.write(func(fr *http2.Framer) error {
+		c.mu.Lock()
+		if c.encTableChanged {
+			c.enc.SetMaxDynamicTableSize(c.encTableSize)
+			c.encTableChanged = false
+		}
+		c.mu.Unlock()
 		c.encBuf.Reset()
 		c.field(":method", "CONNECT")
 		if req.Protocol != "" {
@@ -328,10 +435,18 @@ func (c *Conn) Open(ctx context.Context, req Request) (*Stream, *Response, error
 			}
 		}
 		if c.encBuf.Len() > maxFrame {
-			return errors.New("h2tunnel: request headers exceed a frame")
+			tooLarge = true
+			return nil
 		}
 		return fr.WriteHeaders(http2.HeadersFrameParam{StreamID: s.id, BlockFragment: c.encBuf.Bytes(), EndHeaders: true})
 	})
+	if err == nil && tooLarge {
+		c.mu.Lock()
+		delete(c.streams, s.id)
+		c.mu.Unlock()
+		s.end(errHeadersTooLarge)
+		return nil, nil, errHeadersTooLarge
+	}
 	if err != nil {
 		c.fail(err, false)
 		return nil, nil, err
@@ -392,7 +507,12 @@ func (c *Conn) handle(f http2.Frame) error {
 		if f.IsAck() {
 			return nil
 		}
-		c.tryWrite(func(fr *http2.Framer) error { return fr.WritePing(true, f.Data) })
+		c.mu.Lock()
+		if len(c.pingAcks) < maxPingAcks {
+			c.pingAcks = append(c.pingAcks, f.Data)
+		}
+		c.mu.Unlock()
+		c.signalControl()
 		return nil
 	case *http2.RSTStreamFrame:
 		c.resetStream(f.StreamID, f.ErrCode, true)
@@ -433,15 +553,25 @@ func (c *Conn) handleSettings(f *http2.SettingsFrame) error {
 		case http2.SettingMaxConcurrentStreams:
 			c.maxStreams = int64(s.Val)
 		case http2.SettingEnableConnectProtocol:
+			// Once enabled it stays enabled, RFC 8441 section 3.
+			if c.extendedConnect && s.Val == 0 {
+				return http2.ConnectionError(http2.ErrCodeProtocol)
+			}
 			c.extendedConnect = s.Val == 1
+		case http2.SettingHeaderTableSize:
+			c.encTableSize = s.Val
+			c.encTableChanged = true
 		}
 		return nil
 	})
+	if err == nil {
+		c.settingsAcks++
+	}
 	c.mu.Unlock()
 	if err != nil {
 		return err
 	}
-	c.tryWrite(func(fr *http2.Framer) error { return fr.WriteSettingsAck() })
+	c.signalControl()
 	c.settingsOnce.Do(func() { close(c.settingsSeen) })
 	return nil
 }
@@ -503,52 +633,31 @@ func (c *Conn) handleData(f *http2.DataFrame) error {
 	return nil
 }
 
-// consumed accounts n bytes as read on s, or on the connection alone with a nil s, and queues
-// the WINDOW_UPDATEs due once half a window is owed. A read never waits on the writer, so the
-// credit stays owed when the queue is full and goes out with the next one.
+// consumed accounts n bytes as read on s, or on the connection alone with a nil s, and has
+// the writer send the WINDOW_UPDATEs due once half a window is owed.
 func (c *Conn) consumed(s *Stream, n int64) {
 	if n == 0 {
 		return
 	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	var stream, conn, id uint32
+	owed := false
 	if s != nil {
 		s.mu.Lock()
-		defer s.mu.Unlock()
 		s.recvUnacked += n
 		if s.recvUnacked >= window/2 && s.readErr == nil {
-			stream = uint32(s.recvUnacked) //nolint:gosec // at most a window
-			id = s.id
+			c.creditStreams[s.id] = s
+			owed = true
 		}
+		s.mu.Unlock()
 	}
 	c.recvUnacked += n
 	if c.recvUnacked >= window/2 {
-		conn = uint32(c.recvUnacked) //nolint:gosec // at most a window per stream
+		c.creditOwed = true
+		owed = true
 	}
-	if stream == 0 && conn == 0 {
-		return
-	}
-	queued := c.tryWrite(func(fr *http2.Framer) error {
-		if stream != 0 {
-			if err := fr.WriteWindowUpdate(id, stream); err != nil {
-				return err
-			}
-		}
-		if conn != 0 {
-			return fr.WriteWindowUpdate(0, conn)
-		}
-		return nil
-	})
-	if !queued {
-		return
-	}
-	if stream != 0 {
-		s.recvWindow += int64(stream)
-		s.recvUnacked = 0
-	}
-	if conn != 0 {
-		c.recvUnacked = 0
+	c.mu.Unlock()
+	if owed {
+		c.signalControl()
 	}
 }
 
@@ -585,7 +694,7 @@ func (c *Conn) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 
 func (c *Conn) handleGoAway(f *http2.GoAwayFrame) error {
 	c.mu.Lock()
-	c.goAway = true
+	c.retired = true
 	var unserved []*Stream
 	for id, s := range c.streams {
 		if id > f.LastStreamID {
@@ -607,11 +716,18 @@ func (c *Conn) handleGoAway(f *http2.GoAwayFrame) error {
 // closeIfDrained ends a connection the peer is going away from once its last stream ended.
 func (c *Conn) closeIfDrained() {
 	c.mu.Lock()
-	drained := c.goAway && len(c.streams) == 0 && c.err == nil
+	drained := c.retired && len(c.streams) == 0 && c.err == nil
 	c.mu.Unlock()
 	if drained {
 		c.fail(ErrGoAway, false)
 	}
+}
+
+func (c *Conn) queueReset(id uint32, code http2.ErrCode) {
+	c.mu.Lock()
+	c.resets = append(c.resets, resetFrame{id: id, code: code})
+	c.mu.Unlock()
+	c.signalControl()
 }
 
 func (c *Conn) stream(id uint32) *Stream {
@@ -633,7 +749,7 @@ func (c *Conn) resetStream(id uint32, code http2.ErrCode, fromPeer bool) {
 	if fromPeer {
 		s.fromPeer.Store(true)
 	} else {
-		c.tryWrite(func(fr *http2.Framer) error { return fr.WriteRSTStream(id, code) })
+		c.queueReset(id, code)
 	}
 	s.end(http2.StreamError{StreamID: id, Code: code})
 	c.closeIfDrained()
@@ -855,7 +971,7 @@ func (s *Stream) reset(code http2.ErrCode) {
 	delete(c.streams, s.id)
 	c.mu.Unlock()
 	if !s.fromPeer.Load() {
-		c.tryWrite(func(fr *http2.Framer) error { return fr.WriteRSTStream(s.id, code) })
+		c.queueReset(s.id, code)
 	}
 	s.end(errStreamClosed)
 	c.closeIfDrained()

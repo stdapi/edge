@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -838,4 +839,125 @@ func TestChain_ReplacedHTTP2ConnectionEndsWithTheDialer(t *testing.T) {
 	}
 	_, err = str.Read(make([]byte, 1))
 	require.Error(t, err)
+}
+
+// h2Proxies dials fake HTTP/2 proxies over TLS, one connection per dial, each answering
+// every CONNECT with 200, closing the socket instead on the CONNECT number closeOn when it
+// is not zero.
+type h2Proxies struct {
+	t        *testing.T
+	ca       *CA
+	settings []http2.Setting
+	closeOn  int
+	dials    atomic.Int32
+	ended    chan struct{}
+}
+
+func (p *h2Proxies) dial(_ context.Context, network, _ string) (net.Conn, error) {
+	p.dials.Add(1)
+	cli, srv := tcpPair(p.t)
+	cert, err := p.ca.Leaf("127.0.0.1")
+	if err != nil {
+		return nil, err
+	}
+	first := p.dials.Load() == 1
+	go func() {
+		tc := tls.Server(srv, &tls.Config{Certificates: []tls.Certificate{*cert}, NextProtos: []string{"h2"}, MinVersion: tls.VersionTLS12})
+		if err := tc.Handshake(); err != nil {
+			return
+		}
+		fr := http2.NewFramer(tc, tc)
+		fr.ReadMetaHeaders = hpack.NewDecoder(4096, nil)
+		var buf bytes.Buffer
+		enc := hpack.NewEncoder(&buf)
+		preface := make([]byte, len(http2.ClientPreface))
+		if _, err := io.ReadFull(tc, preface); err != nil {
+			return
+		}
+		settings := append([]http2.Setting{{ID: http2.SettingEnableConnectProtocol, Val: 1}}, p.settings...)
+		if err := fr.WriteSettings(settings...); err != nil {
+			return
+		}
+		headers := 0
+		for {
+			f, err := fr.ReadFrame()
+			if err != nil {
+				if first && p.ended != nil {
+					close(p.ended)
+				}
+				return
+			}
+			if mh, ok := f.(*http2.MetaHeadersFrame); ok {
+				headers++
+				if first && headers == p.closeOn {
+					_ = tc.Close()
+					return
+				}
+				buf.Reset()
+				_ = enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+				_ = fr.WriteHeaders(http2.HeadersFrameParam{StreamID: mh.StreamID, BlockFragment: buf.Bytes(), EndHeaders: true})
+			}
+		}
+	}()
+	_ = network
+	return cli, nil
+}
+
+func (p *h2Proxies) dialer(t *testing.T) *upstreamDialer {
+	t.Helper()
+	tr := DefaultTransport()
+	tr.DialContext = p.dial
+	tr.RootCAs = poolOf(p.ca)
+	u := newUpstreamDialer(tr)
+	t.Cleanup(u.close)
+	return u
+}
+
+// A tunnel opened on a pooled HTTP/2 connection the proxy dropped meanwhile is opened again
+// on a fresh one, the proxy having seen nothing of it.
+func TestChain_StaleH2ConnectionIsRetried(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	proxies := &h2Proxies{t: t, ca: ca, closeOn: 2}
+	u := proxies.dialer(t)
+	proxy, err := url.Parse("https://127.0.0.1:443")
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	first, err := u.connectUDPStream(ctx, proxy, "192.0.2.1", "53")
+	require.NoError(t, err)
+	defer func() { _ = first.close() }()
+	second, err := u.connectUDPStream(ctx, proxy, "192.0.2.1", "53")
+	require.NoError(t, err, "the dial failed instead of opening a fresh connection")
+	defer func() { _ = second.close() }()
+	assert.EqualValues(t, 2, proxies.dials.Load())
+}
+
+// A pooled HTTP/2 connection at the proxy's stream limit is left to its tunnels and a fresh
+// one opened, and it ends once those tunnels end.
+func TestChain_FullH2ConnectionOpensAnother(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	proxies := &h2Proxies{t: t, ca: ca, ended: make(chan struct{}),
+		settings: []http2.Setting{{ID: http2.SettingMaxConcurrentStreams, Val: 1}}}
+	u := proxies.dialer(t)
+	proxy, err := url.Parse("https://127.0.0.1:443")
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	first, err := u.connectUDPStream(ctx, proxy, "192.0.2.1", "53")
+	require.NoError(t, err)
+	second, err := u.connectUDPStream(ctx, proxy, "192.0.2.1", "53")
+	require.NoError(t, err, "the dial failed instead of opening a fresh connection")
+	defer func() { _ = second.close() }()
+	assert.EqualValues(t, 2, proxies.dials.Load())
+
+	require.NoError(t, first.close())
+	select {
+	case <-proxies.ended:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the full connection outlived its last tunnel")
+	}
 }
