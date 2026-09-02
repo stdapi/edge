@@ -54,7 +54,11 @@ func (p *Proxy) connectHijack(w http.ResponseWriter, r *http.Request, target Tar
 
 	// Anything the reader buffered past the CONNECT request is already payload: a client that
 	// writes its ClientHello without waiting for the 200 would otherwise lose it.
-	conn := newPeekConn(client, brw.Reader)
+	var early []byte
+	if n := brw.Reader.Buffered(); n > 0 {
+		early, _ = brw.Peek(n)
+	}
+	conn := newPeekConn(client, early, clientHelloPeekSize)
 
 	// The connection outlives the request that opened it, so what bounds it is the connection,
 	// not the request. ConnContext built exactly that context and handed it to the session, and
@@ -105,10 +109,7 @@ func (p *Proxy) connectHijack(w http.ResponseWriter, r *http.Request, target Tar
 	if werr := writeRawStatus(brw, http.StatusOK, ""); werr != nil {
 		return
 	}
-	// The reader behind conn is sized for requests, and the placement reads a whole
-	// ClientHello before the handshake.
-	pc := newPeekConnSize(conn, clientHelloPeekSize)
-	if ierr := p.terminate(ctx, pc, sess); ierr != nil {
+	if ierr := p.terminate(ctx, conn, sess); ierr != nil {
 		p.logf(ctx, slog.LevelDebug, "connection closed", sess, ierr)
 	}
 }
@@ -141,7 +142,7 @@ func (p *Proxy) connectStream(w http.ResponseWriter, r *http.Request, target Tar
 	w.WriteHeader(http.StatusOK)
 	_ = http.NewResponseController(w).Flush()
 
-	pc := newPeekConnSize(stream, clientHelloPeekSize)
+	pc := newPeekConn(stream, nil, clientHelloPeekSize)
 	if err := p.terminate(r.Context(), pc, sess); err != nil {
 		p.logf(r.Context(), slog.LevelDebug, "stream closed", sess, err)
 	}

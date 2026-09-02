@@ -23,40 +23,67 @@ const (
 	// halfClosedIdleTimeout bounds how long the remaining direction of a relay may sit silent
 	// once the other one is done.
 	halfClosedIdleTimeout = 30 * time.Second
-	// defaultPeekSize covers a protocol discriminator and the buffering http.Server would
-	// have done anyway on the connection it is handed.
-	defaultPeekSize = 4096
+	defaultPeekSize       = 4096
 )
 
 var copyBufPool = sync.Pool{New: func() any { return new([copyBufSize]byte) }}
 
-// peekConn is a net.Conn whose reads go through a buffered reader, so bytes consumed to
-// sniff the protocol are still delivered to whatever ends up serving the connection.
+// peekConn is a net.Conn that reads ahead for a sniff and hands the bytes on. The read-ahead
+// is released once consumed, so a placed connection keeps no buffer of its own.
 type peekConn struct {
 	net.Conn
-	r *bufio.Reader
+	buf []byte
+	max int
 }
 
-func newPeekConn(c net.Conn, buffered *bufio.Reader) *peekConn {
-	if buffered == nil {
-		buffered = bufio.NewReaderSize(c, defaultPeekSize)
+func newPeekConn(c net.Conn, buffered []byte, max int) *peekConn {
+	return &peekConn{Conn: c, buf: buffered[:len(buffered):len(buffered)], max: max}
+}
+
+func (c *peekConn) Read(b []byte) (int, error) {
+	if len(c.buf) == 0 {
+		return c.Conn.Read(b)
 	}
-	return &peekConn{Conn: c, r: buffered}
+	n := copy(b, c.buf)
+	c.buf = c.buf[n:]
+	if len(c.buf) == 0 {
+		c.buf = nil
+	}
+	return n, nil
 }
 
-// newPeekConnSize returns a peekConn whose buffer is large enough to hold size bytes, for a
-// caller that needs to look further ahead than a protocol discriminator.
-func newPeekConnSize(c net.Conn, size int) *peekConn {
-	return &peekConn{Conn: c, r: bufio.NewReaderSize(c, size)}
-}
+func (c *peekConn) Buffered() int { return len(c.buf) }
 
-func (c *peekConn) Read(b []byte) (int, error) { return c.r.Read(b) }
+// Peek returns the next n bytes without consuming them, [bufio.ErrBufferFull] past max, and
+// what arrived before a read error.
+func (c *peekConn) Peek(n int) ([]byte, error) {
+	if n > c.max {
+		return c.buf, bufio.ErrBufferFull
+	}
+	empty := 0
+	for len(c.buf) < n {
+		if cap(c.buf) < n {
+			grown := make([]byte, len(c.buf), min(c.max, max(n, 2*cap(c.buf), defaultPeekSize)))
+			copy(grown, c.buf)
+			c.buf = grown
+		}
+		m, err := c.Conn.Read(c.buf[len(c.buf):cap(c.buf)])
+		c.buf = c.buf[:len(c.buf)+m]
+		if err != nil {
+			return c.buf, err
+		}
+		if m == 0 {
+			empty++
+			if empty == 100 {
+				return c.buf, io.ErrNoProgress
+			}
+		}
+	}
+	return c.buf[:n], nil
+}
 
 // CloseWrite forwards the half-close, which the embedded net.Conn does not promote.
 func (c *peekConn) CloseWrite() error { return closeWrite(c.Conn) }
-
-// Peek returns the next n bytes without consuming them.
-func (c *peekConn) Peek(n int) ([]byte, error) { return c.r.Peek(n) }
 
 // closeWriter is implemented by connections that can be half-closed, which is how a relay
 // tells the far end that one direction is done without tearing down the other.

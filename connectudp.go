@@ -32,9 +32,15 @@ const (
 	// blocks once 32 datagrams wait on the front connection, and a full queue drops so one
 	// stalled client does not stall the stack serving every other tunnel.
 	tunnelSendQueue = 64
+	// tunnelBufSize exceeds the largest packet the terminating stack writes, 1452 bytes in
+	// quic-go, plus the context ID.
+	tunnelBufSize = 2048
 )
 
-var tunnelSeq atomic.Uint64
+var (
+	tunnelSeq     atomic.Uint64
+	tunnelBufPool = sync.Pool{New: func() any { return new([tunnelBufSize]byte) }}
+)
 
 // serveConnectUDP handles a CONNECT-UDP request, RFC 9298. The tunnel's datagrams are placed
 // by the demultiplexer like a redirected socket's, and the tunnel is a session of its own.
@@ -253,7 +259,7 @@ func (t *connectUDPTunnel) serve(ctx context.Context, str *http3.Stream) {
 		if perr != nil || id != 0 || n >= len(b) {
 			continue
 		}
-		t.d.dispatch(t.addr, b[n:])
+		t.d.dispatch(t.addr, b[n:], true)
 	}
 	t.close()
 	<-t.sent
@@ -279,11 +285,24 @@ func (t *connectUDPTunnel) drainCapsules() {
 // send queues b for the client and drops it when the queue is full.
 func (t *connectUDPTunnel) send(b []byte) {
 	// The stack reuses its buffer once the write returns, and the context ID goes first.
-	out := make([]byte, 1+len(b))
+	var out []byte
+	if 1+len(b) <= tunnelBufSize {
+		out = tunnelBufPool.Get().(*[tunnelBufSize]byte)[:1+len(b)]
+	} else {
+		out = make([]byte, 1+len(b))
+	}
+	out[0] = 0
 	copy(out[1:], b)
 	select {
 	case t.sendCh <- out:
 	default:
+		putTunnelBuf(out)
+	}
+}
+
+func putTunnelBuf(b []byte) {
+	if cap(b) == tunnelBufSize {
+		tunnelBufPool.Put((*[tunnelBufSize]byte)(b[:tunnelBufSize]))
 	}
 }
 
@@ -315,7 +334,9 @@ func (t *connectUDPTunnel) sender() {
 }
 
 func (t *connectUDPTunnel) sendDatagram(b []byte) {
-	if err := t.str.SendDatagram(b); err != nil {
+	err := t.str.SendDatagram(b)
+	putTunnelBuf(b)
+	if err != nil {
 		if tooLarge, ok := errors.AsType[*quic.DatagramTooLargeError](err); ok {
 			t.d.p.cfg.logger.Debug("edge: datagram larger than the tunnel carries",
 				slog.String("target", t.target.String()),

@@ -100,7 +100,7 @@ const requestLinePeek = 512
 // What is already buffered is scanned first, and the scan waits for one more byte at a time.
 // A short first write that is not HTTP is decided on the spot.
 func looksLikeHTTPRequestLine(conn *peekConn) bool {
-	n := max(conn.r.Buffered(), 1)
+	n := max(conn.Buffered(), 1)
 	for {
 		b, err := conn.Peek(n)
 		if len(b) > 0 {
@@ -119,7 +119,7 @@ func looksLikeHTTPRequestLine(conn *peekConn) bool {
 		if n >= requestLinePeek {
 			return false
 		}
-		n = min(max(n+1, conn.r.Buffered()), requestLinePeek)
+		n = min(max(n+1, conn.Buffered()), requestLinePeek)
 	}
 }
 

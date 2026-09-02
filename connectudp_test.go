@@ -420,7 +420,7 @@ func TestConnectUDP_ClosedTunnelOwnsNoFlow(t *testing.T) {
 	initial := make([]byte, 1200)
 	initial[0], initial[4], initial[5] = 0xC0, 1, 8
 	copy(initial[6:14], "12345678")
-	d.dispatchLong(tun.addr, tun.key, initial)
+	d.dispatchLong(tun.addr, tun.key, initial, false)
 
 	d.mu.Lock()
 	defer d.mu.Unlock()

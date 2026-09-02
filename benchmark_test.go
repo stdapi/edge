@@ -5,8 +5,11 @@
 package edge
 
 import (
+	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"strconv"
 	"testing"
 )
@@ -340,5 +343,73 @@ func BenchmarkDatagramAdmissionCaptured(b *testing.B) {
 		if e, buf = p.admitInto(target, KindUDP, buf); e == nil || len(buf) != 1 {
 			b.Fatal("no entry or no capture")
 		}
+	}
+}
+
+func tunnelBench(b *testing.B) (*quicDemux, *connectUDPTunnel, *demuxPacketConn, []byte) {
+	b.Helper()
+	ca, err := GenerateCA()
+	if err != nil {
+		b.Fatal(err)
+	}
+	p, err := New(WithCA(ca))
+	if err != nil {
+		b.Fatal(err)
+	}
+	d, err := newQUICDemux(p, newTunnelPacketConn())
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = p.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	b.Cleanup(cancel)
+	target := Target{Scheme: "https", Host: "bench.test", Port: "443"}
+	sess := newSession(ctx, nil, target, KindHTTP, HTTP3)
+	sess.remoteAddr = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 4242}
+	tun := newConnectUDPTunnel(d, sess, target, netip.MustParseAddrPort("127.0.0.1:443"), cancel)
+	if !d.publishTunnel(tun) {
+		b.Fatal("publish")
+	}
+	dpc := newDemuxPacketConn(nil, 64)
+	it := &quicIntercept{conn: dpc}
+	dcid := "ABCDEFGH"
+	d.mu.Lock()
+	flow := d.flows[tun.key]
+	flow.conns[dcid] = &quicConn{odcid: dcid, state: connTerminated, stack: it}
+	d.mu.Unlock()
+
+	pkt := make([]byte, 1200)
+	pkt[0] = 0xC3
+	pkt[4] = 1
+	pkt[5] = 8
+	copy(pkt[6:], dcid)
+	pkt[14] = 0
+	return d, tun, dpc, pkt
+}
+
+// One inner packet of a tunnel, from dispatch to the read the stack's QUIC transport does.
+func BenchmarkTunnelInbound(b *testing.B) {
+	d, tun, dpc, pkt := tunnelBench(b)
+	buf := make([]byte, maxUDPPayload)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		d.dispatch(tun.addr, pkt, true)
+		if _, _, err := dpc.ReadFrom(buf); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// One packet the stack writes back into the tunnel, queued for the sender.
+func BenchmarkTunnelOutbound(b *testing.B) {
+	_, tun, _, pkt := tunnelBench(b)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		tun.send(pkt)
+		out := <-tun.sendCh
+		putTunnelBuf(out)
 	}
 }

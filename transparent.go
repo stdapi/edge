@@ -5,7 +5,6 @@
 package edge
 
 import (
-	"bufio"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -98,7 +97,7 @@ func (p *Proxy) ServeConn(conn net.Conn) error {
 		}
 	}()
 
-	peeked := newPeekConnSize(conn, clientHelloPeekSize)
+	peeked := newPeekConn(conn, nil, clientHelloPeekSize)
 
 	var origin netip.AddrPort
 	if od, ok := conn.(OriginalDestination); ok {
@@ -209,12 +208,12 @@ var errStopHandshake = errors.New("edge: client hello captured")
 
 // peekHandshakeRecords returns the TLS records holding the complete first handshake message,
 // without consuming them from br.
-func peekHandshakeRecords(br *bufio.Reader) ([]byte, error) {
+func peekHandshakeRecords(conn *peekConn) ([]byte, error) {
 	const recordHeader = 5
 
 	// The first record carries the handshake header, whose 3 byte length says how much of
 	// the message is still to come.
-	head, err := br.Peek(recordHeader + 4)
+	head, err := conn.Peek(recordHeader + 4)
 	if err != nil {
 		return nil, fmt.Errorf("peek TLS record header: %w", err)
 	}
@@ -231,7 +230,7 @@ func peekHandshakeRecords(br *bufio.Reader) ([]byte, error) {
 	total := 0
 	payload := 0
 	for payload < want {
-		next, err := br.Peek(total + recordHeader)
+		next, err := conn.Peek(total + recordHeader)
 		if err != nil {
 			return nil, fmt.Errorf("peek TLS record: %w", err)
 		}
@@ -248,7 +247,7 @@ func peekHandshakeRecords(br *bufio.Reader) ([]byte, error) {
 		}
 	}
 
-	return br.Peek(total)
+	return conn.Peek(total)
 }
 
 // replayConn feeds already-read bytes to a TLS server that is only meant to parse them.

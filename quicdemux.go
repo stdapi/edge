@@ -330,8 +330,8 @@ type quicIntercept struct {
 }
 
 // deliver hands a datagram to the stack's QUIC transport.
-func (it *quicIntercept) deliver(addr net.Addr, datagram []byte) {
-	it.conn.deliver(addr, datagram)
+func (it *quicIntercept) deliver(addr net.Addr, datagram []byte, owned bool) {
+	it.conn.deliver(addr, datagram, owned)
 }
 
 // closeIntercept tears one stack down. The listener goes first, so the accept loop returns the
@@ -870,13 +870,13 @@ func (d *quicDemux) run() error {
 		}
 
 		// The buffer is reused on the next read, so anything kept must be copied.
-		d.dispatch(addr, buf[:n])
+		d.dispatch(addr, buf[:n], false)
 	}
 }
 
 // dispatch places one datagram from addr. The tunnels call it from their own goroutines, and a
 // datagram of one flow is only ever handled by the goroutine feeding that flow.
-func (d *quicDemux) dispatch(addr net.Addr, datagram []byte) {
+func (d *quicDemux) dispatch(addr net.Addr, datagram []byte, owned bool) {
 	from := flowKeyOf(addr)
 	if !from.addr.IsValid() || len(datagram) == 0 {
 		return
@@ -885,13 +885,13 @@ func (d *quicDemux) dispatch(addr net.Addr, datagram []byte) {
 		return
 	}
 	if datagram[0]&0x80 != 0 {
-		d.dispatchLong(addr, from, datagram)
+		d.dispatchLong(addr, from, datagram, owned)
 		return
 	}
-	d.dispatchShort(addr, from, datagram)
+	d.dispatchShort(addr, from, datagram, owned)
 }
 
-func (d *quicDemux) dispatchLong(addr net.Addr, from flowKey, datagram []byte) {
+func (d *quicDemux) dispatchLong(addr net.Addr, from flowKey, datagram []byte, owned bool) {
 	version, dcid, _, ok := quicsniff.ParseLongHeader(datagram)
 	if !ok {
 		// Arbitrary bytes are free to set the high bit, so failing the parse places the
@@ -911,14 +911,14 @@ func (d *quicDemux) dispatchLong(addr net.Addr, from flowKey, datagram []byte) {
 				conn.lastSeen = now
 				stack := conn.stack
 				d.mu.Unlock()
-				stack.deliver(addr, datagram)
+				stack.deliver(addr, datagram, owned)
 			case connRejected:
 				conn.lastSeen = now
 				d.mu.Unlock()
 			default:
 				conn.lastSeen = now
 				d.mu.Unlock()
-				d.sniff(from, conn, datagram)
+				d.sniff(from, conn, datagram, owned)
 			}
 			return
 		}
@@ -930,7 +930,7 @@ func (d *quicDemux) dispatchLong(addr net.Addr, from flowKey, datagram []byte) {
 		it, _, _ := d.lookupInterceptLocked(addr)
 		d.mu.Unlock()
 		if it != nil {
-			it.deliver(addr, datagram)
+			it.deliver(addr, datagram, owned)
 		}
 		return
 	}
@@ -939,7 +939,7 @@ func (d *quicDemux) dispatchLong(addr net.Addr, from flowKey, datagram []byte) {
 		conn := d.admitConnLocked(from, addr, string(dcid), now)
 		d.mu.Unlock()
 		if conn != nil {
-			d.sniff(from, conn, datagram)
+			d.sniff(from, conn, datagram, owned)
 		}
 		return
 	}
@@ -949,7 +949,7 @@ func (d *quicDemux) dispatchLong(addr net.Addr, from flowKey, datagram []byte) {
 
 // dispatchShort places a short header datagram. Only the connection IDs the proxy minted are
 // recognizable here, the ones a peer chose being unreadable without its state.
-func (d *quicDemux) dispatchShort(addr net.Addr, from flowKey, datagram []byte) {
+func (d *quicDemux) dispatchShort(addr net.Addr, from flowKey, datagram []byte, owned bool) {
 	d.mu.Lock()
 	if flow := d.flows[from]; flow != nil {
 		flow.lastSeen = time.Now()
@@ -960,7 +960,7 @@ func (d *quicDemux) dispatchShort(addr net.Addr, from flowKey, datagram []byte) 
 		it, origin, ok := d.lookupInterceptLocked(addr)
 		d.mu.Unlock()
 		if it != nil {
-			it.deliver(addr, datagram)
+			it.deliver(addr, datagram, owned)
 		} else if ok {
 			d.statelessReset(addr, origin, datagram)
 		}
@@ -1381,8 +1381,11 @@ func (d *quicDemux) releaseInterceptLocked(conn *quicConn) {
 // sniff feeds a datagram to the reassembler and decides the connection once its ClientHello is
 // complete. A first flight datagram with no Initial in it, 0-RTT typically, still joins the
 // pending ones, so the terminating stack receives the flight whole.
-func (d *quicDemux) sniff(from flowKey, conn *quicConn, datagram []byte) {
-	kept := bytes.Clone(datagram)
+func (d *quicDemux) sniff(from flowKey, conn *quicConn, datagram []byte, owned bool) {
+	kept := datagram
+	if !owned {
+		kept = bytes.Clone(datagram)
+	}
 
 	hello, err := conn.sniffer.Feed(kept)
 	if err != nil && !errors.Is(err, quicsniff.ErrNotInitial) {
@@ -1565,7 +1568,7 @@ func (d *quicDemux) beginTermination(from flowKey, client net.Addr, conn *quicCo
 	}
 
 	for _, dg := range pending {
-		it.deliver(client, dg)
+		it.deliver(client, dg, true)
 	}
 }
 
@@ -1941,11 +1944,12 @@ func newDemuxPacketConn(real net.PacketConn, queue int) *demuxPacketConn {
 // deliver hands a datagram to the QUIC server. It drops rather than blocks: QUIC is built on an
 // unreliable datagram service, and stalling the demultiplexer would hold up every other client
 // on the socket.
-func (c *demuxPacketConn) deliver(addr net.Addr, b []byte) {
-	kept := make([]byte, len(b))
-	copy(kept, b)
+func (c *demuxPacketConn) deliver(addr net.Addr, b []byte, owned bool) {
+	if !owned {
+		b = bytes.Clone(b)
+	}
 	select {
-	case c.in <- datagram{b: kept, addr: addr}:
+	case c.in <- datagram{b: b, addr: addr}:
 	case <-c.closed:
 	default:
 	}

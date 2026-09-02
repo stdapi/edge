@@ -36,7 +36,7 @@ func TestSniff_ShortFirstWriteDecidesWithoutWaiting(t *testing.T) {
 			defer func() { _ = server.Close() }()
 			go func() { _, _ = client.Write([]byte(tc.write)) }()
 
-			pc := newPeekConn(server, nil)
+			pc := newPeekConn(server, nil, defaultPeekSize)
 			_, err := pc.Peek(1)
 			require.NoError(t, err)
 

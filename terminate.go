@@ -60,7 +60,7 @@ func (p *Proxy) terminate(ctx context.Context, conn *peekConn, sess *Session) er
 	if candidates == nil {
 		// The client offered no ALPN, so nothing has said what this is. Past the handshake
 		// the payload is in the clear, which is exactly what the sniff reads.
-		peeked := newPeekConn(tlsConn, nil)
+		peeked := newPeekConn(tlsConn, nil, defaultPeekSize)
 		return p.serveCandidates(ctx, peeked, sess, sniffStreamCandidates(peeked, p.cfg.server.sniffTimeout), &state)
 	}
 	return p.serveCandidates(ctx, tlsConn, sess, candidates, &state)
@@ -71,7 +71,7 @@ func (p *Proxy) terminate(ctx context.Context, conn *peekConn, sess *Session) er
 // the connection was headed to is what the proxy dials, and name verification stands between
 // the two. Nothing is consumed, the handshake reads the same bytes after.
 func (p *Proxy) placeTLS(ctx context.Context, conn *peekConn, sess *Session) error {
-	raw, rerr := peekHandshakeRecords(conn.r)
+	raw, rerr := peekHandshakeRecords(conn)
 	if p.cfg.rejectECH {
 		if rerr != nil {
 			return errECHUnverifiable

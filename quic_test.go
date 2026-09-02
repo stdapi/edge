@@ -995,7 +995,7 @@ func TestQUICDemux_CloseRefusesLatePublish(t *testing.T) {
 	// The dispatch a read-loop goroutine had in flight when close ran. The datagram sets
 	// the long-header bit but is not QUIC, so it is placed by its destination.
 	client := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40000}
-	d.dispatch(client, []byte{0xC0, 0xDE})
+	d.dispatch(client, []byte{0xC0, 0xDE}, false)
 
 	d.mu.Lock()
 	flows := len(d.flows)
