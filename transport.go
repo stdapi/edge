@@ -98,15 +98,6 @@ func (t *Transport) dialer() func(context.Context, string, string) (net.Conn, er
 	return defaultDialer.DialContext
 }
 
-func dialFixed(dial func(context.Context, string, string) (net.Conn, error), fixed string) func(context.Context, string, string) (net.Conn, error) {
-	if fixed == "" {
-		return dial
-	}
-	return func(ctx context.Context, network, _ string) (net.Conn, error) {
-		return dial(ctx, network, fixed)
-	}
-}
-
 // httpTransport builds a net/http transport for TCP upstreams. allowH2 decides whether it
 // may negotiate HTTP/2, which is how the proxy mirrors upstream the version the client chose
 // downstream: an app that asked for HTTP/1.1 must not have its request delivered over h2.
@@ -115,7 +106,7 @@ func dialFixed(dial func(context.Context, string, string) (net.Conn, error), fix
 // origin produced, encoded the way the client asked for it: letting net/http add its own
 // Accept-Encoding and transparently gunzip would change both the request the origin sees and
 // the bytes the client gets, and would hide Content-Encoding from handlers.
-func (t *Transport) httpTransport(allowH2 bool, fixed string) *http.Transport {
+func (t *Transport) httpTransport(allowH2, fixed bool, dial func(context.Context, string, string) (net.Conn, error), proxy func(*http.Request) (*url.URL, error)) *http.Transport {
 	tlsCfg := t.upstreamTLSConfig()
 
 	if allowH2 {
@@ -125,8 +116,8 @@ func (t *Transport) httpTransport(allowH2 bool, fixed string) *http.Transport {
 	}
 
 	tr := &http.Transport{
-		Proxy:                 t.Proxy,
-		DialContext:           dialFixed(t.dialer(), fixed),
+		Proxy:                 proxy,
+		DialContext:           dial,
 		TLSClientConfig:       tlsCfg,
 		TLSHandshakeTimeout:   t.TLSHandshakeTimeout,
 		ResponseHeaderTimeout: t.ResponseHeaderTimeout,
@@ -144,7 +135,7 @@ func (t *Transport) httpTransport(allowH2 bool, fixed string) *http.Transport {
 		// implementation, whatever ALPN ends up negotiating.
 		tr.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
 	}
-	if fixed != "" {
+	if fixed {
 		// A destination serves one authority, so the per host limit is its limit.
 		tr.MaxIdleConns = cmp.Or(t.MaxIdleConnsPerHost, http.DefaultMaxIdleConnsPerHost)
 	}
@@ -215,7 +206,7 @@ func packetConnOf(c net.Conn) net.PacketConn {
 }
 
 // connectedUDPConn keeps the batched reads, ECN and GSO quic-go enables on a *net.UDPConn. A
-// write on a connected socket must carry no address, so the one quic-go passes is dropped.
+// write on a connected socket takes no address, so the one quic-go passes is dropped.
 type connectedUDPConn struct{ *net.UDPConn }
 
 func (c connectedUDPConn) WriteTo(b []byte, _ net.Addr) (int, error) { return c.Write(b) }

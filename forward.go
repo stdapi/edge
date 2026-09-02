@@ -5,6 +5,8 @@
 package edge
 
 import (
+	"context"
+	"net"
 	"net/http"
 	"net/textproto"
 	"strings"
@@ -45,11 +47,20 @@ type upstreamPool struct {
 	h3 http.RoundTripper
 }
 
-func newUpstreamPool(up *upstreamDialer, fixed string) (*upstreamPool, error) {
+func newUpstreamPool(up *upstreamDialer, scheme, fixed string) (*upstreamPool, error) {
 	t := up.t
-	pool := &upstreamPool{h1: t.httpTransport(false, fixed)}
+	dial, proxy := t.dialer(), t.Proxy
+	if fixed != "" {
+		// The destination is fixed by the CONNECT, so the tunnel to it is opened here and
+		// the transport is given no proxy of its own.
+		proxy = nil
+		dial = func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return up.dial(ctx, network, fixed, scheme)
+		}
+	}
+	pool := &upstreamPool{h1: t.httpTransport(false, fixed != "", dial, proxy)}
 	if t.AllowHTTP2 {
-		pool.h2 = t.httpTransport(true, fixed)
+		pool.h2 = t.httpTransport(true, fixed != "", dial, proxy)
 	}
 	if t.AllowHTTP3 {
 		rt, err := newHTTP3Transport(up, fixed)
@@ -81,7 +92,7 @@ func (u *upstreamPool) close() {
 
 func newForwarder(p *Proxy) (*forwarder, error) {
 	up := newUpstreamDialer(p.cfg.transport)
-	shared, err := newUpstreamPool(up, "")
+	shared, err := newUpstreamPool(up, "", "")
 	if err != nil {
 		return nil, err
 	}
@@ -103,20 +114,21 @@ func (f *forwarder) close() {
 	f.up.close()
 }
 
-func (f *forwarder) poolFor(fixed string) (*upstreamPool, error) {
+func (f *forwarder) poolFor(scheme, fixed string) (*upstreamPool, error) {
 	if fixed == "" {
 		return f.shared, nil
 	}
+	key := scheme + " " + fixed
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if pool, ok := f.fixed.Get(fixed); ok {
+	if pool, ok := f.fixed.Get(key); ok {
 		return pool, nil
 	}
-	pool, err := newUpstreamPool(f.up, fixed)
+	pool, err := newUpstreamPool(f.up, scheme, fixed)
 	if err != nil {
 		return nil, err
 	}
-	f.fixed.Add(fixed, pool)
+	f.fixed.Add(key, pool)
 	return pool, nil
 }
 
@@ -128,7 +140,7 @@ func (f *forwarder) poolFor(fixed string) (*upstreamPool, error) {
 // failing because a proxy was inserted, and a client that only speaks HTTP/1.1 must not have
 // its request delivered as h2 frames it never asked for.
 func (f *forwarder) roundTrip(req *http.Request, proto Protocol, fixed string) (*http.Response, error) {
-	pool, err := f.poolFor(fixed)
+	pool, err := f.poolFor(req.URL.Scheme, fixed)
 	if err != nil {
 		return nil, err
 	}

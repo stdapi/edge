@@ -17,18 +17,18 @@ import (
 // MaxIdleConns.
 func TestTransport_DestinationPoolIdleLimit(t *testing.T) {
 	tr := DefaultTransport()
-	shared, err := newUpstreamPool(newUpstreamDialer(tr), "")
+	shared, err := newUpstreamPool(newUpstreamDialer(tr), "", "")
 	require.NoError(t, err)
 	assert.Equal(t, tr.MaxIdleConns, shared.h1.MaxIdleConns)
 	assert.Equal(t, tr.MaxIdleConns, shared.h2.MaxIdleConns)
 
-	pool, err := newUpstreamPool(newUpstreamDialer(tr), "127.0.0.1:443")
+	pool, err := newUpstreamPool(newUpstreamDialer(tr), "https", "127.0.0.1:443")
 	require.NoError(t, err)
 	assert.Equal(t, tr.MaxIdleConnsPerHost, pool.h1.MaxIdleConns)
 	assert.Equal(t, tr.MaxIdleConnsPerHost, pool.h2.MaxIdleConns)
 
 	tr.MaxIdleConnsPerHost = 0
-	pool, err = newUpstreamPool(newUpstreamDialer(tr), "127.0.0.1:443")
+	pool, err = newUpstreamPool(newUpstreamDialer(tr), "https", "127.0.0.1:443")
 	require.NoError(t, err)
 	assert.Equal(t, http.DefaultMaxIdleConnsPerHost, pool.h1.MaxIdleConns)
 }

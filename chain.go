@@ -6,15 +6,18 @@ package edge
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,6 +26,19 @@ import (
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/quic-go/quicvarint"
 )
+
+const (
+	// proxyConnectTimeout bounds the CONNECT and CONNECT-UDP exchange with a proxy.
+	proxyConnectTimeout = time.Minute
+	// proxyResponseBytes bounds the response head a proxy may answer a CONNECT with.
+	proxyResponseBytes = http.DefaultMaxHeaderBytes
+	// proxyKeepAlive keeps the connection to a proxy open while its tunnels are silent.
+	proxyKeepAlive = 10 * time.Second
+)
+
+// errTunnelEnded ends the reads of a tunnel once its stream or the connection to the proxy
+// has ended.
+var errTunnelEnded = errors.New("edge: CONNECT-UDP tunnel ended")
 
 // upstreamDialer opens every connection the proxy makes upstream, through the proxy
 // [Transport.Proxy] selects when it selects one.
@@ -56,7 +72,7 @@ func (u *upstreamDialer) close() {
 }
 
 // proxyFor returns the proxy selected for a connection to addr, nil for a direct one. scheme
-// is what the connection carries, https for TLS and QUIC and http for the clear.
+// is https for TLS and QUIC and http for the clear.
 func (u *upstreamDialer) proxyFor(addr, scheme string) (*url.URL, error) {
 	if u.t.Proxy == nil {
 		return nil, nil
@@ -109,8 +125,8 @@ func quicOn(ctx context.Context, sock net.Conn, addr string, tlsCfg *tls.Config,
 		return nil, fmt.Errorf("edge: dial %s: the dialer returned a socket with no peer", addr)
 	}
 	if _, ok := sock.(*connectUDPConn); ok {
-		// A tunnel carries one datagram per QUIC datagram of the proxy connection, so the
-		// packets stay at the size every path carries.
+		// Each packet goes inside one QUIC datagram of the proxy connection, so the packets
+		// stay at the size every path accepts.
 		qcfg = qcfg.Clone()
 		qcfg.InitialPacketSize = 1200
 		qcfg.DisablePathMTUDiscovery = true
@@ -155,6 +171,7 @@ func (u *upstreamDialer) connect(ctx context.Context, proxy *url.URL, addr strin
 	if err != nil {
 		return nil, fmt.Errorf("dial proxy %s: %w", proxy.Redacted(), err)
 	}
+	_ = conn.SetDeadline(time.Now().Add(proxyConnectTimeout))
 	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	tunnel, err := u.connectOn(ctx, conn, proxy, addr)
 	if !stop() {
@@ -165,6 +182,7 @@ func (u *upstreamDialer) connect(ctx context.Context, proxy *url.URL, addr strin
 		_ = conn.Close()
 		return nil, fmt.Errorf("dial %s through %s: %w", addr, proxy.Redacted(), err)
 	}
+	_ = conn.SetDeadline(time.Time{})
 	return tunnel, nil
 }
 
@@ -187,21 +205,22 @@ func (u *upstreamDialer) connectOn(ctx context.Context, conn net.Conn, proxy *ur
 	if err := req.Write(conn); err != nil {
 		return nil, fmt.Errorf("write CONNECT: %w", err)
 	}
-	br := bufio.NewReader(conn)
+	br := bufio.NewReader(io.LimitReader(conn, proxyResponseBytes))
 	resp, err := http.ReadResponse(br, req)
 	if err != nil {
 		return nil, fmt.Errorf("read CONNECT response: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		_ = resp.Body.Close()
+		// The body is left unread, the caller closes the connection.
 		return nil, errors.New("CONNECT refused with " + resp.Status)
 	}
 	if br.Buffered() == 0 {
 		return conn, nil
 	}
-	// A peer that speaks first, an SMTP banner for instance, may already be behind the
+	// A peer that sends first, an SMTP banner for instance, may already be behind the
 	// response.
-	return bufferedConn{Conn: conn, r: br}, nil
+	early, _ := br.Peek(br.Buffered())
+	return bufferedConn{Conn: conn, r: io.MultiReader(bytes.NewReader(slices.Clone(early)), conn)}, nil
 }
 
 // connectUDP opens a UDP tunnel to addr with a CONNECT-UDP to the proxy, RFC 9298.
@@ -233,6 +252,8 @@ func openTunnelOn(ctx context.Context, cc *http3.ClientConn, proxy *url.URL, hos
 		req.Header.Set("Proxy-Authorization", auth)
 	}
 
+	ctx, done := context.WithTimeout(ctx, proxyConnectTimeout)
+	defer done()
 	str, err := cc.OpenRequestStream(ctx)
 	if err != nil {
 		return nil, err
@@ -310,8 +331,9 @@ func (u *upstreamDialer) openProxyConn(ctx context.Context, proxy *url.URL, addr
 	qc, err := quicOn(ctx, sock, addr, cfg, &quic.Config{
 		EnableDatagrams: true,
 		MaxIdleTimeout:  u.t.IdleConnTimeout,
-		// The connection carries the 1200 byte Initial of a QUIC connection inside a
-		// datagram, which the default initial packet size does not leave room for.
+		KeepAlivePeriod: proxyKeepAlive,
+		// The 1200 byte Initial of an inner QUIC connection goes inside one datagram, which
+		// the default initial packet size does not leave room for.
 		InitialPacketSize: 1350,
 	})
 	if err != nil {
@@ -334,7 +356,7 @@ func (u *upstreamDialer) openProxyConn(ctx context.Context, proxy *url.URL, addr
 }
 
 // connectUDPConn is a CONNECT-UDP tunnel as a connected socket, one datagram per Read and per
-// Write. A datagram larger than the tunnel carries is dropped.
+// Write. A datagram too large for the tunnel is dropped.
 type connectUDPConn struct {
 	str       *http3.RequestStream
 	deadline  atomic.Pointer[time.Time]
@@ -374,10 +396,12 @@ func (c *connectUDPConn) Read(b []byte) (int, error) {
 	for {
 		data, err := c.str.ReceiveDatagram(ctx)
 		if err != nil {
-			if errors.Is(err, context.DeadlineExceeded) {
+			if ctx.Err() != nil {
 				return 0, os.ErrDeadlineExceeded
 			}
-			return 0, err
+			// The error of a stream or a connection is sticky, and some report themselves
+			// as a timeout, which a reader would retry.
+			return 0, errTunnelEnded
 		}
 		// Context ID 0 is a UDP payload, RFC 9298 section 5. Anything else is dropped.
 		id, n, perr := quicvarint.Parse(data)
