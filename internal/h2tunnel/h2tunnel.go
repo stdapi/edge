@@ -421,7 +421,9 @@ func (c *Conn) handleSettings(f *http2.SettingsFrame) error {
 			delta := int64(s.Val) - c.initialWindow
 			c.initialWindow = int64(s.Val)
 			for _, st := range c.streams {
-				st.addSendWindow(delta)
+				if st.addSendWindow(delta) {
+					return http2.ConnectionError(http2.ErrCodeFlowControl)
+				}
 			}
 		case http2.SettingMaxFrameSize:
 			if s.Val < 16384 || s.Val > 1<<24-1 {
@@ -575,8 +577,8 @@ func (c *Conn) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
 		}
 		return nil
 	}
-	if s := c.stream(f.StreamID); s != nil {
-		s.addSendWindow(int64(f.Increment))
+	if s := c.stream(f.StreamID); s != nil && s.addSendWindow(int64(f.Increment)) {
+		c.resetStream(f.StreamID, http2.ErrCodeFlowControl, false)
 	}
 	return nil
 }
@@ -676,11 +678,15 @@ func (s *Stream) signal(ch chan struct{}) {
 	}
 }
 
-func (s *Stream) addSendWindow(delta int64) {
+// addSendWindow grows the send window by delta and reports whether it overflowed, RFC 9113
+// section 6.9.1.
+func (s *Stream) addSendWindow(delta int64) bool {
 	s.mu.Lock()
 	s.sendWindow += delta
+	overflow := s.sendWindow > 1<<31-1
 	s.mu.Unlock()
 	s.signal(s.writeReady)
+	return overflow
 }
 
 // endRead ends the reads with err once the buffered chunks are drained.

@@ -621,3 +621,59 @@ func TestConn_GoAwayEndsWhenDrained(t *testing.T) {
 	}
 	require.ErrorIs(t, c.Err(), ErrGoAway)
 }
+
+// A WINDOW_UPDATE that overflows a stream's send window ends that stream with a
+// FLOW_CONTROL_ERROR the peer receives, and the connection goes on.
+func TestConn_StreamWindowOverflow(t *testing.T) {
+	cli, srv := tcpPair(t)
+	overflow := make(chan uint32, 1)
+	reset := make(chan http2.ErrCode, 1)
+	go func() {
+		peer, err := startFakePeer(srv)
+		if err != nil {
+			return
+		}
+		go func() {
+			id := <-overflow
+			peer.wmu.Lock()
+			_ = peer.fr.WriteWindowUpdate(id, 1<<31-1)
+			_ = peer.fr.WriteWindowUpdate(id, 1<<31-1)
+			peer.wmu.Unlock()
+		}()
+		for {
+			f, rerr := peer.fr.ReadFrame()
+			if rerr != nil {
+				return
+			}
+			switch f := f.(type) {
+			case *http2.MetaHeadersFrame:
+				_ = peer.answer(f.StreamID)
+			case *http2.RSTStreamFrame:
+				reset <- f.ErrCode
+			}
+		}
+	}()
+	c, err := Client(cli)
+	require.NoError(t, err)
+	defer func() { _ = c.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	s, _, err := c.Open(ctx, Request{Authority: "origin.test:443"})
+	require.NoError(t, err)
+
+	overflow <- s.id
+	select {
+	case code := <-reset:
+		assert.Equal(t, http2.ErrCodeFlowControl, code)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the peer did not receive the reset")
+	}
+	_, err = s.Read(make([]byte, 1))
+	var se http2.StreamError
+	require.ErrorAs(t, err, &se)
+	assert.Equal(t, http2.ErrCodeFlowControl, se.Code)
+	require.True(t, c.CanOpen())
+	again, _, err := c.Open(ctx, Request{Authority: "origin.test:443"})
+	require.NoError(t, err)
+	_ = again.Close()
+}
