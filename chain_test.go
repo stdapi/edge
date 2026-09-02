@@ -6,6 +6,7 @@ package edge
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -15,12 +16,16 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/fox-toolkit/edge/internal/h2tunnel"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
 )
 
 // fixedProxy selects one proxy for every connection.
@@ -754,4 +759,83 @@ func TestChain_RefusedCONNECTUDPLeavesTheHTTP2ConnectionShared(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = conn.Close() }()
 	assert.EqualValues(t, 1, dialer.tcp.Load(), "the refusal did not cost the connection")
+}
+
+// h2Peer is the server end of an HTTP/2 connection to a fake proxy, answering every CONNECT
+// with 200 and going away when told.
+func h2Peer(t *testing.T, nc net.Conn) chan<- uint32 {
+	t.Helper()
+	goAway := make(chan uint32, 1)
+	go func() {
+		fr := http2.NewFramer(nc, nc)
+		fr.ReadMetaHeaders = hpack.NewDecoder(4096, nil)
+		var mu sync.Mutex
+		var buf bytes.Buffer
+		enc := hpack.NewEncoder(&buf)
+		preface := make([]byte, len(http2.ClientPreface))
+		if _, err := io.ReadFull(nc, preface); err != nil {
+			return
+		}
+		if err := fr.WriteSettings(http2.Setting{ID: http2.SettingEnableConnectProtocol, Val: 1}); err != nil {
+			return
+		}
+		go func() {
+			last, ok := <-goAway
+			if !ok {
+				return
+			}
+			mu.Lock()
+			_ = fr.WriteGoAway(last, http2.ErrCodeNo, nil)
+			mu.Unlock()
+		}()
+		for {
+			f, err := fr.ReadFrame()
+			if err != nil {
+				return
+			}
+			if mh, ok := f.(*http2.MetaHeadersFrame); ok {
+				mu.Lock()
+				buf.Reset()
+				_ = enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+				_ = fr.WriteHeaders(http2.HeadersFrameParam{StreamID: mh.StreamID, BlockFragment: buf.Bytes(), EndHeaders: true})
+				mu.Unlock()
+			}
+		}
+	}()
+	return goAway
+}
+
+// An HTTP/2 connection to a proxy replaced after a GOAWAY, with a tunnel still on it, ends
+// with the dialer like the one that replaced it.
+func TestChain_ReplacedHTTP2ConnectionEndsWithTheDialer(t *testing.T) {
+	u := newUpstreamDialer(&Transport{})
+	proxy, err := url.Parse("https://proxy.test:443")
+	require.NoError(t, err)
+
+	cli1, srv1 := tcpPair(t)
+	goAway := h2Peer(t, srv1)
+	cc1, err := u.shareH2Conn(proxy, cli1)
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	str, _, err := cc1.Open(ctx, h2tunnel.Request{Authority: "proxy.test:443"})
+	require.NoError(t, err)
+	goAway <- 1
+	require.Eventually(t, func() bool { return !cc1.CanOpen() }, 5*time.Second, 10*time.Millisecond)
+
+	cli2, srv2 := tcpPair(t)
+	h2Peer(t, srv2)
+	cc2, err := u.shareH2Conn(proxy, cli2)
+	require.NoError(t, err)
+	require.NotSame(t, cc1, cc2, "a connection going away is not reused")
+	require.NoError(t, cc1.Err(), "a connection with a tunnel on it stays until the tunnel ends")
+
+	u.close()
+	for _, srv := range []net.Conn{srv1, srv2} {
+		require.NoError(t, srv.SetReadDeadline(time.Now().Add(2*time.Second)))
+		_, err = srv.Read(make([]byte, 1))
+		require.ErrorIs(t, err, io.EOF, "a connection outlived the dialer")
+	}
+	_, err = str.Read(make([]byte, 1))
+	require.Error(t, err)
 }

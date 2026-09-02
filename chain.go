@@ -54,7 +54,10 @@ type upstreamDialer struct {
 	// tried on a proxy.
 	noH3 map[string]time.Time
 	noH2 map[string]time.Time
-	mu   sync.Mutex
+	// draining holds the HTTP/2 connections replaced after a GOAWAY while their last tunnels
+	// end, so that close reaches them.
+	draining []*h2tunnel.Conn
+	mu       sync.Mutex
 	// closed refuses a proxy connection opened after close, so none outlives the forwarder.
 	closed bool
 }
@@ -73,13 +76,16 @@ func newUpstreamDialer(t *Transport) *upstreamDialer {
 func (u *upstreamDialer) close() {
 	u.mu.Lock()
 	u.closed = true
-	conns, h2conns := u.conns, u.h2conns
-	u.conns, u.h2conns = nil, nil
+	conns, h2conns, draining := u.conns, u.h2conns, u.draining
+	u.conns, u.h2conns, u.draining = nil, nil, nil
 	u.mu.Unlock()
 	for _, cc := range conns {
 		_ = cc.CloseWithError(0, "")
 	}
 	for _, cc := range h2conns {
+		_ = cc.Close()
+	}
+	for _, cc := range draining {
 		_ = cc.Close()
 	}
 	_ = u.h3.Close()
@@ -438,9 +444,13 @@ func (u *upstreamDialer) shareH2Conn(proxy *url.URL, tc net.Conn) (*h2tunnel.Con
 		_ = cc.Close()
 		return nil, net.ErrClosed
 	}
-	if other := u.h2conns[key]; other != nil && other.CanOpen() {
-		_ = cc.Close()
-		return other, nil
+	if other := u.h2conns[key]; other != nil {
+		if other.CanOpen() {
+			_ = cc.Close()
+			return other, nil
+		}
+		u.draining = slices.DeleteFunc(u.draining, func(d *h2tunnel.Conn) bool { return d.Err() != nil })
+		u.draining = append(u.draining, other)
 	}
 	u.h2conns[key] = cc
 	return cc, nil

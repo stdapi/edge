@@ -179,11 +179,13 @@ func (c *Conn) write(f func(*http2.Framer) error) error {
 	}
 }
 
-// tryWrite queues f without waiting for it and drops it when the queue is full.
-func (c *Conn) tryWrite(f func(*http2.Framer) error) {
+// tryWrite queues f without waiting for it, and reports false when the queue is full.
+func (c *Conn) tryWrite(f func(*http2.Framer) error) bool {
 	select {
 	case c.writes <- writeRequest{f: f}:
+		return true
 	default:
+		return false
 	}
 }
 
@@ -305,6 +307,7 @@ func (c *Conn) Open(ctx context.Context, req Request) (*Stream, *Response, error
 	s.sendWindow = c.initialWindow
 	s.recvWindow = window
 	c.streams[s.id] = s
+	maxFrame := int(c.maxFrameSize)
 	c.mu.Unlock()
 
 	err := c.write(func(fr *http2.Framer) error {
@@ -324,7 +327,7 @@ func (c *Conn) Open(ctx context.Context, req Request) (*Stream, *Response, error
 				c.field(name, v)
 			}
 		}
-		if c.encBuf.Len() > int(c.maxFrameSize) {
+		if c.encBuf.Len() > maxFrame {
 			return errors.New("h2tunnel: request headers exceed a frame")
 		}
 		return fr.WriteHeaders(http2.HeadersFrameParam{StreamID: s.id, BlockFragment: c.encBuf.Bytes(), EndHeaders: true})
@@ -389,7 +392,8 @@ func (c *Conn) handle(f http2.Frame) error {
 		if f.IsAck() {
 			return nil
 		}
-		return c.write(func(fr *http2.Framer) error { return fr.WritePing(true, f.Data) })
+		c.tryWrite(func(fr *http2.Framer) error { return fr.WritePing(true, f.Data) })
+		return nil
 	case *http2.RSTStreamFrame:
 		c.resetStream(f.StreamID, f.ErrCode, true)
 		return nil
@@ -435,9 +439,7 @@ func (c *Conn) handleSettings(f *http2.SettingsFrame) error {
 	if err != nil {
 		return err
 	}
-	if err := c.write(func(fr *http2.Framer) error { return fr.WriteSettingsAck() }); err != nil {
-		return err
-	}
+	c.tryWrite(func(fr *http2.Framer) error { return fr.WriteSettingsAck() })
 	c.settingsOnce.Do(func() { close(c.settingsSeen) })
 	return nil
 }
@@ -477,7 +479,8 @@ func (c *Conn) handleData(f *http2.DataFrame) error {
 	s := c.stream(f.StreamID)
 	if s == nil {
 		// A stream that ended still had its window on the connection.
-		return c.consumed(nil, n)
+		c.consumed(nil, n)
+		return nil
 	}
 	s.mu.Lock()
 	if n > s.recvWindow {
@@ -494,39 +497,39 @@ func (c *Conn) handleData(f *http2.DataFrame) error {
 		s.endRead(io.EOF)
 	}
 	// The padding is consumed at once, the data when read.
-	return c.consumed(s, n-int64(len(f.Data())))
+	c.consumed(s, n-int64(len(f.Data())))
+	return nil
 }
 
-// consumed accounts n bytes as read on s, or on the connection alone with a nil s, and sends
-// the WINDOW_UPDATEs due once half a window is owed.
-func (c *Conn) consumed(s *Stream, n int64) error {
+// consumed accounts n bytes as read on s, or on the connection alone with a nil s, and queues
+// the WINDOW_UPDATEs due once half a window is owed. A read never waits on the writer, so the
+// credit stays owed when the queue is full and goes out with the next one.
+func (c *Conn) consumed(s *Stream, n int64) {
 	if n == 0 {
-		return nil
+		return
 	}
-	var stream, conn uint32
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var stream, conn, id uint32
 	if s != nil {
 		s.mu.Lock()
+		defer s.mu.Unlock()
 		s.recvUnacked += n
 		if s.recvUnacked >= window/2 && s.readErr == nil {
 			stream = uint32(s.recvUnacked) //nolint:gosec // at most a window
-			s.recvWindow += s.recvUnacked
-			s.recvUnacked = 0
+			id = s.id
 		}
-		s.mu.Unlock()
 	}
-	c.mu.Lock()
 	c.recvUnacked += n
 	if c.recvUnacked >= window/2 {
 		conn = uint32(c.recvUnacked) //nolint:gosec // at most a window per stream
-		c.recvUnacked = 0
 	}
-	c.mu.Unlock()
 	if stream == 0 && conn == 0 {
-		return nil
+		return
 	}
-	return c.write(func(fr *http2.Framer) error {
+	queued := c.tryWrite(func(fr *http2.Framer) error {
 		if stream != 0 {
-			if err := fr.WriteWindowUpdate(s.id, stream); err != nil {
+			if err := fr.WriteWindowUpdate(id, stream); err != nil {
 				return err
 			}
 		}
@@ -535,6 +538,16 @@ func (c *Conn) consumed(s *Stream, n int64) error {
 		}
 		return nil
 	})
+	if !queued {
+		return
+	}
+	if stream != 0 {
+		s.recvWindow += int64(stream)
+		s.recvUnacked = 0
+	}
+	if conn != 0 {
+		c.recvUnacked = 0
+	}
 }
 
 func (c *Conn) handleWindowUpdate(f *http2.WindowUpdateFrame) error {
@@ -585,7 +598,18 @@ func (c *Conn) handleGoAway(f *http2.GoAwayFrame) error {
 	if f.ErrCode != http2.ErrCodeNo {
 		return http2.ConnectionError(f.ErrCode)
 	}
+	c.closeIfDrained()
 	return nil
+}
+
+// closeIfDrained ends a connection the peer is going away from once its last stream ended.
+func (c *Conn) closeIfDrained() {
+	c.mu.Lock()
+	drained := c.goAway && len(c.streams) == 0 && c.err == nil
+	c.mu.Unlock()
+	if drained {
+		c.fail(ErrGoAway, false)
+	}
 }
 
 func (c *Conn) stream(id uint32) *Stream {
@@ -610,6 +634,7 @@ func (c *Conn) resetStream(id uint32, code http2.ErrCode, fromPeer bool) {
 		c.tryWrite(func(fr *http2.Framer) error { return fr.WriteRSTStream(id, code) })
 	}
 	s.end(http2.StreamError{StreamID: id, Code: code})
+	c.closeIfDrained()
 }
 
 // Stream is one CONNECT stream as a net.Conn.
@@ -688,7 +713,7 @@ func (s *Stream) end(err error) {
 		s.signal(s.readReady)
 		s.signal(s.writeReady)
 		if buffered > 0 {
-			_ = s.c.consumed(nil, buffered)
+			s.c.consumed(nil, buffered)
 		}
 	})
 }
@@ -707,7 +732,7 @@ func (s *Stream) Read(b []byte) (int, error) {
 			returned := s.windowReturned
 			s.mu.Unlock()
 			if !returned {
-				_ = s.c.consumed(s, int64(n))
+				s.c.consumed(s, int64(n))
 			}
 			return n, nil
 		}
@@ -827,6 +852,7 @@ func (s *Stream) reset(code http2.ErrCode) {
 		c.tryWrite(func(fr *http2.Framer) error { return fr.WriteRSTStream(s.id, code) })
 	}
 	s.end(errStreamClosed)
+	c.closeIfDrained()
 }
 
 func (s *Stream) LocalAddr() net.Addr  { return s.c.nc.LocalAddr() }

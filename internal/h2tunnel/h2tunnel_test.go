@@ -462,3 +462,162 @@ func TestConn_AbandonedStreamsReturnTheWindow(t *testing.T) {
 	assert.Eventually(t, func() bool { return peer.window() == window }, 5*time.Second, 10*time.Millisecond,
 		"the window was not returned for the bytes the abandoned streams held")
 }
+
+// The peer changes SETTINGS_MAX_FRAME_SIZE while streams are opened, which the race detector
+// watches.
+func TestConn_SettingsWhileOpening(t *testing.T) {
+	cli, srv := tcpPair(t)
+	stop := make(chan struct{})
+	go func() {
+		peer, err := startFakePeer(srv, http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1 << 20})
+		if err != nil {
+			return
+		}
+		go func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				peer.wmu.Lock()
+				_ = peer.fr.WriteSettings(http2.Setting{ID: http2.SettingMaxFrameSize, Val: 16384 + uint32(time.Now().UnixNano()%1000)}) //nolint:gosec // small
+				peer.wmu.Unlock()
+				time.Sleep(50 * time.Microsecond)
+			}
+		}()
+		for {
+			f, rerr := peer.fr.ReadFrame()
+			if rerr != nil {
+				return
+			}
+			if mh, ok := f.(*http2.MetaHeadersFrame); ok {
+				_ = peer.answer(mh.StreamID)
+			}
+		}
+	}()
+
+	c, err := Client(cli)
+	require.NoError(t, err)
+	defer func() { close(stop); _ = c.Close() }()
+	for range 200 {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		s, _, oerr := c.Open(ctx, Request{Authority: "origin.test:443"})
+		cancel()
+		require.NoError(t, oerr)
+		_ = s.Close()
+	}
+}
+
+// A read with bytes in hand returns them, and one without honours its deadline, while the
+// writer is stuck on a peer that stopped reading.
+func TestStream_ReadDeadlineBehindAStuckWriter(t *testing.T) {
+	cli, srv := tcpPair(t)
+	answered := make(chan uint32, 1)
+	ready := make(chan *fakePeer, 1)
+	go func() {
+		peer, err := startFakePeer(srv, http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1 << 24})
+		if err != nil {
+			close(ready)
+			return
+		}
+		_ = peer.fr.WriteWindowUpdate(0, 1<<28)
+		ready <- peer
+		for {
+			f, rerr := peer.fr.ReadFrame()
+			if rerr != nil {
+				return
+			}
+			if mh, ok := f.(*http2.MetaHeadersFrame); ok {
+				_ = peer.answer(mh.StreamID)
+				answered <- mh.StreamID
+				// Nothing reads the socket from here on.
+				return
+			}
+		}
+	}()
+
+	c, err := Client(cli)
+	require.NoError(t, err)
+	defer func() { _ = c.Close() }()
+	peer := <-ready
+	require.NotNil(t, peer)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	s, _, err := c.Open(ctx, Request{Authority: "origin.test:443"})
+	cancel()
+	require.NoError(t, err)
+	id := <-answered
+
+	// More than half a window, so reading it owes a WINDOW_UPDATE.
+	go func() {
+		for range 40 {
+			if werr := peer.writeData(id, make([]byte, 16384)); werr != nil {
+				return
+			}
+		}
+	}()
+	go func() { _, _ = s.Write(make([]byte, 64<<20)) }()
+	time.Sleep(500 * time.Millisecond)
+
+	require.NoError(t, s.SetReadDeadline(time.Now().Add(200*time.Millisecond)))
+	buf := make([]byte, 32<<10)
+	for {
+		start := time.Now()
+		_, rerr := s.Read(buf)
+		require.Less(t, time.Since(start), 2*time.Second, "a read waited on the stuck writer")
+		if rerr != nil {
+			require.ErrorIs(t, rerr, os.ErrDeadlineExceeded)
+			return
+		}
+	}
+}
+
+// A connection the peer is going away from ends once its last stream ended, at once when
+// it has none.
+func TestConn_GoAwayEndsWhenDrained(t *testing.T) {
+	cli, srv := tcpPair(t)
+	goAway := make(chan uint32, 1)
+	go func() {
+		peer, err := startFakePeer(srv)
+		if err != nil {
+			return
+		}
+		go func() {
+			last := <-goAway
+			peer.wmu.Lock()
+			_ = peer.fr.WriteGoAway(last, http2.ErrCodeNo, nil)
+			peer.wmu.Unlock()
+		}()
+		for {
+			f, rerr := peer.fr.ReadFrame()
+			if rerr != nil {
+				return
+			}
+			if mh, ok := f.(*http2.MetaHeadersFrame); ok {
+				_ = peer.answer(mh.StreamID)
+			}
+		}
+	}()
+	c, err := Client(cli)
+	require.NoError(t, err)
+	defer func() { _ = c.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	s, _, err := c.Open(ctx, Request{Authority: "origin.test:443"})
+	require.NoError(t, err)
+
+	goAway <- s.id
+	require.Eventually(t, func() bool { return !c.CanOpen() }, 5*time.Second, 10*time.Millisecond)
+	select {
+	case <-c.Done():
+		t.Fatal("the connection ended with a stream still open on it")
+	case <-time.After(100 * time.Millisecond):
+	}
+	require.NoError(t, s.Close())
+	select {
+	case <-c.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the connection outlived its last stream")
+	}
+	require.ErrorIs(t, c.Err(), ErrGoAway)
+}
