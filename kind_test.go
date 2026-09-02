@@ -852,3 +852,43 @@ func TestKindGRPC_DeleteReachesTheCallAtItsNextMessage(t *testing.T) {
 		})
 	}
 }
+
+// The gate is an io.Reader like any other, so a reader that asks for fewer bytes than a
+// header at a time still sees the stream in order, and a header cut short by an error is
+// handed out whole before the error.
+func TestKindGRPC_MessageGateIsTransparentForAnyReadSize(t *testing.T) {
+	var in []byte
+	in = appendGRPCMessage(in, false, []byte("0123456789"))
+	in = appendGRPCMessage(in, false, nil)
+	in = appendGRPCMessage(in, true, []byte("abc"))
+
+	readAll := func(t *testing.T, src string, size int) ([]byte, error) {
+		t.Helper()
+		g := &messageGate{r: io.NopCloser(strings.NewReader(src)), admit: func() bool { return true }}
+		var out []byte
+		buf := make([]byte, size)
+		for {
+			n, err := g.Read(buf)
+			out = append(out, buf[:n]...)
+			if err != nil {
+				return out, err
+			}
+		}
+	}
+
+	for _, size := range []int{1, 2, 3, 4, 5, 6, 7, 64} {
+		t.Run(fmt.Sprintf("size=%d", size), func(t *testing.T) {
+			out, err := readAll(t, string(in), size)
+			require.ErrorIs(t, err, io.EOF)
+			assert.Equal(t, in, out)
+		})
+	}
+
+	t.Run("truncated header", func(t *testing.T) {
+		for _, size := range []int{1, 64} {
+			out, err := readAll(t, "\x00\x00\x01", size)
+			require.ErrorIs(t, err, io.EOF)
+			assert.Equal(t, []byte{0, 0, 1}, out, "size=%d", size)
+		}
+	})
+}

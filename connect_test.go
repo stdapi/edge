@@ -273,3 +273,57 @@ func TestConnect_CloseOnAnH2StreamEndsOnlyThatTunnel(t *testing.T) {
 	assert.Equal(t, "three\n", line, "the front connection survives its tunnel")
 	waitForSessions(t, p, 2)
 }
+
+// Two CONNECTs to two different literals on one port under one server name reach the two
+// origins they declared, and a third to the first literal does too. Upstream connections are
+// pooled per destination, so the requests of one client never go over a connection another
+// client chose.
+func TestConnect_PoolIsKeyedOnTheDeclaredDestination(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	cert := selfSignedFor(t, ca, "example.test")
+	a, b := twoOriginsOnOnePort(t, func(ln net.Listener, id string) {
+		srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			fmt.Fprint(w, id)
+		})}
+		go func() { _ = srv.Serve(tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{cert}})) }()
+		t.Cleanup(func() { _ = srv.Close() })
+	})
+
+	tr := DefaultTransport()
+	tr.RootCAs = poolOf(ca)
+	p, err := New(WithCA(ca), WithTransport(tr))
+	require.NoError(t, err)
+	p.MustAdd("example.test/", forwardHandler)
+	p.MustAdd[TCP]("[127.0.0.0/8]", relayStream)
+	p.MustAdd[TCP]("[::1]", relayStream)
+	addr := startProxy(t, p)
+
+	get := func(target netip.AddrPort) string {
+		client := tunnelClient(t, addr, target.String(), "example.test", ca)
+		resp, err := client.Get("https://example.test/")
+		require.NoError(t, err)
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		return string(body)
+	}
+	assert.Equal(t, "A", get(a))
+	assert.Equal(t, "B", get(b), "the second CONNECT declared B")
+	assert.Equal(t, "A", get(a))
+}
+
+// twoOriginsOnOnePort starts serve on 127.0.0.1 and on [::1], both on the same port, so the
+// two origins share an authority and differ only by the address a client declares.
+func twoOriginsOnOnePort(t *testing.T, serve func(ln net.Listener, id string)) (a, b netip.AddrPort) {
+	t.Helper()
+	lnA, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	lnB, err := net.Listen("tcp", fmt.Sprintf("[::1]:%d", lnA.Addr().(*net.TCPAddr).Port))
+	if err != nil {
+		_ = lnA.Close()
+		t.Skipf("no IPv6 loopback: %v", err)
+	}
+	serve(lnA, "A")
+	serve(lnB, "B")
+	return netip.MustParseAddrPort(lnA.Addr().String()), netip.MustParseAddrPort(lnB.Addr().String())
+}

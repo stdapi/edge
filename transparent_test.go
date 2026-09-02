@@ -5,6 +5,7 @@
 package edge
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -812,4 +813,68 @@ func TestTransparent_StreamAndHTTPOnOneDestination(t *testing.T) {
 
 	sessions := waitForSessions(t, p, 1)
 	assert.Equal(t, KindTCP, sessions[0].Kind())
+}
+
+type countingListener struct {
+	net.Listener
+	accepted atomic.Int32
+}
+
+func (l *countingListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err == nil {
+		l.accepted.Add(1)
+	}
+	return c, err
+}
+
+// Under plaintext no certificate ties a pooled connection to its name, so the pool is keyed on
+// the destination. A client headed to one origin never uses the connection another client
+// opened to a different one, and two clients headed to the same origin share it.
+func TestTransparent_PlainPoolIsKeyedOnTheDestination(t *testing.T) {
+	var toA countingListener
+	a, b := twoOriginsOnOnePort(t, func(ln net.Listener, id string) {
+		if id == "A" {
+			toA.Listener = ln
+			ln = &toA
+		}
+		srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			fmt.Fprint(w, id)
+		})}
+		go func() { _ = srv.Serve(ln) }()
+		t.Cleanup(func() { _ = srv.Close() })
+	})
+
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+	p.MustAdd("example.test/", forwardHandler)
+
+	var headedTo atomic.Value
+	addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) {
+		return headedTo.Load().(netip.AddrPort), nil
+	})
+	get := func(origin netip.AddrPort) string {
+		headedTo.Store(origin)
+		conn, err := net.Dial("tcp", addr)
+		require.NoError(t, err)
+		defer func() { _ = conn.Close() }()
+		_, err = fmt.Fprint(conn, "GET / HTTP/1.1\r\nHost: example.test\r\n\r\n")
+		require.NoError(t, err)
+		require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+		resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+		require.NoError(t, err)
+		body, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		return string(body)
+	}
+
+	assert.Equal(t, "B", get(b))
+	assert.Equal(t, "A", get(a), "the client was headed to A")
+	// The first connection to A goes back to its pool once its response is done, which the
+	// transport does just after the proxy has written the body.
+	time.Sleep(100 * time.Millisecond)
+	assert.Equal(t, "A", get(a))
+	assert.EqualValues(t, 1, toA.accepted.Load(), "two clients headed to A share one upstream connection")
 }

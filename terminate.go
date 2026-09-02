@@ -272,10 +272,21 @@ func (p *Proxy) serveTerminatedRequest(w http.ResponseWriter, r *http.Request) {
 		r.TLS = state
 	}
 
+	target := terminatedTarget(r, sess)
+	if sess.upstream.IsValid() && sess.TLS() == nil {
+		// The server name of a TLS connection was checked in placeTLS.
+		var ok bool
+		if target, ok = p.verifyRequestHost(r.Context(), sess, target); !ok {
+			http.Error(w, "edge: connection rejected, the host does not resolve to the destination",
+				http.StatusForbidden)
+			return
+		}
+	}
+
 	// Nothing on a terminated connection is challenged, since the client believes it is
 	// talking to the origin. The identity is the one of whatever established the connection,
 	// or none.
-	p.dispatchRequest(w, r, sess, terminatedTarget(r, sess), sess.identity)
+	p.dispatchRequest(w, r, sess, target, sess.identity)
 }
 
 // terminatedTarget resolves the target of a request read off a terminated connection. The Host

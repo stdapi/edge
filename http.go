@@ -5,7 +5,6 @@
 package edge
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"iter"
@@ -182,7 +181,11 @@ func (c *HTTPCtx) ForwardRequest(r *http.Request) (*http.Response, error) {
 		return nil, err
 	}
 
-	resp, err := c.r.p.srv.fwd.roundTrip(out, c.upstreamProtocol())
+	var fixed string
+	if c.r.sess != nil {
+		fixed = c.r.sess.dialAddr()
+	}
+	resp, err := c.r.p.srv.fwd.roundTrip(out, c.upstreamProtocol(), fixed)
 	if err != nil {
 		return nil, fmt.Errorf("forward %s %s: %w", out.Method, out.URL.Redacted(), err)
 	}
@@ -199,16 +202,7 @@ func (c *HTTPCtx) outboundRequest(r *http.Request) (*http.Request, error) {
 		return nil, errors.New("edge: forward a request with no URL")
 	}
 
-	ctx := r.Context()
-	if c.r.sess != nil {
-		// The connection fixed where its traffic goes, the redirect destination or the
-		// CONNECT target.
-		if addr := c.r.sess.dialAddr(); addr != "" {
-			ctx = context.WithValue(ctx, upstreamAddrKey{}, addr)
-		}
-	}
-
-	out := r.Clone(ctx)
+	out := r.Clone(r.Context())
 	// A client request carries no RequestURI; net/http panics otherwise.
 	out.RequestURI = ""
 	out.Close = false

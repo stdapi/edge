@@ -141,7 +141,7 @@ func (p *Proxy) serveTransparentTLS(ctx context.Context, conn *peekConn, origin 
 
 	sess := newSession(ctx, conn, target, 0, 0)
 	sess.transparent = true
-	sess.upstream = origin
+	sess.setUpstream(origin)
 	return p.terminate(ctx, conn, sess)
 }
 
@@ -163,7 +163,7 @@ func (p *Proxy) serveTransparentPlain(ctx context.Context, conn *peekConn, origi
 
 	sess := newSession(ctx, conn, target, 0, 0)
 	sess.transparent = true
-	sess.upstream = origin
+	sess.setUpstream(origin)
 	sess.perRequest = true
 
 	return p.serveCandidates(ctx, conn, sess, sniffStreamCandidates(conn, p.cfg.server.sniffTimeout), nil)

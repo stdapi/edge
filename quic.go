@@ -401,8 +401,7 @@ func (s *QUICStream) Relay() error {
 // closePeer closes to with the application error that ended the peer connection, when there
 // was one.
 func closePeer(to *quic.Conn, err error) {
-	var appErr *quic.ApplicationError
-	if errors.As(err, &appErr) {
+	if appErr, ok := errors.AsType[*quic.ApplicationError](err); ok {
 		_ = to.CloseWithError(appErr.ErrorCode, appErr.ErrorMessage)
 		return
 	}

@@ -269,7 +269,7 @@ func pipeSession(c *routeCtx, r *http.Request, kind Kind, pipe io.Closer) *Sessi
 	sess.remoteAddr = front.remoteAddr
 	sess.localAddr = front.localAddr
 	sess.clientHello = front.clientHello
-	sess.upstream = front.upstream
+	sess.upstream, sess.dial = front.upstream, front.dial
 	sess.transparent = front.transparent
 	if state := front.tlsState.Load(); state != nil {
 		sess.tlsState.Store(state)

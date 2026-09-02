@@ -19,6 +19,10 @@ import (
 
 // Transport configures how the proxy reaches upstream servers. The zero value is not usable;
 // start from [DefaultTransport] and change what you need.
+//
+// Connections are pooled per destination, the address a redirect was headed to or the CONNECT
+// target, and the limits below apply to each pool. Requests with no fixed destination share
+// one pool.
 type Transport struct {
 	// DialContext dials an upstream. It defaults to a net.Dialer with a 30s timeout and
 	// keep-alives enabled. Override it to pin a resolver, force a source address, or route
@@ -79,19 +83,12 @@ func DefaultTransport() *Transport {
 	}
 }
 
-// withUpstreamOverride lets a request reach the destination its connection fixed, the address
-// a redirect was headed to or the CONNECT target, instead of whatever resolving the authority
-// again would produce.
-//
-// Connections are still pooled per authority, so two redirects to different members of the
-// same pool may share one upstream connection. Both are legitimate origins for that
-// authority, which makes the sharing harmless.
-func withUpstreamOverride(dial func(context.Context, string, string) (net.Conn, error)) func(context.Context, string, string) (net.Conn, error) {
-	return func(ctx context.Context, network, addr string) (net.Conn, error) {
-		if fixed, ok := ctx.Value(upstreamAddrKey{}).(string); ok && fixed != "" {
-			addr = fixed
-		}
-		return dial(ctx, network, addr)
+func dialFixed(dial func(context.Context, string, string) (net.Conn, error), fixed string) func(context.Context, string, string) (net.Conn, error) {
+	if fixed == "" {
+		return dial
+	}
+	return func(ctx context.Context, network, _ string) (net.Conn, error) {
+		return dial(ctx, network, fixed)
 	}
 }
 
@@ -103,7 +100,7 @@ func withUpstreamOverride(dial func(context.Context, string, string) (net.Conn, 
 // origin produced, encoded the way the client asked for it: letting net/http add its own
 // Accept-Encoding and transparently gunzip would change both the request the origin sees and
 // the bytes the client gets, and would hide Content-Encoding from handlers.
-func (t *Transport) httpTransport(allowH2 bool) *http.Transport {
+func (t *Transport) httpTransport(allowH2 bool, fixed string) *http.Transport {
 	tlsCfg := t.upstreamTLSConfig()
 
 	if allowH2 {
@@ -135,7 +132,7 @@ func (t *Transport) httpTransport(allowH2 bool) *http.Transport {
 	if tr.DialContext == nil {
 		tr.DialContext = (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext
 	}
-	tr.DialContext = withUpstreamOverride(tr.DialContext)
+	tr.DialContext = dialFixed(tr.DialContext, fixed)
 	return tr
 }
 
@@ -158,7 +155,7 @@ func (t *Transport) upstreamTLSConfig() *tls.Config {
 
 // newHTTP3Transport builds the upstream transport used when a client speaks HTTP/3 and
 // [Transport.AllowHTTP3] is on.
-func newHTTP3Transport(t *Transport) (http.RoundTripper, error) {
+func newHTTP3Transport(t *Transport, fixed string) (http.RoundTripper, error) {
 	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS13}
 	if t.TLSClientConfig != nil {
 		tlsCfg = t.TLSClientConfig.Clone()
@@ -183,10 +180,9 @@ func newHTTP3Transport(t *Transport) (http.RoundTripper, error) {
 		},
 		DisableCompression: true,
 		Dial: func(ctx context.Context, addr string, cfg *tls.Config, qcfg *quic.Config) (*quic.Conn, error) {
-			// The request goes where its connection fixed. The server name stays the one in
-			// the request, so the certificate is still checked against the authority the
-			// client asked for.
-			if fixed, ok := ctx.Value(upstreamAddrKey{}).(string); ok && fixed != "" {
+			// The server name stays the one in the request, so the certificate is still
+			// checked against the authority the client asked for.
+			if fixed != "" {
 				addr = fixed
 			}
 			udpAddr, err := net.ResolveUDPAddr("udp", addr)

@@ -13,6 +13,12 @@ import (
 	"time"
 )
 
+type verifiedHost struct {
+	target  Target
+	host    string
+	refused bool
+}
+
 // nameVerifyTimeout bounds the resolver lookup a transparent connection waits on.
 const nameVerifyTimeout = 5 * time.Second
 
@@ -118,4 +124,23 @@ func (p *Proxy) targetForTransparent(ctx context.Context, target Target, origin 
 	p.cfg.logger.Debug("edge: server name does not resolve to the destination",
 		slog.String("name", target.Host), slog.String("destination", origin.String()))
 	return nameless, fallback, nameDropped
+}
+
+// verifyRequestHost checks the Host of a plaintext request against the destination its
+// connection fixed, the way placeTLS checks a server name, and returns the target the request
+// is routed on. The decision is kept on the session per Host, refusals included.
+func (p *Proxy) verifyRequestHost(ctx context.Context, sess *Session, target Target) (Target, bool) {
+	if p.cfg.verifyNames == VerifyOff || !sess.upstream.IsValid() {
+		return target, true
+	}
+	if _, err := netip.ParseAddr(target.Host); err == nil {
+		return target, true
+	}
+	if v := sess.verified.Load(); v != nil && v.host == target.Host && v.target.Port == target.Port {
+		return v.target, !v.refused
+	}
+	verified, _, verdict := p.targetForTransparent(ctx, target, sess.upstream, true, KindHTTP)
+	refused := verdict == nameMismatch || verdict == nameUnresolved
+	sess.verified.Store(&verifiedHost{host: target.Host, target: verified, refused: refused})
+	return verified, !refused
 }

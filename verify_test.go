@@ -5,6 +5,7 @@
 package edge
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -468,4 +469,129 @@ func TestNameVerification_ResolutionCarriesADeadline(t *testing.T) {
 	assert.False(t, admitted)
 	assert.Equal(t, nameUnresolved, verdict)
 	assert.True(t, r.sawDeadline.Load(), "a resolver without a deadline could stall the connection forever")
+}
+
+func plainOrigin(t *testing.T, body string) (netip.AddrPort, *countingListener) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	cl := &countingListener{Listener: ln}
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, body)
+	})}
+	go func() { _ = srv.Serve(cl) }()
+	t.Cleanup(func() { _ = srv.Close() })
+	return netip.MustParseAddrPort(ln.Addr().String()), cl
+}
+
+func plainRequest(t *testing.T, conn net.Conn, br *bufio.Reader, host string) (int, string) {
+	t.Helper()
+	_, err := fmt.Fprintf(conn, "GET / HTTP/1.1\r\nHost: %s\r\n\r\n", host)
+	require.NoError(t, err)
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+	resp, err := http.ReadResponse(br, nil)
+	require.NoError(t, err)
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	return resp.StatusCode, string(body)
+}
+
+// A plaintext connection has no server name, so the Host of each request is checked against
+// the destination, with the same modes and one resolution per connection as a handshake.
+func TestTransparent_NameVerificationAppliesToPlaintext(t *testing.T) {
+	setup := func(t *testing.T, opts ...ProxyOption) (*Proxy, netip.AddrPort, *countingListener, net.Conn, *bufio.Reader) {
+		t.Helper()
+		origin, accepted := plainOrigin(t, "origin")
+		ca, err := GenerateCA()
+		require.NoError(t, err)
+		p, err := New(append([]ProxyOption{WithCA(ca)}, opts...)...)
+		require.NoError(t, err)
+		p.MustAdd("example.test/", forwardHandler)
+		addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) { return origin, nil })
+		conn, err := net.Dial("tcp", addr)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = conn.Close() })
+		return p, origin, accepted, conn, bufio.NewReader(conn)
+	}
+
+	t.Run("strict refuses a lying host and resolves it once", func(t *testing.T) {
+		r := &fakeResolver{addrs: map[string][]netip.Addr{"example.test": addrsOf("9.9.9.9")}}
+		_, _, accepted, conn, br := setup(t, WithNameVerification(VerifyReject), WithNameResolver(r))
+		for range 2 {
+			status, _ := plainRequest(t, conn, br, "example.test")
+			assert.Equal(t, http.StatusForbidden, status)
+		}
+		assert.EqualValues(t, 1, r.calls.Load(), "one Host, one resolution")
+		assert.Zero(t, accepted.accepted.Load(), "a refused request must not reach the origin")
+	})
+
+	t.Run("strict confirms a host that resolves to the destination", func(t *testing.T) {
+		r := &fakeResolver{}
+		_, dst, _, conn, br := setup(t, WithNameVerification(VerifyReject), WithNameResolver(r))
+		r.addrs = map[string][]netip.Addr{"example.test": {dst.Addr()}}
+		for range 2 {
+			status, body := plainRequest(t, conn, br, "example.test")
+			assert.Equal(t, http.StatusOK, status)
+			assert.Equal(t, "origin", body)
+		}
+		assert.EqualValues(t, 1, r.calls.Load())
+	})
+
+	t.Run("loose routes an unconfirmed host on the destination", func(t *testing.T) {
+		r := &fakeResolver{addrs: map[string][]netip.Addr{"example.test": addrsOf("9.9.9.9")}}
+		p, dst, accepted, conn, br := setup(t, WithNameVerification(VerifyLoose), WithNameResolver(r))
+		var routed atomic.Value
+		p.MustAdd(fmt.Sprintf("%s/*{any}", dst), func(c *HTTPCtx) (*http.Response, error) {
+			routed.Store(c.Host())
+			return Text(http.StatusOK, "by address"), nil
+		})
+		status, body := plainRequest(t, conn, br, "example.test")
+		assert.Equal(t, http.StatusOK, status)
+		assert.Equal(t, "by address", body)
+		assert.Equal(t, dst.Addr().String(), routed.Load(), "the dropped name leaves the destination as the target")
+		assert.Zero(t, accepted.accepted.Load())
+	})
+
+	t.Run("off trusts the host", func(t *testing.T) {
+		r := &fakeResolver{addrs: map[string][]netip.Addr{"example.test": addrsOf("9.9.9.9")}}
+		_, _, accepted, conn, br := setup(t, WithNameResolver(r))
+		status, body := plainRequest(t, conn, br, "example.test")
+		assert.Equal(t, http.StatusOK, status)
+		assert.Equal(t, "origin", body)
+		assert.Zero(t, r.calls.Load())
+		assert.EqualValues(t, 1, accepted.accepted.Load())
+	})
+
+	t.Run("a literal host is not resolved", func(t *testing.T) {
+		r := &fakeResolver{}
+		p, dst, _, conn, br := setup(t, WithNameVerification(VerifyReject), WithNameResolver(r))
+		p.MustAdd("[127.0.0.0/8]/*{any}", func(*HTTPCtx) (*http.Response, error) {
+			return Text(http.StatusOK, "by address"), nil
+		})
+		status, body := plainRequest(t, conn, br, dst.String())
+		assert.Equal(t, http.StatusOK, status)
+		assert.Equal(t, "by address", body)
+		assert.Zero(t, r.calls.Load())
+	})
+}
+
+// The plaintext inside a CONNECT to a literal is the same case. The literal is the
+// destination and the Host of each request is checked against it.
+func TestConnect_NameVerificationAppliesToPlaintextInsideALiteral(t *testing.T) {
+	origin, accepted := plainOrigin(t, "origin")
+	r := &fakeResolver{addrs: map[string][]netip.Addr{"example.test": addrsOf("9.9.9.9")}}
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca), WithNameVerification(VerifyReject), WithNameResolver(r))
+	require.NoError(t, err)
+	p.MustAdd("example.test/", forwardHandler)
+	// An HTTP admission of the literal, so the plaintext inside is served request by request.
+	p.MustAdd("[127.0.0.0/8]/+{any}", forwardHandler)
+	addr := startProxy(t, p)
+
+	conn := connectRaw(t, addr, origin.String())
+	status, _ := plainRequest(t, conn, bufio.NewReader(conn), "example.test")
+	assert.Equal(t, http.StatusForbidden, status)
+	assert.EqualValues(t, 1, r.calls.Load())
+	assert.Zero(t, accepted.accepted.Load())
 }

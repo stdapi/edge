@@ -260,11 +260,16 @@ type messageGate struct {
 }
 
 func (g *messageGate) Read(b []byte) (int, error) {
-	if g.err != nil {
-		return 0, g.err
-	}
 	if len(b) == 0 {
 		return 0, nil
+	}
+	// Header bytes not yet delivered go out before the body and before a sticky error. A
+	// read shorter than a header would otherwise reorder the stream.
+	if g.hdrOut < g.hdrN {
+		return g.handOut(b), nil
+	}
+	if g.err != nil {
+		return 0, g.err
 	}
 	if g.left > 0 {
 		n, err := g.r.Read(b[:min(int64(len(b)), g.left)])
@@ -274,23 +279,18 @@ func (g *messageGate) Read(b []byte) (int, error) {
 		}
 		return n, err
 	}
-	if g.hdrOut < g.hdrN {
-		return g.handOut(b), nil
-	}
 	for g.hdrN < len(g.hdr) {
 		n, err := g.r.Read(g.hdr[g.hdrN:])
 		g.hdrN += n
 		if err != nil {
-			// What was read is handed out first, so the far side sees the same truncated
-			// header a direct read would have produced.
 			g.err = err
-			if g.hdrN > 0 && g.hdrN < len(g.hdr) {
-				n := g.hdrN
-				g.hdrN = 0
-				return copy(b, g.hdr[:n]), nil
-			}
-			if g.hdrN == 0 {
-				return 0, err
+			if g.hdrN < len(g.hdr) {
+				// What was read is handed out first, so the far side sees the same
+				// truncated header a direct read would have produced.
+				if g.hdrN == 0 {
+					return 0, err
+				}
+				return g.handOut(b), nil
 			}
 			break
 		}

@@ -8,10 +8,12 @@ import (
 	"net/http"
 	"net/textproto"
 	"strings"
+	"sync"
+
+	"github.com/fox-toolkit/edge/internal/simplelru"
 )
 
-// upstreamAddrKey carries a per-request dial override through the shared transport.
-type upstreamAddrKey struct{}
+const maxDestinationPools = 1024
 
 // hopByHopHeaders are connection-scoped and must not be forwarded to the next hop.
 // See RFC 9110 section 7.6.1.
@@ -27,60 +29,115 @@ var hopByHopHeaders = [...]string{
 	"Upgrade",
 }
 
-// forwarder sends requests upstream. It keeps one transport per protocol so the version the
-// client chose can be mirrored upstream, and every session shares it so upstream connections
-// are pooled across clients.
+// forwarder pools upstream connections per destination, and requests with no fixed
+// destination share one pool.
 type forwarder struct {
-	p  *Proxy
+	p      *Proxy
+	shared *upstreamPool
+	fixed  *simplelru.LRU[string, *upstreamPool]
+	mu     sync.Mutex
+}
+
+type upstreamPool struct {
 	h1 *http.Transport
 	h2 *http.Transport
 	h3 http.RoundTripper
 }
 
-func newForwarder(p *Proxy) (*forwarder, error) {
-	t := p.cfg.transport
-	f := &forwarder{p: p, h1: t.httpTransport(false)}
-
+func newUpstreamPool(t *Transport, fixed string) (*upstreamPool, error) {
+	pool := &upstreamPool{h1: t.httpTransport(false, fixed)}
 	if t.AllowHTTP2 {
-		f.h2 = t.httpTransport(true)
+		pool.h2 = t.httpTransport(true, fixed)
 	}
 	if t.AllowHTTP3 {
-		rt, err := newHTTP3Transport(t)
+		rt, err := newHTTP3Transport(t, fixed)
 		if err != nil {
 			return nil, err
 		}
-		f.h3 = rt
+		pool.h3 = rt
 	}
-	return f, nil
+	return pool, nil
 }
 
-func (f *forwarder) close() {
-	f.h1.CloseIdleConnections()
-	if f.h2 != nil {
-		f.h2.CloseIdleConnections()
+// closeIdle leaves a connection in flight open until [Transport.IdleConnTimeout].
+func (u *upstreamPool) closeIdle() {
+	u.h1.CloseIdleConnections()
+	if u.h2 != nil {
+		u.h2.CloseIdleConnections()
 	}
-	if c, ok := f.h3.(interface{ Close() error }); ok {
+	if c, ok := u.h3.(interface{ CloseIdleConnections() }); ok {
+		c.CloseIdleConnections()
+	}
+}
+
+func (u *upstreamPool) close() {
+	u.closeIdle()
+	if c, ok := u.h3.(interface{ Close() error }); ok {
 		_ = c.Close()
 	}
 }
 
-// roundTrip sends req upstream over the same HTTP version the client used, and returns the
-// response with its body still streaming.
+func newForwarder(p *Proxy) (*forwarder, error) {
+	shared, err := newUpstreamPool(p.cfg.transport, "")
+	if err != nil {
+		return nil, err
+	}
+	fixed, err := simplelru.NewLRU(maxDestinationPools, func(_ string, pool *upstreamPool) { pool.closeIdle() })
+	if err != nil {
+		return nil, err
+	}
+	return &forwarder{p: p, shared: shared, fixed: fixed}, nil
+}
+
+func (f *forwarder) close() {
+	f.mu.Lock()
+	pools := f.fixed.Values()
+	f.fixed.Purge()
+	f.mu.Unlock()
+	f.shared.close()
+	for _, pool := range pools {
+		pool.close()
+	}
+}
+
+func (f *forwarder) poolFor(fixed string) (*upstreamPool, error) {
+	if fixed == "" {
+		return f.shared, nil
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if pool, ok := f.fixed.Get(fixed); ok {
+		return pool, nil
+	}
+	pool, err := newUpstreamPool(f.p.cfg.transport, fixed)
+	if err != nil {
+		return nil, err
+	}
+	f.fixed.Add(fixed, pool)
+	return pool, nil
+}
+
+// roundTrip sends req upstream over the same HTTP version the client used, to the destination
+// the session fixed when it fixed one, and returns the response with its body still streaming.
 //
 // Mirroring matters because the version is one of the few things an application can observe
 // about its own connection. A test that asserts it was served over HTTP/2 must not start
 // failing because a proxy was inserted, and a client that only speaks HTTP/1.1 must not have
 // its request delivered as h2 frames it never asked for.
-func (f *forwarder) roundTrip(req *http.Request, proto Protocol) (*http.Response, error) {
+func (f *forwarder) roundTrip(req *http.Request, proto Protocol, fixed string) (*http.Response, error) {
+	pool, err := f.poolFor(fixed)
+	if err != nil {
+		return nil, err
+	}
 	switch {
-	case proto == HTTP3 && f.h3 != nil && req.URL.Scheme == "https":
-		return f.h3.RoundTrip(req)
-	case (proto == HTTP2 || proto == HTTP3) && f.h2 != nil:
+	case proto == HTTP3 && pool.h3 != nil && req.URL.Scheme == "https":
+		return pool.h3.RoundTrip(req)
+	case (proto == HTTP2 || proto == HTTP3) && pool.h2 != nil:
 		// h2 is only reachable through ALPN, so an origin that does not offer it is served
 		// over HTTP/1.1 by the same transport.
-		return f.h2.RoundTrip(req)
+		return pool.h2.RoundTrip(req)
 	default:
-		return f.h1.RoundTrip(req)
+		return pool.h1.RoundTrip(req)
 	}
 }
 

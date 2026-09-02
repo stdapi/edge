@@ -135,14 +135,18 @@ type Session struct {
 	tlsConn     *tls.Conn
 	clientHello *ClientHello
 	// via is the CONNECT-UDP tunnel this session arrived through, nil off a socket.
-	via    *Session
-	target Target
+	via *Session
+	// verified is the decision a plaintext connection took on the last Host it checked. The
+	// requests of an h2c connection read and write it concurrently.
+	verified atomic.Pointer[verifiedHost]
+	target   Target
 	// upstream is the destination of a redirected connection or the literal a CONNECT
 	// named, preferred over resolving the authority again, which may not even resolve
 	// outside the client's network.
 	upstream netip.AddrPort
-	// dial is the hostname authority a CONNECT named, resolved by the dial. It is empty when
-	// upstream is set.
+	// dial is what the proxy dials, upstream as a string or the hostname of a CONNECT target,
+	// empty when the proxy resolves the authority itself. It is computed once and read on
+	// every request.
 	dial     string
 	identity string
 	// servableAs holds the kinds the traffic allows, most specific first, and stays empty
@@ -256,21 +260,22 @@ func (s *Session) Upstream() netip.AddrPort { return s.upstream }
 func (s *Session) setDestination(t Target) {
 	if addr, err := netip.ParseAddr(t.Host); err == nil {
 		if port, perr := strconv.ParseUint(t.Port, 10, 16); perr == nil {
-			s.upstream = netip.AddrPortFrom(addr.Unmap(), uint16(port))
+			s.setUpstream(netip.AddrPortFrom(addr.Unmap(), uint16(port)))
 			return
 		}
 	}
 	s.dial = t.Authority()
 }
 
-// dialAddr returns the authority the proxy dials, or an empty string when it is the one the
-// session is routed on.
-func (s *Session) dialAddr() string {
-	if s.upstream.IsValid() {
-		return s.upstream.String()
+func (s *Session) setUpstream(ap netip.AddrPort) {
+	if !ap.IsValid() {
+		return
 	}
-	return s.dial
+	s.upstream = ap
+	s.dial = ap.String()
 }
+
+func (s *Session) dialAddr() string { return s.dial }
 
 // Transparent reports whether the client reached the proxy without being configured to use
 // it, its traffic having been redirected by the network.

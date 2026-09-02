@@ -1068,7 +1068,7 @@ func (d *quicDemux) openUDPFlow(client net.Addr, from flowKey, origin netip.Addr
 	ctx, cancel := context.WithCancel(d.ctx)
 	sess := newSession(ctx, nil, target, KindUDP, 0)
 	d.fillSession(sess, client)
-	sess.upstream = origin
+	sess.setUpstream(origin)
 	u := &udpFlow{
 		upstream: upstream,
 		sess:     sess,
@@ -1290,6 +1290,11 @@ func (d *quicDemux) flowLocked(from flowKey, client net.Addr, now time.Time) *qu
 		if len(d.flows) >= maxQUICFlows {
 			return nil
 		}
+		// closed is written under this lock. A datagram that passed the check in dispatch
+		// before the close finds it set here.
+		if from.tunnel != nil && from.tunnel.closed.Load() {
+			return nil
+		}
 		flow = &quicFlow{
 			lastSeen: now,
 			client:   client,
@@ -1501,7 +1506,7 @@ func (d *quicDemux) beginTermination(from flowKey, client net.Addr, conn *quicCo
 	ctx, cancel := context.WithCancel(context.Background())
 	sess := newSession(ctx, nil, target, kind, 0)
 	d.fillSession(sess, client)
-	sess.upstream = conn.origin
+	sess.setUpstream(conn.origin)
 	sess.clientHello = hello
 	sess.servableAs = candidates
 	sess.closer = &quicConnCloser{d: d, flow: from, odcid: conn.odcid}

@@ -50,16 +50,9 @@ func (p *Proxy) serveConnectUDP(w http.ResponseWriter, r *http.Request, identity
 		http.Error(w, "edge: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	// RFC 9298 section 3.1 has the proxy resolve the target before answering, and answer
-	// 502 when it cannot.
-	upstream, err := p.resolveTarget(r.Context(), target)
-	if err != nil {
-		http.Error(w, "edge: cannot resolve the target: "+err.Error(), http.StatusBadGateway)
-		return
-	}
 
-	// The tunnel is recorded under the most specific kind admitted. What passes through it
-	// is decided unit by unit.
+	// The tunnel is recorded under the most specific kind admitted. Admission comes before
+	// resolution, and a refused target is not resolved.
 	candidates := []Kind{KindHTTP, KindQUIC, KindUDP}
 	var kind Kind
 	for _, k := range candidates {
@@ -70,6 +63,13 @@ func (p *Proxy) serveConnectUDP(w http.ResponseWriter, r *http.Request, identity
 	}
 	if kind == 0 {
 		http.Error(w, "edge: connection rejected, no entry admits this authority", http.StatusForbidden)
+		return
+	}
+	// RFC 9298 section 3.1 has the proxy resolve the target before answering, and answer
+	// 502 when it cannot.
+	upstream, err := p.resolveTarget(r.Context(), target)
+	if err != nil {
+		http.Error(w, "edge: cannot resolve the target: "+err.Error(), http.StatusBadGateway)
 		return
 	}
 
@@ -83,7 +83,7 @@ func (p *Proxy) serveConnectUDP(w http.ResponseWriter, r *http.Request, identity
 	defer cancel()
 	sess := newSession(ctx, nil, target, kind, HTTP3)
 	sess.servableAs = candidates
-	sess.upstream = upstream
+	sess.setUpstream(upstream)
 	sess.identity = identity
 	sess.tunnel = true
 	if front := sessionFromRequest(r); front != nil {
@@ -322,8 +322,7 @@ func (t *connectUDPTunnel) sender() {
 
 func (t *connectUDPTunnel) sendDatagram(b []byte) {
 	if err := t.str.SendDatagram(b); err != nil {
-		var tooLarge *quic.DatagramTooLargeError
-		if errors.As(err, &tooLarge) {
+		if tooLarge, ok := errors.AsType[*quic.DatagramTooLargeError](err); ok {
 			t.d.p.cfg.logger.Debug("edge: datagram larger than the tunnel carries",
 				slog.String("target", t.target.String()),
 				slog.Int("size", len(b)),

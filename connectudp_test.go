@@ -358,21 +358,67 @@ func TestConnectUDP_RoutesRawDatagramsOnTheDeclaredTarget(t *testing.T) {
 	}
 }
 
-// The declared target is admitted before the tunnel exists, and resolved before the proxy
-// answers. Neither failure opens anything.
+// The declared target is admitted before it is resolved, so a refused target is not resolved,
+// and resolution comes before the proxy answers. Neither failure opens anything.
 func TestConnectUDP_RefusesBeforeTheTunnelExists(t *testing.T) {
-	_, ca, front, origin := masqueProxy(t)
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	resolver := &fakeResolver{addrs: map[string][]netip.Addr{"spray.test": addrsOf("10.9.9.9")}}
+	p, err := New(WithCA(ca), WithNameResolver(resolver))
+	require.NoError(t, err)
+	p.MustAdd("unresolved.test/+{any}", forwardHandler)
+	front, _ := startQUICFront(t, p, ca)
 	cc := masqueClient(t, front, ca)
 
-	_, resp, err := openTunnel(t, cc, front, fmt.Sprintf("nothing.test:%d", origin.Port()), nil)
+	_, resp, err := openTunnel(t, cc, front, "spray.test:443", nil)
+	require.Error(t, err)
+	require.NotNil(t, resp)
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode, "a name no entry admits")
+	assert.Zero(t, resolver.calls.Load(), "a refused name is not resolved")
+
+	_, resp, err = openTunnel(t, cc, front, "unresolved.test:443", nil)
 	require.Error(t, err)
 	require.NotNil(t, resp)
 	assert.Equal(t, http.StatusBadGateway, resp.StatusCode, "a name the proxy cannot resolve")
+	assert.EqualValues(t, 1, resolver.calls.Load())
 
-	_, resp, err = openTunnel(t, cc, front, fmt.Sprintf("%s:%d", origin.Addr(), origin.Port()), nil)
+	_, resp, err = openTunnel(t, cc, front, "10.9.9.9:443", nil)
 	require.Error(t, err)
 	require.NotNil(t, resp)
 	assert.Equal(t, http.StatusForbidden, resp.StatusCode, "a literal no entry admits")
+	assert.Empty(t, waitForSessions(t, p, 0))
+}
+
+// A datagram that passed the closed check in dispatch while the tunnel was closing finds no
+// flow and must not create one. The guard runs under the lock the close ran under.
+func TestConnectUDP_ClosedTunnelOwnsNoFlow(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+	p.MustAdd(h3Authority+"/+{any}", forwardHandler)
+	d, err := newQUICDemux(p, newTunnelPacketConn())
+	require.NoError(t, err)
+	t.Cleanup(d.close)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	target := Target{Scheme: "https", Host: h3Authority, Port: "443"}
+	sess := newSession(ctx, nil, target, KindHTTP, HTTP3)
+	sess.remoteAddr = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 4242}
+	tun := newConnectUDPTunnel(d, sess, target, netip.MustParseAddrPort("127.0.0.1:443"), cancel)
+	require.True(t, d.publishTunnel(tun))
+	tun.close()
+
+	initial := make([]byte, 1200)
+	initial[0], initial[4], initial[5] = 0xC0, 1, 8
+	copy(initial[6:14], "12345678")
+	d.dispatchLong(tun.addr, tun.key, initial)
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	assert.Nil(t, d.flowLocked(tun.key, tun.addr, time.Now()))
+	assert.Nil(t, d.admitConnLocked(tun.key, tun.addr, "12345678", time.Now()))
+	assert.Empty(t, d.flows)
 }
 
 // Deleting the entry that admitted a tunnel makes the documented sweep close it, and the next
