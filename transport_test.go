@@ -97,10 +97,21 @@ func TestTransport_ConnectedSocketSkipsICMPErrors(t *testing.T) {
 	_, _, err = pc.ReadFrom(make([]byte, 1))
 	timesOut(err)
 
-	// Any other connected socket the dialer returns is read the same way.
+	// The socket a datagram flow reads and writes, and any other connected socket the dialer
+	// returns for QUIC, go through noICMPConn.
 	other, err := net.DialUDP("udp4", nil, target)
 	require.NoError(t, err)
 	defer other.Close()
+	dc := noICMPConn{other}
+	_, err = dc.Write([]byte("x"))
+	require.NoError(t, err)
+	time.Sleep(50 * time.Millisecond)
+	_, err = dc.Write([]byte("x"))
+	require.NoError(t, err)
+	require.NoError(t, other.SetReadDeadline(time.Now().Add(200*time.Millisecond)))
+	_, err = dc.Read(make([]byte, 1))
+	timesOut(err)
+
 	cc := packetConnOf(struct{ net.Conn }{other})
 	_, err = cc.WriteTo([]byte("x"), nil)
 	require.NoError(t, err)

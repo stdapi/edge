@@ -205,7 +205,28 @@ func packetConnOf(c net.Conn) net.PacketConn {
 	if u, ok := c.(*net.UDPConn); ok {
 		return &connectedUDPConn{UDPConn: u, batch: ipv4.NewPacketConn(u)}
 	}
-	return connectedConn{c}
+	return connectedConn{noICMPConn{c}}
+}
+
+// noICMPConn is a connected socket that skips the ICMP errors the kernel hands it, as an
+// unconnected socket never receives one.
+type noICMPConn struct{ net.Conn }
+
+func (c noICMPConn) Read(b []byte) (int, error) {
+	for {
+		n, err := c.Conn.Read(b)
+		if !icmpError(err) {
+			return n, err
+		}
+	}
+}
+
+func (c noICMPConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	if icmpError(err) {
+		n, err = c.Conn.Write(b)
+	}
+	return n, err
 }
 
 // icmpError reports whether err is what the kernel makes of an ICMP message received for a
@@ -272,21 +293,11 @@ func (c *connectedUDPConn) WriteMsgUDP(b, oob []byte, _ *net.UDPAddr) (int, int,
 type connectedConn struct{ net.Conn }
 
 func (c connectedConn) ReadFrom(b []byte) (int, net.Addr, error) {
-	for {
-		n, err := c.Read(b)
-		if !icmpError(err) {
-			return n, c.RemoteAddr(), err
-		}
-	}
+	n, err := c.Read(b)
+	return n, c.RemoteAddr(), err
 }
 
-func (c connectedConn) WriteTo(b []byte, _ net.Addr) (int, error) {
-	n, err := c.Write(b)
-	if icmpError(err) {
-		n, err = c.Write(b)
-	}
-	return n, err
-}
+func (c connectedConn) WriteTo(b []byte, _ net.Addr) (int, error) { return c.Write(b) }
 
 func (connectedConn) SetReadBuffer(int) error  { return nil }
 func (connectedConn) SetWriteBuffer(int) error { return nil }
