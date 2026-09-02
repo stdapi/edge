@@ -382,7 +382,7 @@ func TestLifecycle_ShutdownDrainsInterceptedHTTP3(t *testing.T) {
 		TLSClientConfig: &tls.Config{RootCAs: poolOf(ca), MinVersion: tls.VersionTLS13},
 		QUICConfig:      &quic.Config{MaxIdleTimeout: 10 * time.Second},
 		Dial: func(ctx context.Context, _ string, cfg *tls.Config, qcfg *quic.Config) (*quic.Conn, error) {
-			udp, err := net.ListenUDP("udp", nil)
+			udp, err := loopbackUDP()
 			if err != nil {
 				return nil, err
 			}
@@ -524,7 +524,7 @@ func TestLifecycle_ShutdownDeadlineBoundsAStuckHTTP3Handler(t *testing.T) {
 		TLSClientConfig: &tls.Config{RootCAs: poolOf(ca), MinVersion: tls.VersionTLS13},
 		QUICConfig:      &quic.Config{MaxIdleTimeout: 10 * time.Second},
 		Dial: func(ctx context.Context, _ string, cfg *tls.Config, qcfg *quic.Config) (*quic.Conn, error) {
-			udp, err := net.ListenUDP("udp", nil)
+			udp, err := loopbackUDP()
 			if err != nil {
 				return nil, err
 			}

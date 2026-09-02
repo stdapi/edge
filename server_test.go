@@ -34,24 +34,56 @@ func startQUICFront(t *testing.T, p *Proxy, ca *CA) (netip.AddrPort, <-chan erro
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	require.NoError(t, err)
 	served := make(chan error, 1)
-	go func() { served <- p.ServeQUIC(pc, *cert) }()
-	t.Cleanup(func() { _ = p.Close() })
+	done := make(chan struct{})
+	go func() {
+		served <- p.ServeQUIC(pc, *cert)
+		close(done)
+	}()
+	t.Cleanup(func() {
+		_ = p.Close()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("ServeQUIC did not return after Close")
+		}
+		// The caller may have read the result already.
+		select {
+		case err := <-served:
+			assert.ErrorIs(t, err, ErrProxyClosed)
+		default:
+		}
+		_ = pc.Close()
+	})
 	return netip.MustParseAddrPort(pc.LocalAddr().String()), served
+}
+
+// loopbackUDP opens the client socket of a QUIC test. A dual-stack socket, what quic.DialAddr
+// opens, loses datagrams on macOS loopback under load and the handshake waits out its timeout.
+func loopbackUDP() (*net.UDPConn, error) {
+	return net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 }
 
 // dialQUICFront opens a QUIC connection to the proxy front at addr, trusting ca.
 func dialQUICFront(t *testing.T, addr netip.AddrPort, ca *CA) *quic.Conn {
 	t.Helper()
+	pc, err := loopbackUDP()
+	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	conn, err := quic.DialAddr(ctx, addr.String(), &tls.Config{
+	conn, err := quic.Dial(ctx, pc, net.UDPAddrFromAddrPort(addr), &tls.Config{
 		RootCAs:    poolOf(ca),
 		ServerName: "127.0.0.1",
 		NextProtos: []string{http3.NextProtoH3},
 		MinVersion: tls.VersionTLS13,
 	}, &quic.Config{EnableDatagrams: true})
+	if err != nil {
+		_ = pc.Close()
+	}
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = conn.CloseWithError(0, "") })
+	t.Cleanup(func() {
+		_ = conn.CloseWithError(0, "")
+		_ = pc.Close()
+	})
 	return conn
 }
 

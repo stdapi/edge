@@ -32,18 +32,26 @@ import (
 // trusting ca, and returns the connection CONNECT-UDP tunnels are opened on.
 func masqueClient(t *testing.T, addr netip.AddrPort, ca *CA) *http3.ClientConn {
 	t.Helper()
+	pc, err := loopbackUDP()
+	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	// The outer connection needs room for a 1200 byte Initial plus the datagram overhead,
 	// which quic-go's default initial packet size does not leave.
-	qconn, err := quic.DialAddr(ctx, addr.String(), &tls.Config{
+	qconn, err := quic.Dial(ctx, pc, net.UDPAddrFromAddrPort(addr), &tls.Config{
 		RootCAs:    poolOf(ca),
 		ServerName: "127.0.0.1",
 		NextProtos: []string{http3.NextProtoH3},
 		MinVersion: tls.VersionTLS13,
 	}, &quic.Config{EnableDatagrams: true, InitialPacketSize: 1350})
+	if err != nil {
+		_ = pc.Close()
+	}
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = qconn.CloseWithError(0, "") })
+	t.Cleanup(func() {
+		_ = qconn.CloseWithError(0, "")
+		_ = pc.Close()
+	})
 	tr := &http3.Transport{EnableDatagrams: true}
 	t.Cleanup(func() { _ = tr.Close() })
 	cc := tr.NewClientConn(qconn)

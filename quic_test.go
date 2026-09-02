@@ -199,7 +199,7 @@ func TestQUIC_RejectDropsTheConnection(t *testing.T) {
 
 	proxyAddr := startQUIC(t, p)
 
-	pc, err := net.ListenUDP("udp", nil)
+	pc, err := loopbackUDP()
 	require.NoError(t, err)
 	defer func() { _ = pc.Close() }()
 
@@ -238,7 +238,7 @@ func TestQUIC_CloseCarriesTheProtocolsNoErrorCode(t *testing.T) {
 
 			proxyAddr := startQUIC(t, p)
 
-			pc, err := net.ListenUDP("udp", nil)
+			pc, err := loopbackUDP()
 			require.NoError(t, err)
 			defer func() { _ = pc.Close() }()
 			conn, err := quic.Dial(t.Context(), pc, net.UDPAddrFromAddrPort(proxyAddr),
@@ -296,7 +296,7 @@ func TestQUIC_SessionALPNDuringHandshake(t *testing.T) {
 	})
 
 	for range 5 {
-		pc, err := net.ListenUDP("udp", nil)
+		pc, err := loopbackUDP()
 		require.NoError(t, err)
 		conn, err := quic.Dial(t.Context(), pc, net.UDPAddrFromAddrPort(proxyAddr),
 			&tls.Config{ServerName: h3Authority, RootCAs: poolOf(proxyCA), NextProtos: []string{"doq"}, MinVersion: tls.VersionTLS13},
@@ -316,7 +316,7 @@ func dialQUICTo(addr netip.AddrPort, roots *x509.CertPool) *http3.Transport {
 		// A short idle timeout so a connection the proxy cut does not hold the test open.
 		QUICConfig: &quic.Config{MaxIdleTimeout: time.Second},
 		Dial: func(ctx context.Context, _ string, cfg *tls.Config, qcfg *quic.Config) (*quic.Conn, error) {
-			pc, err := net.ListenUDP("udp", nil)
+			pc, err := loopbackUDP()
 			if err != nil {
 				return nil, err
 			}
@@ -469,7 +469,7 @@ func TestQUIC_TwoInterceptedConnectionsOnOneSocket(t *testing.T) {
 
 	proxyAddr := startQUIC(t, p)
 
-	clientPC, err := net.ListenUDP("udp", nil)
+	clientPC, err := loopbackUDP()
 	require.NoError(t, err)
 	ctr := &quic.Transport{Conn: clientPC}
 	defer func() { _ = ctr.Close(); _ = clientPC.Close() }()
@@ -520,7 +520,7 @@ func TestQUIC_CloseBeforeAdoptionEndsTheConnection(t *testing.T) {
 	})
 	proxyAddr := startQUIC(t, p)
 
-	pc, err := net.ListenUDP("udp", nil)
+	pc, err := loopbackUDP()
 	require.NoError(t, err)
 	defer func() { _ = pc.Close() }()
 
@@ -778,7 +778,7 @@ func TestQUIC_TProxyTwoInterceptedOriginsOnOneSocket(t *testing.T) {
 
 	wrapper, proxyAddr := startTProxyQUIC(t, p, first)
 
-	clientPC, err := net.ListenUDP("udp", nil)
+	clientPC, err := loopbackUDP()
 	require.NoError(t, err)
 	tr := &quic.Transport{Conn: clientPC}
 	defer func() { _ = tr.Close(); _ = clientPC.Close() }()
@@ -818,7 +818,7 @@ func TestQUIC_StatelessResetForOrphanedTag(t *testing.T) {
 	wrapper, proxyAddr := startTProxyQUIC(t, p, first)
 
 	// Arms the tag and the reset key.
-	clientA, err := net.ListenUDP("udp", nil)
+	clientA, err := loopbackUDP()
 	require.NoError(t, err)
 	tr := &quic.Transport{Conn: clientA}
 	defer func() { _ = tr.Close(); _ = clientA.Close() }()

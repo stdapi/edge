@@ -358,7 +358,7 @@ func TestQUIC_NameVerificationRejectsALyingServerName(t *testing.T) {
 
 	proxyAddr := startQUICRedirected(t, p, origin)
 
-	clientPC, err := net.ListenUDP("udp", nil)
+	clientPC, err := loopbackUDP()
 	require.NoError(t, err)
 	ctr := &quic.Transport{Conn: clientPC}
 	defer func() { _ = ctr.Close(); _ = clientPC.Close() }()
@@ -392,7 +392,7 @@ func TestQUIC_NameVerificationLooseFallsBackToTheDestination(t *testing.T) {
 
 	proxyAddr := startQUICRedirected(t, p, origin)
 
-	clientPC, err := net.ListenUDP("udp", nil)
+	clientPC, err := loopbackUDP()
 	require.NoError(t, err)
 	ctr := &quic.Transport{Conn: clientPC}
 	defer func() { _ = ctr.Close(); _ = clientPC.Close() }()
