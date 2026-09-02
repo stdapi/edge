@@ -178,7 +178,7 @@ func (p *Proxy) serveUpgradedStream(c *routeCtx, w http.ResponseWriter, r *http.
 		p:        p,
 		sess:     upSess,
 		entry:    e,
-		conn:     hijackedConn{Conn: client, r: brw},
+		conn:     bufferedConn{Conn: client, r: brw},
 		params:   params,
 		target:   target,
 		identity: c.identity,
@@ -214,14 +214,14 @@ func (rw readWriteCloser) Write(b []byte) (int, error) {
 	return n, nil
 }
 
-// hijackedConn reads through the buffer the hijack handed back, since anything it holds past
-// the handshake is already stream payload.
-type hijackedConn struct {
+// bufferedConn reads through a buffer that already holds bytes of the stream, the ones a
+// hijack handed back or a CONNECT response left behind.
+type bufferedConn struct {
 	net.Conn
 	r io.Reader
 }
 
-func (c hijackedConn) Read(b []byte) (int, error) { return c.r.Read(b) }
+func (c bufferedConn) Read(b []byte) (int, error) { return c.r.Read(b) }
 
 // pipeConn adapts what an upgrade left behind to a net.Conn. The body of a 101 is a byte pipe
 // with no addresses and no deadlines of its own, and closing it is what ends it.

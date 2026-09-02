@@ -132,7 +132,7 @@ func (c *QUICCtx) dialQUIC(ctx context.Context, addr, serverName string) (*quic.
 	if alpn := c.ALPN(); alpn != "" {
 		cfg.NextProtos = []string{alpn}
 	}
-	conn, err := c.p.cfg.transport.dialQUIC(ctx, addr, cfg, &quic.Config{
+	conn, err := c.p.srv.fwd.up.dialQUIC(ctx, addr, cfg, &quic.Config{
 		MaxIdleTimeout:  c.p.cfg.server.idleTimeout,
 		EnableDatagrams: false,
 	})

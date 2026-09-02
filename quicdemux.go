@@ -1149,7 +1149,7 @@ func (u *udpFlow) newCtx(inbound bool, origin netip.AddrPort) DatagramCtx {
 func (d *quicDemux) dialUDP(addr string) (net.Conn, error) {
 	ctx, cancel := context.WithTimeout(d.ctx, 10*time.Second)
 	defer cancel()
-	return d.p.cfg.transport.dialer()(ctx, "udp", addr)
+	return d.p.srv.fwd.up.dial(ctx, "udp", addr, "https")
 }
 
 // declaredTarget is the authority a datagram flow is routed on, the target a CONNECT-UDP named

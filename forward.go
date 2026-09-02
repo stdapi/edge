@@ -33,6 +33,7 @@ var hopByHopHeaders = [...]string{
 // destination share one pool.
 type forwarder struct {
 	p      *Proxy
+	up     *upstreamDialer
 	shared *upstreamPool
 	fixed  *simplelru.LRU[string, *upstreamPool]
 	mu     sync.Mutex
@@ -44,13 +45,14 @@ type upstreamPool struct {
 	h3 http.RoundTripper
 }
 
-func newUpstreamPool(t *Transport, fixed string) (*upstreamPool, error) {
+func newUpstreamPool(up *upstreamDialer, fixed string) (*upstreamPool, error) {
+	t := up.t
 	pool := &upstreamPool{h1: t.httpTransport(false, fixed)}
 	if t.AllowHTTP2 {
 		pool.h2 = t.httpTransport(true, fixed)
 	}
 	if t.AllowHTTP3 {
-		rt, err := newHTTP3Transport(t, fixed)
+		rt, err := newHTTP3Transport(up, fixed)
 		if err != nil {
 			return nil, err
 		}
@@ -78,7 +80,8 @@ func (u *upstreamPool) close() {
 }
 
 func newForwarder(p *Proxy) (*forwarder, error) {
-	shared, err := newUpstreamPool(p.cfg.transport, "")
+	up := newUpstreamDialer(p.cfg.transport)
+	shared, err := newUpstreamPool(up, "")
 	if err != nil {
 		return nil, err
 	}
@@ -86,7 +89,7 @@ func newForwarder(p *Proxy) (*forwarder, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &forwarder{p: p, shared: shared, fixed: fixed}, nil
+	return &forwarder{p: p, up: up, shared: shared, fixed: fixed}, nil
 }
 
 func (f *forwarder) close() {
@@ -97,6 +100,7 @@ func (f *forwarder) close() {
 	for _, pool := range pools {
 		pool.close()
 	}
+	f.up.close()
 }
 
 func (f *forwarder) poolFor(fixed string) (*upstreamPool, error) {
@@ -108,7 +112,7 @@ func (f *forwarder) poolFor(fixed string) (*upstreamPool, error) {
 	if pool, ok := f.fixed.Get(fixed); ok {
 		return pool, nil
 	}
-	pool, err := newUpstreamPool(f.p.cfg.transport, fixed)
+	pool, err := newUpstreamPool(f.up, fixed)
 	if err != nil {
 		return nil, err
 	}

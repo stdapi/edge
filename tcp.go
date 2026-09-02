@@ -133,7 +133,11 @@ func (c *TCPCtx) DialTo(ctx context.Context, addr string) (net.Conn, error) {
 }
 
 func (c *TCPCtx) dialAddr(ctx context.Context, addr, serverName string) (net.Conn, error) {
-	conn, err := c.p.cfg.transport.dialer()(ctx, "tcp", addr)
+	scheme := "http"
+	if c.tlsState != nil {
+		scheme = "https"
+	}
+	conn, err := c.p.srv.fwd.up.dial(ctx, "tcp", addr, scheme)
 	if err != nil {
 		return nil, fmt.Errorf("dial %s: %w", addr, err)
 	}

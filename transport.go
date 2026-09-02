@@ -9,7 +9,6 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"fmt"
 	"net"
 	"net/http"
 	"net/url"
@@ -32,8 +31,14 @@ type Transport struct {
 	// force a source address, or route upstream traffic through a tunnel.
 	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 
-	// Proxy selects an upstream proxy for a request, chaining this proxy behind another.
-	// A nil Proxy, the default, connects directly.
+	// Proxy specifies a function to return a proxy for a given Request. A TCP, QUIC or UDP
+	// upstream has no request, and the function is called with one for the destination
+	// alone, so [http.ProxyFromEnvironment] applies to it as well.
+	//
+	// The proxy type is determined by the URL scheme. "http" and "https" are supported, and
+	// a QUIC or UDP upstream requires "https".
+	//
+	// If Proxy is nil or returns a nil *URL, no proxy is used.
 	Proxy func(*http.Request) (*url.URL, error)
 
 	// TLSClientConfig is the base configuration for upstream TLS handshakes. The proxy
@@ -165,7 +170,8 @@ func (t *Transport) upstreamTLSConfig() *tls.Config {
 
 // newHTTP3Transport builds the upstream transport used when a client speaks HTTP/3 and
 // [Transport.AllowHTTP3] is on.
-func newHTTP3Transport(t *Transport, fixed string) (http.RoundTripper, error) {
+func newHTTP3Transport(up *upstreamDialer, fixed string) (http.RoundTripper, error) {
+	t := up.t
 	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS13}
 	if t.TLSClientConfig != nil {
 		tlsCfg = t.TLSClientConfig.Clone()
@@ -195,36 +201,9 @@ func newHTTP3Transport(t *Transport, fixed string) (http.RoundTripper, error) {
 			if fixed != "" {
 				addr = fixed
 			}
-			return t.dialQUIC(ctx, addr, cfg, qcfg)
+			return up.dialQUIC(ctx, addr, cfg, qcfg)
 		},
 	}, nil
-}
-
-// dialQUIC opens a QUIC connection to addr on a socket the transport's dialer returns. The
-// socket is closed when the connection ends.
-func (t *Transport) dialQUIC(ctx context.Context, addr string, tlsCfg *tls.Config, qcfg *quic.Config) (*quic.Conn, error) {
-	sock, err := t.dialer()(ctx, "udp", addr)
-	if err != nil {
-		return nil, err
-	}
-	if sock.RemoteAddr() == nil {
-		_ = sock.Close()
-		return nil, fmt.Errorf("edge: dial %s: the dialer returned a socket with no peer", addr)
-	}
-	tr := &quic.Transport{Conn: packetConnOf(sock)}
-	// The socket goes first, so the read loop the transport waits on ends whatever the socket
-	// does with a read deadline.
-	release := func() {
-		_ = sock.Close()
-		_ = tr.Close()
-	}
-	conn, err := tr.Dial(ctx, sock.RemoteAddr(), tlsCfg, qcfg)
-	if err != nil {
-		release()
-		return nil, err
-	}
-	context.AfterFunc(conn.Context(), release)
-	return conn, nil
 }
 
 // packetConnOf presents a connected socket as the packet connection quic-go reads and writes.
@@ -254,3 +233,6 @@ func (c connectedConn) ReadFrom(b []byte) (int, net.Addr, error) {
 }
 
 func (c connectedConn) WriteTo(b []byte, _ net.Addr) (int, error) { return c.Write(b) }
+
+func (connectedConn) SetReadBuffer(int) error  { return nil }
+func (connectedConn) SetWriteBuffer(int) error { return nil }

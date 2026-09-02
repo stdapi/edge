@@ -1349,7 +1349,7 @@ func TestQUIC_DialRefusesASocketWithNoPeer(t *testing.T) {
 		return net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
 	}
 	cfg := &tls.Config{ServerName: h3Authority, NextProtos: []string{"h3"}, InsecureSkipVerify: true}
-	conn, err := tr.dialQUIC(t.Context(), "127.0.0.1:1", cfg, &quic.Config{})
+	conn, err := newUpstreamDialer(tr).dialQUIC(t.Context(), "127.0.0.1:1", cfg, &quic.Config{})
 	require.Error(t, err)
 	assert.Nil(t, conn)
 	assert.Contains(t, err.Error(), "no peer")
@@ -1380,7 +1380,7 @@ func TestQUIC_DialReleasesASocketWithoutDeadlines(t *testing.T) {
 		return noDeadlineConn{c}, nil
 	}
 	cfg := &tls.Config{ServerName: h3Authority, NextProtos: []string{"h3"}, RootCAs: poolOf(originCA), MinVersion: tls.VersionTLS13}
-	conn, err := tr.dialQUIC(t.Context(), origin.String(), cfg, &quic.Config{})
+	conn, err := newUpstreamDialer(tr).dialQUIC(t.Context(), origin.String(), cfg, &quic.Config{})
 	require.NoError(t, err)
 	require.NoError(t, conn.CloseWithError(0, ""))
 
