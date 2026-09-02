@@ -124,7 +124,16 @@ func (c *TCPCtx) dial() (net.Conn, error) {
 	if addr == "" {
 		addr = c.target.Authority()
 	}
-	return c.dialAddr(c.ctx, addr, c.target.Host)
+	return c.dialAddr(c.ctx, addr, c.serverName())
+}
+
+// serverName is the name the upstream handshake verifies, the one the client sent or the
+// target's without one.
+func (c *TCPCtx) serverName() string {
+	if c.tlsState != nil && c.tlsState.ServerName != "" {
+		return stringsutil.ToLowerASCIIString(c.tlsState.ServerName)
+	}
+	return c.target.Host
 }
 
 // DialTo opens a connection to addr, given as host:port, with the transport the proxy is
@@ -208,6 +217,7 @@ func (c *TCPCtx) StartTLS() error {
 	conn, ok := c.client.Conn.(*peekConn)
 	if !ok {
 		conn = newPeekConn(c.client.Conn, nil, clientHelloPeekSize)
+		c.client.Conn = conn
 	}
 	if timeout := p.cfg.transport.TLSHandshakeTimeout; timeout > 0 {
 		_ = conn.SetReadDeadline(time.Now().Add(timeout))
@@ -239,7 +249,7 @@ func (c *TCPCtx) StartTLS() error {
 
 	if c.up.Conn != nil {
 		addr := cmp.Or(c.sess.dialAddr(), c.target.Authority())
-		up, err := c.upgradeTLS(c.ctx, c.up.Conn, addr, cmp.Or(state.ServerName, c.target.Host))
+		up, err := c.upgradeTLS(c.ctx, c.up.Conn, addr, c.serverName())
 		if err != nil {
 			return err
 		}

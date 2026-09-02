@@ -297,6 +297,63 @@ func TestTCP_StartTLS_DialToSpeaksTLSAfterwards(t *testing.T) {
 	require.NoError(t, <-dialed)
 }
 
+// A dial placed after StartTLS verifies the origin against the name the client sent, like
+// one placed before.
+func TestTCP_StartTLS_DialAfterwardsUsesTheClientServerName(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	origin, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{selfSignedFor(t, ca, "db.test")},
+		MinVersion:   tls.VersionTLS12,
+	})
+	require.NoError(t, err)
+	defer func() { _ = origin.Close() }()
+	go func() {
+		for {
+			c, err := origin.Accept()
+			if err != nil {
+				return
+			}
+			go func() { _, _ = io.Copy(c, c); _ = c.Close() }()
+		}
+	}()
+
+	tr := DefaultTransport()
+	tr.RootCAs = poolOf(ca)
+	tr.DialContext = pinnedDialer(origin.Addr().String())
+	p, err := New(WithCA(ca), WithTransport(tr))
+	require.NoError(t, err)
+	errs := make(chan error, 1)
+	p.MustAdd[TCP]("wrong.test", handlerError(errs, func(c *TCPCtx) error {
+		// The origin is TLS from the first byte, so the handler answers the request itself.
+		var req [8]byte
+		if _, err := io.ReadFull(c.Client(), req[:]); err != nil {
+			return err
+		}
+		if _, err := c.Client().Write([]byte{'S'}); err != nil {
+			return err
+		}
+		if err := c.StartTLS(); err != nil {
+			return err
+		}
+		if _, err := c.Dial(); err != nil {
+			return err
+		}
+		return c.Relay()
+	}))
+	addr := startProxy(t, p)
+
+	raw := connectRaw(t, addr, "wrong.test:5432")
+	client := startTLSClient(t, raw, clientTLSConfig(ca, "db.test"))
+	_, err = client.Write([]byte("hello\n"))
+	require.NoError(t, err)
+	line, err := bufio.NewReader(client).ReadString('\n')
+	require.NoError(t, err)
+	assert.Equal(t, "hello\n", line)
+	_ = client.Close()
+	assert.NoError(t, <-errs)
+}
+
 // startTLSAfterRequest consumes the client's request, standing in for a relay to an origin
 // that agreed, then terminates.
 func startTLSAfterRequest(c *TCPCtx) error {
@@ -508,6 +565,7 @@ func TestTCP_StartTLS_NameVerification(t *testing.T) {
 				exchange(t, client, "")
 				_ = client.Close()
 				assert.NoError(t, <-errs)
+				assert.Equal(t, int32(1), tc.resolver.calls.Load())
 				return
 			}
 			require.Error(t, herr, "a refused name must not complete the handshake")
