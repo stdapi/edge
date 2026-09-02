@@ -5,6 +5,7 @@
 package edge
 
 import (
+	"cmp"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -21,8 +22,8 @@ import (
 // start from [DefaultTransport] and change what you need.
 //
 // Connections are pooled per destination, the address a redirect was headed to or the CONNECT
-// target, and the limits below apply to each pool. Requests with no fixed destination share
-// one pool.
+// target, and a destination keeps at most MaxIdleConnsPerHost idle connections. Requests with
+// no fixed destination share one pool, bounded by MaxIdleConns.
 type Transport struct {
 	// DialContext dials an upstream. It defaults to a net.Dialer with a 30s timeout and
 	// keep-alives enabled. Override it to pin a resolver, force a source address, or route
@@ -128,6 +129,10 @@ func (t *Transport) httpTransport(allowH2 bool, fixed string) *http.Transport {
 		// A non-nil map is what tells net/http never to hand the connection to the HTTP/2
 		// implementation, whatever ALPN ends up negotiating.
 		tr.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	}
+	if fixed != "" {
+		// A destination serves one authority, so the per host limit is its limit.
+		tr.MaxIdleConns = cmp.Or(t.MaxIdleConnsPerHost, http.DefaultMaxIdleConnsPerHost)
 	}
 	if tr.DialContext == nil {
 		tr.DialContext = (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext
