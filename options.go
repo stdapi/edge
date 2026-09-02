@@ -398,6 +398,19 @@ func WithMaxFrameBytes(n int) ProxyOption {
 	})
 }
 
+// WithMaxMessageBytes bounds one gRPC message the proxy will buffer to hand a handler, and one
+// a handler sends. A larger one ends the call with [ResourceExhausted]. It defaults to 16 MiB.
+// A call served by [GRPCCtx.Forward] is not bounded.
+func WithMaxMessageBytes(n int) ProxyOption {
+	return optionFunc(func(s sealedOption) error {
+		if n <= 0 {
+			return fmt.Errorf("%w: max message bytes must be greater than zero", ErrInvalidConfig)
+		}
+		s.proxy.cfg.server.maxMessageBytes = n
+		return nil
+	})
+}
+
 // WithMatcher attaches a [Matcher] to an entry, narrowing it beyond its pattern. An entry with
 // matchers is evaluated before one without at the same pattern.
 func WithMatcher(m Matcher) interface {

@@ -38,6 +38,7 @@ type serverConfig struct {
 	sniffTimeout         time.Duration
 	maxHeaderBytes       int
 	maxFrameBytes        int
+	maxMessageBytes      int
 	maxConcurrentStreams int
 }
 
@@ -48,6 +49,7 @@ func defaultServerConfig() serverConfig {
 		sniffTimeout:         time.Second,
 		maxHeaderBytes:       1 << 20,
 		maxFrameBytes:        1 << 20,
+		maxMessageBytes:      defaultMaxMessageBytes,
 		maxConcurrentStreams: 250,
 	}
 }

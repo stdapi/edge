@@ -172,7 +172,7 @@ p, _ := edge.New(
 p.MustAddInterceptor([]string{"GET"}, "api.stripe.com/v1/charges", h, edge.WithMiddleware(retry))
 ```
 
-This is also where anything protocol-specific goes. A gRPC decoder is middleware that recognizes `application/grpc` and unwraps the length-prefixed frames before the handler sees them; edge itself stays an HTTP proxy.
+A gRPC call is not decoded by middleware. `KindGRPC` serves it message by message, on the hostname and the full method name, and a WebSocket connection is served frame by frame by `KindWebSocket`.
 
 ## Sessions
 

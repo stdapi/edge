@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+package pkg;
+
+service Svc {
+  rpc Method(Msg) returns (Msg);
+  rpc Stream(stream Msg) returns (stream Msg);
+}
+
+message Msg {
+  string text = 1;
+}

@@ -97,7 +97,7 @@ func (p *Proxy) serveGRPC(c *routeCtx, w http.ResponseWriter, r *http.Request, s
 	gc.ctx = r.Context()
 	gc.w = w
 	err := runKindHandler(p, sess, func() error { return handler(gc) })
-	if gc.finishOpenCall() {
+	if gc.finishOpenCall(err) {
 		// The response of an open call was written while the handler ran.
 		if err != nil {
 			p.logf(r.Context(), slog.LevelDebug, "grpc handler", sess, err)

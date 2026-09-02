@@ -581,7 +581,7 @@ func grpcEchoOrigin(t *testing.T) (*httptest.Server, *atomic.Int64) {
 	var received atomic.Int64
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
-		src := &msgSource{r: strings.NewReader(string(body))}
+		src := &msgSource{r: strings.NewReader(string(body)), max: defaultMaxMessageBytes}
 		for {
 			if _, _, err := src.next(); err != nil {
 				break
@@ -732,7 +732,7 @@ func TestKindGRPC_ReplyBeforeTheOriginAnsweredIsRefused(t *testing.T) {
 
 // A handler that reads the response stream and returns before the origin answered cancels the
 // call, and the client reads it as canceled.
-func TestKindGRPC_ReturnBeforeTheAnswerCancelsTheCall(t *testing.T) {
+func TestKindGRPC_ReturnBeforeTheAnswerEndsTheCallOnInternal(t *testing.T) {
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.ReadAll(r.Body)
 		select {
@@ -766,7 +766,7 @@ func TestKindGRPC_ReturnBeforeTheAnswerCancelsTheCall(t *testing.T) {
 	_, _ = io.Copy(io.Discard, resp.Body)
 	_ = resp.Body.Close()
 
-	assert.Equal(t, "1", resp.Header.Get("Grpc-Status"), "the proxy canceled the call")
+	assert.Equal(t, "13", resp.Header.Get("Grpc-Status"), "the handler ended the call without a status")
 }
 
 // grpcStreamingOrigin answers a call with one message at once, then a second one when release
