@@ -408,3 +408,27 @@ func TestAdmission_AdmitWithCapturesParameters(t *testing.T) {
 	assert.Equal(t, []Param{{Key: "sub", Value: "mail"}}, params)
 	assert.True(t, p.Admits(Target{Scheme: "https", Host: "mail.corp.test", Port: "443"}, KindTCP))
 }
+
+func TestAdmission_FirstAdmittedWithPicksTheFinestKind(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+	target := Target{Scheme: "https", Host: "api.test", Port: "443"}
+	kinds := []Kind{KindHTTP, KindTCP}
+
+	kind, e, _ := p.firstAdmittedWith(target, kinds)
+	assert.Equal(t, Kind(0), kind)
+	assert.Nil(t, e)
+
+	p.MustAdd[TCP]("{name}.test", relayStream)
+	kind, e, params := p.firstAdmittedWith(target, kinds)
+	assert.Equal(t, KindTCP, kind)
+	require.NotNil(t, e)
+	assert.Equal(t, []Param{{Key: "name", Value: "api"}}, params)
+
+	p.MustAdd("{name}.test/+{any}", forwardHandler)
+	kind, _, params = p.firstAdmittedWith(target, kinds)
+	assert.Equal(t, KindHTTP, kind)
+	assert.Equal(t, []Param{{Key: "name", Value: "api"}}, params)
+}

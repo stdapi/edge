@@ -108,6 +108,23 @@ func (p *Proxy) firstAdmitted(target Target, kinds ...Kind) Kind {
 	return 0
 }
 
+// firstAdmittedWith is [Proxy.firstAdmitted] with the entry and its captured parameters. Every
+// kind is read on one tree snapshot, an entry committing in between cannot split the decision.
+func (p *Proxy) firstAdmittedWith(target Target, kinds []Kind) (Kind, *entry, []Param) {
+	tree := p.getTree()
+	c := tree.pool.Get().(*routeCtx)
+	defer tree.pool.Put(c)
+
+	for _, k := range kinds {
+		e := resolveAdmission(tree.patterns, tree.addrs, tree.handlers+tree.admissions, c, target, k, true)
+		if e != nil {
+			c.entry = e
+			return k, e, c.appendParams(nil)
+		}
+	}
+	return 0, nil, nil
+}
+
 // admitsAny is [Proxy.admitsAny] on one tree snapshot and one borrowed context, for a caller
 // already holding both.
 func (t *iTree) admitsAny(c *routeCtx, target Target, kinds []Kind) bool {

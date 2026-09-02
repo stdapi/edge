@@ -119,11 +119,7 @@ func (p *Proxy) placeTLS(ctx context.Context, conn *peekConn, sess *Session) err
 // closes it when none is admitted.
 func (p *Proxy) serveCandidates(ctx context.Context, conn net.Conn, sess *Session, candidates []Kind, state *tls.ConnectionState) error {
 	sess.servableAs = candidates
-	for _, kind := range candidates {
-		e, params := p.admitWith(sess.target, kind)
-		if e == nil {
-			continue
-		}
+	if kind, e, params := p.firstAdmittedWith(sess.target, candidates); kind != 0 {
 		sess.kind = kind
 		if kind == KindHTTP {
 			return p.serveHTTPConnection(conn, sess, state)
