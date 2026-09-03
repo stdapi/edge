@@ -31,8 +31,10 @@ import (
 )
 
 const (
-	// window is the receive window advertised for every stream and raised on the connection.
-	window = 1 << 20
+	// window is the receive window advertised for every stream, and connWindow the one the
+	// connection is raised to, so that a stream nothing reads starves no other.
+	window     = 1 << 20
+	connWindow = 16 << 20
 	// defaultWindow is the initial window of RFC 9113 section 6.9.2, before any SETTINGS.
 	defaultWindow = 65535
 	// maxHeaderBytes bounds the header block of a response.
@@ -74,6 +76,7 @@ var (
 	ErrExtendedConnect = errors.New("h2tunnel: the peer does not support extended CONNECT")
 	errTooManyStreams  = errors.New("h2tunnel: the peer's concurrent stream limit is reached")
 	errInvalidHeader   = errors.New("h2tunnel: invalid header field")
+	errNoAuthority     = errors.New("h2tunnel: a CONNECT needs an authority")
 	errStreamClosed    = errors.New("h2tunnel: stream closed")
 	errHeadersTooLarge = errors.New("h2tunnel: request headers exceed a frame")
 	errKeepAlive       = errors.New("h2tunnel: the peer stopped answering")
@@ -120,6 +123,7 @@ type Conn struct {
 	writeCh      chan *bytes.Buffer
 	wroteCh      chan error
 	done         chan struct{}
+	ended        chan struct{}
 	settingsSeen chan struct{}
 	keepTimer    *time.Timer
 	// ready lists the streams with a write pending, served round robin from rr.
@@ -289,10 +293,11 @@ func Client(nc net.Conn, keepAlive time.Duration) (*Conn, error) {
 		writeCh:       make(chan *bytes.Buffer, 1),
 		wroteCh:       make(chan error, 1),
 		done:          make(chan struct{}),
+		ended:         make(chan struct{}),
 		settingsSeen:  make(chan struct{}),
 		keepAlive:     keepAlive,
 		sendWindow:    defaultWindow,
-		recv:          inflow{avail: window},
+		recv:          inflow{avail: connWindow},
 		initialWindow: defaultWindow,
 		maxStreams:    1<<32 - 1,
 		maxHeaderList: 1<<32 - 1,
@@ -316,7 +321,7 @@ func Client(nc net.Conn, keepAlive time.Duration) (*Conn, error) {
 		_ = nc.Close()
 		return nil, err
 	}
-	if err := c.fr.WriteWindowUpdate(0, window-defaultWindow); err != nil {
+	if err := c.fr.WriteWindowUpdate(0, connWindow-defaultWindow); err != nil {
 		_ = nc.Close()
 		return nil, err
 	}
@@ -631,13 +636,17 @@ func (c *Conn) encodeOne() bool {
 		s.recv.due = 0
 		return c.encoded(c.fr.WriteWindowUpdate(s.id, uint32(incr))) //nolint:gosec // at most a window
 	}
-	for i := range c.ready {
-		idx := (c.rr + i) % len(c.ready)
+	n := len(c.ready)
+	for i := range n {
+		idx := (c.rr + i) % n
 		s := c.ready[idx]
 		if !c.encodeData(s) {
+			if c.err != nil {
+				return false
+			}
 			continue
 		}
-		c.rr = (idx + 1) % max(len(c.ready), 1)
+		c.rr = (idx + 1) % n
 		if !s.pending.active {
 			c.unready(s)
 		}
@@ -896,16 +905,17 @@ func (c *Conn) handleHeaders(f *http2.MetaHeadersFrame) error {
 		return http2.StreamError{StreamID: f.StreamID, Code: http2.ErrCodeEnhanceYourCalm}
 	}
 	status := f.PseudoValue("status")
-	if status == "" && (!s.answered || !f.StreamEnded() || len(f.PseudoFields()) > 0) {
-		// Trailers alone may follow the answer, RFC 9113 section 8.1.
+	if status == "" && (!s.answered || s.connected || !f.StreamEnded() || len(f.PseudoFields()) > 0) {
+		// Trailers alone may follow a refusal, RFC 9113 section 8.1, and nothing but DATA
+		// a connected stream, section 8.5.
 		return http2.StreamError{StreamID: f.StreamID, Code: http2.ErrCodeProtocol}
 	}
 	if status != "" {
-		code, err := strconv.Atoi(status)
-		if err != nil || s.answered {
+		code, ok := parseStatus(status)
+		if !ok || s.answered {
 			return http2.StreamError{StreamID: f.StreamID, Code: http2.ErrCodeProtocol}
 		}
-		if code >= 100 && code < 200 {
+		if code < 200 {
 			// Informational, the answer is still to come.
 			if f.StreamEnded() {
 				return http2.StreamError{StreamID: f.StreamID, Code: http2.ErrCodeProtocol}
@@ -917,6 +927,7 @@ func (c *Conn) handleHeaders(f *http2.MetaHeadersFrame) error {
 			header.Add(hf.Name, hf.Value)
 		}
 		s.answered = true
+		s.connected = code < 300
 		if s.open != nil {
 			s.open.reply <- openReply{resp: &Response{StatusCode: code, Header: header}}
 			s.open = nil
@@ -926,6 +937,20 @@ func (c *Conn) handleHeaders(f *http2.MetaHeadersFrame) error {
 		return c.endRemote(s)
 	}
 	return nil
+}
+
+// parseStatus reads the three digits of a :status, RFC 9113 section 8.3.2.
+func parseStatus(status string) (int, bool) {
+	if len(status) != 3 {
+		return 0, false
+	}
+	for i := range 3 {
+		if status[i] < '0' || status[i] > '9' {
+			return 0, false
+		}
+	}
+	code, _ := strconv.Atoi(status)
+	return code, code >= 100
 }
 
 func (c *Conn) handleData(fr frame) error {
@@ -1078,8 +1103,8 @@ func (c *Conn) closeStream(s *Stream, err error, code http2.ErrCode) {
 		c.control = append(c.control, control{kind: ctlReset, id: s.id, code: code})
 	}
 	if s.pending.active {
+		s.reply(s.pending.off, err)
 		s.pending = writeReq{}
-		s.reply(0, err)
 	}
 	c.unready(s)
 	if s.open != nil {
@@ -1087,9 +1112,7 @@ func (c *Conn) closeStream(s *Stream, err error, code http2.ErrCode) {
 		s.open = nil
 	}
 	s.err = err
-	if held := s.closeReads(err); held > 0 {
-		c.credit(nil, held, grantAll)
-	}
+	c.credit(nil, s.closeReads(err), grantAll)
 	c.refreshCanOpen()
 	close(s.closed)
 	c.drained()
@@ -1133,6 +1156,7 @@ func (c *Conn) shutdown(err error, goAway bool, code http2.ErrCode) {
 		}
 	}
 	_ = c.nc.Close()
+	close(c.ended)
 }
 
 // CanOpen reports whether the connection takes a new stream, which it does until it ends,
@@ -1152,13 +1176,14 @@ func (c *Conn) Err() error {
 	}
 }
 
-// Done is closed when the connection ends.
+// Done is closed when the connection ends, before its socket is closed.
 func (c *Conn) Done() <-chan struct{} { return c.done }
 
-// Close ends the connection, every stream on it with net.ErrClosed.
+// Close ends the connection, every stream on it with net.ErrClosed, and returns once the
+// socket is closed.
 func (c *Conn) Close() error {
 	c.send(msg{kind: msgClose})
-	<-c.done
+	<-c.ended
 	return nil
 }
 
@@ -1202,8 +1227,12 @@ func (c *Conn) Open(ctx context.Context, req Request) (*Stream, *Response, error
 	}
 }
 
-// validate refuses a field name or value HTTP/2 forbids, RFC 9113 section 8.2.1.
+// validate refuses a CONNECT without an authority, RFC 9113 section 8.5, and a field name
+// or value HTTP/2 forbids, sections 8.2.1 and 8.2.2.
 func (req Request) validate() error {
+	if req.Authority == "" {
+		return errNoAuthority
+	}
 	for _, v := range []string{req.Scheme, req.Authority, req.Path, req.Protocol} {
 		if !httpguts.ValidHeaderFieldValue(v) {
 			return errInvalidHeader
@@ -1213,8 +1242,12 @@ func (req Request) validate() error {
 		if !httpguts.ValidHeaderFieldName(k) {
 			return errInvalidHeader
 		}
+		switch strings.ToLower(k) {
+		case "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade":
+			return errInvalidHeader
+		}
 		for _, v := range vv {
-			if !httpguts.ValidHeaderFieldValue(v) {
+			if !httpguts.ValidHeaderFieldValue(v) || strings.EqualFold(k, "te") && v != "trailers" {
 				return errInvalidHeader
 			}
 		}
@@ -1271,6 +1304,7 @@ type Stream struct {
 	localEnd    bool
 	remoteEnd   bool
 	answered    bool
+	connected   bool
 	fromPeer    bool
 }
 
@@ -1337,9 +1371,15 @@ func (s *Stream) closeReads(err error) int64 {
 
 // Read returns the bytes the peer sent, in order.
 func (s *Stream) Read(b []byte) (int, error) {
+	if len(b) == 0 {
+		return 0, nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for {
+		if !s.readDeadline.IsZero() && !time.Now().Before(s.readDeadline) {
+			return 0, os.ErrDeadlineExceeded
+		}
 		if len(s.chunks) > 0 {
 			n := copy(b, s.chunks[0])
 			if n == len(s.chunks[0]) {
@@ -1358,9 +1398,6 @@ func (s *Stream) Read(b []byte) (int, error) {
 		}
 		if s.readErr != nil {
 			return 0, s.readErr
-		}
-		if !s.readDeadline.IsZero() && !time.Now().Before(s.readDeadline) {
-			return 0, os.ErrDeadlineExceeded
 		}
 		// Nothing to read, so what was consumed is granted back before the wait.
 		if !s.returned && s.unsent >= creditIdle {
