@@ -1157,9 +1157,15 @@ func TestStream_DataAfterEndStreamIsAnError(t *testing.T) {
 	require.True(t, c.CanOpen())
 }
 
-// stuckPeers answers n streams, then stops reading its socket, and returns the streams
+// stuckPeer answers n streams, then stops reading its socket, and returns the streams
 // once the client's writer is stuck on it, the first of them filling the socket.
 func stuckPeer(t *testing.T, n int) (*Conn, []*Stream) {
+	return silentPeer(t, n, true)
+}
+
+// silentPeer answers n streams, then stops reading its socket. With fill, the first stream
+// fills the socket so the client's writer is stuck before it returns.
+func silentPeer(t *testing.T, n int, fill bool) (*Conn, []*Stream) {
 	t.Helper()
 	cli, srv := tcpPair(t)
 	answered := make(chan struct{}, n)
@@ -1195,8 +1201,10 @@ func stuckPeer(t *testing.T, n int) (*Conn, []*Stream) {
 		<-answered
 		streams = append(streams, s)
 	}
-	go func() { _, _ = streams[0].Write(make([]byte, 64<<20)) }()
-	time.Sleep(300 * time.Millisecond)
+	if fill {
+		go func() { _, _ = streams[0].Write(make([]byte, 64<<20)) }()
+		time.Sleep(300 * time.Millisecond)
+	}
 	return conn, streams
 }
 
@@ -1327,4 +1335,151 @@ func TestConn_KeepAlive(t *testing.T) {
 			assert.GreaterOrEqual(t, pings.Load(), int32(3))
 		})
 	}
+}
+
+// A stream error the peer's HEADERS provoke ends that stream alone, the other streams on the
+// connection go on.
+func TestConn_StreamErrorFromHeadersEndsTheStreamAlone(t *testing.T) {
+	cli, srv := tcpPair(t)
+	go func() {
+		peer, err := startFakePeer(srv)
+		if err != nil {
+			return
+		}
+		for {
+			f, rerr := peer.fr.ReadFrame()
+			if rerr != nil {
+				return
+			}
+			if mh, ok := f.(*http2.MetaHeadersFrame); ok {
+				if mh.StreamID == 1 {
+					_ = peer.answer(mh.StreamID)
+					continue
+				}
+				// No :status at all, which the framer lets through.
+				peer.wmu.Lock()
+				peer.encBuf.Reset()
+				_ = peer.enc.WriteField(hpack.HeaderField{Name: "x-foo", Value: "bar"})
+				_ = peer.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: mh.StreamID, BlockFragment: peer.encBuf.Bytes(), EndHeaders: true})
+				peer.wmu.Unlock()
+			}
+		}
+	}()
+	c, err := Client(cli, 0)
+	require.NoError(t, err)
+	defer func() { _ = c.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	first, _, err := c.Open(ctx, Request{Authority: "origin.test:443"})
+	require.NoError(t, err)
+	_, _, err = c.Open(ctx, Request{Authority: "origin.test:443"})
+	var se http2.StreamError
+	require.ErrorAs(t, err, &se, "the answer without a status is a stream error")
+	require.NoError(t, c.Err(), "the connection ended on one stream's HEADERS")
+	_, err = first.Write([]byte("still here"))
+	require.NoError(t, err)
+}
+
+// A write past its deadline sends nothing and keeps the windows it never used.
+func TestStream_PastDeadlineWriteKeepsTheWindow(t *testing.T) {
+	srv := echoServer(t, nil)
+	c := dial(t, srv)
+	s, _ := open(t, c, nil)
+	c.mu.Lock()
+	s.mu.Lock()
+	conn, stream := c.sendWindow, s.sendWindow
+	s.mu.Unlock()
+	c.mu.Unlock()
+	require.NoError(t, s.SetWriteDeadline(time.Now().Add(-time.Second)))
+	for range 100 {
+		_, err := s.Write(make([]byte, 1000))
+		require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+	}
+	require.NoError(t, s.SetWriteDeadline(time.Time{}))
+	_, err := s.Write([]byte("drain"))
+	require.NoError(t, err)
+	c.mu.Lock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	defer c.mu.Unlock()
+	assert.Equal(t, conn-5, c.sendWindow, "the connection send window lost what the skipped frames took")
+	assert.Equal(t, stream-5, s.sendWindow, "the stream send window lost what the skipped frames took")
+}
+
+// A write the deadline cuts while its frame is on the wire ends the stream, a byte stream
+// that lost track of what left cannot go on.
+func TestStream_WriteDeadlineRaceEndsTheStream(t *testing.T) {
+	_, streams := silentPeer(t, 1, false)
+	s := streams[0]
+	require.NoError(t, s.SetWriteDeadline(time.Now().Add(300*time.Millisecond)))
+	_, err := s.Write(make([]byte, 8<<20))
+	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+	require.NoError(t, s.SetWriteDeadline(time.Time{}))
+	_, err = s.Write([]byte("more"))
+	require.Error(t, err)
+	require.NotErrorIs(t, err, os.ErrDeadlineExceeded, "the stream went on after a frame it lost track of")
+}
+
+// A peer whose frames keep arriving is alive, whether or not it answers the PING.
+func TestConn_KeepAliveCountsTraffic(t *testing.T) {
+	cli, srv := tcpPair(t)
+	answered := make(chan uint32, 1)
+	go func() {
+		peer, err := startFakePeer(srv, http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1 << 20})
+		if err != nil {
+			return
+		}
+		go func() {
+			for {
+				f, rerr := peer.fr.ReadFrame()
+				if rerr != nil {
+					return
+				}
+				if mh, ok := f.(*http2.MetaHeadersFrame); ok {
+					_ = peer.answer(mh.StreamID)
+					answered <- mh.StreamID
+				}
+			}
+		}()
+		id := <-answered
+		// Long enough for a PING to go out, short enough for the traffic to resume before
+		// the ack is due.
+		time.Sleep(400 * time.Millisecond)
+		for {
+			if werr := peer.writeData(id, []byte("tick")); werr != nil {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+	// The period leaves the reader room under a loaded machine.
+	c, err := Client(cli, 300*time.Millisecond)
+	require.NoError(t, err)
+	defer func() { _ = c.Close() }()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	s, _, err := c.Open(ctx, Request{Authority: "origin.test:443"})
+	require.NoError(t, err)
+	go func() { _, _ = io.Copy(io.Discard, s) }()
+	time.Sleep(2 * time.Second)
+	require.NoError(t, c.Err(), "the connection ended under live traffic")
+}
+
+// Once the stream IDs run out the connection is retired, its streams go on and the next
+// one is refused the way a GOAWAY refuses it.
+func TestConn_StreamIDExhaustionRetiresTheConnection(t *testing.T) {
+	srv := echoServer(t, nil)
+	c := dial(t, srv)
+	c.mu.Lock()
+	c.nextID = 1<<31 - 1
+	c.mu.Unlock()
+	last, _ := open(t, c, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, _, err := c.Open(ctx, Request{Authority: "origin.test:443"})
+	require.ErrorIs(t, err, ErrGoAway)
+	require.False(t, c.CanOpen())
+	require.NoError(t, c.Err(), "the connection ended on the exhausted IDs")
+	_, err = last.Write([]byte("still here"))
+	require.NoError(t, err)
 }

@@ -203,15 +203,19 @@ func (c *Conn) keepAliveLoop() {
 			return
 		}
 		now := time.Now()
+		lastRead := time.Unix(0, c.lastRead.Load())
 		c.mu.Lock()
 		switch {
+		case !c.pingSent.IsZero() && lastRead.After(c.pingSent):
+			// Any frame since the PING is life, ack or not.
+			c.pingSent = time.Time{}
 		case !c.pingSent.IsZero():
 			if now.Sub(c.pingSent) >= c.keepAlive {
 				c.mu.Unlock()
 				c.fail(errKeepAlive, false)
 				return
 			}
-		case now.Sub(time.Unix(0, c.lastRead.Load())) >= c.keepAlive:
+		case now.Sub(lastRead) >= c.keepAlive:
 			c.pingSent = now
 			c.pingDue = true
 		}
@@ -224,30 +228,34 @@ type writeRequest struct {
 	f func(*http2.Framer) error
 	// res receives the outcome. cancel, when not nil, releases the caller and has the
 	// writer skip the frame, running skip in its place.
-	res    chan error
-	cancel <-chan struct{}
-	skip   func()
+	res     chan error
+	cancel  <-chan struct{}
+	skip    func()
+	started *atomic.Bool
 }
 
 // write has the writer run f and flush, and returns its outcome, the connection's error
-// once it ended, or errCancelled once cancel fired, in which case the frame may still go
-// out unless the writer reached it after the cancel.
-func (c *Conn) write(f func(*http2.Framer) error, cancel <-chan struct{}, skip func()) error {
-	req := writeRequest{f: f, res: make(chan error, 1), cancel: cancel, skip: skip}
+// once it ended, or errCancelled once cancel fired. started reports whether the writer had
+// begun the frame by then, in which case it goes out whole and skip does not run.
+func (c *Conn) write(f func(*http2.Framer) error, cancel <-chan struct{}, skip func()) (err error, started bool) {
+	req := writeRequest{f: f, res: make(chan error, 1), cancel: cancel, skip: skip, started: new(atomic.Bool)}
 	select {
 	case c.writes <- req:
 	case <-c.done:
-		return c.Err()
+		return c.Err(), false
 	case <-cancel:
-		return errCancelled
+		if skip != nil {
+			skip()
+		}
+		return errCancelled, false
 	}
 	select {
 	case err := <-req.res:
-		return err
+		return err, true
 	case <-c.done:
-		return c.Err()
+		return c.Err(), req.started.Load()
 	case <-cancel:
-		return errCancelled
+		return errCancelled, req.started.Load()
 	}
 }
 
@@ -286,6 +294,7 @@ func (c *Conn) writeLoop() {
 				default:
 				}
 			}
+			req.started.Store(true)
 			c.armWriteDeadline()
 			err = c.writeNow(req.f)
 			req.res <- err
@@ -474,7 +483,7 @@ func (c *Conn) Open(ctx context.Context, req Request) (*Stream, *Response, error
 	// section 5.1.1. An error from the writer ends the connection, so what only refuses this
 	// stream is reported apart.
 	var refused error
-	err := c.write(func(fr *http2.Framer) error {
+	err, _ := c.write(func(fr *http2.Framer) error {
 		c.mu.Lock()
 		if refused = c.refusesLocked(req); refused != nil {
 			c.mu.Unlock()
@@ -496,6 +505,10 @@ func (c *Conn) Open(ctx context.Context, req Request) (*Stream, *Response, error
 		}
 		s.id = c.nextID
 		c.nextID += 2
+		if c.nextID > maxStreamID {
+			// The last ID is out, the connection ends with its last stream.
+			c.retired = true
+		}
 		s.sendWindow = c.initialWindow
 		s.recvWindow = window
 		c.streams[s.id] = s
@@ -586,6 +599,9 @@ func (c *Conn) refusesLocked(req Request) error {
 	return nil
 }
 
+// maxStreamID is the last stream ID a client may use, RFC 9113 section 5.1.1.
+const maxStreamID = 1<<31 - 1
+
 func (c *Conn) field(name, value string) {
 	_ = c.enc.WriteField(hpack.HeaderField{Name: name, Value: value})
 }
@@ -610,6 +626,11 @@ func (c *Conn) readLoop() {
 		}
 		c.lastRead.Store(time.Now().UnixNano())
 		if err := c.handle(f); err != nil {
+			var se http2.StreamError
+			if errors.As(err, &se) {
+				c.resetStream(se.StreamID, se.Code, false)
+				continue
+			}
 			c.fail(err, isConnectionError(err))
 			return
 		}
@@ -621,7 +642,7 @@ func isConnectionError(err error) bool {
 	return errors.As(err, &ce)
 }
 
-// handle applies one frame. An error is a connection error.
+// handle applies one frame. A stream error ends that stream, any other error the connection.
 func (c *Conn) handle(f http2.Frame) error {
 	switch f := f.(type) {
 	case *http2.SettingsFrame:
@@ -696,7 +717,7 @@ func (c *Conn) handleSettings(f *http2.SettingsFrame) error {
 		}
 		return nil
 	})
-	if err == nil {
+	if err == nil && c.settingsAcks < maxPingAcks {
 		c.settingsAcks++
 	}
 	c.mu.Unlock()
@@ -1063,6 +1084,9 @@ func (s *Stream) Write(b []byte) (int, error) {
 // when both are empty.
 func (s *Stream) writeFrame(b []byte) (int, error) {
 	for {
+		if dl := s.writeDeadline.Load(); dl != nil && !dl.IsZero() && !time.Now().Before(*dl) {
+			return 0, os.ErrDeadlineExceeded
+		}
 		// The connection lock comes first, the order the read loop takes them in.
 		s.c.mu.Lock()
 		s.mu.Lock()
@@ -1085,9 +1109,11 @@ func (s *Stream) writeFrame(b []byte) (int, error) {
 		if n > 0 {
 			var cancel <-chan struct{}
 			if dl := s.writeDeadline.Load(); dl != nil && !dl.IsZero() {
-				cancel = deadlineChan(*dl)
+				var stop func()
+				cancel, stop = deadlineChan(*dl)
+				defer stop()
 			}
-			err := s.c.write(func(fr *http2.Framer) error { return fr.WriteData(s.id, false, b[:n]) }, cancel, func() {
+			err, started := s.c.write(func(fr *http2.Framer) error { return fr.WriteData(s.id, false, b[:n]) }, cancel, func() {
 				// The frame never left, its window is free again.
 				s.c.mu.Lock()
 				s.c.sendWindow += n
@@ -1095,6 +1121,11 @@ func (s *Stream) writeFrame(b []byte) (int, error) {
 				s.addSendWindow(n)
 			})
 			if errors.Is(err, errCancelled) {
+				if started {
+					// The frame is on the wire past the deadline, and a stream that lost
+					// track of what left cannot go on.
+					s.reset(http2.ErrCodeCancel)
+				}
 				return 0, os.ErrDeadlineExceeded
 			}
 			if err != nil {
@@ -1108,15 +1139,11 @@ func (s *Stream) writeFrame(b []byte) (int, error) {
 	}
 }
 
-// deadlineChan is closed at t, at once when t has passed.
-func deadlineChan(t time.Time) <-chan struct{} {
+// deadlineChan is closed at t. stop releases the timer once the wait is over.
+func deadlineChan(t time.Time) (<-chan struct{}, func()) {
 	ch := make(chan struct{})
-	if d := time.Until(t); d <= 0 {
-		close(ch)
-	} else {
-		time.AfterFunc(d, func() { close(ch) })
-	}
-	return ch
+	timer := time.AfterFunc(time.Until(t), func() { close(ch) })
+	return ch, func() { timer.Stop() }
 }
 
 // CloseWrite ends the proxy-bound direction with END_STREAM.
@@ -1130,7 +1157,8 @@ func (s *Stream) CloseWrite() error {
 	}
 	s.closed = true
 	s.mu.Unlock()
-	return s.c.write(func(fr *http2.Framer) error { return fr.WriteData(s.id, true, nil) }, nil, nil)
+	err, _ := s.c.write(func(fr *http2.Framer) error { return fr.WriteData(s.id, true, nil) }, nil, nil)
+	return err
 }
 
 // Close ends the stream. The peer is told with RST_STREAM unless it ended the stream first.
