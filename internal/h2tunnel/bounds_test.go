@@ -579,78 +579,30 @@ func TestConn_LocalResetsAreNoPeerFlood(t *testing.T) {
 // with ENHANCE_YOUR_CALM once it reads again.
 func TestConn_ControlFloodEndsWithGoAway(t *testing.T) {
 	cli, srv := tcpPair(t)
-	answered := make(chan struct{}, 1)
-	goAway := make(chan http2.ErrCode, 1)
-	ready := make(chan *fakePeer, 1)
-	ended := make(chan struct{})
-	go func() {
-		peer, err := startFakePeer(srv, http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1 << 24})
-		if err != nil {
-			close(ready)
-			return
-		}
-		_ = peer.fr.WriteWindowUpdate(0, 1<<28)
-		ready <- peer
-		for {
-			f, rerr := peer.fr.ReadFrame()
-			if rerr != nil {
-				return
-			}
-			if mh, ok := f.(*http2.MetaHeadersFrame); ok {
-				_ = peer.answer(mh.StreamID)
-				answered <- struct{}{}
-				break
-			}
-		}
-		// Nothing reads the socket until the connection ended.
-		<-ended
-		for {
-			f, rerr := peer.fr.ReadFrame()
-			if rerr != nil {
-				return
-			}
-			if ga, ok := f.(*http2.GoAwayFrame); ok {
-				select {
-				case goAway <- ga.ErrCode:
-				default:
-				}
-			}
-		}
-	}()
-	c, err := Client(cli, 0)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = c.Close() })
-	peer := <-ready
-	require.NotNil(t, peer)
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	s, _, err := c.Open(ctx, Request{Authority: "origin.test:443"})
-	require.NoError(t, err)
-	<-answered
-	// The writer sticks on the socket the peer stopped reading, so nothing drains the acks.
+	gate := newGateConn(cli)
+	p := dialPeerOn(t, gate, srv)
+	p.writeSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1 << 24})
+	p.wantSettingsAck()
+	p.writeWindowUpdate(0, 1<<28)
+	s, _ := p.connect()
+	// The writer is held, so nothing serve encodes leaves and every ack stays owed.
+	gate.hold()
 	go func() { _, _ = s.Write(make([]byte, 64<<20)) }()
-	time.Sleep(300 * time.Millisecond)
-	for range maxControlFrames + 64 {
-		peer.wmu.Lock()
-		werr := peer.fr.WritePing(false, [8]byte{1})
-		peer.wmu.Unlock()
-		if werr != nil {
-			break
-		}
+	waitStuck(t, p.c)
+	// One ack past the bound ends the connection, and every PING was read by then, so
+	// the socket closes with a FIN and not a RST that would drop the GOAWAY.
+	for range maxControlFrames + 1 {
+		p.writePing(false, [8]byte{1})
 	}
 	select {
-	case <-c.Done():
-	case <-time.After(10 * time.Second):
+	case <-p.c.Done():
+	case <-time.After(wantTimeout):
 		t.Fatal("the control flood never ended the connection")
 	}
-	require.ErrorIs(t, c.Err(), errControlFlood)
-	close(ended)
-	select {
-	case code := <-goAway:
-		assert.Equal(t, http2.ErrCodeEnhanceYourCalm, code)
-	case <-time.After(3 * time.Second):
-		t.Fatal("the connection ended on a control flood with no GOAWAY")
-	}
+	require.ErrorIs(t, p.c.Err(), errControlFlood)
+	gate.release()
+	p.wantGoAway(http2.ErrCodeEnhanceYourCalm)
+	p.wantClosed()
 }
 
 // Probe for the chunk joining: a peer sending tiny frames to a reader that falls behind

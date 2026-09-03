@@ -245,6 +245,76 @@ func stuckPeer(t *testing.T, n int) (*Conn, []*Stream) {
 	return silentPeer(t, n, true)
 }
 
+// gateConn is a socket whose writes wait at a gate the test closes and opens, so a stuck
+// writer is stuck by construction and not by what a kernel buffer takes. A write deadline
+// ends the wait as it would on a socket.
+type gateConn struct {
+	net.Conn
+	mu       sync.Mutex
+	cond     sync.Cond
+	held     bool
+	deadline time.Time
+}
+
+func newGateConn(nc net.Conn) *gateConn {
+	g := &gateConn{Conn: nc}
+	g.cond.L = &g.mu
+	return g
+}
+
+func (g *gateConn) hold() {
+	g.mu.Lock()
+	g.held = true
+	g.mu.Unlock()
+}
+
+func (g *gateConn) release() {
+	g.mu.Lock()
+	g.held = false
+	g.cond.Broadcast()
+	g.mu.Unlock()
+}
+
+func (g *gateConn) Write(p []byte) (int, error) {
+	g.mu.Lock()
+	for g.held {
+		if !g.deadline.IsZero() {
+			if !time.Now().Before(g.deadline) {
+				g.mu.Unlock()
+				return 0, os.ErrDeadlineExceeded
+			}
+			time.AfterFunc(time.Until(g.deadline), g.cond.Broadcast)
+		}
+		g.cond.Wait()
+	}
+	g.mu.Unlock()
+	return g.Conn.Write(p)
+}
+
+func (g *gateConn) SetWriteDeadline(t time.Time) error {
+	g.mu.Lock()
+	g.deadline = t
+	g.cond.Broadcast()
+	g.mu.Unlock()
+	return g.Conn.SetWriteDeadline(t)
+}
+
+func (g *gateConn) SetDeadline(t time.Time) error {
+	_ = g.SetWriteDeadline(t)
+	return g.Conn.SetReadDeadline(t)
+}
+
+// waitStuck returns once the write goroutine is held on a buffer and serve's own is full,
+// the state in which nothing serve encodes leaves.
+func waitStuck(t *testing.T, c *Conn) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		var stuck bool
+		c.onLoop(func() { stuck = c.writing && c.out.Len() >= outBound })
+		return stuck
+	}, wantTimeout, time.Millisecond, "the writer never got stuck")
+}
+
 // silentPeer answers n streams, then stops reading its socket. With fill, the first stream
 // fills the socket so the client's writer is stuck before it returns.
 func silentPeer(t *testing.T, n int, fill bool) (*Conn, []*Stream) {
@@ -271,7 +341,8 @@ func silentPeer(t *testing.T, n int, fill bool) (*Conn, []*Stream) {
 		}
 		// Nothing reads the socket from here on.
 	}()
-	conn, err := Client(cli, 0)
+	gate := newGateConn(cli)
+	conn, err := Client(gate, 0)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = conn.Close() })
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -284,8 +355,9 @@ func silentPeer(t *testing.T, n int, fill bool) (*Conn, []*Stream) {
 		streams = append(streams, s)
 	}
 	if fill {
+		gate.hold()
 		go func() { _, _ = streams[0].Write(make([]byte, 64<<20)) }()
-		time.Sleep(300 * time.Millisecond)
+		waitStuck(t, conn)
 	}
 	return conn, streams
 }
