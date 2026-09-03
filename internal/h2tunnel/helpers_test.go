@@ -88,7 +88,7 @@ func open(t *testing.T, c *Conn, header http.Header) (*Stream, *Response) {
 }
 
 // fakePeer is the server end of a TCP connection, reading the client preface, sending the
-// settings the test asks for and answering every HEADERS with 200. What it does past that
+// settings given and answering every HEADERS with 200. What it does past that
 // is the test's.
 type fakePeer struct {
 	fr     *http2.Framer
@@ -497,10 +497,16 @@ func newPeer(t *testing.T, settings ...http2.Setting) *peer {
 	return p
 }
 
-// dialPeer is newPeer before the peer said anything.
+// dialPeer is newPeer before the peer sent anything.
 func dialPeer(t *testing.T) *peer {
 	t.Helper()
 	cli, srv := tcpPair(t)
+	return dialPeerOn(t, cli, srv)
+}
+
+// dialPeerOn is dialPeer on a socket of the case's choosing.
+func dialPeerOn(t *testing.T, cli, srv net.Conn) *peer {
+	t.Helper()
 	c, err := Client(cli, 0)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = c.Close() })
@@ -822,4 +828,15 @@ func (p *peer) wantReadCode(s *Stream, code http2.ErrCode) {
 	var se http2.StreamError
 	require.ErrorAs(p.t, err, &se, "read ended with %v", err)
 	require.Equal(p.t, code, se.Code)
+}
+
+// slowConn delays every socket write, so serve encodes ahead of the write goroutine.
+type slowConn struct {
+	net.Conn
+	delay time.Duration
+}
+
+func (c *slowConn) Write(b []byte) (int, error) {
+	time.Sleep(c.delay)
+	return c.Conn.Write(b)
 }

@@ -2,7 +2,7 @@
 // Mount of this source code is governed by a Apache-2.0 license that can be found
 // at https://github.com/fox-toolkit/edge/blob/master/LICENSE.txt.
 
-// Package h2tunnel speaks the client side of HTTP/2 for CONNECT streams, each served as a
+// Package h2tunnel implements the client side of HTTP/2 for CONNECT streams, each served as a
 // net.Conn. It exists because the HTTP/2 client of the standard library refuses the
 // :protocol pseudo-header, so an extended CONNECT, RFC 8441, cannot be sent through it.
 //
@@ -60,7 +60,7 @@ const (
 	// connection ends past it.
 	maxControlFrames = 1024
 	// creditRefresh is the least a WINDOW_UPDATE grants while the reader keeps up.
-	// creditFlush is how much a reader consumes before telling serve, and creditIdle the
+	// creditFlush is how much a reader consumes before the credit is sent to serve, and creditIdle the
 	// least it grants back when it stops to wait.
 	creditRefresh = window / 2
 	creditFlush   = 32 << 10
@@ -208,7 +208,7 @@ type msg struct {
 	grant grant
 }
 
-// grant says when the credit of a read is granted back to the peer.
+// grant selects when the credit of a read is granted back to the peer.
 type grant uint8
 
 const (
@@ -266,7 +266,7 @@ func (f *inflow) take(n int64) bool {
 	return true
 }
 
-// add records n bytes consumed, and makes them due to the peer unless g says to wait.
+// add records n bytes consumed, and makes them due to the peer unless g defers it.
 func (f *inflow) add(n int64, g grant) {
 	f.unsent += n
 	switch g {
@@ -866,7 +866,7 @@ func (c *Conn) handleSettings(f *http2.SettingsFrame) error {
 		}
 		switch s.ID {
 		case http2.SettingEnablePush:
-			// A server may only say 0, RFC 9113 section 6.5.2.
+			// A server may only send 0, RFC 9113 section 6.5.2.
 			if s.Val != 0 {
 				return http2.ConnectionError(http2.ErrCodeProtocol)
 			}
@@ -938,6 +938,12 @@ func (c *Conn) handleHeaders(f *http2.MetaHeadersFrame) error {
 	if f.Truncated {
 		return http2.StreamError{StreamID: f.StreamID, Code: http2.ErrCodeEnhanceYourCalm}
 	}
+	for _, hf := range f.RegularFields() {
+		// Any message, trailers and informational answers included, RFC 9113 section 8.2.2.
+		if connectionSpecific(hf.Name, hf.Value) {
+			return http2.StreamError{StreamID: f.StreamID, Code: http2.ErrCodeProtocol}
+		}
+	}
 	status := f.PseudoValue("status")
 	if status == "" && (!s.answered || s.connected || !f.StreamEnded() || len(f.PseudoFields()) > 0) {
 		// Trailers alone may follow a refusal, RFC 9113 section 8.1, and nothing but DATA
@@ -958,9 +964,6 @@ func (c *Conn) handleHeaders(f *http2.MetaHeadersFrame) error {
 		}
 		header := make(http.Header, len(f.RegularFields()))
 		for _, hf := range f.RegularFields() {
-			if connectionSpecific(hf.Name, hf.Value) {
-				return http2.StreamError{StreamID: f.StreamID, Code: http2.ErrCodeProtocol}
-			}
 			header.Add(hf.Name, hf.Value)
 		}
 		s.answered = true
@@ -1116,7 +1119,7 @@ func (c *Conn) onKeepAlive() {
 	c.keepTimer.Reset(c.keepAlive - idle)
 }
 
-// resetStream ends the stream of se and tells the peer. The reset is owed by a stream the
+// resetStream ends the stream of se with a RST_STREAM. The reset is owed by a stream the
 // connection opened, so it counts against no bound.
 func (c *Conn) resetStream(se http2.StreamError) {
 	if s := c.streams[se.StreamID]; s != nil {
@@ -1124,8 +1127,8 @@ func (c *Conn) resetStream(se http2.StreamError) {
 	}
 }
 
-// closeStream ends s with err. The peer is told with RST_STREAM and code unless it ended
-// the stream itself, or the stream ended in both directions, or its HEADERS never left.
+// closeStream ends s with err. A RST_STREAM with code is sent unless the peer ended the
+// stream itself, or the stream ended in both directions, or its HEADERS never left.
 func (c *Conn) closeStream(s *Stream, err error, code http2.ErrCode) {
 	if s.gone {
 		return
@@ -1163,7 +1166,7 @@ func (c *Conn) drained() {
 	}
 }
 
-// shutdown ends the connection with err. goAway says whether the peer is told, on a best
+// shutdown ends the connection with err. goAway selects whether a GOAWAY is sent, on a best
 // effort bounded by closeTimeout.
 func (c *Conn) shutdown(err error, goAway bool, code http2.ErrCode) {
 	if c.err != nil {
@@ -1187,7 +1190,11 @@ func (c *Conn) shutdown(err error, goAway bool, code http2.ErrCode) {
 	}
 	close(c.writeCh)
 	if goAway {
-		c.out.Reset()
+		// The frames encoded before a graceful GOAWAY, those of a Write that returned, are
+		// written ahead of it. An error drops them, RFC 9113 section 5.4.1.
+		if code != http2.ErrCodeNo {
+			c.out.Reset()
+		}
 		if werr := c.fr.WriteGoAway(0, code, nil); werr == nil {
 			_ = c.nc.SetWriteDeadline(time.Now().Add(closeTimeout))
 			_, _ = c.nc.Write(c.out.Bytes())
@@ -1356,8 +1363,9 @@ type Stream struct {
 	chunks        [][]byte
 	pending       writeReq
 	recv          inflow
-	// unsent is what the reader consumed and has not told serve, and returned says serve
-	// granted back what was held when the stream ended, so a read grants nothing more.
+	// unsent is what the reader consumed and has not sent to serve, and returned records
+	// that serve granted back what was held when the stream ended, so a read grants nothing
+	// more.
 	unsent      int64
 	sendWindow  int64
 	mu          sync.Mutex
@@ -1496,7 +1504,7 @@ func (s *Stream) Read(b []byte) (int, error) {
 	}
 }
 
-// flush tells serve what the reader consumed, with mu released for the send.
+// flush sends serve what the reader consumed, with mu released for the send.
 func (s *Stream) flush(g grant) {
 	n := s.unsent
 	s.unsent = 0
@@ -1550,7 +1558,7 @@ func (s *Stream) submit(m msg) (int, error) {
 	}
 }
 
-// Close ends the stream. The peer is told with RST_STREAM unless it ended the stream first.
+// Close ends the stream, with a RST_STREAM unless the peer ended it first.
 func (s *Stream) Close() error {
 	if s.c.send(msg{kind: msgCloseStream, s: s, code: http2.ErrCodeCancel}) {
 		select {

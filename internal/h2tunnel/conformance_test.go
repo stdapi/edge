@@ -29,11 +29,11 @@ import (
 type conformanceCase struct {
 	// id is the key in the source, "http2/6.5.2/1" in h2spec.
 	id string
-	// name says what the peer does.
+	// name states what the peer sends.
 	name string
 	// req is the requirement in the words of the RFC.
 	req string
-	// skip says why the case does not apply, or where the client departs from it.
+	// skip gives the reason the case does not apply, or where the client departs from it.
 	skip string
 	run  func(t *testing.T, p *peer)
 }
@@ -636,18 +636,39 @@ var conformance = []conformanceCase{
 	},
 	{
 		id: "http2/5.1/11", name: "DATA on a stream that ended in both directions",
-		req:  "An endpoint that receives any frames after receiving a frame with the END_STREAM flag set MUST treat that as a connection error of type STREAM_CLOSED.",
-		skip: "the client forgets a stream at its end and ignores a late frame on it, crediting its DATA back, as Go's transport does; telling a stream that ended from one the client reset would keep every ended stream",
+		req: "An endpoint MAY treat receipt of any other type of frame on a closed stream as a connection error of type STREAM_CLOSED. The client ignores the frame and credits its DATA back, as Go's transport does.",
+		run: func(t *testing.T, p *peer) {
+			s, id := p.connect()
+			ended(t, p, s, id)
+			p.writeData(id, false, []byte("late"))
+			var credited uint32
+			for credited < 4 {
+				credited += p.wantWindowUpdate(0)
+			}
+			p.wantAlive()
+		},
 	},
 	{
 		id: "http2/5.1/12", name: "HEADERS on a stream that ended in both directions",
-		req:  "An endpoint that receives any frames after receiving a frame with the END_STREAM flag set MUST treat that as a connection error of type STREAM_CLOSED.",
-		skip: "the client forgets a stream at its end and ignores a late frame on it, as Go's transport does",
+		req: "An endpoint MAY treat receipt of any other type of frame on a closed stream as a connection error of type STREAM_CLOSED. The client ignores the frame, as Go's transport does.",
+		run: func(t *testing.T, p *peer) {
+			s, id := p.connect()
+			ended(t, p, s, id)
+			p.writeHeaders(id, true, hpack.HeaderField{Name: "x-late", Value: "1"})
+			p.wantAlive()
+		},
 	},
 	{
 		id: "http2/5.1/13", name: "CONTINUATION on a stream that ended in both directions",
-		req:  "An endpoint that receives any frames after receiving a frame with the END_STREAM flag set MUST treat that as a connection error of type STREAM_CLOSED.",
-		skip: "the client forgets a stream at its end and ignores a late frame on it, as Go's transport does",
+		req: "An endpoint MAY treat receipt of any other type of frame on a closed stream as a connection error of type STREAM_CLOSED. The client ignores the frame, as Go's transport does.",
+		run: func(t *testing.T, p *peer) {
+			s, id := p.connect()
+			ended(t, p, s, id)
+			block := p.block(hpack.HeaderField{Name: "x-late", Value: "1"})
+			require.NoError(t, p.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: block[:1], EndStream: true}))
+			require.NoError(t, p.fr.WriteContinuation(id, true, block[1:]))
+			p.wantAlive()
+		},
 	},
 	{
 		id: "http2/5.3.1/1", name: "HEADERS depending on its own stream",
@@ -1682,6 +1703,78 @@ var conformance = []conformanceCase{
 			require.ErrorIs(t, p.c.Err(), ErrGoAway)
 		},
 	},
+	{
+		id: "rfc9113/6.8/6", name: "what a Write reported leaves ahead of a graceful GOAWAY",
+		req: "GOAWAY allows an endpoint to gracefully stop accepting new streams while still finishing processing of previously established streams. A Write that returned reached the socket unless the connection failed.",
+		run: func(t *testing.T, p *peer) {
+			cli, srv := tcpPair(t)
+			p = dialPeerOn(t, &slowConn{Conn: cli, delay: 400 * time.Millisecond}, srv)
+			p.writeSettings()
+			p.wantSettingsAck()
+			s, id := p.connect()
+			p.writeData(id, true, nil)
+			p.wantReadError(s, io.EOF)
+			p.c.Retire()
+			// The first write is in the write goroutine's hands, the second in the
+			// buffer serve still owns when the CloseWrite drains the connection.
+			_, err := s.Write([]byte("first"))
+			require.NoError(t, err)
+			_, err = s.Write([]byte("second"))
+			require.NoError(t, err)
+			require.NoError(t, s.CloseWrite())
+			var got []byte
+			for f := p.wantData(id); ; f = p.wantData(id) {
+				got = append(got, f.Data()...)
+				if f.StreamEnded() {
+					break
+				}
+			}
+			require.Equal(t, "firstsecond", string(got))
+			p.wantGoAway(http2.ErrCodeNo)
+			p.wantClosed()
+		},
+	},
+	{
+		id: "rfc9113/6.8/7", name: "the last END_STREAM leaves ahead of the answer to the peer's GOAWAY",
+		req: "GOAWAY allows an endpoint to gracefully stop accepting new streams while still finishing processing of previously established streams.",
+		run: func(t *testing.T, p *peer) {
+			s, id := p.connect()
+			p.writeData(id, true, nil)
+			p.wantReadError(s, io.EOF)
+			p.writeGoAway(id, http2.ErrCodeNo)
+			require.Eventually(t, func() bool { return !p.c.CanOpen() }, wantTimeout, time.Millisecond)
+			require.NoError(t, s.CloseWrite())
+			require.True(t, p.wantData(id).StreamEnded())
+			p.wantGoAway(http2.ErrCodeNo)
+			p.wantClosed()
+		},
+	},
+	{
+		id: "rfc9113/8.2.2/2", name: "a connection-specific field in trailers",
+		req: "Any message containing connection-specific header fields MUST be treated as malformed. Clients MUST NOT accept a malformed response.",
+		run: func(t *testing.T, p *peer) {
+			o := p.open(Request{Authority: "origin.test:443"})
+			id := p.wantHeaders().StreamID
+			p.writeHeaders(id, false, status("403"))
+			s, _, err := o.wait(t)
+			require.NoError(t, err)
+			p.writeHeaders(id, true, hpack.HeaderField{Name: "connection", Value: "keep-alive"})
+			p.wantStreamError(id, http2.ErrCodeProtocol)
+			p.wantReadCode(s, http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "rfc9113/8.2.2/3", name: "a connection-specific field in an informational answer",
+		req: "Any message containing connection-specific header fields MUST be treated as malformed. Clients MUST NOT accept a malformed response.",
+		run: func(t *testing.T, p *peer) {
+			o := p.open(Request{Authority: "origin.test:443"})
+			id := p.wantHeaders().StreamID
+			p.writeHeaders(id, false, status("103"), hpack.HeaderField{Name: "connection", Value: "keep-alive"})
+			p.wantStreamError(id, http2.ErrCodeProtocol)
+			_, _, err := o.wait(t)
+			require.Error(t, err)
+		},
+	},
 	// Scenarios of Go's HTTP/2 transport tests that apply to a client of CONNECT streams
 	// and that no case above covers.
 	{
@@ -1823,6 +1916,15 @@ var conformance = []conformanceCase{
 			p.wantStreamError(id, http2.ErrCodeProtocol)
 		},
 	},
+}
+
+// ended closes s in both directions, the client's END_STREAM first.
+func ended(t *testing.T, p *peer, s *Stream, id uint32) {
+	t.Helper()
+	require.NoError(t, s.CloseWrite())
+	require.True(t, p.wantData(id).StreamEnded())
+	p.writeData(id, true, nil)
+	p.wantReadError(s, io.EOF)
 }
 
 // wantCompressionError sends block as the answer and wants the decoding error to end the

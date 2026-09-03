@@ -252,3 +252,43 @@ func TestConn_PaddingOnlyFramesReturnTheWindow(t *testing.T) {
 	assert.Eventually(t, func() bool { return peer.window() == connWindow }, 3*time.Second, 20*time.Millisecond,
 		"the connection window is short by %d after the stream that took it ended", connWindow-peer.window())
 }
+
+// the connection receive window is exact across every path that takes from it,
+// padding, a local Close that drops buffered chunks, DATA on a stream the client reset and
+// DATA on a stream the peer ended.
+func TestConn_ConnectionWindowExactAcrossEveryPath(t *testing.T) {
+	p := newPeer(t)
+	var want int64
+	p.c.onLoop(func() { want = p.c.recv.avail + p.c.recv.unsent })
+	for round := range 12 {
+		s, id := p.connect()
+		p.writeData(id, false, make([]byte, 4<<10))
+		require.NoError(t, p.fr.WriteDataPadded(id, false, make([]byte, 1<<10), make([]byte, 64)))
+		time.Sleep(5 * time.Millisecond)
+		switch round % 3 {
+		case 0:
+			// A local close drops what was buffered.
+			require.NoError(t, s.Close())
+			p.writeData(id, false, make([]byte, 2<<10))
+		case 1:
+			// The peer ends the stream, then sends DATA past it.
+			p.writeData(id, true, make([]byte, 1<<10))
+			time.Sleep(5 * time.Millisecond)
+			p.writeData(id, false, make([]byte, 2<<10))
+			require.NoError(t, s.Close())
+		case 2:
+			p.writeRST(id, http2.ErrCodeCancel)
+		}
+		select {
+		case <-s.closed:
+		case <-time.After(wantTimeout):
+			t.Fatal("the stream did not close")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	var got int64
+	require.Eventually(t, func() bool {
+		p.c.onLoop(func() { got = p.c.recv.avail + p.c.recv.unsent })
+		return got == want
+	}, wantTimeout, 10*time.Millisecond, "the connection receive window drifted: want %d, got %d", want, got)
+}

@@ -517,3 +517,29 @@ func TestConn_OpenCancelledLeavesTheRequestToTheCaller(t *testing.T) {
 		}
 	}
 }
+
+// Open cancelled at the moment the peer answers leaves no stream behind and no
+// caller blocked.
+func TestConn_OpenCancelledAsTheAnswerArrives(t *testing.T) {
+	for range 40 {
+		p := newPeer(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() {
+			_, _, _ = p.c.Open(ctx, Request{Authority: "origin.test:443"})
+			close(done)
+		}()
+		id := p.wantHeaders().StreamID
+		go cancel()
+		p.answer(id)
+		select {
+		case <-done:
+		case <-time.After(wantTimeout):
+			t.Fatal("Open did not return")
+		}
+		var open int
+		p.c.onLoop(func() { open = len(p.c.streams) })
+		require.Zero(t, open, "a stream was left behind")
+		_ = p.c.Close()
+	}
+}

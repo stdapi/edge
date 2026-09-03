@@ -263,8 +263,8 @@ var contract = []contractCase{
 			require.Equal(t, "drain", string(p.wantData(id).Data()))
 			var connNow, streamNow int64
 			p.c.onLoop(func() { connNow, streamNow = p.c.sendWindow, s.sendWindow })
-			assert.Equal(t, conn-5, connNow, "the connection send window lost what the skipped frames took")
-			assert.Equal(t, stream-5, streamNow, "the stream send window lost what the skipped frames took")
+			assert.Equal(t, conn-5, connNow, "the skipped writes took from the connection send window")
+			assert.Equal(t, stream-5, streamNow, "the skipped writes took from the stream send window")
 		},
 	},
 	{

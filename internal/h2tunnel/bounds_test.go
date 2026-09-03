@@ -7,6 +7,7 @@ package h2tunnel
 import (
 	"context"
 	"io"
+	"math/rand"
 	"net/http"
 	"os"
 	"runtime"
@@ -77,7 +78,7 @@ func TestConn_CloseBehindAStuckWrite(t *testing.T) {
 	}
 }
 
-// A read with bytes in hand returns them, and one without honours its deadline, while the
+// A read with bytes in hand returns them, and one without returns at its deadline, while the
 // writer is stuck on a peer that stopped reading.
 func TestStream_ReadDeadlineBehindAStuckWriter(t *testing.T) {
 	cli, srv := tcpPair(t)
@@ -198,7 +199,7 @@ func TestConn_OwedFramesSurviveAStuckWriter(t *testing.T) {
 	require.NoError(t, err)
 	id := <-answered
 
-	// The writer sticks on the socket, and the peer asks for more than the queue holds.
+	// The writer sticks on the socket, and the peer provokes more control frames than the queue bounds.
 	go func() { _, _ = s.Write(make([]byte, 64<<20)) }()
 	time.Sleep(300 * time.Millisecond)
 	for range maxControlFrames - 8 {
@@ -574,9 +575,9 @@ func TestConn_LocalResetsAreNoPeerFlood(t *testing.T) {
 	}
 }
 
-// A peer that provokes more control frames than the socket takes is told with a GOAWAY
-// saying ENHANCE_YOUR_CALM once it reads again.
-func TestConn_ControlFloodIsToldWithGoAway(t *testing.T) {
+// A peer that provokes more control frames than the socket takes receives a GOAWAY
+// with ENHANCE_YOUR_CALM once it reads again.
+func TestConn_ControlFloodEndsWithGoAway(t *testing.T) {
 	cli, srv := tcpPair(t)
 	answered := make(chan struct{}, 1)
 	goAway := make(chan http2.ErrCode, 1)
@@ -650,4 +651,41 @@ func TestConn_ControlFloodIsToldWithGoAway(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("the connection ended on a control flood with no GOAWAY")
 	}
+}
+
+// Probe for the chunk joining: a peer sending tiny frames to a reader that falls behind
+// must lose and repeat nothing across the backlog, the owned tail and partial reads.
+func TestStream_TinyFramesKeepTheirOrder(t *testing.T) {
+	p := newPeer(t)
+	s, id := p.connect()
+	const total = 200 << 10
+	want := make([]byte, total)
+	rnd := rand.New(rand.NewSource(7)) //nolint:gosec // a test stream
+	_, _ = rnd.Read(want)
+	go func() {
+		off := 0
+		for off < total {
+			n := 1 + rnd.Intn(200)
+			if off+n > total {
+				n = total - off
+			}
+			p.writeData(id, false, want[off:off+n])
+			off += n
+			if off%(8<<10) < 200 {
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}()
+	got := make([]byte, 0, total)
+	buf := make([]byte, 777)
+	require.NoError(t, s.SetReadDeadline(time.Now().Add(20*time.Second)))
+	for len(got) < total {
+		n, rerr := s.Read(buf)
+		require.NoError(t, rerr)
+		got = append(got, buf[:n]...)
+		if len(got)%3000 < 777 {
+			time.Sleep(time.Millisecond)
+		}
+	}
+	require.Equal(t, want, got)
 }
