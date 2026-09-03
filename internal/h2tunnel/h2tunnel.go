@@ -835,8 +835,15 @@ func (c *Conn) handle(fr frame) error {
 		return c.handleGoAway(f)
 	case *http2.PushPromiseFrame:
 		return http2.ConnectionError(http2.ErrCodeProtocol)
+	case *http2.PriorityFrame:
+		// A stream cannot depend on itself, RFC 9113 section 5.3.1. The rest of a
+		// PRIORITY frame is nothing to a client.
+		if f.StreamDep == f.StreamID {
+			return http2.StreamError{StreamID: f.StreamID, Code: http2.ErrCodeProtocol}
+		}
+		return nil
 	}
-	// PRIORITY and anything unknown, RFC 9113 section 4.1.
+	// Anything unknown, RFC 9113 section 4.1.
 	return nil
 }
 
@@ -922,6 +929,9 @@ func (c *Conn) handleHeaders(f *http2.MetaHeadersFrame) error {
 	if s == nil {
 		return nil
 	}
+	if f.HasPriority() && f.Priority.StreamDep == f.StreamID {
+		return http2.StreamError{StreamID: f.StreamID, Code: http2.ErrCodeProtocol}
+	}
 	if s.remoteEnd {
 		return http2.StreamError{StreamID: f.StreamID, Code: http2.ErrCodeStreamClosed}
 	}
@@ -948,6 +958,9 @@ func (c *Conn) handleHeaders(f *http2.MetaHeadersFrame) error {
 		}
 		header := make(http.Header, len(f.RegularFields()))
 		for _, hf := range f.RegularFields() {
+			if connectionSpecific(hf.Name, hf.Value) {
+				return http2.StreamError{StreamID: f.StreamID, Code: http2.ErrCodeProtocol}
+			}
 			header.Add(hf.Name, hf.Value)
 		}
 		s.answered = true
@@ -1278,17 +1291,25 @@ func (req Request) validate() error {
 		if !httpguts.ValidHeaderFieldName(k) {
 			return errInvalidHeader
 		}
-		switch strings.ToLower(k) {
-		case "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade":
-			return errInvalidHeader
-		}
 		for _, v := range vv {
-			if !validValue(v) || strings.EqualFold(k, "te") && v != "trailers" {
+			if !validValue(v) || connectionSpecific(strings.ToLower(k), v) {
 				return errInvalidHeader
 			}
 		}
 	}
 	return nil
+}
+
+// connectionSpecific reports whether a field of a lowercase name is one HTTP/2 forbids in a
+// message, RFC 9113 section 8.2.2.
+func connectionSpecific(name, value string) bool {
+	switch name {
+	case "connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade":
+		return true
+	case "te":
+		return value != "trailers"
+	}
+	return false
 }
 
 // validValue reports whether v may be a field value, RFC 9113 section 8.2.1, which no

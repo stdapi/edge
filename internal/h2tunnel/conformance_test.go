@@ -1,0 +1,2113 @@
+// Copyright 2025 Sylvain Müller. All rights reserved.
+// Mount of this source code is governed by a Apache-2.0 license that can be found
+// at https://github.com/fox-toolkit/edge/blob/master/LICENSE.txt.
+
+package h2tunnel
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
+)
+
+// A conformance case is one requirement of an RFC checked against the client, as the peer
+// sees it. The table is the catalogue: h2spec's cases first, under its own keys, then the
+// scenarios of Go's HTTP/2 transport tests that apply to a client of CONNECT streams. A case
+// that cannot apply states the reason instead of a scenario, so every requirement of the
+// sources is accounted for in one place.
+type conformanceCase struct {
+	// id is the key in the source, "http2/6.5.2/1" in h2spec.
+	id string
+	// name says what the peer does.
+	name string
+	// req is the requirement in the words of the RFC.
+	req string
+	// skip says why the case does not apply, or where the client departs from it.
+	skip string
+	run  func(t *testing.T, h *harness)
+}
+
+func TestConformance(t *testing.T) {
+	for _, tc := range conformance {
+		t.Run(tc.id+" "+tc.name, func(t *testing.T) {
+			if tc.skip != "" {
+				t.Skip(tc.skip)
+			}
+			t.Parallel()
+			tc.run(t, newHarness(t))
+		})
+	}
+}
+
+// harness is the peer's end of a connection, driven in a linear sequence: write what the
+// peer sends, want what the client must send back, with every wait bounded.
+type harness struct {
+	t      *testing.T
+	c      *Conn
+	nc     net.Conn
+	fr     *http2.Framer
+	enc    *hpack.Encoder
+	encBuf bytes.Buffer
+	// nextID is the stream id the client's next HEADERS is expected on.
+	nextID uint32
+}
+
+const wantTimeout = 3 * time.Second
+
+// newHarness connects a client and reads its preface, sends the peer's SETTINGS and takes
+// the ack, so a case starts on a settled connection.
+func newHarness(t *testing.T, settings ...http2.Setting) *harness {
+	t.Helper()
+	h := rawHarness(t)
+	h.writeSettings(settings...)
+	h.wantSettingsAck()
+	return h
+}
+
+// rawHarness is newHarness before the peer said anything.
+func rawHarness(t *testing.T) *harness {
+	t.Helper()
+	cli, srv := tcpPair(t)
+	c, err := Client(cli, 0)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+	h := &harness{t: t, c: c, nc: srv, fr: http2.NewFramer(srv, srv), nextID: 1}
+	h.fr.ReadMetaHeaders = hpack.NewDecoder(hpackTableSize, nil)
+	h.fr.SetMaxReadFrameSize(1 << 24)
+	h.enc = hpack.NewEncoder(&h.encBuf)
+	preface := make([]byte, len(http2.ClientPreface))
+	_ = srv.SetReadDeadline(time.Now().Add(wantTimeout))
+	_, err = io.ReadFull(srv, preface)
+	require.NoError(t, err)
+	require.Equal(t, http2.ClientPreface, string(preface), "the client preface, RFC 9113 section 3.4")
+	sf := h.wantSettings()
+	require.False(t, sf.IsAck(), "the client's first frame is its SETTINGS, RFC 9113 section 3.4")
+	return h
+}
+
+// readFrame returns the client's next frame, within wantTimeout.
+func (h *harness) readFrame() (http2.Frame, error) {
+	_ = h.nc.SetReadDeadline(time.Now().Add(wantTimeout))
+	return h.fr.ReadFrame()
+}
+
+// next returns the client's next frame of type T, passing over the others.
+func next[T http2.Frame](h *harness, what string) T {
+	h.t.Helper()
+	for {
+		f, err := h.readFrame()
+		require.NoError(h.t, err, "waiting for %s", what)
+		if f, ok := f.(T); ok {
+			return f
+		}
+	}
+}
+
+func (h *harness) wantSettings() *http2.SettingsFrame {
+	h.t.Helper()
+	return next[*http2.SettingsFrame](h, "SETTINGS")
+}
+
+func (h *harness) wantSettingsAck() {
+	h.t.Helper()
+	for {
+		f := next[*http2.SettingsFrame](h, "SETTINGS ack")
+		if f.IsAck() {
+			return
+		}
+	}
+}
+
+// wantHeaders returns the client's next HEADERS, on the stream id expected next.
+func (h *harness) wantHeaders() *http2.MetaHeadersFrame {
+	h.t.Helper()
+	f := next[*http2.MetaHeadersFrame](h, "HEADERS")
+	require.Equal(h.t, h.nextID, f.StreamID, "stream ids go up by two, RFC 9113 section 5.1.1")
+	h.nextID += 2
+	return f
+}
+
+func (h *harness) wantData(id uint32) *http2.DataFrame {
+	h.t.Helper()
+	for {
+		f := next[*http2.DataFrame](h, "DATA")
+		if f.StreamID == id {
+			return f
+		}
+	}
+}
+
+func (h *harness) wantRST(id uint32, code http2.ErrCode) {
+	h.t.Helper()
+	f := next[*http2.RSTStreamFrame](h, "RST_STREAM")
+	require.Equal(h.t, id, f.StreamID)
+	require.Equal(h.t, code, f.ErrCode)
+}
+
+func (h *harness) wantGoAway(code http2.ErrCode) *http2.GoAwayFrame {
+	h.t.Helper()
+	f := next[*http2.GoAwayFrame](h, "GOAWAY")
+	require.Equal(h.t, code, f.ErrCode)
+	return f
+}
+
+func (h *harness) wantWindowUpdate(id uint32) uint32 {
+	h.t.Helper()
+	for {
+		f := next[*http2.WindowUpdateFrame](h, "WINDOW_UPDATE")
+		if f.StreamID == id {
+			return f.Increment
+		}
+	}
+}
+
+func (h *harness) wantPingAck(data [8]byte) {
+	h.t.Helper()
+	for {
+		f := next[*http2.PingFrame](h, "PING ack")
+		if f.IsAck() {
+			require.Equal(h.t, data, f.Data)
+			return
+		}
+	}
+}
+
+// wantClosed reads to the end of the socket, which the client closes within closeTimeout
+// of a connection error.
+func (h *harness) wantClosed() {
+	h.t.Helper()
+	for {
+		if _, err := h.readFrame(); err != nil {
+			require.False(h.t, errors.Is(err, os.ErrDeadlineExceeded), "the client kept the socket open")
+			return
+		}
+	}
+}
+
+// wantConnectionError is what a connection error looks like from the peer, RFC 9113
+// section 5.4.1: a GOAWAY with the code, then the socket closed, and the connection ended.
+func (h *harness) wantConnectionError(code http2.ErrCode) {
+	h.t.Helper()
+	h.wantGoAway(code)
+	h.wantClosed()
+	select {
+	case <-h.c.Done():
+	case <-time.After(wantTimeout):
+		h.t.Fatal("the connection did not end")
+	}
+	require.Error(h.t, h.c.Err())
+}
+
+// wantStreamError is what a stream error looks like from the peer, RFC 9113 section 5.4.2:
+// a RST_STREAM with the code, the connection going on.
+func (h *harness) wantStreamError(id uint32, code http2.ErrCode) {
+	h.t.Helper()
+	h.wantRST(id, code)
+	h.wantAlive()
+}
+
+// wantAlive proves the connection goes on with a PING the client answers.
+func (h *harness) wantAlive() {
+	h.t.Helper()
+	data := [8]byte{'a', 'l', 'i', 'v', 'e'}
+	h.writePing(false, data)
+	h.wantPingAck(data)
+	require.NoError(h.t, h.c.Err())
+}
+
+// wantNothing reads for a while and fails on any frame of type T.
+func wantNothing[T http2.Frame](h *harness, what string) {
+	h.t.Helper()
+	_ = h.nc.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	for {
+		f, err := h.fr.ReadFrame()
+		if err != nil {
+			require.True(h.t, errors.Is(err, os.ErrDeadlineExceeded), "the socket ended waiting for no %s: %v", what, err)
+			return
+		}
+		if _, ok := f.(T); ok {
+			h.t.Fatalf("the client sent %s: %v", what, f)
+		}
+	}
+}
+
+func (h *harness) writeSettings(settings ...http2.Setting) {
+	require.NoError(h.t, h.fr.WriteSettings(settings...))
+}
+
+func (h *harness) writeSettingsAck() {
+	require.NoError(h.t, h.fr.WriteSettingsAck())
+}
+
+// writeHeaders sends a header block, END_HEADERS set, on id.
+func (h *harness) writeHeaders(id uint32, end bool, fields ...hpack.HeaderField) {
+	h.t.Helper()
+	require.NoError(h.t, h.fr.WriteHeaders(http2.HeadersFrameParam{
+		StreamID: id, BlockFragment: h.block(fields...), EndHeaders: true, EndStream: end,
+	}))
+}
+
+// writeBlock sends a header block as given, END_HEADERS set, on id.
+func (h *harness) writeBlock(id uint32, end bool, block []byte) {
+	h.t.Helper()
+	require.NoError(h.t, h.fr.WriteHeaders(http2.HeadersFrameParam{
+		StreamID: id, BlockFragment: block, EndHeaders: true, EndStream: end,
+	}))
+}
+
+// block encodes fields with the peer's encoder.
+func (h *harness) block(fields ...hpack.HeaderField) []byte {
+	h.encBuf.Reset()
+	for _, f := range fields {
+		_ = h.enc.WriteField(f)
+	}
+	return bytes.Clone(h.encBuf.Bytes())
+}
+
+func status(code string) hpack.HeaderField {
+	return hpack.HeaderField{Name: ":status", Value: code}
+}
+
+// answer sends 200 on id.
+func (h *harness) answer(id uint32) {
+	h.t.Helper()
+	h.writeHeaders(id, false, status("200"))
+}
+
+func (h *harness) writeData(id uint32, end bool, b []byte) {
+	require.NoError(h.t, h.fr.WriteData(id, end, b))
+}
+
+func (h *harness) writeRST(id uint32, code http2.ErrCode) {
+	require.NoError(h.t, h.fr.WriteRSTStream(id, code))
+}
+
+func (h *harness) writePing(ack bool, data [8]byte) {
+	require.NoError(h.t, h.fr.WritePing(ack, data))
+}
+
+func (h *harness) writeGoAway(last uint32, code http2.ErrCode) {
+	require.NoError(h.t, h.fr.WriteGoAway(last, code, nil))
+}
+
+func (h *harness) writeWindowUpdate(id, inc uint32) {
+	require.NoError(h.t, h.fr.WriteWindowUpdate(id, inc))
+}
+
+func (h *harness) writePriority(id uint32, p http2.PriorityParam) {
+	require.NoError(h.t, h.fr.WritePriority(id, p))
+}
+
+// writeRaw sends one frame byte by byte, for what the framer would not write.
+func (h *harness) writeRaw(typ http2.FrameType, flags http2.Flags, id uint32, payload []byte) {
+	h.t.Helper()
+	hdr := []byte{byte(len(payload) >> 16), byte(len(payload) >> 8), byte(len(payload)), byte(typ), byte(flags)}
+	hdr = binary.BigEndian.AppendUint32(hdr, id)
+	_, err := h.nc.Write(append(hdr, payload...))
+	require.NoError(h.t, err)
+}
+
+// open starts a CONNECT on a goroutine and returns what it ends with through wait.
+func (h *harness) open(req Request) *opening {
+	o := &opening{done: make(chan struct{})}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), wantTimeout)
+		defer cancel()
+		o.s, o.resp, o.err = h.c.Open(ctx, req)
+		close(o.done)
+	}()
+	return o
+}
+
+type opening struct {
+	s    *Stream
+	resp *Response
+	err  error
+	done chan struct{}
+}
+
+func (o *opening) wait(t *testing.T) (*Stream, *Response, error) {
+	t.Helper()
+	select {
+	case <-o.done:
+	case <-time.After(wantTimeout):
+		t.Fatal("Open did not return")
+	}
+	return o.s, o.resp, o.err
+}
+
+// connect opens a CONNECT the peer answers with 200, and returns the stream and its id.
+func (h *harness) connect() (*Stream, uint32) {
+	h.t.Helper()
+	o := h.open(Request{Authority: "origin.test:443"})
+	id := h.wantHeaders().StreamID
+	h.answer(id)
+	s, resp, err := o.wait(h.t)
+	require.NoError(h.t, err)
+	require.Equal(h.t, http.StatusOK, resp.StatusCode)
+	return s, id
+}
+
+// read returns what the stream reads next, within wantTimeout.
+func (h *harness) read(s *Stream) ([]byte, error) {
+	h.t.Helper()
+	_ = s.SetReadDeadline(time.Now().Add(wantTimeout))
+	buf := make([]byte, 1<<16)
+	n, err := s.Read(buf)
+	return buf[:n], err
+}
+
+// wantReadAll wants the stream to read n bytes, in as many reads as it takes.
+func (h *harness) wantReadAll(s *Stream, n int) []byte {
+	h.t.Helper()
+	_ = s.SetReadDeadline(time.Now().Add(wantTimeout))
+	buf := make([]byte, n)
+	_, err := io.ReadFull(s, buf)
+	require.NoError(h.t, err)
+	return buf
+}
+
+// wantRead wants the stream to read exactly b next.
+func (h *harness) wantRead(s *Stream, b []byte) {
+	h.t.Helper()
+	got, err := h.read(s)
+	require.NoError(h.t, err)
+	require.Equal(h.t, b, got)
+}
+
+// wantReadError wants the stream's reads to end with err.
+func (h *harness) wantReadError(s *Stream, err error) {
+	h.t.Helper()
+	_, got := h.read(s)
+	require.ErrorIs(h.t, got, err)
+}
+
+// wantReadCode wants the stream's reads to end with a stream error of code.
+func (h *harness) wantReadCode(s *Stream, code http2.ErrCode) {
+	h.t.Helper()
+	_, err := h.read(s)
+	var se http2.StreamError
+	require.ErrorAs(h.t, err, &se, "read ended with %v", err)
+	require.Equal(h.t, code, se.Code)
+}
+
+// str is an HPACK string literal, huff the same Huffman-coded, RFC 7541 section 5.2.
+func str(v string) []byte { return append([]byte{byte(len(v))}, v...) }
+
+func huff(v string) []byte {
+	b := hpack.AppendHuffmanString(nil, v)
+	return append([]byte{0x80 | byte(len(b))}, b...)
+}
+
+func cat(parts ...[]byte) []byte { return bytes.Join(parts, nil) }
+
+// bigBlock is a header block past one frame, Huffman coding included.
+func bigBlock(h *harness) []byte {
+	return h.block(status("200"), hpack.HeaderField{Name: "x-pad", Value: strings.Repeat("a", 30000)})
+}
+
+var conformance = []conformanceCase{
+	// h2spec generic: what an endpoint accepts.
+	{
+		id: "generic/1/1", name: "the client sends the connection preface",
+		req: "The client connection preface starts with a sequence of 24 octets, followed by a SETTINGS frame.",
+		run: func(t *testing.T, h *harness) { h.wantAlive() },
+	},
+	{
+		id: "generic/2/1", name: "PRIORITY on an idle stream",
+		req: "The endpoint MUST accept PRIORITY frame.",
+		run: func(t *testing.T, h *harness) {
+			h.writePriority(101, http2.PriorityParam{Weight: 15})
+			h.wantAlive()
+		},
+	},
+	{
+		id: "generic/2/2", name: "WINDOW_UPDATE on a stream the peer ended",
+		req: "The endpoint MUST accept WINDOW_UPDATE frame.",
+		run: func(t *testing.T, h *harness) {
+			s, id := h.connect()
+			h.writeData(id, true, nil)
+			h.wantReadError(s, io.EOF)
+			h.writeWindowUpdate(id, 10)
+			h.wantAlive()
+		},
+	},
+	{
+		id: "generic/2/3", name: "PRIORITY on a stream the peer ended",
+		req: "The endpoint MUST accept PRIORITY frame.",
+		run: func(t *testing.T, h *harness) {
+			s, id := h.connect()
+			h.writeData(id, true, nil)
+			h.wantReadError(s, io.EOF)
+			h.writePriority(id, http2.PriorityParam{Weight: 15})
+			h.wantAlive()
+		},
+	},
+	{
+		id: "generic/2/4", name: "RST_STREAM on a stream the peer ended",
+		req: "The endpoint MUST accept RST_STREAM frame.",
+		run: func(t *testing.T, h *harness) {
+			s, id := h.connect()
+			h.writeData(id, true, nil)
+			h.wantReadError(s, io.EOF)
+			h.writeRST(id, http2.ErrCodeCancel)
+			h.wantAlive()
+			_, err := s.Write([]byte("late"))
+			require.Error(t, err)
+		},
+	},
+	{
+		id: "generic/2/5", name: "PRIORITY on a closed stream",
+		req: "The endpoint MUST accept PRIORITY frame.",
+		run: func(t *testing.T, h *harness) {
+			s, id := h.connect()
+			require.NoError(t, s.Close())
+			h.wantRST(id, http2.ErrCodeCancel)
+			h.writePriority(id, http2.PriorityParam{Weight: 15})
+			h.wantAlive()
+		},
+	},
+	{
+		id: "generic/3.10/1", name: "the answer in HEADERS and one CONTINUATION",
+		req: "The endpoint MUST accept CONTINUATION frame.",
+		run: func(t *testing.T, h *harness) {
+			o := h.open(Request{Authority: "origin.test:443"})
+			id := h.wantHeaders().StreamID
+			block := h.block(status("200"), hpack.HeaderField{Name: "x-a", Value: "1"})
+			require.NoError(t, h.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: block[:1]}))
+			require.NoError(t, h.fr.WriteContinuation(id, true, block[1:]))
+			_, resp, err := o.wait(t)
+			require.NoError(t, err)
+			require.Equal(t, "1", resp.Header.Get("x-a"))
+		},
+	},
+	{
+		id: "generic/3.10/2", name: "the answer in HEADERS and several CONTINUATIONs",
+		req: "The endpoint MUST accept multiple CONTINUATION frames.",
+		run: func(t *testing.T, h *harness) {
+			o := h.open(Request{Authority: "origin.test:443"})
+			id := h.wantHeaders().StreamID
+			block := h.block(status("200"), hpack.HeaderField{Name: "x-a", Value: "1"})
+			require.NoError(t, h.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: block[:1]}))
+			require.NoError(t, h.fr.WriteContinuation(id, false, block[1:2]))
+			require.NoError(t, h.fr.WriteContinuation(id, true, block[2:]))
+			_, resp, err := o.wait(t)
+			require.NoError(t, err)
+			require.Equal(t, "1", resp.Header.Get("x-a"))
+		},
+	},
+	{
+		id: "generic/3.1/1", name: "one DATA frame",
+		req: "The endpoint MUST accept DATA frame.",
+		run: func(t *testing.T, h *harness) {
+			s, id := h.connect()
+			h.writeData(id, false, []byte("hello"))
+			h.wantRead(s, []byte("hello"))
+		},
+	},
+	{
+		id: "generic/3.1/2", name: "several DATA frames",
+		req: "The endpoint MUST accept multiple DATA frames.",
+		run: func(t *testing.T, h *harness) {
+			s, id := h.connect()
+			h.writeData(id, false, []byte("hel"))
+			h.writeData(id, false, []byte("lo"))
+			require.Equal(t, "hello", string(h.wantReadAll(s, 5)))
+		},
+	},
+	{
+		id: "generic/3.1/3", name: "a padded DATA frame",
+		req: "The endpoint MUST accept DATA frame with padding.",
+		run: func(t *testing.T, h *harness) {
+			s, id := h.connect()
+			require.NoError(t, h.fr.WriteDataPadded(id, false, []byte("hello"), make([]byte, 7)))
+			h.wantRead(s, []byte("hello"))
+		},
+	},
+	{
+		id: "generic/3.2/1", name: "the answer in one HEADERS frame",
+		req: "The endpoint MUST accept HEADERS frame.",
+		run: func(t *testing.T, h *harness) { h.connect() },
+	},
+	{
+		id: "generic/3.2/2", name: "the answer in a padded HEADERS frame",
+		req: "The endpoint MUST accept HEADERS frame with padding.",
+		run: func(t *testing.T, h *harness) {
+			o := h.open(Request{Authority: "origin.test:443"})
+			id := h.wantHeaders().StreamID
+			require.NoError(t, h.fr.WriteHeaders(http2.HeadersFrameParam{
+				StreamID: id, BlockFragment: h.block(status("200")), EndHeaders: true, PadLength: 9,
+			}))
+			_, resp, err := o.wait(t)
+			require.NoError(t, err)
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+		},
+	},
+	{
+		id: "generic/3.2/3", name: "the answer in a HEADERS frame with priority",
+		req: "The endpoint MUST accept HEADERS frame with priority.",
+		run: func(t *testing.T, h *harness) {
+			o := h.open(Request{Authority: "origin.test:443"})
+			id := h.wantHeaders().StreamID
+			require.NoError(t, h.fr.WriteHeaders(http2.HeadersFrameParam{
+				StreamID: id, BlockFragment: h.block(status("200")), EndHeaders: true,
+				Priority: http2.PriorityParam{StreamDep: 0, Weight: 15},
+			}))
+			_, resp, err := o.wait(t)
+			require.NoError(t, err)
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+		},
+	},
+	{
+		id: "generic/3.3/1", name: "PRIORITY with weight 1",
+		req: "The endpoint MUST accept PRIORITY frame with priority 1.",
+		run: func(t *testing.T, h *harness) {
+			_, id := h.connect()
+			h.writePriority(id, http2.PriorityParam{Weight: 0})
+			h.wantAlive()
+		},
+	},
+	{
+		id: "generic/3.3/2", name: "PRIORITY with weight 256",
+		req: "The endpoint MUST accept PRIORITY frame with priority 256.",
+		run: func(t *testing.T, h *harness) {
+			_, id := h.connect()
+			h.writePriority(id, http2.PriorityParam{Weight: 255})
+			h.wantAlive()
+		},
+	},
+	{
+		id: "generic/3.3/3", name: "PRIORITY with a stream dependency",
+		req: "The endpoint MUST accept PRIORITY frame with stream dependency.",
+		run: func(t *testing.T, h *harness) {
+			_, id := h.connect()
+			_, id2 := h.connect()
+			h.writePriority(id2, http2.PriorityParam{StreamDep: id, Weight: 15})
+			h.wantAlive()
+		},
+	},
+	{
+		id: "generic/3.3/4", name: "PRIORITY with an exclusive dependency",
+		req: "The endpoint MUST accept PRIORITY frame with exclusive.",
+		run: func(t *testing.T, h *harness) {
+			_, id := h.connect()
+			_, id2 := h.connect()
+			h.writePriority(id2, http2.PriorityParam{StreamDep: id, Weight: 15, Exclusive: true})
+			h.wantAlive()
+		},
+	},
+	{
+		id: "generic/3.3/5", name: "PRIORITY for an idle stream, then HEADERS on a lower one",
+		req:  "The endpoint MUST respond the HEADER frame.",
+		skip: "a server opens no stream toward a client, which disables push",
+	},
+	{
+		id: "generic/3.4/1", name: "RST_STREAM",
+		req: "The endpoint MUST accept RST_STREAM frame.",
+		run: func(t *testing.T, h *harness) {
+			s, id := h.connect()
+			h.writeRST(id, http2.ErrCodeCancel)
+			h.wantReadCode(s, http2.ErrCodeCancel)
+			h.wantAlive()
+		},
+	},
+	{
+		id: "generic/3.5/1", name: "SETTINGS",
+		req: "The endpoint MUST accept SETTINGS frame.",
+		run: func(t *testing.T, h *harness) {
+			h.writeSettings(http2.Setting{ID: http2.SettingMaxConcurrentStreams, Val: 100})
+			h.wantSettingsAck()
+		},
+	},
+	{
+		id: "generic/3.7/1", name: "PING",
+		req: "The endpoint MUST accept PING frame.",
+		run: func(t *testing.T, h *harness) { h.wantAlive() },
+	},
+	{
+		id: "generic/3.8/1", name: "GOAWAY",
+		req: "The endpoint MUST accept GOAWAY frame.",
+		run: func(t *testing.T, h *harness) {
+			h.writeGoAway(0, http2.ErrCodeNo)
+			h.wantGoAway(http2.ErrCodeNo)
+			h.wantClosed()
+			require.ErrorIs(t, h.c.Err(), ErrGoAway)
+		},
+	},
+	{
+		id: "generic/3.9/1", name: "WINDOW_UPDATE on the connection",
+		req: "The endpoint MUST accept WINDOW_UPDATE frame.",
+		run: func(t *testing.T, h *harness) {
+			h.writeWindowUpdate(0, 1<<20)
+			h.wantAlive()
+		},
+	},
+	{
+		id: "generic/3.9/2", name: "WINDOW_UPDATE on a stream",
+		req: "The endpoint MUST accept WINDOW_UPDATE frame.",
+		run: func(t *testing.T, h *harness) {
+			_, id := h.connect()
+			h.writeWindowUpdate(id, 1<<20)
+			h.wantAlive()
+		},
+	},
+	{
+		id: "generic/4/1", name: "a CONNECT answered, with DATA both ways",
+		req: "The endpoint MUST respond to the request.",
+		run: func(t *testing.T, h *harness) {
+			s, id := h.connect()
+			_, err := s.Write([]byte("ping"))
+			require.NoError(t, err)
+			require.Equal(t, "ping", string(h.wantData(id).Data()))
+			h.writeData(id, false, []byte("pong"))
+			h.wantRead(s, []byte("pong"))
+		},
+	},
+	{id: "generic/4/2", name: "a HEAD request", req: "The endpoint MUST respond to the request.", skip: "a client of CONNECT streams sends no other method"},
+	{id: "generic/4/3", name: "a POST request", req: "The endpoint MUST respond to the request.", skip: "a client of CONNECT streams sends no other method"},
+	{id: "generic/4/4", name: "a POST request with trailers", req: "The endpoint MUST respond to the request.", skip: "a client of CONNECT streams sends no other method"},
+	{
+		id: "generic/5/1", name: "an indexed field", req: "The endpoint MUST accept indexed header field representation",
+		run: func(t *testing.T, h *harness) { wantAnswerBlock(t, h, []byte{0x88}) },
+	},
+	{
+		id: "generic/5/2", name: "a literal with incremental indexing, indexed name", req: "The endpoint MUST accept literal header field with incremental indexing",
+		run: func(t *testing.T, h *harness) { wantAnswerBlock(t, h, cat([]byte{0x48}, str("200"))) },
+	},
+	{
+		id: "generic/5/3", name: "a literal with incremental indexing, indexed name, Huffman", req: "The endpoint MUST accept literal header field with incremental indexing",
+		run: func(t *testing.T, h *harness) { wantAnswerBlock(t, h, cat([]byte{0x48}, huff("200"))) },
+	},
+	{
+		id: "generic/5/4", name: "a literal with incremental indexing, new name", req: "The endpoint MUST accept literal header field with incremental indexing",
+		run: func(t *testing.T, h *harness) { wantAnswerBlock(t, h, cat([]byte{0x40}, str(":status"), str("200"))) },
+	},
+	{
+		id: "generic/5/5", name: "a literal with incremental indexing, new name, Huffman", req: "The endpoint MUST accept literal header field with incremental indexing",
+		run: func(t *testing.T, h *harness) { wantAnswerBlock(t, h, cat([]byte{0x40}, huff(":status"), huff("200"))) },
+	},
+	{
+		id: "generic/5/6", name: "a literal without indexing, indexed name", req: "The endpoint MUST accept literal header field without indexing",
+		run: func(t *testing.T, h *harness) { wantAnswerBlock(t, h, cat([]byte{0x08}, str("200"))) },
+	},
+	{
+		id: "generic/5/7", name: "a literal without indexing, indexed name, Huffman", req: "The endpoint MUST accept literal header field without indexing",
+		run: func(t *testing.T, h *harness) { wantAnswerBlock(t, h, cat([]byte{0x08}, huff("200"))) },
+	},
+	{
+		id: "generic/5/8", name: "a literal without indexing, new name", req: "The endpoint MUST accept literal header field without indexing",
+		run: func(t *testing.T, h *harness) { wantAnswerBlock(t, h, cat([]byte{0x00}, str(":status"), str("200"))) },
+	},
+	{
+		id: "generic/5/9", name: "a literal without indexing, new name, Huffman", req: "The endpoint MUST accept literal header field without indexing",
+		run: func(t *testing.T, h *harness) { wantAnswerBlock(t, h, cat([]byte{0x00}, huff(":status"), huff("200"))) },
+	},
+	{
+		id: "generic/5/10", name: "a literal never indexed, indexed name", req: "The endpoint MUST accept literal header field never indexed",
+		run: func(t *testing.T, h *harness) { wantAnswerBlock(t, h, cat([]byte{0x18}, str("200"))) },
+	},
+	{
+		id: "generic/5/11", name: "a literal never indexed, indexed name, Huffman", req: "The endpoint MUST accept literal header field never indexed",
+		run: func(t *testing.T, h *harness) { wantAnswerBlock(t, h, cat([]byte{0x18}, huff("200"))) },
+	},
+	{
+		id: "generic/5/12", name: "a literal never indexed, new name", req: "The endpoint MUST accept literal header field never indexed",
+		run: func(t *testing.T, h *harness) { wantAnswerBlock(t, h, cat([]byte{0x10}, str(":status"), str("200"))) },
+	},
+	{
+		id: "generic/5/13", name: "a literal never indexed, new name, Huffman", req: "The endpoint MUST accept literal header field never indexed",
+		run: func(t *testing.T, h *harness) { wantAnswerBlock(t, h, cat([]byte{0x10}, huff(":status"), huff("200"))) },
+	},
+	{
+		id: "generic/5/14", name: "a dynamic table size update", req: "The endpoint MUST accept dynamic table size update",
+		run: func(t *testing.T, h *harness) { wantAnswerBlock(t, h, []byte{0x20, 0x88}) },
+	},
+	{
+		id: "generic/5/15", name: "several dynamic table size updates", req: "The endpoint MUST accept multiple dynamic table size update",
+		run: func(t *testing.T, h *harness) { wantAnswerBlock(t, h, []byte{0x20, 0x3f, 0xe1, 0x1f, 0x88}) },
+	},
+
+	// RFC 9113 section 3, starting HTTP/2.
+	{
+		id: "http2/3.5/1", name: "the peer's first frame is not SETTINGS",
+		req: "The server connection preface consists of a potentially empty SETTINGS frame that MUST be the first frame the server sends in the HTTP/2 connection. Clients and servers MUST treat an invalid connection preface as a connection error of type PROTOCOL_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			h = rawHarness(t)
+			h.writePing(false, [8]byte{})
+			h.wantConnectionError(http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/3.5/2", name: "the peer is not HTTP/2",
+		req: "The endpoint MUST terminate the TCP connection.",
+		run: func(t *testing.T, h *harness) {
+			h = rawHarness(t)
+			_, err := h.nc.Write([]byte("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n"))
+			require.NoError(t, err)
+			h.wantClosed()
+		},
+	},
+
+	// RFC 9113 section 4, frames.
+	{
+		id: "http2/4.1/1", name: "a frame of an unknown type",
+		req: "Implementations MUST ignore and discard frames of unknown types.",
+		run: func(t *testing.T, h *harness) {
+			h.writeRaw(0xee, 0, 0, []byte{1, 2, 3})
+			h.wantAlive()
+		},
+	},
+	{
+		id: "http2/4.1/2", name: "a frame with undefined flags",
+		req: "Flags that have no defined semantics for a particular frame type MUST be ignored and MUST be left unset (0x00) when sending.",
+		run: func(t *testing.T, h *harness) {
+			data := [8]byte{1, 2, 3, 4, 5, 6, 7, 8}
+			h.writeRaw(http2.FramePing, 0xfe, 0, data[:])
+			h.wantPingAck(data)
+		},
+	},
+	{
+		id: "http2/4.1/3", name: "a frame with the reserved bit set",
+		req: "The semantics of this bit are undefined, and the bit MUST remain unset (0x00) when sending and MUST be ignored when receiving.",
+		run: func(t *testing.T, h *harness) {
+			h.writeRaw(http2.FrameSettings, 0, 1<<31, nil)
+			h.wantSettingsAck()
+		},
+	},
+	{
+		id: "http2/4.2/1", name: "a DATA frame of 2^14 octets",
+		req: "All implementations MUST be capable of receiving and minimally processing frames up to 2^14 octets in length.",
+		run: func(t *testing.T, h *harness) {
+			s, id := h.connect()
+			h.writeData(id, false, bytes.Repeat([]byte{7}, 1<<14))
+			require.Equal(t, bytes.Repeat([]byte{7}, 1<<14), h.wantReadAll(s, 1<<14))
+		},
+	},
+	{
+		id: "http2/4.2/2", name: "a DATA frame past SETTINGS_MAX_FRAME_SIZE",
+		req: "An endpoint MUST send an error code of FRAME_SIZE_ERROR if a frame exceeds the size defined in SETTINGS_MAX_FRAME_SIZE.",
+		run: func(t *testing.T, h *harness) {
+			_, id := h.connect()
+			h.writeData(id, false, make([]byte, 1<<14+1))
+			h.wantConnectionError(http2.ErrCodeFrameSize)
+		},
+	},
+	{
+		id: "http2/4.2/3", name: "a HEADERS frame past SETTINGS_MAX_FRAME_SIZE",
+		req: "A frame size error in a frame that could alter the state of the entire connection MUST be treated as a connection error; this includes any frame carrying a field block.",
+		run: func(t *testing.T, h *harness) {
+			h.open(Request{Authority: "origin.test:443"})
+			id := h.wantHeaders().StreamID
+			h.writeBlock(id, false, bigBlock(h))
+			h.wantConnectionError(http2.ErrCodeFrameSize)
+		},
+	},
+	{
+		id: "http2/4.3/1", name: "an invalid header block",
+		req: "A decoding error in a field block MUST be treated as a connection error of type COMPRESSION_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			h.open(Request{Authority: "origin.test:443"})
+			id := h.wantHeaders().StreamID
+			h.writeBlock(id, false, []byte{0xff, 0xff, 0xff, 0xff, 0xff})
+			h.wantConnectionError(http2.ErrCodeCompression)
+		},
+	},
+	{
+		id: "http2/4.3/2", name: "PRIORITY in the middle of a header block",
+		req: "Each field block is processed as a discrete unit. Field blocks MUST be transmitted as a contiguous sequence of frames, with no interleaved frames of any other type or from any other stream.",
+		run: func(t *testing.T, h *harness) {
+			h.open(Request{Authority: "origin.test:443"})
+			id := h.wantHeaders().StreamID
+			block := h.block(status("200"))
+			require.NoError(t, h.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: block[:1]}))
+			h.writePriority(id, http2.PriorityParam{Weight: 15})
+			h.wantConnectionError(http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/4.3/3", name: "HEADERS on another stream in the middle of a header block",
+		req: "Field blocks MUST be transmitted as a contiguous sequence of frames, with no interleaved frames of any other type or from any other stream.",
+		run: func(t *testing.T, h *harness) {
+			h.open(Request{Authority: "origin.test:443"})
+			id := h.wantHeaders().StreamID
+			h.open(Request{Authority: "origin.test:443"})
+			id2 := h.wantHeaders().StreamID
+			block := h.block(status("200"))
+			require.NoError(t, h.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: block[:1]}))
+			h.writeBlock(id2, false, block)
+			h.wantConnectionError(http2.ErrCodeProtocol)
+		},
+	},
+
+	// RFC 9113 section 5, streams.
+	{
+		id: "http2/5.1.1/1", name: "HEADERS on an even stream id",
+		req: "Streams initiated by a client MUST use odd-numbered stream identifiers. An endpoint that receives an unexpected stream identifier MUST respond with a connection error of type PROTOCOL_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			h.connect()
+			h.writeHeaders(2, false, status("200"))
+			h.wantConnectionError(http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/5.1.1/2", name: "a stream id below the previous one",
+		req:  "The endpoint MUST respond with a connection error of type PROTOCOL_ERROR.",
+		skip: "the order of new stream ids is a rule on the endpoint that opens streams, and a server opens none toward a client that disables push",
+	},
+	{
+		id: "http2/5.1.2/1", name: "the client at the peer's concurrent stream limit",
+		req: "Endpoints MUST NOT exceed the limit set by their peer.",
+		run: func(t *testing.T, h *harness) {
+			h.writeSettings(http2.Setting{ID: http2.SettingMaxConcurrentStreams, Val: 1})
+			h.wantSettingsAck()
+			s, _ := h.connect()
+			require.Eventually(t, func() bool { return !h.c.CanOpen() }, wantTimeout, time.Millisecond)
+			_, _, err := h.open(Request{Authority: "origin.test:443"}).wait(t)
+			require.ErrorIs(t, err, errTooManyStreams)
+			wantNothing[*http2.MetaHeadersFrame](h, "HEADERS past the stream limit")
+			require.NoError(t, s.Close())
+			h.connect()
+		},
+	},
+	{
+		id: "http2/5.1/1", name: "DATA on an idle stream",
+		req: "Receiving any frame other than HEADERS or PRIORITY on a stream in this state MUST be treated as a connection error of type PROTOCOL_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			h.writeData(101, false, []byte("x"))
+			h.wantConnectionError(http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/5.1/2", name: "RST_STREAM on an idle stream",
+		req: "Receiving any frame other than HEADERS or PRIORITY on a stream in this state MUST be treated as a connection error of type PROTOCOL_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			h.writeRST(101, http2.ErrCodeCancel)
+			h.wantConnectionError(http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/5.1/3", name: "WINDOW_UPDATE on an idle stream",
+		req: "Receiving any frame other than HEADERS or PRIORITY on a stream in this state MUST be treated as a connection error of type PROTOCOL_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			h.writeWindowUpdate(101, 1)
+			h.wantConnectionError(http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/5.1/4", name: "CONTINUATION on an idle stream",
+		req: "Receiving any frame other than HEADERS or PRIORITY on a stream in this state MUST be treated as a connection error of type PROTOCOL_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			require.NoError(t, h.fr.WriteContinuation(101, true, h.block(status("200"))))
+			h.wantConnectionError(http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/5.1/5", name: "DATA after the peer's END_STREAM",
+		req: "If an endpoint receives additional frames, except for WINDOW_UPDATE, PRIORITY, or RST_STREAM, for a stream that is in this state, it MUST respond with a stream error of type STREAM_CLOSED.",
+		run: func(t *testing.T, h *harness) {
+			s, id := h.connect()
+			h.writeData(id, true, nil)
+			h.wantReadError(s, io.EOF)
+			h.writeData(id, false, []byte("late"))
+			h.wantStreamError(id, http2.ErrCodeStreamClosed)
+		},
+	},
+	{
+		id: "http2/5.1/6", name: "HEADERS after the peer's END_STREAM",
+		req: "If an endpoint receives additional frames, except for WINDOW_UPDATE, PRIORITY, or RST_STREAM, for a stream that is in this state, it MUST respond with a stream error of type STREAM_CLOSED.",
+		run: func(t *testing.T, h *harness) {
+			s, id := h.connect()
+			h.writeData(id, true, nil)
+			h.wantReadError(s, io.EOF)
+			h.writeHeaders(id, true, hpack.HeaderField{Name: "x-late", Value: "1"})
+			h.wantStreamError(id, http2.ErrCodeStreamClosed)
+		},
+	},
+	{
+		id: "http2/5.1/7", name: "HEADERS and CONTINUATION after the peer's END_STREAM",
+		req: "If an endpoint receives additional frames, except for WINDOW_UPDATE, PRIORITY, or RST_STREAM, for a stream that is in this state, it MUST respond with a stream error of type STREAM_CLOSED.",
+		run: func(t *testing.T, h *harness) {
+			s, id := h.connect()
+			h.writeData(id, true, nil)
+			h.wantReadError(s, io.EOF)
+			block := h.block(hpack.HeaderField{Name: "x-late", Value: "1"})
+			require.NoError(t, h.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: block[:1], EndStream: true}))
+			require.NoError(t, h.fr.WriteContinuation(id, true, block[1:]))
+			h.wantStreamError(id, http2.ErrCodeStreamClosed)
+		},
+	},
+	{
+		id: "http2/5.1/8", name: "DATA after the client's RST_STREAM",
+		req: "An endpoint MUST ignore frames that it receives on closed streams after it has sent a RST_STREAM frame.",
+		run: func(t *testing.T, h *harness) {
+			s, id := h.connect()
+			require.NoError(t, s.Close())
+			h.wantRST(id, http2.ErrCodeCancel)
+			h.writeData(id, false, []byte("late"))
+			h.wantAlive()
+		},
+	},
+	{
+		id: "http2/5.1/9", name: "HEADERS after the client's RST_STREAM",
+		req: "An endpoint MUST ignore frames that it receives on closed streams after it has sent a RST_STREAM frame.",
+		run: func(t *testing.T, h *harness) {
+			s, id := h.connect()
+			require.NoError(t, s.Close())
+			h.wantRST(id, http2.ErrCodeCancel)
+			h.writeHeaders(id, true, hpack.HeaderField{Name: "x-late", Value: "1"})
+			h.wantAlive()
+		},
+	},
+	{
+		id: "http2/5.1/10", name: "HEADERS and CONTINUATION after the client's RST_STREAM",
+		req: "An endpoint MUST ignore frames that it receives on closed streams after it has sent a RST_STREAM frame.",
+		run: func(t *testing.T, h *harness) {
+			s, id := h.connect()
+			require.NoError(t, s.Close())
+			h.wantRST(id, http2.ErrCodeCancel)
+			block := h.block(hpack.HeaderField{Name: "x-late", Value: "1"})
+			require.NoError(t, h.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: block[:1], EndStream: true}))
+			require.NoError(t, h.fr.WriteContinuation(id, true, block[1:]))
+			h.wantAlive()
+		},
+	},
+	{
+		id: "http2/5.1/11", name: "DATA on a stream that ended in both directions",
+		req:  "An endpoint that receives any frames after receiving a frame with the END_STREAM flag set MUST treat that as a connection error of type STREAM_CLOSED.",
+		skip: "the client forgets a stream at its end and ignores a late frame on it, crediting its DATA back, as Go's transport does; telling a stream that ended from one the client reset would keep every ended stream",
+	},
+	{
+		id: "http2/5.1/12", name: "HEADERS on a stream that ended in both directions",
+		req:  "An endpoint that receives any frames after receiving a frame with the END_STREAM flag set MUST treat that as a connection error of type STREAM_CLOSED.",
+		skip: "the client forgets a stream at its end and ignores a late frame on it, as Go's transport does",
+	},
+	{
+		id: "http2/5.1/13", name: "CONTINUATION on a stream that ended in both directions",
+		req:  "An endpoint that receives any frames after receiving a frame with the END_STREAM flag set MUST treat that as a connection error of type STREAM_CLOSED.",
+		skip: "the client forgets a stream at its end and ignores a late frame on it, as Go's transport does",
+	},
+	{
+		id: "http2/5.3.1/1", name: "HEADERS depending on its own stream",
+		req: "A stream cannot depend on itself. An endpoint MUST treat this as a stream error of type PROTOCOL_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			h.open(Request{Authority: "origin.test:443"})
+			id := h.wantHeaders().StreamID
+			require.NoError(t, h.fr.WriteHeaders(http2.HeadersFrameParam{
+				StreamID: id, BlockFragment: h.block(status("200")), EndHeaders: true,
+				Priority: http2.PriorityParam{StreamDep: id, Weight: 15},
+			}))
+			h.wantStreamError(id, http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/5.3.1/2", name: "PRIORITY depending on its own stream",
+		req: "A stream cannot depend on itself. An endpoint MUST treat this as a stream error of type PROTOCOL_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			_, id := h.connect()
+			h.writePriority(id, http2.PriorityParam{StreamDep: id, Weight: 15})
+			h.wantStreamError(id, http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/5.4.1/1", name: "a PING of the wrong length",
+		req: "An endpoint that encounters a connection error SHOULD first send a GOAWAY frame with the stream identifier of the last stream that it successfully received from its peer. After sending the GOAWAY frame for an error condition, the endpoint MUST close the TCP connection.",
+		run: func(t *testing.T, h *harness) {
+			h.writeRaw(http2.FramePing, 0, 0, make([]byte, 7))
+			h.wantConnectionError(http2.ErrCodeFrameSize)
+		},
+	},
+	{
+		id: "http2/5.4.1/2", name: "the GOAWAY of a connection error names the last stream",
+		req: "An endpoint that encounters a connection error SHOULD first send a GOAWAY frame with the stream identifier of the last stream that it successfully received from its peer.",
+		run: func(t *testing.T, h *harness) {
+			h.connect()
+			h.writeRaw(http2.FramePing, 0, 0, make([]byte, 7))
+			f := h.wantGoAway(http2.ErrCodeFrameSize)
+			require.Equal(t, uint32(0), f.LastStreamID, "a client received no stream from its peer")
+			h.wantClosed()
+		},
+	},
+	{
+		id: "http2/5.5/1", name: "an extension frame on a stream",
+		req: "Implementations MUST ignore unknown or unsupported values in all extensible protocol elements.",
+		run: func(t *testing.T, h *harness) {
+			_, id := h.connect()
+			h.writeRaw(0xee, 0, id, []byte{1, 2, 3})
+			h.wantAlive()
+		},
+	},
+	{
+		id: "http2/5.5/2", name: "an extension frame in the middle of a header block",
+		req: "Extension frames that appear in the middle of a field block are not permitted; these MUST be treated as a connection error of type PROTOCOL_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			h.open(Request{Authority: "origin.test:443"})
+			id := h.wantHeaders().StreamID
+			block := h.block(status("200"))
+			require.NoError(t, h.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: block[:1]}))
+			h.writeRaw(0xee, 0, id, []byte{1, 2, 3})
+			h.wantConnectionError(http2.ErrCodeProtocol)
+		},
+	},
+
+	// RFC 9113 section 6, frame definitions.
+	{
+		id: "http2/6.10/1", name: "HEADERS and several CONTINUATIONs",
+		req: "Any number of CONTINUATION frames can be sent, as long as the preceding frame is on the same stream and is a HEADERS, PUSH_PROMISE, or CONTINUATION frame without the END_HEADERS flag set.",
+		run: func(t *testing.T, h *harness) {
+			o := h.open(Request{Authority: "origin.test:443"})
+			id := h.wantHeaders().StreamID
+			block := h.block(status("200"))
+			require.NoError(t, h.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: nil}))
+			require.NoError(t, h.fr.WriteContinuation(id, false, block[:1]))
+			require.NoError(t, h.fr.WriteContinuation(id, false, nil))
+			require.NoError(t, h.fr.WriteContinuation(id, true, block[1:]))
+			_, resp, err := o.wait(t)
+			require.NoError(t, err)
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+		},
+	},
+	{
+		id: "http2/6.10/2", name: "another frame before END_HEADERS",
+		req: "A receiver MUST treat the receipt of any other type of frame or a frame on a different stream as a connection error of type PROTOCOL_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			h.open(Request{Authority: "origin.test:443"})
+			id := h.wantHeaders().StreamID
+			block := h.block(status("200"))
+			require.NoError(t, h.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: block[:1]}))
+			require.NoError(t, h.fr.WriteContinuation(id, false, nil))
+			h.writeData(id, false, []byte("x"))
+			h.wantConnectionError(http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/6.10/3", name: "CONTINUATION on stream 0",
+		req: "If a CONTINUATION frame is received with a Stream Identifier field of 0x00, the recipient MUST respond with a connection error of type PROTOCOL_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			h.open(Request{Authority: "origin.test:443"})
+			id := h.wantHeaders().StreamID
+			block := h.block(status("200"))
+			require.NoError(t, h.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: block[:1]}))
+			h.writeRaw(http2.FrameContinuation, http2.FlagContinuationEndHeaders, 0, block[1:])
+			h.wantConnectionError(http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/6.10/4", name: "CONTINUATION after HEADERS with END_HEADERS",
+		req: "A CONTINUATION frame MUST be preceded by a HEADERS, PUSH_PROMISE or CONTINUATION frame without the END_HEADERS flag set. A recipient that observes violation of this rule MUST respond with a connection error of type PROTOCOL_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			h.open(Request{Authority: "origin.test:443"})
+			id := h.wantHeaders().StreamID
+			h.answer(id)
+			require.NoError(t, h.fr.WriteContinuation(id, true, h.block(hpack.HeaderField{Name: "x-a", Value: "1"})))
+			h.wantConnectionError(http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/6.10/5", name: "CONTINUATION after CONTINUATION with END_HEADERS",
+		req: "A CONTINUATION frame MUST be preceded by a HEADERS, PUSH_PROMISE or CONTINUATION frame without the END_HEADERS flag set. A recipient that observes violation of this rule MUST respond with a connection error of type PROTOCOL_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			h.open(Request{Authority: "origin.test:443"})
+			id := h.wantHeaders().StreamID
+			block := h.block(status("200"))
+			require.NoError(t, h.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: block[:1]}))
+			require.NoError(t, h.fr.WriteContinuation(id, true, block[1:]))
+			require.NoError(t, h.fr.WriteContinuation(id, true, h.block(hpack.HeaderField{Name: "x-a", Value: "1"})))
+			h.wantConnectionError(http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/6.10/6", name: "CONTINUATION after DATA",
+		req: "A CONTINUATION frame MUST be preceded by a HEADERS, PUSH_PROMISE or CONTINUATION frame without the END_HEADERS flag set. A recipient that observes violation of this rule MUST respond with a connection error of type PROTOCOL_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			s, id := h.connect()
+			h.writeData(id, false, []byte("x"))
+			h.wantRead(s, []byte("x"))
+			require.NoError(t, h.fr.WriteContinuation(id, true, h.block(hpack.HeaderField{Name: "x-a", Value: "1"})))
+			h.wantConnectionError(http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/6.1/1", name: "DATA on stream 0",
+		req: "If a DATA frame is received whose Stream Identifier field is 0x00, the recipient MUST respond with a connection error of type PROTOCOL_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			h.writeRaw(http2.FrameData, 0, 0, []byte("x"))
+			h.wantConnectionError(http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/6.1/2", name: "DATA on a stream the peer ended",
+		req: "If a DATA frame is received whose stream is not in the \"open\" or \"half-closed (local)\" state, the recipient MUST respond with a stream error of type STREAM_CLOSED.",
+		run: func(t *testing.T, h *harness) {
+			s, id := h.connect()
+			h.writeData(id, true, nil)
+			h.wantReadError(s, io.EOF)
+			h.writeData(id, false, []byte("late"))
+			h.wantStreamError(id, http2.ErrCodeStreamClosed)
+		},
+	},
+	{
+		id: "http2/6.1/3", name: "DATA with a pad length past its payload",
+		req: "If the length of the padding is the length of the frame payload or greater, the recipient MUST treat this as a connection error of type PROTOCOL_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			_, id := h.connect()
+			h.writeRaw(http2.FrameData, http2.FlagDataPadded, id, []byte{10, 'a', 'b'})
+			h.wantConnectionError(http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/6.2/1", name: "HEADERS without END_HEADERS, then PRIORITY",
+		req: "A HEADERS frame without the END_HEADERS flag set MUST be followed by a CONTINUATION frame for the same stream. A receiver MUST treat the receipt of any other type of frame or a frame on a different stream as a connection error of type PROTOCOL_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			h.open(Request{Authority: "origin.test:443"})
+			id := h.wantHeaders().StreamID
+			require.NoError(t, h.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: h.block(status("200"))[:1]}))
+			h.writePriority(id, http2.PriorityParam{Weight: 15})
+			h.wantConnectionError(http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/6.2/2", name: "HEADERS on another stream before END_HEADERS",
+		req: "A HEADERS frame without the END_HEADERS flag set MUST be followed by a CONTINUATION frame for the same stream. A receiver MUST treat the receipt of any other type of frame or a frame on a different stream as a connection error of type PROTOCOL_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			h.open(Request{Authority: "origin.test:443"})
+			id := h.wantHeaders().StreamID
+			h.open(Request{Authority: "origin.test:443"})
+			id2 := h.wantHeaders().StreamID
+			block := h.block(status("200"))
+			require.NoError(t, h.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: block[:1]}))
+			h.writeBlock(id2, false, block)
+			h.wantConnectionError(http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/6.2/3", name: "HEADERS on stream 0",
+		req: "If a HEADERS frame is received whose Stream Identifier field is 0x00, the recipient MUST respond with a connection error of type PROTOCOL_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			h.writeRaw(http2.FrameHeaders, http2.FlagHeadersEndHeaders, 0, h.block(status("200")))
+			h.wantConnectionError(http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/6.2/4", name: "HEADERS with a pad length past its payload",
+		req:  "Padding that exceeds the size remaining for the field block fragment MUST be treated as a PROTOCOL_ERROR.",
+		skip: "the framer of x/net makes it a stream error on the stream, as Go's own server and transport do, before the client sees the frame",
+	},
+	{
+		id: "http2/6.3/1", name: "PRIORITY on stream 0",
+		req: "If a PRIORITY frame is received with a stream identifier of 0x00, the recipient MUST respond with a connection error of type PROTOCOL_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			h.writeRaw(http2.FramePriority, 0, 0, make([]byte, 5))
+			h.wantConnectionError(http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/6.3/2", name: "PRIORITY of a length other than 5",
+		req:  "A PRIORITY frame with a length other than 5 octets MUST be treated as a stream error of type FRAME_SIZE_ERROR.",
+		skip: "the framer of x/net makes it a connection error of type FRAME_SIZE_ERROR, as Go's own server and transport do, before the client sees the frame",
+	},
+	{
+		id: "http2/6.4/1", name: "RST_STREAM on stream 0",
+		req: "If a RST_STREAM frame is received with a stream identifier of 0x0, the recipient MUST treat this as a connection error of type PROTOCOL_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			h.writeRaw(http2.FrameRSTStream, 0, 0, make([]byte, 4))
+			h.wantConnectionError(http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/6.4/2", name: "RST_STREAM on an idle stream",
+		req: "RST_STREAM frames MUST NOT be sent for a stream in the \"idle\" state. If a RST_STREAM frame identifying an idle stream is received, the recipient MUST treat this as a connection error of type PROTOCOL_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			h.connect()
+			h.writeRST(h.nextID, http2.ErrCodeCancel)
+			h.wantConnectionError(http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/6.4/3", name: "RST_STREAM of a length other than 4",
+		req: "A RST_STREAM frame with a length other than 4 octets MUST be treated as a connection error of type FRAME_SIZE_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			_, id := h.connect()
+			h.writeRaw(http2.FrameRSTStream, 0, id, make([]byte, 3))
+			h.wantConnectionError(http2.ErrCodeFrameSize)
+		},
+	},
+	{
+		id: "http2/6.5.2/1", name: "SETTINGS_ENABLE_PUSH of 2",
+		req: "Any value other than 0 or 1 MUST be treated as a connection error of type PROTOCOL_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			h.writeSettings(http2.Setting{ID: http2.SettingEnablePush, Val: 2})
+			h.wantConnectionError(http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/6.5.2/2", name: "SETTINGS_INITIAL_WINDOW_SIZE past 2^31-1",
+		req: "Values above the maximum flow-control window size of 2^31-1 MUST be treated as a connection error of type FLOW_CONTROL_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			h.writeSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1 << 31})
+			h.wantConnectionError(http2.ErrCodeFlowControl)
+		},
+	},
+	{
+		id: "http2/6.5.2/3", name: "SETTINGS_MAX_FRAME_SIZE below 2^14",
+		req: "The initial value is 2^14 (16,384) octets. The value advertised by an endpoint MUST be between this initial value and the maximum allowed frame size (2^24-1 or 16,777,215 octets), inclusive. Values outside this range MUST be treated as a connection error of type PROTOCOL_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			h.writeSettings(http2.Setting{ID: http2.SettingMaxFrameSize, Val: 16383})
+			h.wantConnectionError(http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/6.5.2/4", name: "SETTINGS_MAX_FRAME_SIZE past 2^24-1",
+		req: "Values outside this range MUST be treated as a connection error of type PROTOCOL_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			h.writeSettings(http2.Setting{ID: http2.SettingMaxFrameSize, Val: 1 << 24})
+			h.wantConnectionError(http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/6.5.2/5", name: "a SETTINGS parameter of an unknown identifier",
+		req: "An endpoint that receives a SETTINGS frame with any unknown or unsupported identifier MUST ignore that setting.",
+		run: func(t *testing.T, h *harness) {
+			h.writeSettings(http2.Setting{ID: 0xff, Val: 1})
+			h.wantSettingsAck()
+			h.wantAlive()
+		},
+	},
+	{
+		id: "http2/6.5.3/1", name: "SETTINGS_INITIAL_WINDOW_SIZE twice in one frame",
+		req: "The values in the SETTINGS frame MUST be processed in the order they appear, with no other frame processing between values.",
+		run: func(t *testing.T, h *harness) {
+			h.writeSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1}, http2.Setting{ID: http2.SettingInitialWindowSize, Val: 100})
+			h.wantSettingsAck()
+			s, id := h.connect()
+			go func() { _, _ = s.Write(make([]byte, 150)) }()
+			require.Len(t, h.wantData(id).Data(), 100)
+			wantNothing[*http2.DataFrame](h, "DATA past the send window")
+		},
+	},
+	{
+		id: "http2/6.5.3/2", name: "SETTINGS is acknowledged",
+		req: "Once all values have been processed, the recipient MUST immediately emit a SETTINGS frame with the ACK flag set.",
+		run: func(t *testing.T, h *harness) {
+			h.writeSettings(http2.Setting{ID: http2.SettingMaxConcurrentStreams, Val: 100})
+			h.wantSettingsAck()
+		},
+	},
+	{
+		id: "http2/6.5/1", name: "a SETTINGS ack with a payload",
+		req: "Receipt of a SETTINGS frame with the ACK flag set and a length field value other than 0 MUST be treated as a connection error of type FRAME_SIZE_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			h.writeRaw(http2.FrameSettings, http2.FlagSettingsAck, 0, make([]byte, 6))
+			h.wantConnectionError(http2.ErrCodeFrameSize)
+		},
+	},
+	{
+		id: "http2/6.5/2", name: "SETTINGS on a stream",
+		req: "If an endpoint receives a SETTINGS frame whose Stream Identifier field is anything other than 0x00, the endpoint MUST respond with a connection error of type PROTOCOL_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			h.writeRaw(http2.FrameSettings, 0, 1, nil)
+			h.wantConnectionError(http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/6.5/3", name: "SETTINGS of a length not a multiple of 6",
+		req: "A SETTINGS frame with a length other than a multiple of 6 octets MUST be treated as a connection error of type FRAME_SIZE_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			h.writeRaw(http2.FrameSettings, 0, 0, make([]byte, 5))
+			h.wantConnectionError(http2.ErrCodeFrameSize)
+		},
+	},
+	{
+		id: "http2/6.7/1", name: "PING",
+		req: "Receivers of a PING frame that does not include an ACK flag MUST send a PING frame with the ACK flag set in response, with an identical frame payload.",
+		run: func(t *testing.T, h *harness) { h.wantAlive() },
+	},
+	{
+		id: "http2/6.7/2", name: "a PING ack",
+		req: "An endpoint MUST NOT respond to PING frames containing this flag.",
+		run: func(t *testing.T, h *harness) {
+			h.writePing(true, [8]byte{1})
+			wantNothing[*http2.PingFrame](h, "an answer to a PING ack")
+		},
+	},
+	{
+		id: "http2/6.7/3", name: "PING on a stream",
+		req: "If a PING frame is received with a Stream Identifier field value other than 0x00, the recipient MUST respond with a connection error of type PROTOCOL_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			_, id := h.connect()
+			h.writeRaw(http2.FramePing, 0, id, make([]byte, 8))
+			h.wantConnectionError(http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/6.7/4", name: "PING of a length other than 8",
+		req: "Receipt of a PING frame with a length field value other than 8 MUST be treated as a connection error of type FRAME_SIZE_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			h.writeRaw(http2.FramePing, 0, 0, make([]byte, 9))
+			h.wantConnectionError(http2.ErrCodeFrameSize)
+		},
+	},
+	{
+		id: "http2/6.8/1", name: "GOAWAY on a stream",
+		req: "An endpoint MUST treat a GOAWAY frame with a stream identifier other than 0x00 as a connection error of type PROTOCOL_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			_, id := h.connect()
+			h.writeRaw(http2.FrameGoAway, 0, id, make([]byte, 8))
+			h.wantConnectionError(http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/6.9.1/1", name: "a send window of 1",
+		req: "The sender MUST NOT send a flow-controlled frame with a length that exceeds the space available in either of the flow-control windows advertised by the receiver.",
+		run: func(t *testing.T, h *harness) {
+			h.writeSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1})
+			h.wantSettingsAck()
+			s, id := h.connect()
+			wrote := make(chan error, 1)
+			go func() { _, err := s.Write(make([]byte, 10)); wrote <- err }()
+			require.Len(t, h.wantData(id).Data(), 1)
+			wantNothing[*http2.DataFrame](h, "DATA past the send window")
+			h.writeWindowUpdate(id, 9)
+			for got := 1; got < 10; {
+				got += len(h.wantData(id).Data())
+			}
+			require.NoError(t, <-wrote)
+		},
+	},
+	{
+		id: "http2/6.9.1/2", name: "WINDOW_UPDATE past 2^31-1 on the connection",
+		req: "If a sender receives a WINDOW_UPDATE that causes a flow-control window to exceed this maximum, it MUST terminate either the stream or the connection, as appropriate. For streams, the sender sends a RST_STREAM with an error code of FLOW_CONTROL_ERROR; for the connection, a GOAWAY frame with an error code of FLOW_CONTROL_ERROR is sent.",
+		run: func(t *testing.T, h *harness) {
+			h.writeWindowUpdate(0, 1<<31-1)
+			h.wantConnectionError(http2.ErrCodeFlowControl)
+		},
+	},
+	{
+		id: "http2/6.9.1/3", name: "WINDOW_UPDATE past 2^31-1 on a stream",
+		req: "For streams, the sender sends a RST_STREAM with an error code of FLOW_CONTROL_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			s, id := h.connect()
+			h.writeWindowUpdate(id, 1<<31-1)
+			h.wantStreamError(id, http2.ErrCodeFlowControl)
+			h.wantReadCode(s, http2.ErrCodeFlowControl)
+		},
+	},
+	{
+		id: "http2/6.9.2/1", name: "SETTINGS_INITIAL_WINDOW_SIZE changed under an open stream",
+		req: "When the value of SETTINGS_INITIAL_WINDOW_SIZE changes, a receiver MUST adjust the size of all stream flow-control windows that it maintains by the difference between the new value and the old value.",
+		run: func(t *testing.T, h *harness) {
+			h.writeSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 0})
+			h.wantSettingsAck()
+			s, id := h.connect()
+			go func() { _, _ = s.Write(make([]byte, 5)) }()
+			wantNothing[*http2.DataFrame](h, "DATA on a window of 0")
+			h.writeSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 5})
+			h.wantSettingsAck()
+			require.Len(t, h.wantData(id).Data(), 5)
+		},
+	},
+	{
+		id: "http2/6.9.2/2", name: "SETTINGS_INITIAL_WINDOW_SIZE driving a send window negative",
+		req: "A change to SETTINGS_INITIAL_WINDOW_SIZE can cause the available space in a flow-control window to become negative. A sender MUST track the negative flow-control window and MUST NOT send new flow-controlled frames until it receives WINDOW_UPDATE frames that cause the flow-control window to become positive.",
+		run: func(t *testing.T, h *harness) {
+			h.writeSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 10})
+			h.wantSettingsAck()
+			s, id := h.connect()
+			_, err := s.Write(make([]byte, 10))
+			require.NoError(t, err)
+			require.Len(t, h.wantData(id).Data(), 10)
+			h.writeSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 5})
+			h.wantSettingsAck()
+			go func() { _, _ = s.Write(make([]byte, 3)) }()
+			h.writeWindowUpdate(id, 5)
+			wantNothing[*http2.DataFrame](h, "DATA on a window of 0")
+			h.writeWindowUpdate(id, 3)
+			require.Len(t, h.wantData(id).Data(), 3)
+		},
+	},
+	{
+		id: "http2/6.9.2/3", name: "SETTINGS_INITIAL_WINDOW_SIZE past 2^31-1",
+		req: "An endpoint MUST treat a change to SETTINGS_INITIAL_WINDOW_SIZE that causes any flow-control window to exceed the maximum size as a connection error of type FLOW_CONTROL_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			_, id := h.connect()
+			h.writeWindowUpdate(id, 1<<30)
+			h.writeSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1 << 30})
+			h.wantConnectionError(http2.ErrCodeFlowControl)
+		},
+	},
+	{
+		id: "http2/6.9/1", name: "WINDOW_UPDATE of 0 on the connection",
+		req: "A receiver MUST treat the receipt of a WINDOW_UPDATE frame with a flow-control window increment of 0 as a stream error of type PROTOCOL_ERROR; errors on the connection flow-control window MUST be treated as a connection error.",
+		run: func(t *testing.T, h *harness) {
+			h.writeRaw(http2.FrameWindowUpdate, 0, 0, make([]byte, 4))
+			h.wantConnectionError(http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/6.9/2", name: "WINDOW_UPDATE of 0 on a stream",
+		req: "A receiver MUST treat the receipt of a WINDOW_UPDATE frame with a flow-control window increment of 0 as a stream error of type PROTOCOL_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			_, id := h.connect()
+			h.writeRaw(http2.FrameWindowUpdate, 0, id, make([]byte, 4))
+			h.wantStreamError(id, http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/6.9/3", name: "WINDOW_UPDATE of a length other than 4",
+		req: "A WINDOW_UPDATE frame with a length other than 4 octets MUST be treated as a connection error of type FRAME_SIZE_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			h.writeRaw(http2.FrameWindowUpdate, 0, 0, make([]byte, 5))
+			h.wantConnectionError(http2.ErrCodeFrameSize)
+		},
+	},
+
+	// RFC 9113 section 7, error codes.
+	{
+		id: "http2/7/1", name: "GOAWAY with an unknown error code",
+		req: "Unknown or unsupported error codes MUST NOT trigger any special behavior. These MAY be treated by an implementation as being equivalent to INTERNAL_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			s, id := h.connect()
+			h.writeGoAway(id, 0xff)
+			h.wantClosed()
+			_, err := h.read(s)
+			require.Error(t, err)
+			require.False(t, errors.Is(err, os.ErrDeadlineExceeded))
+		},
+	},
+	{
+		id: "http2/7/2", name: "RST_STREAM with an unknown error code",
+		req: "Unknown or unsupported error codes MUST NOT trigger any special behavior.",
+		run: func(t *testing.T, h *harness) {
+			s, id := h.connect()
+			h.writeRST(id, 0xff)
+			h.wantReadCode(s, 0xff)
+			h.wantAlive()
+		},
+	},
+
+	// RFC 9113 section 8, HTTP semantics.
+	{
+		id: "http2/8.1.2.1/1", name: "an unknown pseudo-header in the answer",
+		req: "Endpoints MUST NOT generate pseudo-header fields other than those defined in this document. Endpoints MUST treat a request or response that contains undefined or invalid pseudo-header fields as malformed.",
+		run: func(t *testing.T, h *harness) {
+			h.open(Request{Authority: "origin.test:443"})
+			id := h.wantHeaders().StreamID
+			h.writeHeaders(id, false, status("200"), hpack.HeaderField{Name: ":foo", Value: "1"})
+			h.wantStreamError(id, http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/8.1.2.1/2", name: "a request pseudo-header in the answer",
+		req: "Pseudo-header fields defined for requests MUST NOT appear in responses; pseudo-header fields defined for responses MUST NOT appear in requests.",
+		run: func(t *testing.T, h *harness) {
+			h.open(Request{Authority: "origin.test:443"})
+			id := h.wantHeaders().StreamID
+			h.writeHeaders(id, false, status("200"), hpack.HeaderField{Name: ":method", Value: "GET"})
+			h.wantStreamError(id, http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/8.1.2.1/3", name: "a pseudo-header in trailers",
+		req: "Pseudo-header fields MUST NOT appear in a trailer section.",
+		run: func(t *testing.T, h *harness) {
+			o := h.open(Request{Authority: "origin.test:443"})
+			id := h.wantHeaders().StreamID
+			h.writeHeaders(id, false, status("404"))
+			_, _, err := o.wait(t)
+			require.NoError(t, err)
+			h.writeHeaders(id, true, status("200"))
+			h.wantStreamError(id, http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/8.1.2.1/4", name: "a pseudo-header after a regular field",
+		req: "All pseudo-header fields MUST appear in a field block before all regular field lines. Any request or response that contains a pseudo-header field that appears in a field block after a regular field line MUST be treated as malformed.",
+		run: func(t *testing.T, h *harness) {
+			h.open(Request{Authority: "origin.test:443"})
+			id := h.wantHeaders().StreamID
+			h.writeHeaders(id, false, hpack.HeaderField{Name: "x-a", Value: "1"}, status("200"))
+			h.wantStreamError(id, http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/8.1.2.2/1", name: "a connection-specific field in the answer",
+		req: "An endpoint MUST NOT generate an HTTP/2 message containing connection-specific header fields. Any message containing connection-specific header fields MUST be treated as malformed.",
+		run: func(t *testing.T, h *harness) {
+			h.open(Request{Authority: "origin.test:443"})
+			id := h.wantHeaders().StreamID
+			h.writeHeaders(id, false, status("200"), hpack.HeaderField{Name: "connection", Value: "close"})
+			h.wantStreamError(id, http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/8.1.2.2/2", name: "a TE other than trailers in the answer",
+		req: "The only exception to this is the TE header field, which MAY be present in an HTTP/2 request; when it is, it MUST NOT contain any value other than \"trailers\".",
+		run: func(t *testing.T, h *harness) {
+			h.open(Request{Authority: "origin.test:443"})
+			id := h.wantHeaders().StreamID
+			h.writeHeaders(id, false, status("200"), hpack.HeaderField{Name: "te", Value: "gzip"})
+			h.wantStreamError(id, http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/8.1.2.3/1", name: "an extended CONNECT with an empty :path",
+		req: "This pseudo-header field MUST NOT be empty for \"http\" or \"https\" URIs.",
+		run: func(t *testing.T, h *harness) {
+			h.writeSettings(http2.Setting{ID: http2.SettingEnableConnectProtocol, Val: 1})
+			h.wantSettingsAck()
+			_, _, err := h.open(Request{Authority: "proxy.test", Protocol: "connect-udp", Scheme: "https"}).wait(t)
+			require.ErrorIs(t, err, errNoTarget)
+			wantNothing[*http2.MetaHeadersFrame](h, "HEADERS of a refused request")
+		},
+	},
+	{id: "http2/8.1.2.3/2", name: "a request without :method", req: "All HTTP/2 requests MUST include exactly one valid value for the :method, :scheme, and :path pseudo-header fields, unless they are CONNECT requests.", skip: "a rule on the requests a server receives, the client's own request is checked under rfc9113/8.5"},
+	{id: "http2/8.1.2.3/3", name: "a request without :scheme", req: "All HTTP/2 requests MUST include exactly one valid value for the :method, :scheme, and :path pseudo-header fields, unless they are CONNECT requests.", skip: "a rule on the requests a server receives, the client's own request is checked under rfc9113/8.5"},
+	{id: "http2/8.1.2.3/4", name: "a request without :path", req: "All HTTP/2 requests MUST include exactly one valid value for the :method, :scheme, and :path pseudo-header fields, unless they are CONNECT requests.", skip: "a rule on the requests a server receives, the client's own request is checked under rfc9113/8.5"},
+	{id: "http2/8.1.2.3/5", name: "a request with two :method", req: "All HTTP/2 requests MUST include exactly one valid value for the :method, :scheme, and :path pseudo-header fields, unless they are CONNECT requests.", skip: "a rule on the requests a server receives, the client's own request is checked under rfc9113/8.5"},
+	{id: "http2/8.1.2.3/6", name: "a request with two :scheme", req: "All HTTP/2 requests MUST include exactly one valid value for the :method, :scheme, and :path pseudo-header fields, unless they are CONNECT requests.", skip: "a rule on the requests a server receives, the client's own request is checked under rfc9113/8.5"},
+	{id: "http2/8.1.2.3/7", name: "a request with two :path", req: "All HTTP/2 requests MUST include exactly one valid value for the :method, :scheme, and :path pseudo-header fields, unless they are CONNECT requests.", skip: "a rule on the requests a server receives, the client's own request is checked under rfc9113/8.5"},
+	{id: "http2/8.1.2.6/1", name: "content-length against one DATA frame", req: "A request or response that is defined as having content is malformed if the value of a content-length header field does not equal the sum of the DATA frame payload lengths.", skip: "a CONNECT tunnel has no content, and a client MUST ignore a content-length in a 2xx answer to CONNECT, RFC 9110 section 9.3.6"},
+	{id: "http2/8.1.2.6/2", name: "content-length against several DATA frames", req: "A request or response that is defined as having content is malformed if the value of a content-length header field does not equal the sum of the DATA frame payload lengths.", skip: "a CONNECT tunnel has no content, and a client MUST ignore a content-length in a 2xx answer to CONNECT, RFC 9110 section 9.3.6"},
+	{
+		id: "http2/8.1.2/1", name: "an uppercase field name in the answer",
+		req: "A field name MUST NOT contain characters in the ranges 0x00-0x20, 0x41-0x5a, or 0x7f-0xff. A request or response containing uppercase characters in field names MUST be treated as malformed.",
+		run: func(t *testing.T, h *harness) {
+			h.open(Request{Authority: "origin.test:443"})
+			id := h.wantHeaders().StreamID
+			h.writeHeaders(id, false, status("200"), hpack.HeaderField{Name: "X-A", Value: "1"})
+			h.wantStreamError(id, http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/8.1/1", name: "a second HEADERS without END_STREAM",
+		req: "A HEADERS frame with the END_STREAM flag set that carries an informational status code is malformed. Trailers ... consist of a HEADERS frame with the END_STREAM flag set. An endpoint that receives a HEADERS frame without the END_STREAM flag set after receiving the HEADERS frame that opens a request or after receiving a final (non-informational) status code MUST treat the corresponding request or response as malformed.",
+		run: func(t *testing.T, h *harness) {
+			o := h.open(Request{Authority: "origin.test:443"})
+			id := h.wantHeaders().StreamID
+			h.writeHeaders(id, false, status("404"))
+			_, _, err := o.wait(t)
+			require.NoError(t, err)
+			h.writeHeaders(id, false, hpack.HeaderField{Name: "x-a", Value: "1"})
+			h.wantStreamError(id, http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "http2/8.2/1", name: "PUSH_PROMISE",
+		req: "PUSH_PROMISE MUST NOT be sent if the SETTINGS_ENABLE_PUSH setting of the peer endpoint is set to 0. An endpoint that has set this setting and has received acknowledgment MUST treat the receipt of a PUSH_PROMISE frame as a connection error of type PROTOCOL_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			_, id := h.connect()
+			h.writeRaw(http2.FramePushPromise, http2.FlagPushPromiseEndHeaders, id, cat([]byte{0, 0, 0, 2}, h.block(hpack.HeaderField{Name: ":method", Value: "GET"})))
+			h.wantConnectionError(http2.ErrCodeProtocol)
+		},
+	},
+
+	// h2spec hpack, RFC 7541: decoding errors end the connection with COMPRESSION_ERROR,
+	// RFC 9113 section 4.3.
+	{
+		id: "hpack/2.3.3/1", name: "an indexed field past the tables",
+		req: "Indices ... MUST be treated as a decoding error.",
+		run: func(t *testing.T, h *harness) { wantCompressionError(t, h, []byte{0xff, 0x01}) },
+	},
+	{
+		id: "hpack/2.3.3/2", name: "a literal whose name index is past the tables",
+		req: "Indices ... MUST be treated as a decoding error.",
+		run: func(t *testing.T, h *harness) { wantCompressionError(t, h, cat([]byte{0x7f, 0x01}, str("200"))) },
+	},
+	{
+		id: "hpack/4.2/1", name: "a dynamic table size update at the end of the block",
+		req: "This dynamic table size update MUST occur at the beginning of the first header block following the change to the dynamic table size.",
+		run: func(t *testing.T, h *harness) {
+			wantAnswerBlock(t, h, cat([]byte{0x88, 0x40}, str("x-a"), str("1")))
+			wantCompressionError(t, h, []byte{0x88, 0x20})
+		},
+	},
+	{
+		id: "hpack/5.2/1", name: "a Huffman string padded by more than 7 bits",
+		req: "A padding strictly longer than 7 bits MUST be treated as a decoding error.",
+		run: func(t *testing.T, h *harness) {
+			b := hpack.AppendHuffmanString(nil, "200")
+			wantCompressionError(t, h, cat([]byte{0x08, 0x80 | byte(len(b)+1)}, b, []byte{0xff}))
+		},
+	},
+	{
+		id: "hpack/5.2/2", name: "a Huffman string padded with zeros",
+		req: "A padding not corresponding to the most significant bits of the code for the EOS symbol MUST be treated as a decoding error.",
+		run: func(t *testing.T, h *harness) { wantCompressionError(t, h, []byte{0x08, 0x81, 0x10}) },
+	},
+	{
+		id: "hpack/5.2/3", name: "a Huffman string holding the EOS symbol",
+		req: "A Huffman-encoded string literal containing the EOS symbol MUST be treated as a decoding error.",
+		run: func(t *testing.T, h *harness) { wantCompressionError(t, h, []byte{0x08, 0x84, 0xff, 0xff, 0xff, 0xff}) },
+	},
+	{
+		id: "hpack/6.1/1", name: "an indexed field of index 0",
+		req: "The index value of 0 is not used. It MUST be treated as a decoding error if found in an indexed header field representation.",
+		run: func(t *testing.T, h *harness) { wantCompressionError(t, h, []byte{0x80}) },
+	},
+	{
+		id: "hpack/6.3/1", name: "a dynamic table size update past SETTINGS_HEADER_TABLE_SIZE",
+		req: "The new maximum size MUST be lower than or equal to the limit determined by the protocol using HPACK. A value that exceeds this limit MUST be treated as a decoding error.",
+		run: func(t *testing.T, h *harness) { wantCompressionError(t, h, []byte{0x3f, 0xe1, 0x3f, 0x88}) },
+	},
+
+	// RFC 8441, extended CONNECT.
+	{
+		id: "rfc8441/3/1", name: "SETTINGS_ENABLE_CONNECT_PROTOCOL of 2",
+		req: "Upon receipt of SETTINGS_ENABLE_CONNECT_PROTOCOL with a value of 1, a client MAY use the Extended CONNECT ... Any value other than 0 or 1 MUST be treated as a connection error of type PROTOCOL_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			h.writeSettings(http2.Setting{ID: http2.SettingEnableConnectProtocol, Val: 2})
+			h.wantConnectionError(http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "rfc8441/3/2", name: "SETTINGS_ENABLE_CONNECT_PROTOCOL from 1 back to 0",
+		req: "A sender MUST NOT send a SETTINGS_ENABLE_CONNECT_PROTOCOL parameter with the value of 0 after previously sending a value of 1.",
+		run: func(t *testing.T, h *harness) {
+			h.writeSettings(http2.Setting{ID: http2.SettingEnableConnectProtocol, Val: 1})
+			h.wantSettingsAck()
+			h.writeSettings(http2.Setting{ID: http2.SettingEnableConnectProtocol, Val: 0})
+			h.wantConnectionError(http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "rfc8441/4/1", name: "an extended CONNECT before the setting",
+		req: "A client MUST NOT send the extended CONNECT method to a server that has not advertised support.",
+		run: func(t *testing.T, h *harness) {
+			_, _, err := h.open(Request{Authority: "proxy.test", Protocol: "connect-udp", Scheme: "https", Path: "/.well-known/masque/udp/h/1/"}).wait(t)
+			require.ErrorIs(t, err, ErrExtendedConnect)
+			wantNothing[*http2.MetaHeadersFrame](h, "HEADERS of an extended CONNECT the peer did not enable")
+		},
+	},
+	{
+		id: "rfc8441/4/2", name: "the pseudo-headers of an extended CONNECT",
+		req: "A new pseudo-header field :protocol MAY be included on request HEADERS indicating the desired protocol of the tunnel created by CONNECT. On requests that contain the :protocol pseudo-header field, the :scheme and :path pseudo-header fields of the target URI MUST also be included. The :authority pseudo-header field contains the host and port to connect to.",
+		run: func(t *testing.T, h *harness) {
+			h.writeSettings(http2.Setting{ID: http2.SettingEnableConnectProtocol, Val: 1})
+			h.wantSettingsAck()
+			h.open(Request{Authority: "proxy.test", Protocol: "connect-udp", Scheme: "https", Path: "/.well-known/masque/udp/h/1/"})
+			f := h.wantHeaders()
+			require.Equal(t, "CONNECT", f.PseudoValue("method"))
+			require.Equal(t, "connect-udp", f.PseudoValue("protocol"))
+			require.Equal(t, "https", f.PseudoValue("scheme"))
+			require.Equal(t, "/.well-known/masque/udp/h/1/", f.PseudoValue("path"))
+			require.Equal(t, "proxy.test", f.PseudoValue("authority"))
+		},
+	},
+	{
+		id: "rfc8441/4/3", name: "an extended CONNECT without :scheme and :path",
+		req: "On requests that contain the :protocol pseudo-header field, the :scheme and :path pseudo-header fields of the target URI MUST also be included.",
+		run: func(t *testing.T, h *harness) {
+			h.writeSettings(http2.Setting{ID: http2.SettingEnableConnectProtocol, Val: 1})
+			h.wantSettingsAck()
+			_, _, err := h.open(Request{Authority: "proxy.test", Protocol: "connect-udp"}).wait(t)
+			require.ErrorIs(t, err, errNoTarget)
+			wantNothing[*http2.MetaHeadersFrame](h, "HEADERS of a refused request")
+		},
+	},
+
+	// RFC 9113, what h2spec has no case for.
+	{
+		id: "rfc9113/6.5.2/1", name: "SETTINGS_ENABLE_PUSH of 1 from a server",
+		req: "A server MUST NOT explicitly set this value to 1. A client MUST treat receipt of a SETTINGS frame with SETTINGS_ENABLE_PUSH set to 1 as a connection error of type PROTOCOL_ERROR.",
+		run: func(t *testing.T, h *harness) {
+			h.writeSettings(http2.Setting{ID: http2.SettingEnablePush, Val: 1})
+			h.wantConnectionError(http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "rfc9113/8.5/1", name: "the pseudo-headers of a CONNECT",
+		req: "The :method pseudo-header field is set to CONNECT. The :scheme and :path pseudo-header fields MUST be omitted. The :authority pseudo-header field contains the host and port to connect to.",
+		run: func(t *testing.T, h *harness) {
+			h.open(Request{Authority: "origin.test:443"})
+			f := h.wantHeaders()
+			require.Equal(t, "CONNECT", f.PseudoValue("method"))
+			require.Equal(t, "origin.test:443", f.PseudoValue("authority"))
+			require.Empty(t, f.PseudoValue("scheme"))
+			require.Empty(t, f.PseudoValue("path"))
+			require.Empty(t, f.PseudoValue("protocol"))
+		},
+	},
+	{
+		id: "rfc9113/8.5/2", name: "a CONNECT without an authority",
+		req: "The :authority pseudo-header field contains the host and port to connect to. A CONNECT request that does not conform to these restrictions is malformed.",
+		run: func(t *testing.T, h *harness) {
+			_, _, err := h.open(Request{}).wait(t)
+			require.ErrorIs(t, err, errNoAuthority)
+			wantNothing[*http2.MetaHeadersFrame](h, "HEADERS of a refused request")
+		},
+	},
+	{
+		id: "rfc9113/8.5/3", name: "trailers on a connected stream",
+		req: "A CONNECT request that ... the proxy sends a 2xx (Successful) response ... After the initial HEADERS frame sent by each peer, all subsequent HEADERS frames MUST NOT be sent: DATA frames alone are sent on the stream from there on.",
+		run: func(t *testing.T, h *harness) {
+			_, id := h.connect()
+			h.writeHeaders(id, true, hpack.HeaderField{Name: "x-trailer", Value: "1"})
+			h.wantStreamError(id, http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "rfc9113/8.1/1", name: "trailers after a refusal",
+		req: "Trailers ... consist of a HEADERS frame with the END_STREAM flag set ... A response consists of ... a final HEADERS frame ... and optionally a trailer section.",
+		run: func(t *testing.T, h *harness) {
+			o := h.open(Request{Authority: "origin.test:443"})
+			id := h.wantHeaders().StreamID
+			h.writeHeaders(id, false, status("404"))
+			s, resp, err := o.wait(t)
+			require.NoError(t, err)
+			require.Equal(t, http.StatusNotFound, resp.StatusCode)
+			h.writeData(id, false, []byte("denied"))
+			h.writeHeaders(id, true, hpack.HeaderField{Name: "x-trailer", Value: "1"})
+			h.wantRead(s, []byte("denied"))
+			h.wantReadError(s, io.EOF)
+			h.wantAlive()
+		},
+	},
+	{
+		id: "rfc9113/8.1/2", name: "an informational answer before the final one",
+		req: "A response is a series of zero or more informational (1xx) responses, each of which consists of a HEADERS frame, followed by the final response, which consists of a HEADERS frame.",
+		run: func(t *testing.T, h *harness) {
+			o := h.open(Request{Authority: "origin.test:443"})
+			id := h.wantHeaders().StreamID
+			h.writeHeaders(id, false, status("103"))
+			h.answer(id)
+			_, resp, err := o.wait(t)
+			require.NoError(t, err)
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+		},
+	},
+	{
+		id: "rfc9113/8.1/3", name: "an informational answer with END_STREAM",
+		req: "A HEADERS frame with the END_STREAM flag set that carries an informational status code is malformed.",
+		run: func(t *testing.T, h *harness) {
+			o := h.open(Request{Authority: "origin.test:443"})
+			id := h.wantHeaders().StreamID
+			h.writeHeaders(id, true, status("103"))
+			h.wantStreamError(id, http2.ErrCodeProtocol)
+			_, _, err := o.wait(t)
+			require.Error(t, err, "Open waits for an answer that cannot come")
+		},
+	},
+	{
+		id: "rfc9113/8.1/4", name: "DATA before the answer",
+		req: "A response consists of ... the final response, which consists of a HEADERS frame, followed by zero or more DATA frames.",
+		run: func(t *testing.T, h *harness) {
+			o := h.open(Request{Authority: "origin.test:443"})
+			id := h.wantHeaders().StreamID
+			h.writeData(id, true, []byte("early"))
+			h.wantStreamError(id, http2.ErrCodeProtocol)
+			_, _, err := o.wait(t)
+			require.Error(t, err, "Open waits for an answer that cannot come")
+		},
+	},
+	{
+		id: "rfc9113/8.3.2/1", name: "a :status that is not three digits",
+		req: "A single :status pseudo-header field is defined that carries the HTTP status code field. This pseudo-header field MUST be included in all responses, including interim responses.",
+		run: func(t *testing.T, h *harness) {
+			h.open(Request{Authority: "origin.test:443"})
+			id := h.wantHeaders().StreamID
+			h.writeHeaders(id, false, status("0200"))
+			h.wantStreamError(id, http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "rfc9113/8.3.2/2", name: "an answer without :status",
+		req: "This pseudo-header field MUST be included in all responses, including interim responses.",
+		run: func(t *testing.T, h *harness) {
+			h.open(Request{Authority: "origin.test:443"})
+			id := h.wantHeaders().StreamID
+			h.writeHeaders(id, false, hpack.HeaderField{Name: "x-a", Value: "1"})
+			h.wantStreamError(id, http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "rfc9113/8.2.1/1", name: "a field value with CR or LF from the caller",
+		req: "A field value MUST NOT contain the zero value (ASCII NUL, 0x00), line feed (ASCII LF, 0x0a), or carriage return (ASCII CR, 0x0d) at any position.",
+		run: func(t *testing.T, h *harness) {
+			_, _, err := h.open(Request{Authority: "origin.test:443", Header: http.Header{"X-A": {"1\r\nx-b: 2"}}}).wait(t)
+			require.ErrorIs(t, err, errInvalidHeader)
+			wantNothing[*http2.MetaHeadersFrame](h, "HEADERS of a refused request")
+		},
+	},
+	{
+		id: "rfc9113/8.2.1/2", name: "a field value with surrounding whitespace from the caller",
+		req: "A field value MUST NOT start or end with an ASCII whitespace character (ASCII SP or HTAB, 0x20 or 0x09).",
+		run: func(t *testing.T, h *harness) {
+			_, _, err := h.open(Request{Authority: "origin.test:443", Header: http.Header{"X-A": {" 1"}}}).wait(t)
+			require.ErrorIs(t, err, errInvalidHeader)
+			wantNothing[*http2.MetaHeadersFrame](h, "HEADERS of a refused request")
+		},
+	},
+	{
+		id: "rfc9113/8.2.2/1", name: "a connection-specific field from the caller",
+		req: "An endpoint MUST NOT generate an HTTP/2 message containing connection-specific header fields.",
+		run: func(t *testing.T, h *harness) {
+			_, _, err := h.open(Request{Authority: "origin.test:443", Header: http.Header{"Connection": {"close"}}}).wait(t)
+			require.ErrorIs(t, err, errInvalidHeader)
+			wantNothing[*http2.MetaHeadersFrame](h, "HEADERS of a refused request")
+		},
+	},
+	{
+		id: "rfc9113/6.8/1", name: "GOAWAY with open streams",
+		req: "Once the GOAWAY is sent, the sender will ignore frames sent on streams initiated by the receiver if the stream has an identifier higher than the included last stream identifier. Receivers of a GOAWAY frame MUST NOT open additional streams on the connection.",
+		run: func(t *testing.T, h *harness) {
+			s, id := h.connect()
+			h.writeGoAway(id, http2.ErrCodeNo)
+			require.Eventually(t, func() bool { return !h.c.CanOpen() }, wantTimeout, time.Millisecond)
+			_, _, err := h.open(Request{Authority: "origin.test:443"}).wait(t)
+			require.ErrorIs(t, err, ErrGoAway)
+			wantNothing[*http2.MetaHeadersFrame](h, "HEADERS after GOAWAY")
+			h.writeData(id, false, []byte("still"))
+			h.wantRead(s, []byte("still"))
+			require.NoError(t, s.Close())
+			h.wantGoAway(http2.ErrCodeNo)
+			h.wantClosed()
+		},
+	},
+	{
+		id: "rfc9113/6.8/2", name: "GOAWAY ending the streams above its last stream id",
+		req: "The last stream identifier in the GOAWAY frame contains the highest-numbered stream identifier for which the sender of the GOAWAY frame might have taken some action on or might yet take action on. All streams up to and including the identified stream might have been processed in some way. Activity on streams numbered higher than the last stream identifier cannot have been processed.",
+		run: func(t *testing.T, h *harness) {
+			s1, id1 := h.connect()
+			s2, id2 := h.connect()
+			h.writeGoAway(id1, http2.ErrCodeNo)
+			h.wantReadError(s2, ErrGoAway)
+			wantNothing[*http2.RSTStreamFrame](h, "RST_STREAM on a stream the peer will not process")
+			h.writeData(id1, false, []byte("still"))
+			h.wantRead(s1, []byte("still"))
+			_ = id2
+		},
+	},
+	{
+		id: "rfc9113/6.8/3", name: "a second GOAWAY lowering the last stream id",
+		req: "An endpoint MAY send multiple GOAWAY frames if circumstances change. ... Endpoints MUST NOT increase the value they send in the last stream identifier, since the peers might already have retried unprocessed requests on another connection.",
+		run: func(t *testing.T, h *harness) {
+			s1, id1 := h.connect()
+			s2, id2 := h.connect()
+			h.writeGoAway(id2, http2.ErrCodeNo)
+			require.Eventually(t, func() bool { return !h.c.CanOpen() }, wantTimeout, time.Millisecond)
+			h.writeGoAway(id1, http2.ErrCodeNo)
+			h.wantReadError(s2, ErrGoAway)
+			h.writeData(id1, false, []byte("still"))
+			h.wantRead(s1, []byte("still"))
+		},
+	},
+	{
+		id: "rfc9113/6.9.1/1", name: "padding is credited back",
+		req: "The entire DATA frame payload is included in flow control, including the Pad Length and Padding fields if present.",
+		run: func(t *testing.T, h *harness) {
+			s, id := h.connect()
+			require.NoError(t, h.fr.WriteDataPadded(id, false, []byte("hello"), make([]byte, 255)))
+			h.wantRead(s, []byte("hello"))
+			require.NoError(t, s.Close())
+			h.wantRST(id, http2.ErrCodeCancel)
+			var credited uint32
+			for credited < 261 {
+				credited += h.wantWindowUpdate(0)
+			}
+			require.Equal(t, uint32(261), credited)
+		},
+	},
+	{
+		id: "rfc9113/5.1/1", name: "RST_STREAM on a stream that ended in both directions",
+		req: "An endpoint MUST NOT send a RST_STREAM in response to a RST_STREAM frame, to avoid looping. ... An endpoint MUST minimally process and then discard any frames it receives in this state.",
+		run: func(t *testing.T, h *harness) {
+			s, id := h.connect()
+			require.NoError(t, s.CloseWrite())
+			f := h.wantData(id)
+			require.True(t, f.StreamEnded())
+			h.writeData(id, true, nil)
+			h.wantReadError(s, io.EOF)
+			h.writeRST(id, http2.ErrCodeCancel)
+			wantNothing[*http2.RSTStreamFrame](h, "RST_STREAM in answer to RST_STREAM")
+			h.wantAlive()
+		},
+	},
+	{
+		id: "rfc9113/5.4.2/1", name: "a stream error ends that stream alone",
+		req: "A stream error is an error related to a specific stream that does not affect processing of other streams. An endpoint that detects a stream error sends a RST_STREAM frame that contains the stream identifier of the stream where the error occurred.",
+		run: func(t *testing.T, h *harness) {
+			s1, id1 := h.connect()
+			s2, id2 := h.connect()
+			h.writeHeaders(id2, false, status("bad"))
+			h.wantStreamError(id2, http2.ErrCodeProtocol)
+			h.wantReadCode(s2, http2.ErrCodeProtocol)
+			h.writeData(id1, false, []byte("on"))
+			h.wantRead(s1, []byte("on"))
+		},
+	},
+
+	// Scenarios of Go's HTTP/2 transport tests that apply to a client of CONNECT streams
+	// and that no case above covers.
+	{
+		id: "rfc9113/6.9/4", name: "the client credits what it reads",
+		req: "Flow control is specific to a connection. ... A receiver ... sends WINDOW_UPDATE frames as it consumes data and frees up space in flow-control windows.",
+		run: func(t *testing.T, h *harness) {
+			s, id := h.connect()
+			const total = 3 * window
+			done := make(chan []byte, 1)
+			go func() { done <- h.wantReadAll(s, total) }()
+			var sent, avail int
+			avail = window
+			for sent < total {
+				n := min(avail, 16384, total-sent)
+				if n == 0 {
+					avail += int(h.wantWindowUpdate(id))
+					continue
+				}
+				h.writeData(id, false, bytes.Repeat([]byte{byte(sent)}, n))
+				sent += n
+				avail -= n
+			}
+			select {
+			case got := <-done:
+				require.Len(t, got, total)
+			case <-time.After(wantTimeout):
+				t.Fatal("the reads did not complete")
+			}
+		},
+	},
+	{
+		id: "rfc9113/6.5.2/2", name: "the request bounded by the peer's SETTINGS_MAX_HEADER_LIST_SIZE",
+		req: "SETTINGS_MAX_HEADER_LIST_SIZE: This advisory setting informs a peer of the maximum field section size that the sender is prepared to accept, in octets.",
+		run: func(t *testing.T, h *harness) {
+			h.writeSettings(http2.Setting{ID: http2.SettingMaxHeaderListSize, Val: 300})
+			h.wantSettingsAck()
+			_, _, err := h.open(Request{Authority: "origin.test:443", Header: http.Header{"X-A": {strings.Repeat("a", 1000)}}}).wait(t)
+			require.ErrorIs(t, err, errHeadersTooLarge)
+			wantNothing[*http2.MetaHeadersFrame](h, "HEADERS past the peer's bound")
+			h.connect()
+		},
+	},
+	{
+		id: "rfc9113/6.5.2/3", name: "an answer past the client's SETTINGS_MAX_HEADER_LIST_SIZE",
+		req: "SETTINGS_MAX_HEADER_LIST_SIZE: This advisory setting informs a peer of the maximum field section size that the sender is prepared to accept, in octets.",
+		run: func(t *testing.T, h *harness) {
+			o := h.open(Request{Authority: "origin.test:443"})
+			id := h.wantHeaders().StreamID
+			// Fields that fit a frame each, past the bound together, a decoder that stops
+			// emitting rather than one refusing a string, RFC 9113 section 10.5.1.
+			fields := []hpack.HeaderField{status("200")}
+			for i := range 64 {
+				fields = append(fields, hpack.HeaderField{Name: fmt.Sprintf("x-%02d", i), Value: strings.Repeat("{", 1000)})
+			}
+			block := h.block(fields...)
+			require.NoError(t, h.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: id, BlockFragment: block[:16384]}))
+			for block = block[16384:]; len(block) > 16384; block = block[16384:] {
+				require.NoError(t, h.fr.WriteContinuation(id, false, block[:16384]))
+			}
+			require.NoError(t, h.fr.WriteContinuation(id, true, block))
+			h.wantStreamError(id, http2.ErrCodeEnhanceYourCalm)
+			_, _, err := o.wait(t)
+			require.Error(t, err)
+		},
+	},
+	{
+		id: "rfc7541/4.2/1", name: "the encoder signals the peer's table size",
+		req: "This dynamic table size update MUST occur at the beginning of the first header block following the change to the dynamic table size.",
+		run: func(t *testing.T, h *harness) {
+			h.connect()
+			h.writeSettings(http2.Setting{ID: http2.SettingHeaderTableSize, Val: 0})
+			h.wantSettingsAck()
+			h.fr.ReadMetaHeaders = nil
+			h.open(Request{Authority: "origin.test:443"})
+			f := next[*http2.HeadersFrame](h, "HEADERS")
+			require.Equal(t, byte(0x20), f.HeaderBlockFragment()[0], "a dynamic table size update to 0 opens the block")
+		},
+	},
+	{
+		id: "rfc9113/6.8/4", name: "GOAWAY with an error code",
+		req: "The error code ... contains the reason for closing the connection.",
+		run: func(t *testing.T, h *harness) {
+			s, id := h.connect()
+			h.writeGoAway(id, http2.ErrCodeInternal)
+			h.wantClosed()
+			var ce http2.ConnectionError
+			require.ErrorAs(t, h.c.Err(), &ce)
+			require.Equal(t, http2.ErrCodeInternal, http2.ErrCode(ce))
+			_, err := h.read(s)
+			require.ErrorAs(t, err, &ce)
+		},
+	},
+	{
+		id: "rfc9113/5.4.2/2", name: "RST_STREAM before the answer",
+		req: "RST_STREAM ... allows for immediate termination of a stream. ... The RST_STREAM frame contains a single unsigned, 32-bit integer identifying the error code. The error code indicates why the stream is being terminated.",
+		run: func(t *testing.T, h *harness) {
+			o := h.open(Request{Authority: "origin.test:443"})
+			id := h.wantHeaders().StreamID
+			h.writeRST(id, http2.ErrCodeRefusedStream)
+			_, _, err := o.wait(t)
+			var se http2.StreamError
+			require.ErrorAs(t, err, &se)
+			require.Equal(t, http2.ErrCodeRefusedStream, se.Code)
+			h.wantAlive()
+		},
+	},
+	{
+		id: "rfc9113/8.1/5", name: "many informational answers of unknown codes",
+		req: "A response is a series of zero or more informational (1xx) responses, each of which consists of a HEADERS frame, followed by the final response.",
+		run: func(t *testing.T, h *harness) {
+			o := h.open(Request{Authority: "origin.test:443"})
+			id := h.wantHeaders().StreamID
+			for range 100 {
+				h.writeHeaders(id, false, status("199"), hpack.HeaderField{Name: "x-hint", Value: strings.Repeat("h", 1000)})
+			}
+			h.answer(id)
+			_, resp, err := o.wait(t)
+			require.NoError(t, err)
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+		},
+	},
+	{
+		id: "rfc9113/8.2.1/3", name: "a field value with CR or LF in the answer",
+		req: "A field value MUST NOT contain the zero value (ASCII NUL, 0x00), line feed (ASCII LF, 0x0a), or carriage return (ASCII CR, 0x0d) at any position. ... A request or response that contains a field that violates any of these conditions MUST be treated as malformed.",
+		run: func(t *testing.T, h *harness) {
+			h.open(Request{Authority: "origin.test:443"})
+			id := h.wantHeaders().StreamID
+			h.writeHeaders(id, false, status("200"), hpack.HeaderField{Name: "x-a", Value: "1\r\nx-b: 2"})
+			h.wantStreamError(id, http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "rfc9113/8.2.1/4", name: "an empty field name in the answer",
+		req: "A field name MUST NOT contain characters in the ranges 0x00-0x20, 0x41-0x5a, or 0x7f-0xff. ... A request or response that contains a field that violates any of these conditions MUST be treated as malformed.",
+		run: func(t *testing.T, h *harness) {
+			h.open(Request{Authority: "origin.test:443"})
+			id := h.wantHeaders().StreamID
+			h.writeHeaders(id, false, status("200"), hpack.HeaderField{Name: "", Value: "1"})
+			h.wantStreamError(id, http2.ErrCodeProtocol)
+		},
+	},
+}
+
+// wantCompressionError sends block as the answer and wants the decoding error to end the
+// connection, RFC 9113 section 4.3.
+func wantCompressionError(t *testing.T, h *harness, block []byte) {
+	t.Helper()
+	h.open(Request{Authority: "origin.test:443"})
+	id := h.wantHeaders().StreamID
+	h.writeBlock(id, false, block)
+	h.wantConnectionError(http2.ErrCodeCompression)
+}
+
+// wantAnswerBlock sends block as the answer and wants it decoded as a 200.
+func wantAnswerBlock(t *testing.T, h *harness, block []byte) {
+	t.Helper()
+	o := h.open(Request{Authority: "origin.test:443"})
+	id := h.wantHeaders().StreamID
+	h.writeBlock(id, false, block)
+	_, resp, err := o.wait(t)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+}
