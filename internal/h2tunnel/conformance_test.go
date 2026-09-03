@@ -1635,6 +1635,69 @@ var conformance = []conformanceCase{
 		},
 	},
 	{
+		id: "rfc9113/5.1/3", name: "a WINDOW_UPDATE the framer refuses on an idle stream",
+		req: "Receiving any frame other than HEADERS or PRIORITY on a stream in this state MUST be treated as a connection error of type PROTOCOL_ERROR. ... RST_STREAM frames MUST NOT be sent for a stream in the \"idle\" state.",
+		run: func(t *testing.T, p *peer) {
+			p.writeRaw(http2.FrameWindowUpdate, 0, 101, []byte{0, 0, 0, 0})
+			p.wantConnectionError(http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "rfc9113/5.1/4", name: "HEADERS the framer refuses on a stream the server would open",
+		req: "If this stream is initiated by the server, as described in Section 5.1.1, then receiving a HEADERS frame MUST also be treated as a connection error of type PROTOCOL_ERROR.",
+		run: func(t *testing.T, p *peer) {
+			// A regular field ahead of a pseudo-header, which the framer refuses on its own.
+			p.writeHeaders(2, false, hpack.HeaderField{Name: "x-first", Value: "1"}, status("200"))
+			p.wantConnectionError(http2.ErrCodeProtocol)
+		},
+	},
+	{
+		id: "rfc9113/5.1/5", name: "a write on a stream the peer ended at once",
+		req: "A stream that is \"half-closed (remote)\" can be used by the endpoint to send frames of any type.",
+		run: func(t *testing.T, p *peer) {
+			o := p.open(Request{Authority: "origin.test:443"})
+			id := p.wantHeaders().StreamID
+			p.writeHeaders(id, true, status("200"))
+			s, resp, err := o.wait(t)
+			require.NoError(t, err)
+			require.Equal(t, 200, resp.StatusCode)
+			n, err := s.Write([]byte("still open"))
+			require.NoError(t, err)
+			require.Equal(t, 10, n)
+			require.Equal(t, "still open", string(p.wantData(id).Data()))
+		},
+	},
+	{
+		id: "rfc9113/5.1/6", name: "a WINDOW_UPDATE after the client's END_STREAM",
+		req: "An endpoint can receive any type of frame in this state.",
+		run: func(t *testing.T, p *peer) {
+			s, id := p.connect()
+			require.NoError(t, s.CloseWrite())
+			require.True(t, p.wantData(id).StreamEnded())
+			p.writeWindowUpdate(id, 1024)
+			p.wantAlive()
+		},
+	},
+	{
+		id: "rfc9113/4.2/2", name: "DATA split at the peer's frame size",
+		req: "The size of a frame payload is limited by the maximum size that a receiver advertises in the SETTINGS_MAX_FRAME_SIZE setting.",
+		run: func(t *testing.T, p *peer) {
+			p.writeSettings(
+				http2.Setting{ID: http2.SettingMaxFrameSize, Val: 16384},
+				http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1 << 20})
+			p.wantSettingsAck()
+			s, id := p.connect()
+			p.writeWindowUpdate(0, 1<<20)
+			const total = 200 << 10
+			go func() { _, _ = s.Write(make([]byte, total)) }()
+			for sent := 0; sent < total; {
+				f := p.wantData(id)
+				require.LessOrEqual(t, int(f.Length), 16384)
+				sent += int(f.Length)
+			}
+		},
+	},
+	{
 		id: "rfc9113/4.2/1", name: "a request past the peer's frame size continues",
 		req: "An endpoint MUST send an error code of FRAME_SIZE_ERROR if a frame exceeds the size defined in SETTINGS_MAX_FRAME_SIZE. ... Field blocks MUST be transmitted as a contiguous sequence of frames.",
 		run: func(t *testing.T, p *peer) {

@@ -60,11 +60,7 @@ const (
 	// connection ends past it.
 	maxControlFrames = 1024
 	// creditRefresh is the least a WINDOW_UPDATE grants while the reader keeps up.
-	// creditFlush is how much a reader consumes before the credit is sent to serve, and creditIdle the
-	// least it grants back when it stops to wait.
 	creditRefresh = window / 2
-	creditFlush   = 32 << 10
-	creditIdle    = 4 << 10
 	// maxStreamID is the last stream ID a client may use, RFC 9113 section 5.1.1.
 	maxStreamID = 1<<31 - 1
 	// msgQueue bounds the messages waiting for serve, and frameQueue the frames read ahead
@@ -208,15 +204,12 @@ type msg struct {
 	grant grant
 }
 
-// grant selects when the credit of a read is granted back to the peer.
+// grant selects when credit is granted back to the peer.
 type grant uint8
 
 const (
-	// grantBatch waits for creditRefresh.
-	grantBatch grant = iota
-	// grantLow waits for creditRefresh unless the peer has less window left than is owed,
-	// the reader having stopped to wait.
-	grantLow
+	// grantLow waits for creditRefresh unless the peer has less window left than is owed.
+	grantLow grant = iota
 	// grantAll grants at once, the stream having ended.
 	grantAll
 )
@@ -269,15 +262,8 @@ func (f *inflow) take(n int64) bool {
 // add records n bytes consumed, and makes them due to the peer unless g defers it.
 func (f *inflow) add(n int64, g grant) {
 	f.unsent += n
-	switch g {
-	case grantBatch:
-		if f.unsent < creditRefresh {
-			return
-		}
-	case grantLow:
-		if f.unsent < creditRefresh && f.unsent < f.avail {
-			return
-		}
+	if g == grantLow && f.unsent < creditRefresh && f.unsent < f.avail {
+		return
 	}
 	f.avail += f.unsent
 	f.due += f.unsent
@@ -781,6 +767,12 @@ func (c *Conn) onFrame(fr frame) {
 	}
 	var se http2.StreamError
 	if errors.As(err, &se) {
+		if c.idle(se.StreamID) {
+			// No RST_STREAM may answer an idle stream, RFC 9113 section 6.4, so a frame
+			// the framer refused there leaves only the connection error of section 5.1.
+			c.shutdown(err, true, http2.ErrCodeProtocol)
+			return
+		}
 		// A malformed frame on one stream ends that stream, RFC 9113 section 5.4.2.
 		c.resetStream(se)
 		return
@@ -1024,7 +1016,7 @@ func (c *Conn) handleData(fr frame) error {
 	}
 	// The padding is consumed at once, the data when read.
 	if pad := n - int64(len(fr.data)); pad > 0 {
-		c.credit(s, pad, grantBatch)
+		c.credit(s, pad, grantLow)
 	}
 	if fr.end {
 		return c.endRemote(s)
@@ -1344,7 +1336,7 @@ func (req Request) headerSize() int {
 	return n
 }
 
-// Stream is one CONNECT stream as a net.Conn. mu guards chunks, readErr, unsent, returned
+// Stream is one CONNECT stream as a net.Conn. mu guards chunks, readErr, returned
 // and the read deadline, which the readers share with serve, and cond wakes every reader.
 // wmu serializes the writers, wrote is serve's answer to the pending write, and closed is
 // closed once the stream ended, err set before. serve owns the rest.
@@ -1363,14 +1355,12 @@ type Stream struct {
 	chunks        [][]byte
 	pending       writeReq
 	recv          inflow
-	// unsent is what the reader consumed and has not sent to serve, and returned records
-	// that serve granted back what was held when the stream ended, so a read grants nothing
-	// more.
-	unsent      int64
-	sendWindow  int64
-	mu          sync.Mutex
-	wmu         sync.Mutex
-	id          uint32
+	sendWindow    int64
+	mu            sync.Mutex
+	wmu           sync.Mutex
+	id            uint32
+	// returned records that serve granted back what the stream held when it ended, so a
+	// read grants nothing more.
 	returned    bool
 	tailOwned   bool
 	ready       bool
@@ -1440,7 +1430,7 @@ func (s *Stream) endReads(err error) {
 // closed here reads nothing more, one the peer ended drains to its end.
 func (s *Stream) closeReads(err error, local bool) int64 {
 	s.mu.Lock()
-	held := s.unsent
+	var held int64
 	for _, chunk := range s.chunks {
 		held += int64(len(chunk))
 	}
@@ -1452,7 +1442,6 @@ func (s *Stream) closeReads(err error, local bool) int64 {
 	case s.readErr == nil:
 		s.readErr = err
 	}
-	s.unsent = 0
 	s.returned = true
 	if s.readTimer != nil {
 		s.readTimer.Stop()
@@ -1485,29 +1474,19 @@ func (s *Stream) Read(b []byte) (int, error) {
 				s.chunks[0] = s.chunks[0][n:]
 			}
 			if !s.returned {
-				s.unsent += int64(n)
-				if s.unsent >= creditFlush {
-					s.flush(grantBatch)
-				}
+				s.flush(int64(n), grantLow)
 			}
 			return n, nil
 		}
 		if s.readErr != nil {
 			return 0, s.readErr
 		}
-		// Nothing to read, so what was consumed is granted back before the wait.
-		if !s.returned && s.unsent >= creditIdle {
-			s.flush(grantLow)
-			continue
-		}
 		s.cond.Wait()
 	}
 }
 
 // flush sends serve what the reader consumed, with mu released for the send.
-func (s *Stream) flush(g grant) {
-	n := s.unsent
-	s.unsent = 0
+func (s *Stream) flush(n int64, g grant) {
 	s.mu.Unlock()
 	s.c.send(msg{kind: msgRead, s: s, n: n, grant: g})
 	s.mu.Lock()

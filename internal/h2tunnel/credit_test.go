@@ -6,6 +6,7 @@ package h2tunnel
 
 import (
 	"context"
+	"io"
 	"testing"
 	"time"
 
@@ -291,4 +292,107 @@ func TestConn_ConnectionWindowExactAcrossEveryPath(t *testing.T) {
 		p.c.onLoop(func() { got = p.c.recv.avail + p.c.recv.unsent })
 		return got == want
 	}, wantTimeout, 10*time.Millisecond, "the connection receive window drifted: want %d, got %d", want, got)
+}
+
+// A stream that read everything it received and went quiet holds no connection window.
+// Without the reclaim, enough of them take it all and every stream on the connection stops.
+func TestConn_QuietStreamsHoldNoConnectionWindow(t *testing.T) {
+	cli, srv := tcpPair(t)
+	answered := make(chan uint32, 1<<10)
+	c, err := Client(cli, 0)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+	peer := creditPeer(t, srv, answered, http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1 << 20})
+	require.Eventually(t, func() bool { return peer.window() == connWindow }, wantTimeout, 5*time.Millisecond)
+
+	// What one stream carries, held in the test rather than taken from the implementation,
+	// so the bound stands whatever a reader keeps back.
+	const quiet = 32<<10 - 1
+	const streams = connWindow/quiet + 8
+	for n := range streams {
+		ctx, cancel := context.WithTimeout(context.Background(), wantTimeout)
+		s, _, oerr := c.Open(ctx, Request{Authority: "origin.test:443"})
+		cancel()
+		require.NoError(t, oerr, "open %d", n)
+		id := <-answered
+		for off := 0; off < quiet; off += 16384 {
+			require.NoError(t, peer.writeData(id, make([]byte, min(16384, quiet-off))))
+		}
+		// Buffered before the read, so no Read of it waits and grants back what a wait does.
+		require.Eventually(t, func() bool { return buffered(s) == quiet }, wantTimeout, time.Millisecond,
+			"stream %d never received what the peer sent", n)
+		_, rerr := io.ReadFull(s, make([]byte, quiet))
+		require.NoError(t, rerr, "stream %d", n)
+	}
+
+	require.Eventually(t, func() bool { return peer.window() > connWindow/4 }, wantTimeout, 20*time.Millisecond,
+		"the connection window never came back though every stream read everything it received")
+
+	// The connection still carries, on a stream opened after the others went quiet.
+	ctx, cancel := context.WithTimeout(context.Background(), wantTimeout)
+	fresh, _, oerr := c.Open(ctx, Request{Authority: "origin.test:443"})
+	cancel()
+	require.NoError(t, oerr)
+	require.NoError(t, peer.writeData(<-answered, []byte("x")))
+	require.NoError(t, fresh.SetReadDeadline(time.Now().Add(wantTimeout)))
+	b := make([]byte, 1)
+	_, rerr := io.ReadFull(fresh, b)
+	require.NoError(t, rerr)
+	require.Equal(t, "x", string(b))
+	require.NoError(t, c.Err())
+}
+
+// buffered is what the peer delivered on s and no reader has taken.
+func buffered(s *Stream) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var n int
+	for _, chunk := range s.chunks {
+		n += len(chunk)
+	}
+	return n
+}
+
+// The connection window also runs low on data no reader has taken, with nothing held. What
+// the readers hold after that must come back too.
+func TestConn_QuietStreamsHoldNoConnectionWindowAfterABuffer(t *testing.T) {
+	cli, srv := tcpPair(t)
+	answered := make(chan uint32, 1<<10)
+	c, err := Client(cli, 0)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+	peer := creditPeer(t, srv, answered, http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1 << 20})
+	require.Eventually(t, func() bool { return peer.window() == connWindow }, wantTimeout, 5*time.Millisecond)
+
+	// Full streams nobody reads, enough of them to take the connection window low.
+	for n := 0; peer.window() > connWindow/4; n++ {
+		ctx, cancel := context.WithTimeout(context.Background(), wantTimeout)
+		s, _, oerr := c.Open(ctx, Request{Authority: "origin.test:443"})
+		cancel()
+		require.NoError(t, oerr, "buffer %d", n)
+		_ = s
+		id := <-answered
+		for off := 0; off < window; off += 16384 {
+			require.NoError(t, peer.writeData(id, make([]byte, 16384)))
+		}
+		require.Less(t, n, 64, "the connection window never went low")
+	}
+
+	// Then the quiet streams, which read everything they receive and stop.
+	const quiet = 32<<10 - 1
+	for n := range 160 {
+		ctx, cancel := context.WithTimeout(context.Background(), wantTimeout)
+		s, _, oerr := c.Open(ctx, Request{Authority: "origin.test:443"})
+		cancel()
+		require.NoError(t, oerr, "quiet %d", n)
+		id := <-answered
+		for off := 0; off < quiet; off += 16384 {
+			require.NoError(t, peer.writeData(id, make([]byte, min(16384, quiet-off))))
+		}
+		require.Eventually(t, func() bool { return buffered(s) == quiet }, wantTimeout, time.Millisecond,
+			"quiet stream %d never received what the peer sent", n)
+		_, rerr := io.ReadFull(s, make([]byte, quiet))
+		require.NoError(t, rerr, "quiet stream %d", n)
+	}
+	require.NoError(t, c.Err())
 }

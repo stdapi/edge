@@ -525,8 +525,9 @@ func TestConn_OpenCancelledAsTheAnswerArrives(t *testing.T) {
 		p := newPeer(t)
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan struct{})
+		var s *Stream
 		go func() {
-			_, _, _ = p.c.Open(ctx, Request{Authority: "origin.test:443"})
+			s, _, _ = p.c.Open(ctx, Request{Authority: "origin.test:443"})
 			close(done)
 		}()
 		id := p.wantHeaders().StreamID
@@ -536,6 +537,10 @@ func TestConn_OpenCancelledAsTheAnswerArrives(t *testing.T) {
 		case <-done:
 		case <-time.After(wantTimeout):
 			t.Fatal("Open did not return")
+		}
+		if s != nil {
+			// The answer won the race, so the stream is the caller's to close.
+			require.NoError(t, s.Close())
 		}
 		var open int
 		p.c.onLoop(func() { open = len(p.c.streams) })
