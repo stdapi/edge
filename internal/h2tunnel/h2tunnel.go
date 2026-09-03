@@ -37,7 +37,8 @@ const (
 	connWindow = 16 << 20
 	// defaultWindow is the initial window of RFC 9113 section 6.9.2, before any SETTINGS.
 	defaultWindow = 65535
-	// maxHeaderBytes bounds the header block of a response.
+	// maxHeaderBytes bounds the header list of a response, and of a request before the
+	// encoder.
 	maxHeaderBytes = 64 << 10
 	// hpackTableSize is the decoding table size of RFC 9113 section 6.5.2.
 	hpackTableSize = 4096
@@ -46,12 +47,17 @@ const (
 	writeTimeout = 30 * time.Second
 	// closeTimeout bounds the GOAWAY a close sends, and the write it may have to wait out.
 	closeTimeout = time.Second
+	// chunkBacklog is how many chunks a stream buffers before the small payloads that follow
+	// join one chunk of chunkMin or more, so a peer sending tiny frames to a reader that
+	// fell behind costs no chunk per frame, and a reader that keeps up copies nothing.
+	chunkBacklog = 8
+	chunkMin     = 4 << 10
 	// maxDataFrame bounds a DATA frame the connection sends, whatever the peer allows.
 	maxDataFrame = 256 << 10
 	// outBound is how far serve encodes ahead of the write goroutine. Past it, DATA waits.
 	outBound = 64 << 10
-	// maxControlFrames bounds the frames a peer provokes, acks and resets, while the socket
-	// takes none. The connection ends past it.
+	// maxControlFrames bounds the acks a peer provokes while the socket takes none. The
+	// connection ends past it.
 	maxControlFrames = 1024
 	// creditRefresh is the least a WINDOW_UPDATE grants while the reader keeps up.
 	// creditFlush is how much a reader consumes before telling serve, and creditIdle the
@@ -77,8 +83,9 @@ var (
 	errTooManyStreams  = errors.New("h2tunnel: the peer's concurrent stream limit is reached")
 	errInvalidHeader   = errors.New("h2tunnel: invalid header field")
 	errNoAuthority     = errors.New("h2tunnel: a CONNECT needs an authority")
+	errNoTarget        = errors.New("h2tunnel: an extended CONNECT needs a scheme and a path")
 	errStreamClosed    = errors.New("h2tunnel: stream closed")
-	errHeadersTooLarge = errors.New("h2tunnel: request headers exceed a frame")
+	errHeadersTooLarge = errors.New("h2tunnel: request headers too large")
 	errKeepAlive       = errors.New("h2tunnel: the peer stopped answering")
 	errControlFlood    = errors.New("h2tunnel: too many control frames owed to a peer that reads none")
 )
@@ -507,7 +514,7 @@ func (c *Conn) open(s *Stream, req *openReq) {
 		refused = ErrExtendedConnect
 	case int64(len(c.streams)) >= c.maxStreams:
 		refused = errTooManyStreams
-	case int64(req.req.headerSize()) > min(int64(c.maxFrameSize), c.maxHeaderList):
+	case int64(req.req.headerSize()) > min(maxHeaderBytes, c.maxHeaderList):
 		// The bound comes before the encoder, whose table keeps every field it indexes
 		// whether the block goes out or not.
 		refused = errHeadersTooLarge
@@ -681,7 +688,6 @@ func (c *Conn) encodeControl(ctl control) error {
 	case ctlPing:
 		return c.fr.WritePing(false, ctl.ping)
 	case ctlReset:
-		c.queuedControl--
 		return c.fr.WriteRSTStream(ctl.id, ctl.code)
 	}
 	return nil
@@ -704,11 +710,22 @@ func (c *Conn) encodeHeaders(s *Stream, req *Request) error {
 			c.field(name, v)
 		}
 	}
-	if c.encBuf.Len() > int(c.maxFrameSize) {
-		return errors.New("h2tunnel: request headers exceed a frame past the bound")
-	}
 	s.headersSent = true
-	return c.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: s.id, BlockFragment: c.encBuf.Bytes(), EndHeaders: true})
+	// A block past the frame size goes on in CONTINUATION frames, which nothing may come
+	// between, so the whole of it is encoded here.
+	block := c.encBuf.Bytes()
+	size := int(c.maxFrameSize)
+	n := min(len(block), size)
+	if err := c.fr.WriteHeaders(http2.HeadersFrameParam{StreamID: s.id, BlockFragment: block[:n], EndHeaders: n == len(block)}); err != nil {
+		return err
+	}
+	for off := n; off < len(block); off += size {
+		end := min(off+size, len(block))
+		if err := c.fr.WriteContinuation(s.id, end == len(block), block[off:end]); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (c *Conn) field(name, value string) {
@@ -831,14 +848,16 @@ func (c *Conn) handleSettings(f *http2.SettingsFrame) error {
 		}
 		return nil
 	}
-	if f.NumSettings() > 100 || f.HasDuplicates() {
-		return http2.ConnectionError(http2.ErrCodeProtocol)
-	}
 	err := f.ForeachSetting(func(s http2.Setting) error {
 		if err := s.Valid(); err != nil {
 			return err
 		}
 		switch s.ID {
+		case http2.SettingEnablePush:
+			// A server may only say 0, RFC 9113 section 6.5.2.
+			if s.Val != 0 {
+				return http2.ConnectionError(http2.ErrCodeProtocol)
+			}
 		case http2.SettingInitialWindowSize:
 			// The change applies to every open stream, RFC 9113 section 6.9.2.
 			delta := int64(s.Val) - c.initialWindow
@@ -1079,7 +1098,8 @@ func (c *Conn) onKeepAlive() {
 	c.keepTimer.Reset(c.keepAlive - idle)
 }
 
-// resetStream ends the stream of se and tells the peer.
+// resetStream ends the stream of se and tells the peer. The reset is owed by a stream the
+// connection opened, so it counts against no bound.
 func (c *Conn) resetStream(se http2.StreamError) {
 	if s := c.streams[se.StreamID]; s != nil {
 		c.closeStream(s, se, se.Code)
@@ -1099,7 +1119,6 @@ func (c *Conn) closeStream(s *Stream, err error, code http2.ErrCode) {
 		s.writeTimer = nil
 	}
 	if s.headersSent && !s.fromPeer && (!s.localEnd || !s.remoteEnd) {
-		c.queuedControl++
 		c.control = append(c.control, control{kind: ctlReset, id: s.id, code: code})
 	}
 	if s.pending.active {
@@ -1133,7 +1152,6 @@ func (c *Conn) shutdown(err error, goAway bool, code http2.ErrCode) {
 	}
 	c.err = err
 	c.canOpen.Store(false)
-	close(c.done)
 	if c.keepTimer != nil {
 		c.keepTimer.Stop()
 	}
@@ -1141,6 +1159,7 @@ func (c *Conn) shutdown(err error, goAway bool, code http2.ErrCode) {
 		s.fromPeer = true
 		c.closeStream(s, err, http2.ErrCodeNo)
 	}
+	close(c.done)
 	// A write stuck on the socket returns at the deadline, and the write goroutine with it.
 	_ = c.nc.SetWriteDeadline(time.Now().Add(closeTimeout))
 	if c.writing {
@@ -1227,14 +1246,18 @@ func (c *Conn) Open(ctx context.Context, req Request) (*Stream, *Response, error
 	}
 }
 
-// validate refuses a CONNECT without an authority, RFC 9113 section 8.5, and a field name
-// or value HTTP/2 forbids, sections 8.2.1 and 8.2.2.
+// validate refuses a CONNECT without an authority, RFC 9113 section 8.5, an extended one
+// without a scheme and a path, RFC 8441 section 4, and a field name or value HTTP/2
+// forbids, sections 8.2.1 and 8.2.2.
 func (req Request) validate() error {
 	if req.Authority == "" {
 		return errNoAuthority
 	}
+	if req.Protocol != "" && (req.Scheme == "" || req.Path == "") {
+		return errNoTarget
+	}
 	for _, v := range []string{req.Scheme, req.Authority, req.Path, req.Protocol} {
-		if !httpguts.ValidHeaderFieldValue(v) {
+		if !validValue(v) {
 			return errInvalidHeader
 		}
 	}
@@ -1247,12 +1270,22 @@ func (req Request) validate() error {
 			return errInvalidHeader
 		}
 		for _, v := range vv {
-			if !httpguts.ValidHeaderFieldValue(v) || strings.EqualFold(k, "te") && v != "trailers" {
+			if !validValue(v) || strings.EqualFold(k, "te") && v != "trailers" {
 				return errInvalidHeader
 			}
 		}
 	}
 	return nil
+}
+
+// validValue reports whether v may be a field value, RFC 9113 section 8.2.1, which no
+// space or tab may start or end.
+func validValue(v string) bool {
+	if v == "" {
+		return true
+	}
+	first, last := v[0], v[len(v)-1]
+	return httpguts.ValidHeaderFieldValue(v) && first != ' ' && first != '\t' && last != ' ' && last != '\t'
 }
 
 // headerSize is the size of the header list, RFC 7541 section 4.1, which the encoded block
@@ -1297,6 +1330,7 @@ type Stream struct {
 	wmu         sync.Mutex
 	id          uint32
 	returned    bool
+	tailOwned   bool
 	ready       bool
 	creditDue   bool
 	gone        bool
@@ -1331,9 +1365,20 @@ func (s *Stream) writeExpired() bool {
 	return !s.writeDeadline.IsZero() && !time.Now().Before(s.writeDeadline)
 }
 
+// deliver buffers b for the readers. Past chunkBacklog chunks, a payload under chunkMin
+// joins the last chunk when that one is the stream's own buffer, and starts one otherwise.
 func (s *Stream) deliver(b []byte) {
 	s.mu.Lock()
-	s.chunks = append(s.chunks, b)
+	switch n := len(s.chunks); {
+	case s.tailOwned && len(b) < chunkMin:
+		s.chunks[n-1] = append(s.chunks[n-1], b...)
+	case n < chunkBacklog || len(b) >= chunkMin:
+		s.chunks = append(s.chunks, b)
+		s.tailOwned = false
+	default:
+		s.chunks = append(s.chunks, append(make([]byte, 0, chunkMin), b...))
+		s.tailOwned = true
+	}
 	s.cond.Broadcast()
 	s.mu.Unlock()
 }
@@ -1385,6 +1430,9 @@ func (s *Stream) Read(b []byte) (int, error) {
 			if n == len(s.chunks[0]) {
 				s.chunks[0] = nil
 				s.chunks = s.chunks[1:]
+				if len(s.chunks) == 0 {
+					s.tailOwned = false
+				}
 			} else {
 				s.chunks[0] = s.chunks[0][n:]
 			}
@@ -1453,7 +1501,12 @@ func (s *Stream) submit(m msg) (int, error) {
 			return 0, s.err
 		}
 	case <-s.c.done:
-		return 0, s.c.Err()
+		select {
+		case r := <-s.wrote:
+			return r.n, r.err
+		default:
+			return 0, s.c.Err()
+		}
 	}
 }
 
