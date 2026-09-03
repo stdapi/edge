@@ -1120,7 +1120,8 @@ func (c *Conn) resetStream(se http2.StreamError) {
 }
 
 // closeStream ends s with err. A RST_STREAM with code is sent unless the peer ended the
-// stream itself, or the stream ended in both directions, or its HEADERS never left.
+// stream itself, or the stream ended in both directions, or its HEADERS never left, or the
+// connection ends with it, the queued frame never reaching the writer.
 func (c *Conn) closeStream(s *Stream, err error, code http2.ErrCode) {
 	if s.gone {
 		return
