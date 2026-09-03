@@ -41,10 +41,10 @@ type MatcherOption[H Handler] interface {
 	applyMatcher(sealedOption) error
 }
 
-// kinded carries the kind in an option's type. An interface is identified by its method set,
-// so without a method naming H the type parameter would be ignored and an option of one kind
-// would satisfy every other. It is a hint to the caller and not a guarantee, a method set
-// being reassemblable by embedding, which is why newEntry checks what an option wrote.
+// kinded puts the kind in an option's type. An interface is identified by its method set, so
+// a type parameter no method mentions is ignored, and an option of one kind would satisfy
+// every other. It is a hint to the caller and no guarantee, a method set being reassemblable
+// by embedding, which is why newEntry checks what an option wrote.
 type kinded[H Handler] interface {
 	forKind(H)
 }
@@ -58,8 +58,8 @@ type sealedOption struct {
 }
 
 // The placements an option reaches are its type. A proxy-wide setting applies to every kind,
-// so a proxy option carries none, and an entry option carries no applyProxy, so asserting one
-// to [ProxyOption] fails rather than reaching a closure with no entry to write to.
+// so a proxy option has no kind. An entry option has no applyProxy, so asserting one to
+// [ProxyOption] fails instead of reaching a closure with no entry to write to.
 type proxyOption func(sealedOption) error
 
 func (o proxyOption) applyProxy(s sealedOption) error { return o(s) }

@@ -360,11 +360,17 @@ func newEntry[H Handler](p *Proxy, pattern string, handler H, opts ...EntryOptio
 		}
 	}
 
-	// The kind constraints refuse a matcher option on the wrong entry at compile time, but a
-	// method set is reassemblable by embedding, so what an option wrote is checked here.
+	// The kind constraints refuse these options on the wrong entry at compile time, but a
+	// method set is reassemblable by embedding, so what they wrote is checked here. The length
+	// test is exact while matchers is a []RequestMatcher, so connection matchers will need a
+	// field and a check of their own.
 	if !kind.requiresPath() && len(e.matchers) > 0 {
-		return nil, fmt.Errorf("%w: a matcher narrows a request, and a %s entry admits a connection before any request exists",
-			ErrInvalidConfig, kind)
+		return nil, fmt.Errorf("%w: a request matcher does not apply to a %s entry", ErrInvalidConfig, kind)
+	}
+	for _, mw := range e.mws {
+		if mw.kind != kind {
+			return nil, fmt.Errorf("%w: %s middleware does not apply to a %s entry", ErrInvalidConfig, mw.kind, kind)
+		}
 	}
 	if len(e.matchers) > p.cfg.maxMatchers {
 		return nil, fmt.Errorf("%w: %w", ErrInvalidEntry, ErrTooManyMatchers)

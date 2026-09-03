@@ -74,15 +74,41 @@ func TestEntry_MethodsIdentifyAnEntry(t *testing.T) {
 	assert.Equal(t, post, lookupHTTP(p, "api.test/v1", mustMethods(http.MethodPost)))
 }
 
-// An entry setting overrides the proxy default, and it governs the lookup rather than the
-// accessor alone.
-func TestEntry_TrailingSlashOverridesTheProxyDefault(t *testing.T) {
+// A middleware wraps the kind of its own signature, and an entry takes no other. The compiler
+// refuses it, and registration refuses what a reassembled method set wrote.
+func TestEntry_MiddlewareOfAnotherKindIsRefused(t *testing.T) {
 	p := testProxy(t)
-	p.MustAdd("api.test/v1/charges", noopHandler)
-	p.MustAdd("api.test/v1/refunds", noopHandler, WithTrailingSlash[HTTP](RelaxedSlash))
 
-	assert.Equal(t, ExactSlash, lookupHTTP(p, "api.test/v1/charges").TrailingSlashOption())
-	assert.Equal(t, RelaxedSlash, lookupHTTP(p, "api.test/v1/refunds").TrailingSlashOption())
+	forged := option[TCP](func(s sealedOption) error {
+		s.entry.mws = append(s.entry.mws, middleware{m: func(next HTTP) HTTP { return next }, kind: KindHTTP})
+		return nil
+	})
+
+	_, err := p.Add[TCP]("smtp.test:465", noopStream, forged)
+	require.ErrorIs(t, err, ErrInvalidConfig)
+
+	_, err = p.Add[TCP]("smtp.test:465", noopStream, WithMiddleware(func(next TCP) TCP { return next }))
+	require.NoError(t, err)
+}
+
+// An entry setting overrides the proxy default in both directions, and it is the lookup that
+// obeys it.
+func TestEntry_TrailingSlashOverridesTheProxyDefault(t *testing.T) {
+	zero := Entry[HTTP]{}
+
+	p := testProxy(t, WithDefaultTrailingSlash(RelaxedSlash))
+	p.MustAdd("api.test/v1/charges", noopHandler)
+	p.MustAdd("api.test/v1/refunds", noopHandler, WithTrailingSlash[HTTP](ExactSlash))
+
+	assert.NotEqual(t, zero, match(t, p, http.MethodGet, "https", "api.test:443", "/v1/charges/"))
+	assert.Equal(t, zero, match(t, p, http.MethodGet, "https", "api.test:443", "/v1/refunds/"))
+
+	q := testProxy(t)
+	q.MustAdd("api.test/v1/charges", noopHandler)
+	q.MustAdd("api.test/v1/refunds", noopHandler, WithTrailingSlash[HTTP](RelaxedSlash))
+
+	assert.Equal(t, zero, match(t, q, http.MethodGet, "https", "api.test:443", "/v1/charges/"))
+	assert.NotEqual(t, zero, match(t, q, http.MethodGet, "https", "api.test:443", "/v1/refunds/"))
 
 	_, err := p.Add("api.test/v1/disputes", noopHandler, WithTrailingSlash[HTTP](TrailingSlashOption(99)))
 	require.ErrorIs(t, err, ErrInvalidConfig)

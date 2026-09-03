@@ -60,8 +60,8 @@ func (m SchemeMatcher) Equal(matcher RequestMatcher) bool {
 
 func (m SchemeMatcher) String() string { return "scheme=" + m.scheme }
 
-// QueryMatcher matches a query parameter against an exact value. A key repeated in the query
-// carries several values and the matcher accepts the request when any of them is the one.
+// QueryMatcher matches a query parameter against an exact value. A repeated key gives several
+// values, and any one of them equal to it is enough.
 type QueryMatcher struct {
 	key   string
 	value string
@@ -128,8 +128,8 @@ func (m QueryRegexpMatcher) Equal(matcher RequestMatcher) bool {
 
 func (m QueryRegexpMatcher) String() string { return "query:" + m.key + "~=" + rawExpr(m.re) }
 
-// HeaderMatcher matches a request header against an exact value. A header repeated in the
-// request carries several values and the matcher accepts it when any of them is the one.
+// HeaderMatcher matches a request header against an exact value. A repeated header gives
+// several values, and any one of them equal to it is enough.
 type HeaderMatcher struct {
 	key   string
 	value string

@@ -188,8 +188,8 @@ func (r Entry[H]) Params() iter.Seq[string] { return slices.Values(r.e.params) }
 // MatchersLen returns the number of matchers attached to this entry.
 func (r Entry[H]) MatchersLen() int { return len(r.e.matchers) }
 
-// Matchers returns an iterator over the matchers attached to this entry.
-func (r Entry[H]) Matchers() iter.Seq[RequestMatcher] { return slices.Values(r.e.matchers) }
+// RequestMatchers returns an iterator over the matchers attached to this entry.
+func (r Entry[H]) RequestMatchers() iter.Seq[RequestMatcher] { return slices.Values(r.e.matchers) }
 
 // MatchersPriority returns the matcher priority of this entry.
 func (r Entry[H]) MatchersPriority() uint { return r.e.priority }
@@ -233,7 +233,7 @@ func (v EntryView) Admits() bool { return v.e.admits() }
 func (v EntryView) Implied() bool { return v.e.implied }
 
 // Matchers returns an iterator over the matchers attached to this entry.
-func (v EntryView) Matchers() iter.Seq[RequestMatcher] { return slices.Values(v.e.matchers) }
+func (v EntryView) RequestMatchers() iter.Seq[RequestMatcher] { return slices.Values(v.e.matchers) }
 
 func (v EntryView) String() string { return v.e.String() }
 

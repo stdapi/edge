@@ -129,8 +129,8 @@ func TestMatcher_Protocol(t *testing.T) {
 	assert.ErrorIs(t, err, ErrInvalidMatcher)
 }
 
-// A key repeated in the query or the header is several values, and the matcher reads them
-// all rather than the first alone.
+// A repeated key in the query or the header gives several values, and the matcher reads them
+// all, one match being enough.
 func TestMatcher_ReadsEveryValueOfARepeatedKey(t *testing.T) {
 	q, err := MatchQuery("tenant", "acme")
 	require.NoError(t, err)
