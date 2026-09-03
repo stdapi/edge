@@ -99,7 +99,7 @@ func TestProxy_InterceptHTTPS(t *testing.T) {
 			return nil, err
 		}
 		return Rewrite(resp, []byte(string(body)+" | patched")), nil
-	}, WithMethods(http.MethodGet))
+	}, WithMethods[HTTP](http.MethodGet))
 
 	addr := startProxy(t, p)
 	client := proxyClient(addr, ca.CertPool())
@@ -152,7 +152,7 @@ func TestProxy_ShortCircuit(t *testing.T) {
 			return Text(http.StatusBadRequest, "missing idempotency key"), nil
 		}
 		return c.Forward()
-	}, WithMethods(http.MethodPost))
+	}, WithMethods[HTTP](http.MethodPost))
 
 	addr := startProxy(t, p)
 	client := proxyClient(addr, ca.CertPool())
@@ -201,7 +201,7 @@ func TestProxy_StreamEntryTerminatesAndReoriginates(t *testing.T) {
 	p.MustAdd("+{any}/", func(c *HTTPCtx) (*http.Response, error) {
 		handlerRan = true
 		return c.Forward()
-	}, WithMethods(http.MethodGet))
+	}, WithMethods[HTTP](http.MethodGet))
 
 	addr := startProxy(t, p)
 
@@ -248,7 +248,7 @@ func TestProxy_PlainHTTPAbsoluteTarget(t *testing.T) {
 		}
 		body, _ := ReadBody(resp, 0)
 		return Rewrite(resp, []byte(strings.ToUpper(string(body)))), nil
-	}, WithMethods(http.MethodGet))
+	}, WithMethods[HTTP](http.MethodGet))
 
 	addr := startProxy(t, p)
 	client := proxyClient(addr, nil)

@@ -162,7 +162,7 @@ func (p *Proxy) getTree() *iTree { return p.tree.Load() }
 
 // MustAdd registers handler for pattern and panics on error. It is a convenience wrapper for
 // [Proxy.Add].
-func (p *Proxy) MustAdd[H Handler](pattern string, handler H, opts ...EntryOption) Entry[H] {
+func (p *Proxy) MustAdd[H Handler](pattern string, handler H, opts ...EntryOption[H]) Entry[H] {
 	e, err := p.Add(pattern, handler, opts...)
 	if err != nil {
 		panic(err)
@@ -203,10 +203,10 @@ func (p *Proxy) MustAdd[H Handler](pattern string, handler H, opts ...EntryOptio
 //   - [*EntryConflictError]: it conflicts with an existing entry.
 //   - [*EntryNameConflictError]: the name is already registered.
 //   - [ErrInvalidEntry]: the handler is nil or the pattern is empty.
-//   - [ErrInvalidConfig]: an option is invalid, or does not apply to this kind.
+//   - [ErrInvalidConfig]: an option is invalid.
 //   - [ErrInvalidMatcher]: a matcher option is invalid.
 //   - [ErrNoCertificateAuthority]: termination needs a CA and none is configured.
-func (p *Proxy) Add[H Handler](pattern string, handler H, opts ...EntryOption) (Entry[H], error) {
+func (p *Proxy) Add[H Handler](pattern string, handler H, opts ...EntryOption[H]) (Entry[H], error) {
 	txn := p.Txn(true)
 	defer txn.Abort()
 	e, err := txn.Add(pattern, handler, opts...)
@@ -221,7 +221,7 @@ func (p *Proxy) Add[H Handler](pattern string, handler H, opts ...EntryOption) (
 // be reapplied: anything not provided falls back to the proxy default.
 //
 // The change takes effect on the next unit routed, on connections already open included.
-func (p *Proxy) Update[H Handler](pattern string, handler H, opts ...EntryOption) (Entry[H], error) {
+func (p *Proxy) Update[H Handler](pattern string, handler H, opts ...EntryOption[H]) (Entry[H], error) {
 	txn := p.Txn(true)
 	defer txn.Abort()
 	e, err := txn.Update(pattern, handler, opts...)
@@ -240,7 +240,7 @@ func (p *Proxy) Update[H Handler](pattern string, handler H, opts ...EntryOption
 // The connections already open are left untouched. Their next request or datagram is routed
 // again and refused when nothing matches any more, and a TCP, QUIC or WebSocket connection
 // keeps its handler until it ends. See [Proxy.Sessions] to close those.
-func (p *Proxy) Delete[H Handler](pattern string, opts ...MatcherOption) (Entry[H], error) {
+func (p *Proxy) Delete[H Handler](pattern string, opts ...MatcherOption[H]) (Entry[H], error) {
 	txn := p.Txn(true)
 	defer txn.Abort()
 	e, err := txn.Delete[H](pattern, opts...)
@@ -252,13 +252,13 @@ func (p *Proxy) Delete[H Handler](pattern string, opts ...MatcherOption) (Entry[
 }
 
 // Has reports whether an entry is registered for the given kind, pattern and matchers.
-func (p *Proxy) Has[H Handler](pattern string, matchers ...Matcher) bool {
+func (p *Proxy) Has[H Handler](pattern string, matchers ...RequestMatcher) bool {
 	_, ok := p.Lookup[H](pattern, matchers...)
 	return ok
 }
 
 // Lookup returns the entry registered for the given kind, pattern and matchers.
-func (p *Proxy) Lookup[H Handler](pattern string, matchers ...Matcher) (Entry[H], bool) {
+func (p *Proxy) Lookup[H Handler](pattern string, matchers ...RequestMatcher) (Entry[H], bool) {
 	e := p.getTree().entryFor(kindOf[H](), pattern, matchers)
 	if e == nil {
 		return Entry[H]{}, false
@@ -327,9 +327,9 @@ func (p *Proxy) Txn(write bool) *Txn {
 // newEntry builds an entry without registering it. If an error occurs, it returns one of:
 //   - [*PatternError]: the pattern syntax is invalid.
 //   - [ErrInvalidEntry]: the handler is nil or the pattern is empty.
-//   - [ErrInvalidConfig]: an option is invalid or does not apply to this kind.
+//   - [ErrInvalidConfig]: an option is invalid.
 //   - [ErrInvalidMatcher]: a matcher option is invalid.
-func newEntry[H Handler](p *Proxy, pattern string, handler H, opts ...EntryOption) (*entry, error) {
+func newEntry[H Handler](p *Proxy, pattern string, handler H, opts ...EntryOption[H]) (*entry, error) {
 	kind := kindOf[H]()
 	if isNilHandler(handler) {
 		return nil, fmt.Errorf("%w: nil handler", ErrInvalidEntry)
@@ -360,6 +360,12 @@ func newEntry[H Handler](p *Proxy, pattern string, handler H, opts ...EntryOptio
 		}
 	}
 
+	// The kind constraints refuse a matcher option on the wrong entry at compile time, but a
+	// method set is reassemblable by embedding, so what an option wrote is checked here.
+	if !kind.requiresPath() && len(e.matchers) > 0 {
+		return nil, fmt.Errorf("%w: a matcher narrows a request, and a %s entry admits a connection before any request exists",
+			ErrInvalidConfig, kind)
+	}
 	if len(e.matchers) > p.cfg.maxMatchers {
 		return nil, fmt.Errorf("%w: %w", ErrInvalidEntry, ErrTooManyMatchers)
 	}

@@ -53,7 +53,7 @@ func TestParser_SchemeIsRefusedInAnInterceptorPattern(t *testing.T) {
 	p := testProxy(t)
 
 	for _, pattern := range []string{"https://api.test/v1", "http://api.test/v1"} {
-		_, err := p.Add(pattern, noopHandler, WithMethods(http.MethodGet))
+		_, err := p.Add(pattern, noopHandler, WithMethods[HTTP](http.MethodGet))
 		var pe *PatternError
 		require.ErrorAs(t, err, &pe, pattern)
 		assert.Contains(t, pe.Error(), "it carries no scheme",
@@ -62,7 +62,7 @@ func TestParser_SchemeIsRefusedInAnInterceptorPattern(t *testing.T) {
 
 	// A port, on the other hand, is part of the pattern.
 	for _, pattern := range []string{"api.test:8443/v1", "localhost:8080/api"} {
-		_, err := p.Add(pattern, noopHandler, WithMethods(http.MethodGet))
+		_, err := p.Add(pattern, noopHandler, WithMethods[HTTP](http.MethodGet))
 		require.NoError(t, err, pattern)
 	}
 }

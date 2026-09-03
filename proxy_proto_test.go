@@ -61,7 +61,7 @@ func TestProxy_InterceptHTTP2(t *testing.T) {
 			clientALPN = st.NegotiatedProtocol
 		}
 		return c.Forward()
-	}, WithMethods(http.MethodGet))
+	}, WithMethods[HTTP](http.MethodGet))
 
 	addr := startProxy(t, p)
 	client := h2Client(addr, ca.CertPool())
@@ -174,7 +174,7 @@ func TestProxy_StreamsWithoutBuffering(t *testing.T) {
 	}
 	p.MustAdd(originHost(originURL)+"/events", func(c *HTTPCtx) (*http.Response, error) {
 		return c.Forward()
-	}, WithMethods(http.MethodGet))
+	}, WithMethods[HTTP](http.MethodGet))
 
 	addr := startProxy(t, p)
 	client := proxyClient(addr, ca.CertPool())

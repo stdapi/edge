@@ -129,13 +129,29 @@ func TestMatcher_Protocol(t *testing.T) {
 	assert.ErrorIs(t, err, ErrInvalidMatcher)
 }
 
-func TestMatcher_Func(t *testing.T) {
-	m := MatcherFunc(func(c RequestContext) bool { return c.Method() == http.MethodPost })
-	assert.True(t, m.Match(matchCtx(t, http.MethodPost, "a.test:443", "/", nil)))
-	assert.False(t, m.Match(matchCtx(t, http.MethodGet, "a.test:443", "/", nil)))
-	// Two function matchers are never equal, so an interceptor carrying one cannot be identified
-	// by its matchers.
-	assert.False(t, m.Equal(m))
+// A key repeated in the query or the header is several values, and the matcher reads them
+// all rather than the first alone.
+func TestMatcher_ReadsEveryValueOfARepeatedKey(t *testing.T) {
+	q, err := MatchQuery("tenant", "acme")
+	require.NoError(t, err)
+	qre, err := MatchQueryRegexp("tenant", "ac.*")
+	require.NoError(t, err)
+
+	c := matchCtx(t, http.MethodGet, "a.test:443", "/v1?tenant=other&tenant=acme", nil)
+	assert.True(t, q.Match(c))
+	assert.True(t, qre.Match(c))
+
+	h, err := MatchHeader("X-Tenant", "acme")
+	require.NoError(t, err)
+	hre, err := MatchHeaderRegexp("X-Tenant", "ac.*")
+	require.NoError(t, err)
+
+	headers := http.Header{}
+	headers.Add("X-Tenant", "other")
+	headers.Add("X-Tenant", "acme")
+	c = matchCtx(t, http.MethodGet, "a.test:443", "/v1", headers)
+	assert.True(t, h.Match(c))
+	assert.True(t, hre.Match(c))
 }
 
 func TestMatcher_NarrowsAnInterceptor(t *testing.T) {
@@ -144,8 +160,8 @@ func TestMatcher_NarrowsAnInterceptor(t *testing.T) {
 	beta, err := MatchHeader("X-Channel", "beta")
 	require.NoError(t, err)
 
-	special := p.MustAdd("api.test/v1/charges", noopHandler, WithMatcher(beta), WithMethods(http.MethodGet))
-	fallback := p.MustAdd("api.test/v1/charges", noopHandler, WithMethods(http.MethodGet))
+	special := p.MustAdd("api.test/v1/charges", noopHandler, WithRequestMatchers[HTTP](beta), WithMethods[HTTP](http.MethodGet))
+	fallback := p.MustAdd("api.test/v1/charges", noopHandler, WithMethods[HTTP](http.MethodGet))
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/charges", nil)
 	req.Header.Set("X-Channel", "beta")
@@ -171,8 +187,8 @@ func TestMatcher_ProtocolAndRemoteIPComeFromTheRequest(t *testing.T) {
 	lan, err := MatchRemoteIP("192.0.2.0/24")
 	require.NoError(t, err)
 
-	narrow := p.MustAdd("api.test/v1/charges", noopHandler, WithMatchers(h3, lan), WithMethods(http.MethodGet))
-	fallback := p.MustAdd("api.test/v1/charges", noopHandler, WithMethods(http.MethodGet))
+	narrow := p.MustAdd("api.test/v1/charges", noopHandler, WithRequestMatchers[HTTP](h3, lan), WithMethods[HTTP](http.MethodGet))
+	fallback := p.MustAdd("api.test/v1/charges", noopHandler, WithMethods[HTTP](http.MethodGet))
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/charges", nil)
 	req.Proto, req.ProtoMajor, req.ProtoMinor = "HTTP/3.0", 3, 0

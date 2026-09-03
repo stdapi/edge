@@ -235,10 +235,10 @@ func TestSemantics_HandlerPanicBecomesAnError(t *testing.T) {
 	p, authority, client := interceptingProxy(t, origin)
 	p.MustAdd(authority+"/boom", func(c *HTTPCtx) (*http.Response, error) {
 		panic("handler exploded")
-	}, WithMethods(http.MethodGet))
+	}, WithMethods[HTTP](http.MethodGet))
 	p.MustAdd(authority+"/fine", func(c *HTTPCtx) (*http.Response, error) {
 		return Text(http.StatusOK, "still alive"), nil
-	}, WithMethods(http.MethodGet))
+	}, WithMethods[HTTP](http.MethodGet))
 
 	resp, err := client.Get(origin.URL + "/boom")
 	require.NoError(t, err)
@@ -272,7 +272,7 @@ func TestSemantics_PanicReachesTheErrorHandler(t *testing.T) {
 	}))
 	p.MustAdd(authority+"/boom", func(c *HTTPCtx) (*http.Response, error) {
 		panic(sentinel)
-	}, WithMethods(http.MethodGet))
+	}, WithMethods[HTTP](http.MethodGet))
 
 	resp, err := client.Get(origin.URL + "/boom")
 	require.NoError(t, err)
@@ -300,7 +300,7 @@ func TestSemantics_ErrorHandler(t *testing.T) {
 	}))
 	p.MustAdd(authority+"/fail", func(c *HTTPCtx) (*http.Response, error) {
 		return nil, sentinel
-	}, WithMethods(http.MethodGet))
+	}, WithMethods[HTTP](http.MethodGet))
 
 	resp, err := client.Get(origin.URL + "/fail")
 	require.NoError(t, err)
@@ -331,7 +331,7 @@ func TestSemantics_MiddlewareOrder(t *testing.T) {
 	p.MustAdd(authority+"/x", func(c *HTTPCtx) (*http.Response, error) {
 		order = append(order, "handler")
 		return Status(http.StatusOK), nil
-	}, WithMiddleware(record("interceptor")), WithMethods(http.MethodGet))
+	}, WithMiddleware(record("interceptor")), WithMethods[HTTP](http.MethodGet))
 
 	resp, err := client.Get(origin.URL + "/x")
 	require.NoError(t, err)
@@ -349,7 +349,7 @@ func TestSemantics_NoInterceptorForwardsUnchanged(t *testing.T) {
 	p, authority, client := interceptingProxy(t, origin)
 	p.MustAdd(authority+"/known", func(c *HTTPCtx) (*http.Response, error) {
 		return Text(http.StatusOK, "handled"), nil
-	}, WithMethods(http.MethodGet))
+	}, WithMethods[HTTP](http.MethodGet))
 
 	resp, err := client.Get(origin.URL + "/unknown")
 	require.NoError(t, err)
@@ -385,7 +385,7 @@ func TestSemantics_RawPathIsPreserved(t *testing.T) {
 	p.MustAdd(originHost(originURL)+"/*{any}", func(c *HTTPCtx) (*http.Response, error) {
 		routed = c.RoutingPath()
 		return c.Forward()
-	}, WithMethods(http.MethodGet))
+	}, WithMethods[HTTP](http.MethodGet))
 	client := proxyClient(startProxy(t, p), ca.CertPool())
 
 	cases := []struct{ wire, wantRouted string }{

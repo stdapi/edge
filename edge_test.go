@@ -30,7 +30,7 @@ func FuzzRoundTripRegistration(f *testing.F) {
 	f.Fuzz(func(t *testing.T, raw string) {
 		p := mustFuzzProxy(t)
 
-		ic, err := p.Add(raw, noopHandler, WithMethods(http.MethodGet))
+		ic, err := p.Add(raw, noopHandler, WithMethods[HTTP](http.MethodGet))
 		if err != nil {
 			return
 		}
@@ -43,7 +43,7 @@ func FuzzRoundTripRegistration(f *testing.F) {
 			t.Fatalf("Lookup returned a different entry for %q", raw)
 		}
 
-		deleted, err := p.Delete[HTTP](raw, WithMethods(http.MethodGet))
+		deleted, err := p.Delete[HTTP](raw, WithMethods[HTTP](http.MethodGet))
 		if err != nil {
 			t.Fatalf("delete %q: %v", raw, err)
 		}

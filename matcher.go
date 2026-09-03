@@ -19,18 +19,19 @@ import (
 	"golang.org/x/net/http/httpguts"
 )
 
-// Matcher narrows an interceptor beyond its pattern and method. Every matcher on an interceptor must
-// match for the interceptor to be selected. An interceptor carrying matchers is evaluated before one
-// without at the same pattern, so an interceptor with no matcher is the fallback.
-//
-// Match must be free of side effects and must not retain the [RequestContext], whose
-// lifetime ends when Match returns.
-type Matcher interface {
-	// Match reports whether the request satisfies this matcher.
+// RequestMatcher evaluates if an HTTP request satisfies specific conditions. Matchers are
+// evaluated after hostname, port and path matching succeeds. All matchers associated with an
+// entry must match for the entry to be selected. Implementations must be safe for concurrent
+// use by multiple goroutines and must not retain the [RequestContext].
+type RequestMatcher interface {
+	// Match evaluates if the [RequestContext] satisfies this matcher.
 	Match(c RequestContext) bool
-	// Equal reports whether matcher is this matcher. It identifies an interceptor for lookup and
-	// deletion, so it must be a value comparison, not identity.
-	Equal(matcher Matcher) bool
+	// Equal reports whether this matcher is semantically equivalent to another.
+	// Implementation must
+	//  - Handle type checking: matchers of different types are not equal
+	//  - Be reflexive: m.Equal(m) == true
+	//  - Be symmetric: m.Equal(n) == n.Equal(m)
+	Equal(matcher RequestMatcher) bool
 }
 
 // SchemeMatcher matches the scheme of the request target. Attach one with [WithScheme].
@@ -52,14 +53,15 @@ func (m SchemeMatcher) Scheme() string { return m.scheme }
 
 func (m SchemeMatcher) Match(c RequestContext) bool { return c.Scheme() == m.scheme }
 
-func (m SchemeMatcher) Equal(matcher Matcher) bool {
+func (m SchemeMatcher) Equal(matcher RequestMatcher) bool {
 	other, ok := matcher.(SchemeMatcher)
 	return ok && other.scheme == m.scheme
 }
 
 func (m SchemeMatcher) String() string { return "scheme=" + m.scheme }
 
-// QueryMatcher matches an exact query parameter value.
+// QueryMatcher matches a query parameter against an exact value. A key repeated in the query
+// carries several values and the matcher accepts the request when any of them is the one.
 type QueryMatcher struct {
 	key   string
 	value string
@@ -80,11 +82,10 @@ func (m QueryMatcher) Key() string { return m.key }
 func (m QueryMatcher) Value() string { return m.value }
 
 func (m QueryMatcher) Match(c RequestContext) bool {
-	v, ok := c.QueryParams()[m.key]
-	return ok && len(v) > 0 && v[0] == m.value
+	return slices.Contains(c.QueryParams()[m.key], m.value)
 }
 
-func (m QueryMatcher) Equal(matcher Matcher) bool {
+func (m QueryMatcher) Equal(matcher RequestMatcher) bool {
 	other, ok := matcher.(QueryMatcher)
 	return ok && other.key == m.key && other.value == m.value
 }
@@ -117,18 +118,18 @@ func (m QueryRegexpMatcher) Key() string { return m.key }
 func (m QueryRegexpMatcher) Value() string { return rawExpr(m.re) }
 
 func (m QueryRegexpMatcher) Match(c RequestContext) bool {
-	v, ok := c.QueryParams()[m.key]
-	return ok && len(v) > 0 && m.re.MatchString(v[0])
+	return slices.ContainsFunc(c.QueryParams()[m.key], m.re.MatchString)
 }
 
-func (m QueryRegexpMatcher) Equal(matcher Matcher) bool {
+func (m QueryRegexpMatcher) Equal(matcher RequestMatcher) bool {
 	other, ok := matcher.(QueryRegexpMatcher)
 	return ok && other.key == m.key && other.re.String() == m.re.String()
 }
 
 func (m QueryRegexpMatcher) String() string { return "query:" + m.key + "~=" + rawExpr(m.re) }
 
-// HeaderMatcher matches an exact request header value.
+// HeaderMatcher matches a request header against an exact value. A header repeated in the
+// request carries several values and the matcher accepts it when any of them is the one.
 type HeaderMatcher struct {
 	key   string
 	value string
@@ -149,11 +150,10 @@ func (m HeaderMatcher) Key() string { return m.key }
 func (m HeaderMatcher) Value() string { return m.value }
 
 func (m HeaderMatcher) Match(c RequestContext) bool {
-	v, ok := firstHeader(c.Request().Header, m.key)
-	return ok && v == m.value
+	return slices.Contains(c.Request().Header[m.key], m.value)
 }
 
-func (m HeaderMatcher) Equal(matcher Matcher) bool {
+func (m HeaderMatcher) Equal(matcher RequestMatcher) bool {
 	other, ok := matcher.(HeaderMatcher)
 	return ok && other.key == m.key && other.value == m.value
 }
@@ -186,11 +186,10 @@ func (m HeaderRegexpMatcher) Key() string { return m.key }
 func (m HeaderRegexpMatcher) Value() string { return rawExpr(m.re) }
 
 func (m HeaderRegexpMatcher) Match(c RequestContext) bool {
-	v, ok := firstHeader(c.Request().Header, m.key)
-	return ok && m.re.MatchString(v)
+	return slices.ContainsFunc(c.Request().Header[m.key], m.re.MatchString)
 }
 
-func (m HeaderRegexpMatcher) Equal(matcher Matcher) bool {
+func (m HeaderRegexpMatcher) Equal(matcher RequestMatcher) bool {
 	other, ok := matcher.(HeaderRegexpMatcher)
 	return ok && other.key == m.key && other.re.String() == m.re.String()
 }
@@ -221,7 +220,7 @@ func (m RemoteIPMatcher) Match(c RequestContext) bool {
 	return addr.IsValid() && m.prefix.Contains(addr.WithZone(""))
 }
 
-func (m RemoteIPMatcher) Equal(matcher Matcher) bool {
+func (m RemoteIPMatcher) Equal(matcher RequestMatcher) bool {
 	other, ok := matcher.(RemoteIPMatcher)
 	return ok && other.prefix == m.prefix
 }
@@ -249,21 +248,12 @@ func (m ProtocolMatcher) Protocol() Protocol { return m.proto }
 
 func (m ProtocolMatcher) Match(c RequestContext) bool { return c.Protocol() == m.proto }
 
-func (m ProtocolMatcher) Equal(matcher Matcher) bool {
+func (m ProtocolMatcher) Equal(matcher RequestMatcher) bool {
 	other, ok := matcher.(ProtocolMatcher)
 	return ok && other.proto == m.proto
 }
 
 func (m ProtocolMatcher) String() string { return "proto=" + m.proto.String() }
-
-// MatcherFunc adapts a function to the [Matcher] interface. Two MatcherFunc values are never
-// equal, so an interceptor carrying one cannot be identified by its matchers: give it a name with
-// [WithName] and delete it with [Proxy.removeInterceptor].
-type MatcherFunc func(c RequestContext) bool
-
-func (f MatcherFunc) Match(c RequestContext) bool { return f(c) }
-
-func (f MatcherFunc) Equal(Matcher) bool { return false }
 
 // MethodMatcher matches the request method against a set. Attach one with [WithMethods].
 type MethodMatcher struct {
@@ -305,7 +295,7 @@ func (m MethodMatcher) Match(c RequestContext) bool {
 	}
 }
 
-func (m MethodMatcher) Equal(matcher Matcher) bool {
+func (m MethodMatcher) Equal(matcher RequestMatcher) bool {
 	other, ok := matcher.(MethodMatcher)
 	return ok && slices.Equal(other.methods, m.methods)
 }
@@ -339,13 +329,6 @@ func rawExpr(re *regexp.Regexp) string {
 	return expr[4 : len(expr)-2]
 }
 
-func firstHeader(headers http.Header, k string) (string, bool) {
-	if v := headers[k]; len(v) > 0 {
-		return v[0], true
-	}
-	return "", false
-}
-
 // validMethod reports whether s is a valid HTTP method token (RFC 9110 section 9).
 func validMethod(method string) bool {
 	return len(method) > 0 && strings.IndexFunc(method, isNotToken) == -1
@@ -354,13 +337,12 @@ func validMethod(method string) bool {
 func isNotToken(r rune) bool { return !httpguts.IsTokenRune(r) }
 
 var (
-	_ Matcher = SchemeMatcher{}
-	_ Matcher = QueryMatcher{}
-	_ Matcher = QueryRegexpMatcher{}
-	_ Matcher = HeaderMatcher{}
-	_ Matcher = HeaderRegexpMatcher{}
-	_ Matcher = RemoteIPMatcher{}
-	_ Matcher = ProtocolMatcher{}
-	_ Matcher = MatcherFunc(nil)
-	_ Matcher = MethodMatcher{}
+	_ RequestMatcher = SchemeMatcher{}
+	_ RequestMatcher = QueryMatcher{}
+	_ RequestMatcher = QueryRegexpMatcher{}
+	_ RequestMatcher = HeaderMatcher{}
+	_ RequestMatcher = HeaderRegexpMatcher{}
+	_ RequestMatcher = RemoteIPMatcher{}
+	_ RequestMatcher = ProtocolMatcher{}
+	_ RequestMatcher = MethodMatcher{}
 )

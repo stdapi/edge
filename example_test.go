@@ -28,7 +28,7 @@ func ExampleProxy_Add() {
 			return edge.Text(http.StatusPaymentRequired, "declined"), nil
 		}
 		return c.Forward()
-	}, edge.WithMethods(http.MethodGet, http.MethodPost))
+	}, edge.WithMethods[edge.HTTP](http.MethodGet, http.MethodPost))
 
 	// The catch-all is a route, not a hidden default: what passes through is written down.
 	p.MustAdd("api.stripe.com/*{any}", func(c *edge.HTTPCtx) (*http.Response, error) {

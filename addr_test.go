@@ -313,14 +313,14 @@ func TestAddr_RangeInterceptorPortScopesTheAuthority(t *testing.T) {
 // resolves, renames and deletes by name exactly as one on a name host does.
 func TestAddr_NameIndexSpansBothWorlds(t *testing.T) {
 	p := testProxy(t)
-	ic := p.MustAdd("[10.0.0.0/8]/api", noopHandler, WithName("ranged"))
+	ic := p.MustAdd("[10.0.0.0/8]/api", noopHandler, WithName[HTTP]("ranged"))
 	assert.Equal(t, ic, namedHTTP(p, "ranged"))
 
-	_, err := p.Add("other.test/api", noopHandler, WithName("ranged"))
+	_, err := p.Add("other.test/api", noopHandler, WithName[HTTP]("ranged"))
 	var nce *EntryNameConflictError
 	require.ErrorAs(t, err, &nce)
 
-	renamed, err := p.Update("[10.0.0.0/8]/api", noopHandler, WithName("renamed"))
+	renamed, err := p.Update("[10.0.0.0/8]/api", noopHandler, WithName[HTTP]("renamed"))
 	require.NoError(t, err)
 	assert.Zero(t, namedHTTP(p, "ranged"))
 	assert.Equal(t, renamed, namedHTTP(p, "renamed"))
@@ -336,7 +336,7 @@ func TestAddr_IterationAndLookupByPattern(t *testing.T) {
 	p := testProxy(t)
 	tn := p.MustAdd[TCP]("[fd00::/8]", noopStream)
 	ic := p.MustAdd("[10.0.0.0/8]/api", noopHandler)
-	named := p.MustAdd("api.test/v1", noopHandler, WithMethods(http.MethodGet))
+	named := p.MustAdd("api.test/v1", noopHandler, WithMethods[HTTP](http.MethodGet))
 
 	// Three admissions: the declared stream entry and the two the request entries imply.
 	assert.Equal(t, 3, admissionsLen(p))

@@ -42,7 +42,7 @@ func TestOptions_Rejected(t *testing.T) {
 	}{
 		{"nil CA", WithCA(nil)},
 		{"nil error handler", WithErrorHandler(nil)},
-		{"nil middleware", WithMiddleware(nil)},
+		{"nil middleware", WithMiddleware[HTTP](nil)},
 		{"nil transport", WithTransport(nil)},
 		{"nil logger", WithLogger(nil)},
 		{"zero max params", WithMaxPatternParams(0)},
@@ -51,7 +51,7 @@ func TestOptions_Rejected(t *testing.T) {
 		{"negative idle timeout", WithIdleTimeout(-time.Second)},
 		{"negative sniff timeout", WithSniffTimeout(-time.Second)},
 		{"zero max header bytes", WithMaxHeaderBytes(0)},
-		{"unknown trailing slash", WithTrailingSlash(TrailingSlashOption(99))},
+		{"unknown trailing slash", WithDefaultTrailingSlash(TrailingSlashOption(99))},
 	}
 
 	for _, tc := range cases {
@@ -76,7 +76,7 @@ func TestOptions_Applied(t *testing.T) {
 		WithMaxPatternParams(4),
 		WithMaxPatternParamKeyBytes(8),
 		WithMaxMatchers(2),
-		WithTrailingSlash(RelaxedSlash),
+		WithDefaultTrailingSlash(RelaxedSlash),
 		WithRegexpParam(true),
 		WithLogger(slog.New(slog.DiscardHandler)),
 	)
@@ -98,10 +98,10 @@ func TestOptions_LimitsAreEnforced(t *testing.T) {
 		p, err := New(WithCA(ca), WithMaxPatternParams(2))
 		require.NoError(t, err)
 
-		_, err = p.Add("api.test/{a}/{b}", noopHandler, WithMethods(http.MethodGet))
+		_, err = p.Add("api.test/{a}/{b}", noopHandler, WithMethods[HTTP](http.MethodGet))
 		require.NoError(t, err)
 
-		_, err = p.Add("api.test/{a}/{b}/{c}", noopHandler, WithMethods(http.MethodGet))
+		_, err = p.Add("api.test/{a}/{b}/{c}", noopHandler, WithMethods[HTTP](http.MethodGet))
 		var pe *PatternError
 		require.ErrorAs(t, err, &pe)
 		assert.Contains(t, pe.Error(), "too many parameters")
@@ -111,7 +111,7 @@ func TestOptions_LimitsAreEnforced(t *testing.T) {
 		p, err := New(WithCA(ca), WithMaxPatternParamKeyBytes(4))
 		require.NoError(t, err)
 
-		_, err = p.Add("api.test/{abcde}", noopHandler, WithMethods(http.MethodGet))
+		_, err = p.Add("api.test/{abcde}", noopHandler, WithMethods[HTTP](http.MethodGet))
 		var pe *PatternError
 		require.ErrorAs(t, err, &pe)
 		assert.Contains(t, pe.Error(), "key too large")
@@ -124,7 +124,7 @@ func TestOptions_LimitsAreEnforced(t *testing.T) {
 		header, err := MatchHeader("X-Channel", "beta")
 		require.NoError(t, err)
 
-		_, err = p.Add("api.test/v1", noopHandler, WithScheme("https"), WithMatcher(header), WithMethods(http.MethodGet))
+		_, err = p.Add("api.test/v1", noopHandler, WithScheme[HTTP]("https"), WithRequestMatchers[HTTP](header), WithMethods[HTTP](http.MethodGet))
 		require.ErrorIs(t, err, ErrTooManyMatchers)
 	})
 
@@ -132,7 +132,7 @@ func TestOptions_LimitsAreEnforced(t *testing.T) {
 		p, err := New(WithCA(ca))
 		require.NoError(t, err)
 
-		_, err = p.Add("api.test/{id:[0-9]+}", noopHandler, WithMethods(http.MethodGet))
+		_, err = p.Add("api.test/{id:[0-9]+}", noopHandler, WithMethods[HTTP](http.MethodGet))
 		var pe *PatternError
 		require.ErrorAs(t, err, &pe)
 		assert.Contains(t, pe.Error(), "feature not enabled")
@@ -141,7 +141,7 @@ func TestOptions_LimitsAreEnforced(t *testing.T) {
 
 func TestOptions_RegexpParam(t *testing.T) {
 	p := testProxy(t, WithRegexpParam(true))
-	p.MustAdd("api.test/v1/{id:ch_[0-9]+}", noopHandler, WithMethods(http.MethodGet))
+	p.MustAdd("api.test/v1/{id:ch_[0-9]+}", noopHandler, WithMethods[HTTP](http.MethodGet))
 
 	assert.NotZero(t, match(t, p, http.MethodGet, "https", "api.test:443", "/v1/ch_123"))
 	assert.Zero(t, match(t, p, http.MethodGet, "https", "api.test:443", "/v1/re_123"))
@@ -150,7 +150,7 @@ func TestOptions_RegexpParam(t *testing.T) {
 func TestPatternError_PointsAtTheOffendingSegment(t *testing.T) {
 	p := testProxy(t)
 
-	_, err := p.Add("api.test/v1/{}", noopHandler, WithMethods(http.MethodGet))
+	_, err := p.Add("api.test/v1/{}", noopHandler, WithMethods[HTTP](http.MethodGet))
 	var pe *PatternError
 	require.ErrorAs(t, err, &pe)
 
@@ -218,16 +218,34 @@ func TestKind_String(t *testing.T) {
 	assert.Equal(t, "unknown", Kind(0).String())
 }
 
-// Middleware names the kind it wraps by its own signature, so a value that is not a handler
-// wrapper at all has no kind to be registered under.
-func TestOptions_MiddlewareMustWrapAHandler(t *testing.T) {
-	ca, _ := GenerateCA()
+// Middleware names the kind it wraps by its own signature, so a proxy-wide registration takes
+// any kind and reaches the entries of that kind alone.
+func TestOptions_ProxyMiddlewareTakesEveryKind(t *testing.T) {
+	var seen []string
+	tagHTTP := func(next HTTP) HTTP {
+		return func(c *HTTPCtx) (*http.Response, error) {
+			seen = append(seen, "http")
+			return next(c)
+		}
+	}
+	tagTCP := func(next TCP) TCP {
+		return func(c *TCPCtx) error {
+			seen = append(seen, "tcp")
+			return next(c)
+		}
+	}
 
-	_, err := New(WithCA(ca), WithMiddleware(func(int) int { return 0 }))
-	require.ErrorIs(t, err, ErrInvalidConfig)
+	p := testProxy(t, WithMiddleware(tagHTTP), WithMiddleware(tagTCP))
+	e := p.MustAdd("api.test/v1", func(c *HTTPCtx) (*http.Response, error) {
+		seen = append(seen, "handler")
+		return Status(http.StatusOK), nil
+	})
 
-	_, err = New(WithCA(ca), WithMiddleware(func(next TCP) TCP { return next }))
+	served, _ := e.e.serve.(HTTP)
+	require.NotNil(t, served)
+	_, err := served(nil)
 	require.NoError(t, err)
+	assert.Equal(t, []string{"http", "handler"}, seen)
 }
 
 // One option, both placements: the same WithMiddleware works proxy-wide and on a single

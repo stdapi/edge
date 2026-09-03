@@ -24,7 +24,7 @@ type Txn struct {
 
 // Add registers handler for pattern. See [Proxy.Add]. Adding on a read-only transaction
 // returns [ErrReadOnlyTxn].
-func (txn *Txn) Add[H Handler](pattern string, handler H, opts ...EntryOption) (Entry[H], error) {
+func (txn *Txn) Add[H Handler](pattern string, handler H, opts ...EntryOption[H]) (Entry[H], error) {
 	if txn.rootTxn == nil {
 		panic(ErrSettledTxn)
 	}
@@ -50,7 +50,7 @@ func (txn *Txn) Add[H Handler](pattern string, handler H, opts ...EntryOption) (
 
 // Update overrides the handler and options of an existing entry. See [Proxy.Update].
 // Updating on a read-only transaction returns [ErrReadOnlyTxn].
-func (txn *Txn) Update[H Handler](pattern string, handler H, opts ...EntryOption) (Entry[H], error) {
+func (txn *Txn) Update[H Handler](pattern string, handler H, opts ...EntryOption[H]) (Entry[H], error) {
 	if txn.rootTxn == nil {
 		panic(ErrSettledTxn)
 	}
@@ -70,7 +70,7 @@ func (txn *Txn) Update[H Handler](pattern string, handler H, opts ...EntryOption
 
 // Delete removes the entry registered for the given kind, pattern and matchers. See
 // [Proxy.Delete]. Deleting on a read-only transaction returns [ErrReadOnlyTxn].
-func (txn *Txn) Delete[H Handler](pattern string, opts ...MatcherOption) (Entry[H], error) {
+func (txn *Txn) Delete[H Handler](pattern string, opts ...MatcherOption[H]) (Entry[H], error) {
 	if txn.rootTxn == nil {
 		panic(ErrSettledTxn)
 	}
@@ -95,7 +95,7 @@ func (txn *Txn) Delete[H Handler](pattern string, opts ...MatcherOption) (Entry[
 	}
 
 	var adm *entry
-	if kind.perMessage() {
+	if kind.requiresPath() {
 		adm = impliedAdmission(e)
 	}
 	deleted, ok := txn.rootTxn.delete(e, adm)
@@ -107,13 +107,13 @@ func (txn *Txn) Delete[H Handler](pattern string, opts ...MatcherOption) (Entry[
 }
 
 // Has reports whether an entry is registered for the given kind, pattern and matchers.
-func (txn *Txn) Has[H Handler](pattern string, matchers ...Matcher) bool {
+func (txn *Txn) Has[H Handler](pattern string, matchers ...RequestMatcher) bool {
 	_, ok := txn.Lookup[H](pattern, matchers...)
 	return ok
 }
 
 // Lookup returns the entry registered for the given kind, pattern and matchers.
-func (txn *Txn) Lookup[H Handler](pattern string, matchers ...Matcher) (Entry[H], bool) {
+func (txn *Txn) Lookup[H Handler](pattern string, matchers ...RequestMatcher) (Entry[H], bool) {
 	if txn.rootTxn == nil {
 		panic(ErrSettledTxn)
 	}
@@ -246,7 +246,7 @@ func (txn *Txn) Snapshot() *Txn {
 // admissionFor returns the admission e implies, nil for a kind that is its own. Running
 // requireCA here keeps every refusal ahead of the first mutation.
 func (txn *Txn) admissionFor(e *entry) (*entry, error) {
-	if !e.kind.perMessage() {
+	if !e.kind.requiresPath() {
 		return nil, txn.requireCA(e)
 	}
 	adm := impliedAdmission(e)

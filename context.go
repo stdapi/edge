@@ -18,9 +18,9 @@ type Param struct {
 	Value string
 }
 
-// RequestContext is the read-only view of a request handed to a [Matcher]. It is valid during
-// the [Matcher.Match] call and reused once that call returns. It exposes the request and
-// nothing of the connection, which serves many requests.
+// RequestContext is the read-only view of a request handed to a [RequestMatcher]. It is
+// valid during the [RequestMatcher.Match] call and reused once that call returns. It exposes
+// the request and nothing of the connection, which serves many requests.
 type RequestContext interface {
 	// Request returns the request being routed.
 	Request() *http.Request
@@ -151,8 +151,8 @@ func (c *routeCtx) getQueries() url.Values {
 	return c.cachedQueries
 }
 
-// onlyRequestContext seals the routing state down to [RequestContext] so a [Matcher] cannot
-// reach the mutating half of the API.
+// onlyRequestContext seals the routing state down to [RequestContext] so a [RequestMatcher]
+// cannot reach the mutating half of the API.
 type onlyRequestContext struct {
 	c *routeCtx
 }

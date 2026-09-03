@@ -18,8 +18,8 @@ func TestEntry_Accessors(t *testing.T) {
 
 	type annotationKey struct{}
 	e := p.MustAdd("api.stripe.com:8443/v1/{id}/refunds/*{rest}", noopHandler,
-		WithName("refunds"), WithAnnotation(annotationKey{}, "recorded"),
-		WithTrailingSlash(RelaxedSlash), WithScheme("https"), WithMethods(http.MethodGet))
+		WithName[HTTP]("refunds"), WithAnnotation[HTTP](annotationKey{}, "recorded"),
+		WithTrailingSlash[HTTP](RelaxedSlash), WithScheme[HTTP]("https"), WithMethods[HTTP](http.MethodGet))
 
 	assert.Equal(t, "api.stripe.com:8443/v1/{id}/refunds/*{rest}", e.Pattern())
 	assert.Equal(t, "api.stripe.com", e.Host())
@@ -65,8 +65,8 @@ func TestEntry_KindComesFromTheHandler(t *testing.T) {
 // matchers, and matchers are part of what identifies an entry.
 func TestEntry_MethodsIdentifyAnEntry(t *testing.T) {
 	p := testProxy(t)
-	get := p.MustAdd("api.test/v1", noopHandler, WithMethods(http.MethodGet))
-	post := p.MustAdd("api.test/v1", noopHandler, WithMethods(http.MethodPost))
+	get := p.MustAdd("api.test/v1", noopHandler, WithMethods[HTTP](http.MethodGet))
+	post := p.MustAdd("api.test/v1", noopHandler, WithMethods[HTTP](http.MethodPost))
 
 	assert.NotEqual(t, get, post)
 	assert.Equal(t, 2, p.Len())
@@ -74,34 +74,29 @@ func TestEntry_MethodsIdentifyAnEntry(t *testing.T) {
 	assert.Equal(t, post, lookupHTTP(p, "api.test/v1", mustMethods(http.MethodPost)))
 }
 
-// An option that cannot describe a kind is refused at registration rather than left to do
-// nothing.
-func TestEntry_OptionsAreCheckedAgainstTheKind(t *testing.T) {
+// An entry setting overrides the proxy default, and it governs the lookup rather than the
+// accessor alone.
+func TestEntry_TrailingSlashOverridesTheProxyDefault(t *testing.T) {
 	p := testProxy(t)
+	p.MustAdd("api.test/v1/charges", noopHandler)
+	p.MustAdd("api.test/v1/refunds", noopHandler, WithTrailingSlash[HTTP](RelaxedSlash))
 
-	_, err := p.Add[TCP]("smtp.test:465", noopStream, WithMethods(http.MethodGet))
+	assert.Equal(t, ExactSlash, lookupHTTP(p, "api.test/v1/charges").TrailingSlashOption())
+	assert.Equal(t, RelaxedSlash, lookupHTTP(p, "api.test/v1/refunds").TrailingSlashOption())
+
+	_, err := p.Add("api.test/v1/disputes", noopHandler, WithTrailingSlash[HTTP](TrailingSlashOption(99)))
 	require.ErrorIs(t, err, ErrInvalidConfig)
-
-	_, err = p.Add[TCP]("smtp.test:465", noopStream, WithScheme("https"))
-	require.ErrorIs(t, err, ErrInvalidConfig)
-
-	// A middleware of another kind cannot have the right signature either.
-	_, err = p.Add[TCP]("smtp.test:465", noopStream, WithMiddleware(func(next HTTP) HTTP { return next }))
-	require.ErrorIs(t, err, ErrInvalidConfig)
-
-	_, err = p.Add[TCP]("smtp.test:465", noopStream, WithMiddleware(func(next TCP) TCP { return next }))
-	require.NoError(t, err)
 }
 
 func TestEntry_NameLookup(t *testing.T) {
 	p := testProxy(t)
-	e := p.MustAdd("api.test/v1/charges", noopHandler, WithName("charges"), WithMethods(http.MethodGet))
+	e := p.MustAdd("api.test/v1/charges", noopHandler, WithName[HTTP]("charges"), WithMethods[HTTP](http.MethodGet))
 
 	assert.Equal(t, e, namedHTTP(p, "charges"))
 	assert.Zero(t, namedHTTP(p, "nothing"))
 
 	// A name identifies one entry across every kind.
-	_, err := p.Add("api.test/v1/refunds", noopHandler, WithName("charges"), WithMethods(http.MethodPost))
+	_, err := p.Add("api.test/v1/refunds", noopHandler, WithName[HTTP]("charges"), WithMethods[HTTP](http.MethodPost))
 	var conflict *EntryNameConflictError
 	require.ErrorAs(t, err, &conflict)
 
@@ -147,11 +142,11 @@ func TestEntry_UpdateReplacesTheHandler(t *testing.T) {
 	p := testProxy(t)
 	p.MustAdd("api.test/v1", func(c *HTTPCtx) (*http.Response, error) {
 		return Text(http.StatusOK, "first"), nil
-	}, WithMethods(http.MethodGet))
+	}, WithMethods[HTTP](http.MethodGet))
 
 	updated, err := p.Update("api.test/v1", func(c *HTTPCtx) (*http.Response, error) {
 		return Text(http.StatusOK, "second"), nil
-	}, WithMethods(http.MethodGet))
+	}, WithMethods[HTTP](http.MethodGet))
 	require.NoError(t, err)
 	assert.Equal(t, 1, p.Len(), "an update must not add an entry")
 
@@ -159,7 +154,7 @@ func TestEntry_UpdateReplacesTheHandler(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "second", readAll(t, resp))
 
-	_, err = p.Update("api.test/missing", noopHandler, WithMethods(http.MethodGet))
+	_, err = p.Update("api.test/missing", noopHandler, WithMethods[HTTP](http.MethodGet))
 	assert.ErrorIs(t, err, ErrEntryNotFound)
 }
 
@@ -169,10 +164,10 @@ func TestEntry_Validation(t *testing.T) {
 	_, err := p.Add("api.test/v1", HTTP(nil))
 	assert.ErrorIs(t, err, ErrInvalidEntry, "a nil handler must be refused")
 
-	_, err = p.Add("api.test/v1", noopHandler, WithMethods("BAD METHOD"))
+	_, err = p.Add("api.test/v1", noopHandler, WithMethods[HTTP]("BAD METHOD"))
 	assert.ErrorIs(t, err, ErrInvalidMatcher)
 
-	_, err = p.Add("api.test/v1", noopHandler, WithMatchersPriority(5))
+	_, err = p.Add("api.test/v1", noopHandler, WithMatchersPriority[HTTP](5))
 	assert.ErrorIs(t, err, ErrInvalidEntry, "a priority with no matcher has nothing to order")
 
 	_, err = p.Add("", noopHandler)

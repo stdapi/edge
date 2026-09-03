@@ -85,7 +85,7 @@ func TestProxy_ProtocolUpgrade(t *testing.T) {
 	p.MustAdd(originHost(originURL)+"/ws", func(c *HTTPCtx) (*http.Response, error) {
 		sawUpgrade = c.Request().Header.Get("Upgrade")
 		return c.Forward()
-	}, WithMethods(http.MethodGet))
+	}, WithMethods[HTTP](http.MethodGet))
 
 	addr := startProxy(t, p)
 
@@ -163,7 +163,7 @@ func TestUpgrade_TransparentPlaintextPipeIsListedAndClosed(t *testing.T) {
 	p.MustAdd[TCP]("ws.example.test", relayStream)
 	p.MustAdd("ws.example.test/ws", func(c *HTTPCtx) (*http.Response, error) {
 		return c.Forward()
-	}, WithMethods(http.MethodGet))
+	}, WithMethods[HTTP](http.MethodGet))
 
 	addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) {
 		return originAddr, nil
@@ -211,7 +211,7 @@ func TestUpgrade_HostDivergesFromTheConnectAuthority(t *testing.T) {
 	p.MustAdd[TCP]("b.example.test", relayStream)
 	p.MustAdd("b.example.test/ws", func(c *HTTPCtx) (*http.Response, error) {
 		return c.Forward()
-	}, WithMethods(http.MethodGet))
+	}, WithMethods[HTTP](http.MethodGet))
 
 	raw, err := dialThroughProxy(t, startProxy(t, p), "a.example.test:443", ca)
 	require.NoError(t, err)
@@ -275,9 +275,9 @@ func TestUpgrade_RefusedWhenTheRouteGoesAwayFirst(t *testing.T) {
 		if _, derr := p.Delete[TCP](originHost(originURL)); derr != nil {
 			return nil, derr
 		}
-		_, derr := p.Delete[HTTP](pattern, WithMethods(http.MethodGet))
+		_, derr := p.Delete[HTTP](pattern, WithMethods[HTTP](http.MethodGet))
 		return resp, derr
-	}, WithMethods(http.MethodGet))
+	}, WithMethods[HTTP](http.MethodGet))
 
 	raw, err := dialThroughProxy(t, startProxy(t, p), originURL.Host, ca)
 	require.NoError(t, err)
@@ -306,7 +306,7 @@ func TestUpgrade_CloseEndsAPipeOnAFrontConnection(t *testing.T) {
 	p.MustAdd[TCP](originHost(originURL), relayStream)
 	p.MustAdd(originHost(originURL)+"/ws", func(c *HTTPCtx) (*http.Response, error) {
 		return c.Forward()
-	}, WithMethods(http.MethodGet))
+	}, WithMethods[HTTP](http.MethodGet))
 
 	raw, err := net.Dial("tcp", startProxy(t, p))
 	require.NoError(t, err)

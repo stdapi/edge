@@ -41,7 +41,7 @@ func (it Iter) Entries(pattern string) iter.Seq[EntryView] {
 		}
 
 		for _, ic := range matched.entries {
-			if ic.pattern.path == "" {
+			if ic.implied {
 				continue
 			}
 			if ic.pattern.str == pattern {
@@ -108,25 +108,25 @@ func (it Iter) PatternPrefix(prefix string) iter.Seq[EntryView] {
 	return views(it.patternPrefix(prefix, false))
 }
 
-// patternPrefix walks the trees yielding either the per-message entries or the ones keyed on
-// an authority, never both. They share the trees but nothing else, and an admission implied by
-// a registration is not something a caller asked for when it asked for entries.
+// patternPrefix walks the trees yielding either what was registered or what admits an
+// authority. A registration is an entry of any kind, with a path or without, and never an
+// admission another registration implied, which nobody asked for when asking for entries.
 //
 // The address root is walked whole rather than guided, its keys are encoded and a textual
 // prefix cannot steer the descent, so the registered spelling is filtered instead.
-func (it Iter) patternPrefix(prefix string, authorities bool) iter.Seq[*entry] {
+func (it Iter) patternPrefix(prefix string, admissions bool) iter.Seq[*entry] {
 	return func(yield func(*entry) bool) {
-		if !it.walkPatterns(it.patterns.searchPattern(prefix), prefix, authorities, false, yield) {
+		if !it.walkPatterns(it.patterns.searchPattern(prefix), prefix, admissions, false, yield) {
 			return
 		}
-		it.walkPatterns(it.addrs, prefix, authorities, true, yield)
+		it.walkPatterns(it.addrs, prefix, admissions, true, yield)
 	}
 }
 
 // walkPatterns yields the matching entries under start and reports whether the walk ran to
 // completion rather than being stopped by its consumer. With filterAll set, every entry is
 // held to the string prefix, which is what the address root does instead of a guided descent.
-func (it Iter) walkPatterns(start *node, prefix string, authorities, filterAll bool, yield func(*entry) bool) bool {
+func (it Iter) walkPatterns(start *node, prefix string, admissions, filterAll bool, yield func(*entry) bool) bool {
 	if start == nil {
 		return true
 	}
@@ -165,7 +165,7 @@ func (it Iter) walkPatterns(start *node, prefix string, authorities, filterAll b
 
 		if elem.isLeaf() {
 			for _, ic := range elem.entries {
-				if (ic.pattern.path == "") != authorities {
+				if (admissions && !ic.admits()) || (!admissions && ic.implied) {
 					continue
 				}
 				if (filterAll || len(ic.params) > 0) && !strings.HasPrefix(ic.pattern.str, prefix) {
@@ -186,16 +186,7 @@ func (it Iter) walkPatterns(start *node, prefix string, authorities, filterAll b
 // tree at the time [Iter] is created. This function is safe for concurrent use by multiple
 // goroutines and while mutations are ongoing.
 func (it Iter) Admissions() iter.Seq[EntryView] {
-	return func(yield func(EntryView) bool) {
-		for ic := range it.patternPrefix("", true) {
-			if !ic.admits() {
-				continue
-			}
-			if !yield(EntryView{e: ic}) {
-				return
-			}
-		}
-	}
+	return views(it.patternPrefix("", true))
 }
 
 // All returns a range iterator over all entries registered in the routing tree. The iterator reflect a snapshot

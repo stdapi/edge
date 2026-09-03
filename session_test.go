@@ -706,8 +706,9 @@ func TestSession_UpgradeRefusedAfterAChangeInTheWindow(t *testing.T) {
 	relayFrames := func(c *WebSocketCtx) error { return c.Relay() }
 	var originURL *url.URL
 	origin, originURL := wsOrigin(t, func() {
-		p.MustAdd(originHost(originURL)+"/ws", relayFrames, WithMatcher(
-			MatcherFunc(func(rc RequestContext) bool { return rc.Header("X-Tenant") == "acme" })))
+		tenant, err := MatchHeader("X-Tenant", "acme")
+		require.NoError(t, err)
+		p.MustAdd(originHost(originURL)+"/ws", relayFrames, WithRequestMatchers[WebSocket](tenant))
 	})
 	p.MustAdd(originHost(originURL)+"/ws", relayFrames)
 

@@ -34,6 +34,13 @@ type Handler interface {
 	HTTP | GRPC | WebSocket | TCP | QUIC | UDP
 }
 
+// PathKeyed is the kinds whose entry is keyed on a hostname and a path. The others are keyed
+// on an authority alone and are decided before a request exists, so an option reading a
+// request is declared on this constraint.
+type PathKeyed interface {
+	HTTP | GRPC | WebSocket
+}
+
 // Kind is the traffic a handler is registered for. It is fixed by the handler signature,
 // never by the pattern.
 type Kind uint8
@@ -118,10 +125,9 @@ func (k Kind) admittedAs() Kind {
 // above, so an entry naming one still outranks a refinement that names none.
 func (k Kind) refines() bool { return k != k.admittedAs() }
 
-// perMessage reports whether the kind routes each message of a connection, rather than the
-// connection itself. A per-message kind is keyed on a hostname and a path, the others on an
-// authority alone, which is what keeps the two key spaces disjoint.
-func (k Kind) perMessage() bool {
+// requiresPath reports whether this kind is keyed on a hostname and a path. The others are
+// keyed on an authority alone, which is what keeps the two key spaces disjoint.
+func (k Kind) requiresPath() bool {
 	switch k {
 	case KindHTTP, KindGRPC, KindWebSocket:
 		return true
@@ -129,7 +135,3 @@ func (k Kind) perMessage() bool {
 		return false
 	}
 }
-
-// requiresPath reports whether a pattern for this kind must carry a path. It is the same
-// split as perMessage, named for what the parser checks.
-func (k Kind) requiresPath() bool { return k.perMessage() }

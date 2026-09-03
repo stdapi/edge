@@ -80,7 +80,7 @@ func (t *iTree) allocateContext() *routeCtx {
 
 // entryFor returns the entry registered for the exact combination of kind, pattern and
 // matchers, or nil.
-func (t *iTree) entryFor(kind Kind, pattern string, matchers []Matcher) *entry {
+func (t *iTree) entryFor(kind Kind, pattern string, matchers []RequestMatcher) *entry {
 	key, isAddr := patternKey(pattern)
 	root := t.patterns
 	if isAddr {

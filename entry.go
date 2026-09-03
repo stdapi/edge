@@ -27,7 +27,7 @@ type entry struct {
 	name     string
 	mws      []middleware
 	params   []string
-	matchers []Matcher
+	matchers []RequestMatcher
 
 	pattern     pattern
 	priority    uint
@@ -113,7 +113,7 @@ func (e *entry) samePort(other *entry) bool {
 }
 
 // matchersEqual reports whether this entry's matchers are equal to the provided ones.
-func (e *entry) matchersEqual(matchers []Matcher) bool {
+func (e *entry) matchersEqual(matchers []RequestMatcher) bool {
 	if len(e.matchers) != len(matchers) {
 		return false
 	}
@@ -189,7 +189,7 @@ func (r Entry[H]) Params() iter.Seq[string] { return slices.Values(r.e.params) }
 func (r Entry[H]) MatchersLen() int { return len(r.e.matchers) }
 
 // Matchers returns an iterator over the matchers attached to this entry.
-func (r Entry[H]) Matchers() iter.Seq[Matcher] { return slices.Values(r.e.matchers) }
+func (r Entry[H]) Matchers() iter.Seq[RequestMatcher] { return slices.Values(r.e.matchers) }
 
 // MatchersPriority returns the matcher priority of this entry.
 func (r Entry[H]) MatchersPriority() uint { return r.e.priority }
@@ -233,7 +233,7 @@ func (v EntryView) Admits() bool { return v.e.admits() }
 func (v EntryView) Implied() bool { return v.e.implied }
 
 // Matchers returns an iterator over the matchers attached to this entry.
-func (v EntryView) Matchers() iter.Seq[Matcher] { return slices.Values(v.e.matchers) }
+func (v EntryView) Matchers() iter.Seq[RequestMatcher] { return slices.Values(v.e.matchers) }
 
 func (v EntryView) String() string { return v.e.String() }
 

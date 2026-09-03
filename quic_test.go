@@ -178,7 +178,7 @@ func TestQUIC_HandlerCanShortCircuit(t *testing.T) {
 
 	p.MustAdd(h3Authority+"/blocked", func(c *HTTPCtx) (*http.Response, error) {
 		return Text(http.StatusForbidden, "blocked by edge over "+c.Protocol().String()), nil
-	}, WithMethods(http.MethodGet))
+	}, WithMethods[HTTP](http.MethodGet))
 
 	proxyAddr := startQUIC(t, p)
 	port := fmt.Sprint(proxyAddr.Port())

@@ -13,7 +13,7 @@ func namedHTTP(p *Proxy, name string) Entry[HTTP] {
 }
 
 // lookupHTTP returns the HTTP entry registered for pattern and matchers, or the zero value.
-func lookupHTTP(p *Proxy, pattern string, matchers ...Matcher) Entry[HTTP] {
+func lookupHTTP(p *Proxy, pattern string, matchers ...RequestMatcher) Entry[HTTP] {
 	e, _ := p.Lookup[HTTP](pattern, matchers...)
 	return e
 }
@@ -30,7 +30,7 @@ func admissionsLen(p *Proxy) int {
 }
 
 // mustMethods builds a method matcher for a test that used to pass a method set.
-func mustMethods(methods ...string) Matcher {
+func mustMethods(methods ...string) RequestMatcher {
 	m, err := MatchMethods(methods...)
 	if err != nil {
 		panic(err)

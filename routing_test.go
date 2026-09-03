@@ -51,7 +51,7 @@ func matchRequest(t *testing.T, p *Proxy, scheme, authority string, req *http.Re
 
 func TestRouting_SchemeIsOptional(t *testing.T) {
 	p := testProxy(t)
-	p.MustAdd("api.stripe.com/v1/charges", noopHandler, WithMethods(http.MethodGet))
+	p.MustAdd("api.stripe.com/v1/charges", noopHandler, WithMethods[HTTP](http.MethodGet))
 
 	for _, scheme := range []string{"http", "https"} {
 		ic := match(t, p, http.MethodGet, scheme, "api.stripe.com:443", "/v1/charges")
@@ -62,7 +62,7 @@ func TestRouting_SchemeIsOptional(t *testing.T) {
 
 func TestRouting_SchemeQualified(t *testing.T) {
 	p := testProxy(t)
-	p.MustAdd("api.stripe.com/v1/charges", noopHandler, WithScheme("https"), WithMethods(http.MethodGet))
+	p.MustAdd("api.stripe.com/v1/charges", noopHandler, WithScheme[HTTP]("https"), WithMethods[HTTP](http.MethodGet))
 
 	assert.NotZero(t, match(t, p, http.MethodGet, "https", "api.stripe.com:443", "/v1/charges"))
 	assert.Zero(t, match(t, p, http.MethodGet, "http", "api.stripe.com:80", "/v1/charges"))
@@ -70,8 +70,8 @@ func TestRouting_SchemeQualified(t *testing.T) {
 
 func TestRouting_SchemeQualifiedBeatsUnqualified(t *testing.T) {
 	p := testProxy(t)
-	generic := p.MustAdd("api.stripe.com/v1/charges", noopHandler, WithMethods(http.MethodGet))
-	secure := p.MustAdd("api.stripe.com/v1/charges", noopHandler, WithScheme("https"), WithMethods(http.MethodGet))
+	generic := p.MustAdd("api.stripe.com/v1/charges", noopHandler, WithMethods[HTTP](http.MethodGet))
+	secure := p.MustAdd("api.stripe.com/v1/charges", noopHandler, WithScheme[HTTP]("https"), WithMethods[HTTP](http.MethodGet))
 
 	// An interceptor carrying a matcher is more constrained, so it is tried first.
 	assert.Equal(t, secure, match(t, p, http.MethodGet, "https", "api.stripe.com:443", "/v1/charges"))
@@ -80,7 +80,7 @@ func TestRouting_SchemeQualifiedBeatsUnqualified(t *testing.T) {
 
 func TestRouting_PortIsOptional(t *testing.T) {
 	p := testProxy(t)
-	p.MustAdd("localhost:8080/api", noopHandler, WithMethods(http.MethodGet))
+	p.MustAdd("localhost:8080/api", noopHandler, WithMethods[HTTP](http.MethodGet))
 
 	assert.NotZero(t, match(t, p, http.MethodGet, "http", "localhost:8080", "/api"))
 	assert.Zero(t, match(t, p, http.MethodGet, "http", "localhost:9090", "/api"))
@@ -89,8 +89,8 @@ func TestRouting_PortIsOptional(t *testing.T) {
 
 func TestRouting_StaticPathBeatsParam(t *testing.T) {
 	p := testProxy(t)
-	static := p.MustAdd("api.stripe.com/v1/charges", noopHandler, WithMethods(http.MethodGet))
-	param := p.MustAdd("api.stripe.com/v1/{id}", noopHandler, WithMethods(http.MethodGet))
+	static := p.MustAdd("api.stripe.com/v1/charges", noopHandler, WithMethods[HTTP](http.MethodGet))
+	param := p.MustAdd("api.stripe.com/v1/{id}", noopHandler, WithMethods[HTTP](http.MethodGet))
 
 	assert.Equal(t, static, match(t, p, http.MethodGet, "https", "api.stripe.com:443", "/v1/charges"))
 	assert.Equal(t, param, match(t, p, http.MethodGet, "https", "api.stripe.com:443", "/v1/ch_123"))
@@ -98,8 +98,8 @@ func TestRouting_StaticPathBeatsParam(t *testing.T) {
 
 func TestRouting_StaticPathBeatsSchemeQualifiedParam(t *testing.T) {
 	p := testProxy(t)
-	static := p.MustAdd("api.stripe.com/v1/charges", noopHandler, WithMethods(http.MethodGet))
-	p.MustAdd("api.stripe.com/v1/{id}", noopHandler, WithScheme("https"), WithMethods(http.MethodGet))
+	static := p.MustAdd("api.stripe.com/v1/charges", noopHandler, WithMethods[HTTP](http.MethodGet))
+	p.MustAdd("api.stripe.com/v1/{id}", noopHandler, WithScheme[HTTP]("https"), WithMethods[HTTP](http.MethodGet))
 
 	// The scheme is a matcher rather than a tree edge precisely so it cannot promote a
 	// parameter above a static segment.
@@ -108,8 +108,8 @@ func TestRouting_StaticPathBeatsSchemeQualifiedParam(t *testing.T) {
 
 func TestRouting_HostWildcard(t *testing.T) {
 	p := testProxy(t)
-	wild := p.MustAdd("+{sub}.stripe.com/v1/charges", noopHandler, WithMethods(http.MethodGet))
-	exact := p.MustAdd("api.stripe.com/v1/charges", noopHandler, WithMethods(http.MethodGet))
+	wild := p.MustAdd("+{sub}.stripe.com/v1/charges", noopHandler, WithMethods[HTTP](http.MethodGet))
+	exact := p.MustAdd("api.stripe.com/v1/charges", noopHandler, WithMethods[HTTP](http.MethodGet))
 
 	assert.Equal(t, exact, match(t, p, http.MethodGet, "https", "api.stripe.com:443", "/v1/charges"))
 	assert.Equal(t, wild, match(t, p, http.MethodGet, "https", "a.b.stripe.com:443", "/v1/charges"))
@@ -118,7 +118,7 @@ func TestRouting_HostWildcard(t *testing.T) {
 
 func TestRouting_CapturesParams(t *testing.T) {
 	p := testProxy(t)
-	p.MustAdd("+{sub}.stripe.com/v1/{id}/refunds/*{rest}", noopHandler, WithMethods(http.MethodGet))
+	p.MustAdd("+{sub}.stripe.com/v1/{id}/refunds/*{rest}", noopHandler, WithMethods[HTTP](http.MethodGet))
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/ch_123/refunds/a/b", nil)
 
@@ -139,7 +139,7 @@ func TestRouting_CapturesParams(t *testing.T) {
 
 func TestRouting_WildcardAuthorityMatchesEveryHost(t *testing.T) {
 	p := testProxy(t)
-	p.MustAdd("+{any}/v1/charges", noopHandler, WithMethods(http.MethodGet))
+	p.MustAdd("+{any}/v1/charges", noopHandler, WithMethods[HTTP](http.MethodGet))
 
 	assert.NotZero(t, match(t, p, http.MethodGet, "https", "api.stripe.com:443", "/v1/charges"))
 	assert.NotZero(t, match(t, p, http.MethodGet, "http", "example.test:80", "/v1/charges"))
@@ -155,7 +155,7 @@ func TestRouting_WildcardAuthorityMatchesEveryHost(t *testing.T) {
 func TestRouting_HostnameIsRequired(t *testing.T) {
 	p := testProxy(t)
 
-	_, err := p.Add("/v1/charges", noopHandler, WithMethods(http.MethodGet))
+	_, err := p.Add("/v1/charges", noopHandler, WithMethods[HTTP](http.MethodGet))
 	var pe *PatternError
 	require.ErrorAs(t, err, &pe)
 	assert.Contains(t, pe.Error(), "write +{any} to match every hostname")
@@ -163,8 +163,8 @@ func TestRouting_HostnameIsRequired(t *testing.T) {
 
 func TestRouting_IPLiteralHost(t *testing.T) {
 	p := testProxy(t)
-	p.MustAdd("127.0.0.1:8080/health", noopHandler, WithMethods(http.MethodGet))
-	p.MustAdd("[::1]:8080/health", noopHandler, WithMethods(http.MethodGet))
+	p.MustAdd("127.0.0.1:8080/health", noopHandler, WithMethods[HTTP](http.MethodGet))
+	p.MustAdd("[::1]:8080/health", noopHandler, WithMethods[HTTP](http.MethodGet))
 
 	assert.NotZero(t, match(t, p, http.MethodGet, "http", "127.0.0.1:8080", "/health"))
 	assert.NotZero(t, match(t, p, http.MethodGet, "http", "[::1]:8080", "/health"))
@@ -173,7 +173,7 @@ func TestRouting_IPLiteralHost(t *testing.T) {
 
 func TestRouting_MethodConstraint(t *testing.T) {
 	p := testProxy(t)
-	post := p.MustAdd("api.stripe.com/v1/charges", noopHandler, WithMethods(http.MethodPost))
+	post := p.MustAdd("api.stripe.com/v1/charges", noopHandler, WithMethods[HTTP](http.MethodPost))
 	any := p.MustAdd("api.stripe.com/v1/charges", noopHandler)
 
 	assert.Equal(t, post, match(t, p, http.MethodPost, "https", "api.stripe.com:443", "/v1/charges"))
@@ -183,13 +183,13 @@ func TestRouting_MethodConstraint(t *testing.T) {
 func TestRouting_TrailingSlash(t *testing.T) {
 	t.Run("exact by default", func(t *testing.T) {
 		p := testProxy(t)
-		p.MustAdd("api.stripe.com/v1/charges", noopHandler, WithMethods(http.MethodGet))
+		p.MustAdd("api.stripe.com/v1/charges", noopHandler, WithMethods[HTTP](http.MethodGet))
 		assert.Zero(t, match(t, p, http.MethodGet, "https", "api.stripe.com:443", "/v1/charges/"))
 	})
 
 	t.Run("relaxed", func(t *testing.T) {
-		p := testProxy(t, WithTrailingSlash(RelaxedSlash))
-		p.MustAdd("api.stripe.com/v1/charges", noopHandler, WithMethods(http.MethodGet))
+		p := testProxy(t, WithDefaultTrailingSlash(RelaxedSlash))
+		p.MustAdd("api.stripe.com/v1/charges", noopHandler, WithMethods[HTTP](http.MethodGet))
 		assert.NotZero(t, match(t, p, http.MethodGet, "https", "api.stripe.com:443", "/v1/charges/"))
 	})
 }
@@ -198,21 +198,21 @@ func TestRouting_TrailingSlash(t *testing.T) {
 // matcher naming it could only ever be dead weight.
 func TestRouting_RejectsConnect(t *testing.T) {
 	p := testProxy(t)
-	_, err := p.Add("api.stripe.com/", noopHandler, WithMethods(http.MethodConnect))
+	_, err := p.Add("api.stripe.com/", noopHandler, WithMethods[HTTP](http.MethodConnect))
 	require.ErrorIs(t, err, ErrInvalidMatcher)
 	assert.Contains(t, err.Error(), "establishes a connection")
 }
 
 func TestRouting_ConflictDetection(t *testing.T) {
 	p := testProxy(t)
-	p.MustAdd("api.stripe.com/v1/charges", noopHandler, WithMethods(http.MethodGet))
+	p.MustAdd("api.stripe.com/v1/charges", noopHandler, WithMethods[HTTP](http.MethodGet))
 
-	_, err := p.Add("api.stripe.com/v1/charges", noopHandler, WithMethods(http.MethodGet))
+	_, err := p.Add("api.stripe.com/v1/charges", noopHandler, WithMethods[HTTP](http.MethodGet))
 	var conflict *EntryConflictError
 	require.ErrorAs(t, err, &conflict)
 
 	// Differing by a matcher is not a conflict: the matchers tell the two interceptors apart.
-	_, err = p.Add("api.stripe.com/v1/charges", noopHandler, WithScheme("https"), WithMethods(http.MethodGet))
+	_, err = p.Add("api.stripe.com/v1/charges", noopHandler, WithScheme[HTTP]("https"), WithMethods[HTTP](http.MethodGet))
 	require.NoError(t, err)
 }
 
@@ -229,8 +229,8 @@ func countAuthorities(p *Proxy) int {
 func TestRouting_PortDiscriminatesTwoInterceptors(t *testing.T) {
 	p := testProxy(t)
 
-	api := p.MustAdd("localhost:8080/api", noopHandler, WithMethods(http.MethodGet))
-	ui := p.MustAdd("localhost:3000/api", noopHandler, WithMethods(http.MethodGet))
+	api := p.MustAdd("localhost:8080/api", noopHandler, WithMethods[HTTP](http.MethodGet))
+	ui := p.MustAdd("localhost:3000/api", noopHandler, WithMethods[HTTP](http.MethodGet))
 	assert.Equal(t, 2, p.Len())
 
 	assert.Equal(t, api, match(t, p, http.MethodGet, "http", "localhost:8080", "/api"))
@@ -247,7 +247,7 @@ func TestRouting_PortDiscriminatesTwoInterceptors(t *testing.T) {
 	assert.Equal(t, ui, lookupHTTP(p, "localhost:3000/api", mustMethods(http.MethodGet)))
 	assert.Zero(t, lookupHTTP(p, "localhost/api", mustMethods(http.MethodGet)))
 
-	deleted, err := p.Delete[HTTP]("localhost:8080/api", WithMethods(http.MethodGet))
+	deleted, err := p.Delete[HTTP]("localhost:8080/api", WithMethods[HTTP](http.MethodGet))
 	require.NoError(t, err)
 	assert.Equal(t, api, deleted)
 	assert.Equal(t, ui, match(t, p, http.MethodGet, "http", "localhost:3000", "/api"))
@@ -264,8 +264,8 @@ func TestRouting_PortOutranksTheRest(t *testing.T) {
 
 	// Registered least specific first, so only the ordering can put them back in order.
 	any := p.MustAdd("localhost/api", noopHandler)
-	header := p.MustAdd("localhost/api", noopHandler, WithMatcher(beta))
-	get := p.MustAdd("localhost/api", noopHandler, WithMethods(http.MethodGet))
+	header := p.MustAdd("localhost/api", noopHandler, WithRequestMatchers[HTTP](beta))
+	get := p.MustAdd("localhost/api", noopHandler, WithMethods[HTTP](http.MethodGet))
 	port := p.MustAdd("localhost:8080/api", noopHandler)
 
 	req := httptest.NewRequest(http.MethodGet, "/api", nil)

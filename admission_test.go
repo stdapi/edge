@@ -278,25 +278,37 @@ func TestAdmission_TxnAgreesWithTheProxy(t *testing.T) {
 	}
 }
 
+// forgedMatcher writes a matcher onto an entry of any kind, which the exported constructors
+// refuse at compile time. Outside the package the same reach comes from embedding an
+// EntryOption of one kind in a struct promoting forKind of another.
+func forgedMatcher[H Handler](m RequestMatcher) EntryOption[H] {
+	return option[H](func(s sealedOption) error {
+		s.entry.matchers = append(s.entry.matchers, m)
+		return nil
+	})
+}
+
 // A matcher on an entry keyed on an authority alone is never evaluated, so accepting one would
-// write a policy narrower than the one enforced.
+// write a policy narrower than the one enforced. WithRequestMatchers is declared on PathKeyed
+// and the compiler refuses it there, so what registration has to catch is an option that
+// reached the entry another way, which embedding an interface makes possible.
 func TestAdmission_MatchersAreRefusedOnConnectionKinds(t *testing.T) {
 	p := testProxy(t)
 
 	beta, err := MatchHeader("X-Channel", "beta")
 	require.NoError(t, err)
 
-	_, err = p.Add[TCP]("db.test:5432", noopStream, WithMatcher(beta))
+	_, err = p.Add[TCP]("db.test:5432", noopStream, forgedMatcher[TCP](beta))
 	require.ErrorIs(t, err, ErrInvalidConfig)
 
-	_, err = p.Add[UDP]("[0.0.0.0/0]:53", forwardDatagram, WithMatchers(beta))
+	_, err = p.Add[UDP]("[0.0.0.0/0]:53", forwardDatagram, forgedMatcher[UDP](beta))
 	require.ErrorIs(t, err, ErrInvalidConfig)
 
-	_, err = p.Add[QUIC]("game.test:443", func(*QUICCtx) error { return nil }, WithMatcher(beta))
+	_, err = p.Add[QUIC]("game.test:443", func(*QUICCtx) error { return nil }, forgedMatcher[QUIC](beta))
 	require.ErrorIs(t, err, ErrInvalidConfig)
 
-	// On a per-message kind the same matcher is exactly what narrows an entry.
-	_, err = p.Add("api.test/v1", noopHandler, WithMatcher(beta))
+	// On a kind keyed on a path the same matcher is exactly what narrows an entry.
+	_, err = p.Add("api.test/v1", noopHandler, WithRequestMatchers[HTTP](beta))
 	require.NoError(t, err)
 }
 

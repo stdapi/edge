@@ -25,7 +25,7 @@ func benchProxy(b *testing.B, patterns ...string) *Proxy {
 		b.Fatal(err)
 	}
 	for _, pattern := range patterns {
-		if _, err := p.Add(pattern, noopHandler, WithMethods(http.MethodGet)); err != nil {
+		if _, err := p.Add(pattern, noopHandler, WithMethods[HTTP](http.MethodGet)); err != nil {
 			b.Fatalf("register %s: %v", pattern, err)
 		}
 	}

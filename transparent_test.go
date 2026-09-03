@@ -99,7 +99,7 @@ func TestTransparent_TLSInterceptRoutesOnServerName(t *testing.T) {
 	p.MustAdd("api.example.test/v1/charges", func(c *HTTPCtx) (*http.Response, error) {
 		seenTarget = Target{Scheme: c.Scheme(), Host: c.Host(), Port: c.Port()}
 		return c.Forward()
-	}, WithMethods(http.MethodGet))
+	}, WithMethods[HTTP](http.MethodGet))
 
 	addr := startTransparent(t, p)
 
@@ -190,7 +190,7 @@ func TestTransparent_PlaintextRoutesOnHostHeader(t *testing.T) {
 	p.MustAdd("api.example.test/ping", func(c *HTTPCtx) (*http.Response, error) {
 		seen = Target{Scheme: c.Scheme(), Host: c.Host(), Port: c.Port()}
 		return c.Forward()
-	}, WithMethods(http.MethodGet))
+	}, WithMethods[HTTP](http.MethodGet))
 
 	addr := startTransparent(t, p)
 
@@ -547,7 +547,7 @@ func TestTransparent_PlaintextWithOriginalDestination(t *testing.T) {
 	p := testProxy(t, WithTransport(tr))
 	p.MustAdd("api.example.test/ping", func(c *HTTPCtx) (*http.Response, error) {
 		return c.Forward()
-	}, WithMethods(http.MethodGet))
+	}, WithMethods[HTTP](http.MethodGet))
 
 	addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) {
 		return originAddr, nil

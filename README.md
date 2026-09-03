@@ -137,7 +137,7 @@ An authority pattern carries its port the same way: `p.MustAddTunnel("localhost:
 The scheme is a matcher, not part of the pattern:
 
 ```go
-p.MustAddInterceptor([]string{"POST"}, "api.test/v1", h, edge.WithScheme("https"))
+p.MustAddInterceptor([]string{"POST"}, "api.test/v1", h, edge.WithScheme[edge.HTTP]("https"))
 ```
 
 Writing one in a pattern is an error describing what is refused.

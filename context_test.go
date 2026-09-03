@@ -69,7 +69,7 @@ func TestContext_Accessors(t *testing.T) {
 		require.Equal(t, c.Session().RemoteAddr(), c.RemoteAddr())
 
 		return Text(http.StatusOK, "done"), nil
-	}, WithMethods(http.MethodPost))
+	}, WithMethods[HTTP](http.MethodPost))
 
 	req, err := http.NewRequest(http.MethodPost, origin.URL+"/v1/ch_1/refunds?limit=10", nil)
 	require.NoError(t, err)
@@ -146,7 +146,7 @@ func TestContext_SetRequest(t *testing.T) {
 		req.URL.Path = "/new"
 		c.SetRequest(req)
 		return c.Forward()
-	}, WithMethods(http.MethodGet))
+	}, WithMethods[HTTP](http.MethodGet))
 
 	resp, err := client.Get(origin.URL + "/old")
 	require.NoError(t, err)

@@ -33,7 +33,7 @@ func TestConcurrency_InterceptorMutationDuringTraffic(t *testing.T) {
 	p.MustAdd(authority+"/stable", func(c *HTTPCtx) (*http.Response, error) {
 		served.Add(1)
 		return Text(http.StatusOK, "stable"), nil
-	}, WithMethods(http.MethodGet))
+	}, WithMethods[HTTP](http.MethodGet))
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
@@ -50,13 +50,13 @@ func TestConcurrency_InterceptorMutationDuringTraffic(t *testing.T) {
 			pattern := fmt.Sprintf("%s/churn/%d", authority, i%16)
 			ic, err := p.Add(pattern, func(c *HTTPCtx) (*http.Response, error) {
 				return Text(http.StatusOK, "churn"), nil
-			}, WithMethods(http.MethodGet))
+			}, WithMethods[HTTP](http.MethodGet))
 			if err != nil {
 				continue
 			}
 			// The matchers identify an entry, methods included, so a delete names the same
 			// ones the add did.
-			if _, err := p.Delete[HTTP](ic.Pattern(), WithMethods(http.MethodGet)); err != nil {
+			if _, err := p.Delete[HTTP](ic.Pattern(), WithMethods[HTTP](http.MethodGet)); err != nil {
 				t.Errorf("delete %s: %v", pattern, err)
 				return
 			}
