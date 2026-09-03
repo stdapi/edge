@@ -791,11 +791,16 @@ func (c *Conn) onFrame(fr frame) {
 		err = io.ErrUnexpectedEOF
 	}
 	var ce http2.ConnectionError
-	if errors.As(err, &ce) {
+	switch {
+	case errors.As(err, &ce):
 		c.shutdown(err, true, http2.ErrCode(ce))
-		return
+	case errors.Is(err, http2.ErrFrameTooLarge):
+		c.shutdown(err, true, http2.ErrCodeFrameSize)
+	case errors.Is(err, errControlFlood):
+		c.shutdown(err, true, http2.ErrCodeEnhanceYourCalm)
+	default:
+		c.shutdown(err, false, 0)
 	}
-	c.shutdown(err, false, 0)
 }
 
 // handle applies one frame. A stream error ends that stream, any other error the connection.
@@ -1131,7 +1136,8 @@ func (c *Conn) closeStream(s *Stream, err error, code http2.ErrCode) {
 		s.open = nil
 	}
 	s.err = err
-	c.credit(nil, s.closeReads(err), grantAll)
+	local := err == net.ErrClosed || err == errStreamClosed && !s.remoteEnd
+	c.credit(nil, s.closeReads(err, local), grantAll)
 	c.refreshCanOpen()
 	close(s.closed)
 	c.drained()
@@ -1140,7 +1146,7 @@ func (c *Conn) closeStream(s *Stream, err error, code http2.ErrCode) {
 // drained ends a connection nothing may open on once its last stream ended.
 func (c *Conn) drained() {
 	if c.retired && len(c.streams) == 0 {
-		c.shutdown(ErrGoAway, false, 0)
+		c.shutdown(ErrGoAway, true, http2.ErrCodeNo)
 	}
 }
 
@@ -1241,7 +1247,14 @@ func (c *Conn) Open(ctx context.Context, req Request) (*Stream, *Response, error
 	case <-c.done:
 		return nil, nil, c.Err()
 	case <-ctx.Done():
-		c.send(msg{kind: msgCloseStream, s: s, code: http2.ErrCodeCancel})
+		// Serve reads the caller's request until the stream is closed, so Open does not
+		// return before it is.
+		if c.send(msg{kind: msgCloseStream, s: s, code: http2.ErrCodeCancel}) {
+			select {
+			case <-s.closed:
+			case <-c.done:
+			}
+		}
 		return nil, nil, ctx.Err()
 	}
 }
@@ -1394,15 +1407,21 @@ func (s *Stream) endReads(err error) {
 }
 
 // closeReads is endReads for a stream that ended, and returns what was consumed or
-// buffered and never granted back, accounted on the connection by the caller.
-func (s *Stream) closeReads(err error) int64 {
+// buffered and never granted back, accounted on the connection by the caller. A stream
+// closed here reads nothing more, one the peer ended drains to its end.
+func (s *Stream) closeReads(err error, local bool) int64 {
 	s.mu.Lock()
-	if s.readErr == nil {
-		s.readErr = err
-	}
 	held := s.unsent
 	for _, chunk := range s.chunks {
 		held += int64(len(chunk))
+	}
+	switch {
+	case local:
+		s.readErr = err
+		s.chunks = nil
+		s.tailOwned = false
+	case s.readErr == nil:
+		s.readErr = err
 	}
 	s.unsent = 0
 	s.returned = true
