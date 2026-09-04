@@ -14,17 +14,17 @@ import (
 )
 
 var (
-	// ErrEntryNotFound is returned when no interceptor matches the lookup.
-	ErrEntryNotFound = errors.New("interceptor not found")
-	// ErrInvalidEntry is returned when an interceptor cannot be built from the given arguments.
-	ErrInvalidEntry = errors.New("invalid interceptor")
+	// ErrEntryNotFound is returned when no entry matches the lookup.
+	ErrEntryNotFound = errors.New("entry not found")
+	// ErrInvalidEntry is returned when an entry cannot be built from the given arguments.
+	ErrInvalidEntry = errors.New("invalid entry")
 	// ErrInvalidAuthority is returned when an authority pattern cannot be parsed.
 	ErrInvalidAuthority = errors.New("invalid authority")
 	// ErrReadOnlyTxn is returned on a write in a read-only transaction.
 	ErrReadOnlyTxn = errors.New("write on read-only transaction")
 	// ErrSettledTxn is the panic value of an operation on a committed or aborted transaction.
 	ErrSettledTxn = errors.New("transaction settled")
-	// ErrTooManyMatchers is returned when an interceptor carries more matchers than configured.
+	// ErrTooManyMatchers is returned when an entry carries more matchers than configured.
 	ErrTooManyMatchers = errors.New("too many matchers")
 	// ErrInvalidConfig is returned when a proxy or option is invalid.
 	ErrInvalidConfig = errors.New("invalid config")
@@ -41,20 +41,20 @@ var (
 	ErrTooManyOrigins = errors.New("too many origins for one datagram flow")
 )
 
-// EntryConflictError represents a conflict that occurred during interceptor registration.
-// It contains the interceptor being registered, and the existing interceptors that caused the conflict.
+// EntryConflictError represents a conflict that occurred during entry registration.
+// It contains the entry being registered, and the existing entries that caused the conflict.
 type EntryConflictError struct {
-	// New is the interceptor that was being registered when the conflict was detected.
+	// New is the entry that was being registered when the conflict was detected.
 	New *entry
-	// Conflicts contains the previously registered interceptors that conflict with New.
+	// Conflicts contains the previously registered entries that conflict with New.
 	Conflicts []*entry
-	// isShadowed indicate that the New interceptor shadow other interceptors.
+	// isShadowed indicate that the New entry shadow other entries.
 	isShadowed bool
 }
 
 func (e *EntryConflictError) Error() string {
 	sb := new(strings.Builder)
-	sb.WriteString("interceptor conflict: new interceptor\n")
+	sb.WriteString("entry conflict: new entry\n")
 	entryf(sb, e.New, 4, true)
 
 	if e.isShadowed {
@@ -75,18 +75,18 @@ func (e *EntryConflictError) Error() string {
 	return sb.String()
 }
 
-// EntryNameConflictError represents a conflict that occurred during interceptor name registration.
-// It contains the interceptor being registered, and the existing interceptor that caused the conflict.
+// EntryNameConflictError represents a conflict that occurred during entry name registration.
+// It contains the entry being registered, and the existing entry that caused the conflict.
 type EntryNameConflictError struct {
-	// New is the interceptor that was being registered when the conflict was detected.
+	// New is the entry that was being registered when the conflict was detected.
 	New *entry
-	// Conflict is the previously registered interceptor that conflicts with New.
+	// Conflict is the previously registered entry that conflicts with New.
 	Conflict *entry
 }
 
 func (e *EntryNameConflictError) Error() string {
 	sb := new(strings.Builder)
-	sb.WriteString("interceptor name already registered: new interceptor\n")
+	sb.WriteString("entry name already registered: new entry\n")
 	entryf(sb, e.New, 4, true)
 	sb.WriteString("\nconflicts with\n")
 	entryf(sb, e.Conflict, 4, true)
@@ -95,7 +95,7 @@ func (e *EntryNameConflictError) Error() string {
 
 func newEntryNotFoundError(ic *entry) error {
 	sb := new(strings.Builder)
-	sb.WriteString("interceptor\n")
+	sb.WriteString("entry\n")
 	entryf(sb, ic, 4, false)
 	sb.WriteString("\nis not registered")
 	return fmt.Errorf("%w: %s", ErrEntryNotFound, sb.String())

@@ -94,7 +94,7 @@ func (t Target) String() string {
 }
 
 // normalized fills in the scheme and the port from each other when one of them is missing,
-// so a caller-built target matches the same interceptors a real request would.
+// so a caller-built target matches the same entries a real request would.
 func (t Target) normalized() Target {
 	if t.Scheme == "" {
 		t.Scheme = schemeForPort(t.Port)
