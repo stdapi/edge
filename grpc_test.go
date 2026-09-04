@@ -258,7 +258,7 @@ func TestKindGRPC_FailAfterOpenEndsTheCallOnItsStatus(t *testing.T) {
 		if ferr := m.Forward(); ferr != nil {
 			return ferr
 		}
-		return c.Fail(ResourceExhausted, "quota")
+		return c.Fail(CodeResourceExhausted, "quota")
 	})
 
 	resp := grpcDo(t, client, origin.URL+"/pkg.Svc/Watch", grpcPayload("hello"))
@@ -287,7 +287,7 @@ func TestKindGRPC_FailBeforeTheOriginAnsweredIsTrailersOnly(t *testing.T) {
 		}
 		_ = c.CloseSend()
 		<-reached
-		return c.Fail(PermissionDenied, "policy")
+		return c.Fail(CodePermissionDenied, "policy")
 	})
 
 	resp := grpcDo(t, client, origin.URL+"/pkg.Svc/Watch", grpcPayload("hello"))
@@ -320,7 +320,7 @@ func TestKindGRPC_FailAfterTheOriginFailedReadsAsTheStatus(t *testing.T) {
 		}
 		_, readErr = c.Inbound().ReadMessage()
 		replyErr = m.Reply([]byte("answer"))
-		return c.Fail(PermissionDenied, "policy")
+		return c.Fail(CodePermissionDenied, "policy")
 	})
 
 	resp := grpcDo(t, client, origin.URL+"/pkg.Svc/Method", grpcPayload("hello"))
@@ -343,7 +343,7 @@ func TestKindGRPC_FailAfterAFailedForwardReadsAsTheStatus(t *testing.T) {
 
 	p.MustAdd(host+"/pkg.Svc/Method", func(c *GRPCCtx) error {
 		if ferr := c.Forward(); ferr != nil {
-			return c.Fail(PermissionDenied, "origin down")
+			return c.Fail(CodePermissionDenied, "origin down")
 		}
 		return nil
 	})
@@ -467,7 +467,7 @@ func TestKindGRPC_FailAfterInboundEndedRewritesTheStatus(t *testing.T) {
 			return rerr
 		}
 		originStatus = resp.Trailer.Get("Grpc-Status")
-		return c.Fail(NotFound, "hidden")
+		return c.Fail(CodeNotFound, "hidden")
 	})
 
 	resp := grpcDo(t, client, origin.URL+"/pkg.Svc/Get", grpcPayload("hello"))

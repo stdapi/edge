@@ -131,7 +131,7 @@ func TestConformanceGRPC_FailMidStreamReadsAsTheStatus(t *testing.T) {
 		if err := m.Forward(); err != nil {
 			return err
 		}
-		return c.Fail(ResourceExhausted, "quota")
+		return c.Fail(CodeResourceExhausted, "quota")
 	})
 
 	out, err := runGRPCurl(t, proxyAddr, caFile, "-d", `{"text":"a"}{"text":"b"}`, target, "pkg.Svc/Stream")

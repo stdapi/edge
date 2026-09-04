@@ -122,7 +122,7 @@ func ExampleProxy_Add_grpc() {
 	p.MustAdd("api.test/billing.v1.Billing/Charge", func(c *edge.GRPCCtx) error {
 		calls++
 		if calls <= 2 {
-			return c.Fail(edge.Unavailable, "upstream flaky")
+			return c.Fail(edge.CodeUnavailable, "upstream flaky")
 		}
 		return c.Forward()
 	})

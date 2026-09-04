@@ -36,40 +36,40 @@ const defaultMaxMessageBytes = 16 << 20
 type Code uint32
 
 const (
-	// OK means the call succeeded.
-	OK Code = 0
-	// Canceled means the operation was cancelled, typically by the caller.
-	Canceled Code = 1
-	// Unknown is an error whose code the server could not determine.
-	Unknown Code = 2
-	// InvalidArgument means the client sent an argument the server rejects.
-	InvalidArgument Code = 3
-	// DeadlineExceeded means the deadline expired before the operation completed.
-	DeadlineExceeded Code = 4
-	// NotFound means the requested entity was not found.
-	NotFound Code = 5
-	// AlreadyExists means the entity a client tried to create is already there.
-	AlreadyExists Code = 6
-	// PermissionDenied means the caller is not allowed to run the operation.
-	PermissionDenied Code = 7
-	// ResourceExhausted means a quota is exhausted or the system is out of capacity.
-	ResourceExhausted Code = 8
-	// FailedPrecondition means the system is not in the state the operation requires.
-	FailedPrecondition Code = 9
-	// Aborted means the operation was aborted, typically on a concurrency conflict.
-	Aborted Code = 10
-	// OutOfRange means the operation was attempted past the valid range.
-	OutOfRange Code = 11
-	// Unimplemented means the operation is not implemented or not supported.
-	Unimplemented Code = 12
-	// Internal means an invariant the system depends on was broken.
-	Internal Code = 13
-	// Unavailable means the service is currently unavailable, and a retry may work.
-	Unavailable Code = 14
-	// DataLoss means data was lost or corrupted unrecoverably.
-	DataLoss Code = 15
-	// Unauthenticated means the caller has no valid credentials.
-	Unauthenticated Code = 16
+	// CodeOK means the call succeeded.
+	CodeOK Code = 0
+	// CodeCanceled means the operation was cancelled, typically by the caller.
+	CodeCanceled Code = 1
+	// CodeUnknown is an error whose code the server could not determine.
+	CodeUnknown Code = 2
+	// CodeInvalidArgument means the client sent an argument the server rejects.
+	CodeInvalidArgument Code = 3
+	// CodeDeadlineExceeded means the deadline expired before the operation completed.
+	CodeDeadlineExceeded Code = 4
+	// CodeNotFound means the requested entity was not found.
+	CodeNotFound Code = 5
+	// CodeAlreadyExists means the entity a client tried to create is already there.
+	CodeAlreadyExists Code = 6
+	// CodePermissionDenied means the caller is not allowed to run the operation.
+	CodePermissionDenied Code = 7
+	// CodeResourceExhausted means a quota is exhausted or the system is out of capacity.
+	CodeResourceExhausted Code = 8
+	// CodeFailedPrecondition means the system is not in the state the operation requires.
+	CodeFailedPrecondition Code = 9
+	// CodeAborted means the operation was aborted, typically on a concurrency conflict.
+	CodeAborted Code = 10
+	// CodeOutOfRange means the operation was attempted past the valid range.
+	CodeOutOfRange Code = 11
+	// CodeUnimplemented means the operation is not implemented or not supported.
+	CodeUnimplemented Code = 12
+	// CodeInternal means an invariant the system depends on was broken.
+	CodeInternal Code = 13
+	// CodeUnavailable means the service is currently unavailable, and a retry may work.
+	CodeUnavailable Code = 14
+	// CodeDataLoss means data was lost or corrupted unrecoverably.
+	CodeDataLoss Code = 15
+	// CodeUnauthenticated means the caller has no valid credentials.
+	CodeUnauthenticated Code = 16
 )
 
 func (c Code) String() string {
@@ -95,7 +95,7 @@ type MessageReader struct {
 
 // ReadMessage returns the next message and blocks until one arrives. It returns an error once
 // no message will arrive, and once no entry matches the call any more, in which case the
-// message that arrived is refused and the call is answered with [Unavailable].
+// message that arrived is refused and the call is answered with [CodeUnavailable].
 func (r *MessageReader) ReadMessage() (*MessageCtx, error) { return r.read() }
 
 // MergeMessages returns a reader over the messages of a and b. When one of them ends with
@@ -207,7 +207,7 @@ func (s *msgSource) step() ([]byte, bool, error) {
 //
 // The call keeps its handler, and every message is checked against the entries as they stand
 // when it arrives. Once no entry matches the method any more, the message is refused, the
-// call is answered with [Unavailable] and closed toward the origin.
+// call is answered with [CodeUnavailable] and closed toward the origin.
 //
 // It is not safe for concurrent use and is returned to a pool once the handler returns, so
 // anything kept past that must be copied.
@@ -258,8 +258,8 @@ func markRefused(resp *http.Response) {
 	if resp.Trailer == nil {
 		resp.Trailer = make(http.Header, 2)
 	}
-	resp.Trailer.Set("Grpc-Status", strconv.FormatUint(uint64(Unavailable), 10))
-	resp.Trailer.Set("Grpc-Message", grpcPercentEncode(Unavailable.String()))
+	resp.Trailer.Set("Grpc-Status", strconv.FormatUint(uint64(CodeUnavailable), 10))
+	resp.Trailer.Set("Grpc-Message", grpcPercentEncode(CodeUnavailable.String()))
 }
 
 // messageGate passes a stream of length-prefixed messages through and asks, once the header
@@ -587,7 +587,7 @@ func (b *refusedBody) Close() error { return b.gate.Close() }
 // An [GRPCCtx.Inbound] the handler never asked for is relayed unchanged once the handler
 // returns. The call ends on the trailers of the origin when the handler returns after Inbound
 // ended, and otherwise on a status the proxy sets, the one given to [GRPCCtx.Fail], the one
-// the returned error maps to, or [Internal].
+// the returned error maps to, or [CodeInternal].
 //
 // Call Open before any goroutine reads. [GRPCCtx.Respond] fails after Open.
 func (c *GRPCCtx) Open() error {
@@ -783,7 +783,7 @@ func (k *grpcCall) status() (code Code, msg string, ended bool) {
 	return k.code, k.msg, k.ended
 }
 
-func (k *grpcCall) refuse() { k.end(Unavailable, Unavailable.String()) }
+func (k *grpcCall) refuse() { k.end(CodeUnavailable, CodeUnavailable.String()) }
 
 func (k *grpcCall) fail(code Code, msg string) {
 	k.end(code, msg)
@@ -920,7 +920,7 @@ func (k *grpcCall) finish(err error) {
 		code := statusOf(err)
 		k.end(code, code.String())
 	case !done:
-		k.end(Internal, Internal.String())
+		k.end(CodeInternal, CodeInternal.String())
 	}
 	k.cancel()
 	_ = k.inPw.Close()
@@ -952,7 +952,7 @@ func (k *grpcCall) relayInbound() error {
 // trailers, after the messages already sent, and the origin is canceled. The first status set
 // on an open call is the one the client reads.
 //
-//	return c.Fail(edge.Unavailable, "upstream flaky")
+//	return c.Fail(edge.CodeUnavailable, "upstream flaky")
 func (c *GRPCCtx) Fail(code Code, msg string) error {
 	if call := c.current(); call != nil && call.isOpen() {
 		call.fail(code, msg)
@@ -1014,7 +1014,7 @@ func (c *GRPCCtx) response() (*http.Response, error) {
 		return nil, c.err
 	}
 	if c.resp == nil {
-		return grpcStatusResponse(Internal, "handler produced no response"), nil
+		return grpcStatusResponse(CodeInternal, "handler produced no response"), nil
 	}
 	return c.resp, nil
 }
@@ -1025,13 +1025,13 @@ func (c *GRPCCtx) response() (*http.Response, error) {
 func statusOf(err error) Code {
 	switch {
 	case errors.Is(err, context.Canceled):
-		return Canceled
+		return CodeCanceled
 	case errors.Is(err, context.DeadlineExceeded):
-		return DeadlineExceeded
+		return CodeDeadlineExceeded
 	case errors.Is(err, errMessageTooLarge):
-		return ResourceExhausted
+		return CodeResourceExhausted
 	}
-	return Unavailable
+	return CodeUnavailable
 }
 
 func grpcStatusResponse(code Code, msg string) *http.Response {

@@ -373,7 +373,7 @@ func WithMaxFrameBytes(n int) ProxyOption {
 }
 
 // WithMaxMessageBytes bounds one gRPC message the proxy will buffer to hand a handler, and one
-// a handler sends. A larger one ends the call with [ResourceExhausted]. It defaults to 16 MiB.
+// a handler sends. A larger one ends the call with [CodeResourceExhausted]. It defaults to 16 MiB.
 // A call served by [GRPCCtx.Forward] is not bounded.
 func WithMaxMessageBytes(n int) ProxyOption {
 	return proxyOption(func(s sealedOption) error {

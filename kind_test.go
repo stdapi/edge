@@ -296,7 +296,7 @@ func TestKindGRPC_FailAnswersWithoutTheServer(t *testing.T) {
 	require.NoError(t, err)
 
 	p.MustAdd(host+"/pkg.Svc/Method", func(c *GRPCCtx) error {
-		return c.Fail(Unavailable, "upstream flaky")
+		return c.Fail(CodeUnavailable, "upstream flaky")
 	})
 
 	req, err := http.NewRequest(http.MethodPost, origin.URL+"/pkg.Svc/Method", strings.NewReader(""))
@@ -513,7 +513,7 @@ func TestKindGRPC_DecideOnTheFirstMessage(t *testing.T) {
 			return rerr
 		}
 		if string(m.Bytes()) == "forbidden" {
-			return c.Fail(PermissionDenied, "policy")
+			return c.Fail(CodePermissionDenied, "policy")
 		}
 		if oerr := c.Open(); oerr != nil {
 			return oerr
