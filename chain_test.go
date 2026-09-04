@@ -528,7 +528,7 @@ func TestChain_DatagramFlowThroughCONNECTUDPUpgrade(t *testing.T) {
 	assert.Equal(t, 2, flows, "one flow inside each tunnel")
 	assert.EqualValues(t, 1, dialer.udp.Load(), "HTTP/3 was tried once, then the failed dial remembered")
 	assert.EqualValues(t, 2, dialer.tcp.Load(), "one connection per tunnel")
-	assert.True(t, front.srv.fwd.up.deferred(front.srv.fwd.up.noH3, &url.URL{Scheme: "https", Host: backFront.String()}))
+	assert.True(t, front.srv.fwd.up.remembers(noH3Dial, &url.URL{Scheme: "https", Host: backFront.String()}))
 }
 
 // A plain http proxy carries CONNECT-UDP the way it carries CONNECT, in the clear, and HTTP/3
@@ -661,7 +661,7 @@ func TestChain_H2ProxyWithoutExtendedConnectUpgradesOverHTTP11(t *testing.T) {
 	}
 	assert.EqualValues(t, 3, dialer.tcp.Load(), "HTTP/2 tried once, then one HTTP/1.1 connection per tunnel")
 	up := front.srv.fwd.up
-	assert.True(t, up.deferred(up.noH2, &url.URL{Scheme: "https", Host: backFront.String()}))
+	assert.True(t, up.remembers(noH2Extended, &url.URL{Scheme: "https", Host: backFront.String()}))
 
 	conn, err := up.dial(t.Context(), "tcp", "127.0.0.1:443", "https")
 	require.NoError(t, err)
@@ -823,7 +823,7 @@ func TestChain_ReplacedHTTP2ConnectionEndsWithTheDialer(t *testing.T) {
 
 	cli1, srv1 := tcpPair(t)
 	goAway := h2Peer(t, srv1)
-	cc1, err := u.shareH2Conn(proxy, cli1)
+	cc1, _, err := u.shareH2Conn(proxy, cli1)
 	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -834,7 +834,7 @@ func TestChain_ReplacedHTTP2ConnectionEndsWithTheDialer(t *testing.T) {
 
 	cli2, srv2 := tcpPair(t)
 	h2Peer(t, srv2)
-	cc2, err := u.shareH2Conn(proxy, cli2)
+	cc2, _, err := u.shareH2Conn(proxy, cli2)
 	require.NoError(t, err)
 	require.NotSame(t, cc1, cc2, "a connection going away is not reused")
 	require.NoError(t, cc1.Err(), "a connection with a tunnel on it stays until the tunnel ends")
@@ -1105,7 +1105,7 @@ func TestChain_TCPStreamThroughCONNECTOverHTTP3(t *testing.T) {
 	waitForSessions(t, back, 2)
 	proxy := &url.URL{Scheme: "https", Host: backFront.String()}
 	up := front.srv.fwd.up
-	assert.True(t, up.deferred(up.noTCP, proxy))
+	assert.True(t, up.remembers(noTCPDial, proxy))
 
 	require.NoError(t, up.h3Conn(proxy).CloseWithError(0, ""))
 	getThroughTunnel(t, frontAddr, port, ca)
@@ -1113,22 +1113,27 @@ func TestChain_TCPStreamThroughCONNECTOverHTTP3(t *testing.T) {
 	assert.EqualValues(t, 2, dialer.udp.Load())
 }
 
+// listenBoth listens on one port over TCP and over UDP.
+func listenBoth(t *testing.T) (net.Listener, net.PacketConn) {
+	t.Helper()
+	for range 10 {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		if pc, perr := net.ListenPacket("udp", ln.Addr().String()); perr == nil {
+			return ln, pc
+		}
+		_ = ln.Close()
+	}
+	t.Fatal("no port free on both tcp and udp")
+	return nil, nil
+}
+
 // startDualFront serves p over TLS and over QUIC on one port.
 func startDualFront(t *testing.T, p *Proxy, ca *CA) netip.AddrPort {
 	t.Helper()
 	cert, err := ca.Leaf("127.0.0.1")
 	require.NoError(t, err)
-	var ln net.Listener
-	var pc net.PacketConn
-	for range 10 {
-		ln, err = net.Listen("tcp", "127.0.0.1:0")
-		require.NoError(t, err)
-		if pc, err = net.ListenPacket("udp", ln.Addr().String()); err == nil {
-			break
-		}
-		_ = ln.Close()
-	}
-	require.NoError(t, err, "no port free on both tcp and udp")
+	ln, pc := listenBoth(t)
 	cfg := &tls.Config{Certificates: []tls.Certificate{*cert}, MinVersion: tls.VersionTLS12, NextProtos: []string{"h2", "http/1.1"}}
 	go func() { _ = p.serveFront(tls.NewListener(cancelListener{ln}, cfg)) }()
 	go func() { _ = p.ServeQUIC(pc, *cert) }()
@@ -1163,8 +1168,135 @@ func TestChain_TCPStreamJoinsTheHTTP3ConnectionAFlowOpened(t *testing.T) {
 
 	echoThrough(t, udpFront, "ping")
 	assert.EqualValues(t, 1, dialer.udp.Load())
-	getThroughTunnel(t, frontAddr, port, ca)
-	assert.EqualValues(t, 1, dialer.tcp.Load(), "the tunnel joined the HTTP/3 connection")
+	conn, err := front.srv.fwd.up.dial(t.Context(), "tcp", "inner.test:"+port, "https")
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+	require.IsType(t, (*h3StreamConn)(nil), conn, "the tunnel joined the HTTP/3 connection")
+	assert.EqualValues(t, 1, dialer.tcp.Load())
+}
+
+// An HTTP/3 connection the proxy is closing is left to its tunnels, and dropped for the next
+// CONNECT.
+func TestChain_HTTP3ConnectionGoingAwayIsLeft(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	proxyAddr, srv := h3ConnectEcho(t, ca)
+	front, _ := chainedFront(t, ca, "https://"+proxyAddr.String())
+	up := front.srv.fwd.up
+	proxy := &url.URL{Scheme: "https", Host: proxyAddr.String()}
+
+	first, err := up.dial(t.Context(), "tcp", "192.0.2.1:443", "https")
+	require.NoError(t, err)
+	defer func() { _ = first.Close() }()
+	require.IsType(t, (*h3StreamConn)(nil), first)
+
+	// Shutdown sends GOAWAY and waits for the first tunnel, which outlives the test.
+	go func() { _ = srv.Shutdown(context.Background()) }()
+	require.Eventually(t, func() bool {
+		if conn, derr := up.dial(t.Context(), "tcp", "192.0.2.1:443", "https"); derr == nil {
+			_ = conn.Close()
+		}
+		return up.h3Conn(proxy) == nil
+	}, 5*time.Second, 50*time.Millisecond, "the connection going away stayed in the cache")
+
+	_, err = first.Write([]byte("ping"))
+	require.NoError(t, err)
+	buf := make([]byte, 4)
+	_, err = io.ReadFull(first, buf)
+	require.NoError(t, err)
+	assert.Equal(t, "ping", string(buf), "the tunnel on the connection going away lives on")
+}
+
+// A proxy answering neither on TCP nor on UDP fails one dial with both errors, and the next
+// dials try TCP alone.
+func TestChain_ProxyDownOnBothIsDialedOverTCPAlone(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	front, dialer := chainedFront(t, ca, "https://127.0.0.1:1")
+	up := front.srv.fwd.up
+
+	_, err = up.dial(t.Context(), "tcp", "192.0.2.1:443", "https")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "dial proxy")
+	assert.Contains(t, err.Error(), "over HTTP/3")
+	proxy := &url.URL{Scheme: "https", Host: "127.0.0.1:1"}
+	assert.True(t, up.remembers(noTCPDial, proxy))
+	assert.True(t, up.remembers(noH3Dial, proxy))
+
+	_, err = up.dial(t.Context(), "tcp", "192.0.2.1:443", "https")
+	require.Error(t, err)
+	assert.EqualValues(t, 2, dialer.tcp.Load())
+	assert.EqualValues(t, 1, dialer.udp.Load(), "HTTP/3 is not dialed again")
+}
+
+// versionedProxy serves CONNECT over HTTP/1.1 alone and answers 405 over HTTP/2 and HTTP/3, on
+// one port for TCP and UDP.
+func versionedProxy(t *testing.T, ca *CA) netip.AddrPort {
+	t.Helper()
+	cert, err := ca.Leaf("127.0.0.1")
+	require.NoError(t, err)
+	ln, pc := listenBoth(t)
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect || r.ProtoMajor != 1 {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		conn, _, herr := http.NewResponseController(w).Hijack()
+		if herr != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		if _, werr := io.WriteString(conn, "HTTP/1.1 200 Connection Established\r\n\r\n"); werr != nil {
+			return
+		}
+		_, _ = io.Copy(conn, conn)
+	})
+	tcp := &http.Server{Handler: handler, TLSConfig: &tls.Config{Certificates: []tls.Certificate{*cert}, MinVersion: tls.VersionTLS12}}
+	udp := &http3.Server{Handler: handler, EnableDatagrams: true, TLSConfig: &tls.Config{Certificates: []tls.Certificate{*cert}, MinVersion: tls.VersionTLS13}}
+	go func() { _ = tcp.ServeTLS(ln, "", "") }()
+	go func() { _ = udp.Serve(pc) }()
+	t.Cleanup(func() {
+		_ = tcp.Close()
+		_ = udp.Close()
+		_ = pc.Close()
+	})
+	return netip.MustParseAddrPort(ln.Addr().String())
+}
+
+// A proxy that answers a CONNECT with 405 over HTTP/3 and over HTTP/2 gets it over HTTP/1.1,
+// and the next CONNECT goes there at once.
+func TestChain_CONNECTNotServedOverHTTP3AndHTTP2GoesOverHTTP11(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	proxyAddr := versionedProxy(t, ca)
+	front, dialer := chainedFront(t, ca, "https://"+proxyAddr.String())
+	up := front.srv.fwd.up
+	proxy := &url.URL{Scheme: "https", Host: proxyAddr.String()}
+
+	_, err = up.dial(t.Context(), "udp", "192.0.2.1:53", "https")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "CONNECT-UDP refused with 405")
+	require.NotNil(t, up.h3Conn(proxy), "the HTTP/3 connection stays")
+
+	conn, err := up.dial(t.Context(), "tcp", "192.0.2.1:443", "https")
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+	_, err = conn.Write([]byte("ping"))
+	require.NoError(t, err)
+	buf := make([]byte, 4)
+	_, err = io.ReadFull(conn, buf)
+	require.NoError(t, err)
+	assert.Equal(t, "ping", string(buf))
+	assert.True(t, up.remembers(noH3Connect, proxy))
+	assert.True(t, up.remembers(noH2Connect, proxy))
+	assert.EqualValues(t, 2, dialer.tcp.Load(), "one HTTP/2 connection, then one HTTP/1.1 connection")
+	assert.NotNil(t, up.h2Conn(proxy), "the HTTP/2 connection stays")
+
+	second, err := up.dial(t.Context(), "tcp", "192.0.2.1:443", "https")
+	require.NoError(t, err)
+	defer func() { _ = second.Close() }()
+	assert.EqualValues(t, 3, dialer.tcp.Load(), "HTTP/1.1 at once")
+	assert.EqualValues(t, 1, dialer.udp.Load())
 }
 
 // A CONNECT the proxy refuses on the HTTP/2 connection fails with the status, and leaves the
@@ -1222,6 +1354,8 @@ func TestChain_TunnelOverHTTP3IsAConnection(t *testing.T) {
 			return
 		}
 		defer func() { _ = c.Close() }()
+		time.Sleep(200 * time.Millisecond)
+		_, _ = io.WriteString(c, "banner")
 		got, _ := io.ReadAll(c)
 		_, _ = fmt.Fprintf(c, "got:%s", got)
 	}()
@@ -1246,13 +1380,49 @@ func TestChain_TunnelOverHTTP3IsAConnection(t *testing.T) {
 	_, err = conn.Read(make([]byte, 16))
 	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
 	require.NoError(t, conn.SetReadDeadline(time.Time{}))
+	banner := make([]byte, 6)
+	_, err = io.ReadFull(conn, banner)
+	require.NoError(t, err)
+	assert.Equal(t, "banner", string(banner), "the bytes the cut read received")
 	require.NoError(t, conn.(closeWriter).CloseWrite())
 	got, err := io.ReadAll(conn)
 	require.NoError(t, err)
 	assert.Equal(t, "got:\x00hello", string(got))
 }
 
-func h3ConnectEcho(t *testing.T, ca *CA) netip.AddrPort {
+// A write past its deadline resets its stream, and no other on the connection.
+func TestChain_WriteDeadlineResetsTheStreamAlone(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	proxyAddr, _ := h3ConnectEcho(t, ca)
+	front, _ := chainedFront(t, ca, "https://"+proxyAddr.String())
+	up := front.srv.fwd.up
+
+	late, err := up.dial(t.Context(), "tcp", "192.0.2.1:443", "https")
+	require.NoError(t, err)
+	defer func() { _ = late.Close() }()
+	other, err := up.dial(t.Context(), "tcp", "192.0.2.1:443", "https")
+	require.NoError(t, err)
+	defer func() { _ = other.Close() }()
+
+	require.NoError(t, late.SetWriteDeadline(time.Now().Add(-time.Second)))
+	_, err = late.Write([]byte("late"))
+	require.Error(t, err)
+	assert.True(t, isTimeout(err))
+	require.NoError(t, late.SetWriteDeadline(time.Time{}))
+	_, err = late.Write([]byte("again"))
+	require.Error(t, err, "the stream is reset")
+	assert.False(t, isTimeout(err))
+
+	_, err = other.Write([]byte("pong"))
+	require.NoError(t, err)
+	buf := make([]byte, 4)
+	_, err = io.ReadFull(other, buf)
+	require.NoError(t, err)
+	assert.Equal(t, "pong", string(buf))
+}
+
+func h3ConnectEcho(t *testing.T, ca *CA) (netip.AddrPort, *http3.Server) {
 	t.Helper()
 	cert, err := ca.Leaf("127.0.0.1")
 	require.NoError(t, err)
@@ -1288,7 +1458,7 @@ func h3ConnectEcho(t *testing.T, ca *CA) netip.AddrPort {
 		_ = srv.Close()
 		_ = pc.Close()
 	})
-	return netip.MustParseAddrPort(pc.LocalAddr().String())
+	return netip.MustParseAddrPort(pc.LocalAddr().String()), srv
 }
 
 // An HTTP/3 proxy without CONNECT-UDP leaves no failed dial remembered, and the CONNECT
@@ -1296,7 +1466,7 @@ func h3ConnectEcho(t *testing.T, ca *CA) netip.AddrPort {
 func TestChain_H3ProxyWithoutCONNECTUDPCarriesCONNECT(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
-	proxyAddr := h3ConnectEcho(t, ca)
+	proxyAddr, _ := h3ConnectEcho(t, ca)
 	front, dialer := chainedFront(t, ca, "https://"+proxyAddr.String())
 	up := front.srv.fwd.up
 
@@ -1304,7 +1474,7 @@ func TestChain_H3ProxyWithoutCONNECTUDPCarriesCONNECT(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "the proxy does not support CONNECT-UDP")
 	proxy := &url.URL{Scheme: "https", Host: proxyAddr.String()}
-	assert.False(t, up.deferred(up.noH3, proxy), "the dial over HTTP/3 succeeded")
+	assert.False(t, up.remembers(noH3Dial, proxy), "the dial over HTTP/3 succeeded")
 
 	conn, err := up.dial(t.Context(), "tcp", "192.0.2.1:443", "https")
 	require.NoError(t, err)

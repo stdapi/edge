@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,8 +36,8 @@ const (
 	proxyResponseBytes = http.DefaultMaxHeaderBytes
 	// proxyKeepAlive keeps the connection to a proxy open while its tunnels are silent.
 	proxyKeepAlive = 10 * time.Second
-	// proxyRetry is how long the dialer remembers a failed dial to a proxy, over HTTP/3 or
-	// over TCP.
+	// proxyRetry is how long the dialer remembers a fact of a proxy, a failed dial or a
+	// version that does not serve a CONNECT.
 	proxyRetry = 5 * time.Minute
 )
 
@@ -44,7 +45,42 @@ var (
 	// errTunnelEnded ends the reads of a tunnel once its stream or the connection to the
 	// proxy has ended.
 	errTunnelEnded = errors.New("edge: tunnel ended")
-	errRefused     = errors.New("refused")
+	errOpenStream  = errors.New("open stream")
+)
+
+// refusal is the status a proxy answered a CONNECT or a CONNECT-UDP with.
+type refusal struct {
+	status string
+	code   int
+}
+
+func newRefusal(code int) *refusal {
+	return &refusal{code: code, status: strconv.Itoa(code) + " " + http.StatusText(code)}
+}
+
+func (r *refusal) Error() string { return "refused with " + r.status }
+
+func isRefusal(err error) bool {
+	_, ok := errors.AsType[*refusal](err)
+	return ok
+}
+
+// notServed reports whether the proxy answered that it does not serve the method, which
+// another version of the proxy may.
+func notServed(err error) bool {
+	r, ok := errors.AsType[*refusal](err)
+	return ok && (r.code == http.StatusMethodNotAllowed || r.code == http.StatusNotImplemented)
+}
+
+// proxyFact is what the dialer remembers of a proxy for proxyRetry.
+type proxyFact string
+
+const (
+	noH3Dial     proxyFact = "no dial over HTTP/3"
+	noTCPDial    proxyFact = "no dial over TCP"
+	noH2Extended proxyFact = "no extended CONNECT over HTTP/2"
+	noH2Connect  proxyFact = "no CONNECT over HTTP/2"
+	noH3Connect  proxyFact = "no CONNECT over HTTP/3"
 )
 
 // upstreamDialer opens every connection the proxy makes upstream, through the proxy
@@ -54,10 +90,8 @@ type upstreamDialer struct {
 	h3      *http3.Transport
 	conns   map[string]*h3ProxyConn
 	h2conns map[string]*h2tunnel.Conn
-	// noH3 and noTCP record until when a failed dial to a proxy, over HTTP/3 or over TCP, is
-	// remembered, and noH2 until when HTTP/2 is not tried for a CONNECT-UDP, for lack of
-	// extended CONNECT.
-	noH3, noTCP, noH2 map[string]time.Time
+	// remembered is when each proxyFact of a proxy expires.
+	remembered map[string]time.Time
 	// draining holds the HTTP/2 connections replaced after a GOAWAY while their last tunnels
 	// end, so that close reaches them.
 	draining []*h2tunnel.Conn
@@ -68,13 +102,11 @@ type upstreamDialer struct {
 
 func newUpstreamDialer(t *Transport) *upstreamDialer {
 	return &upstreamDialer{
-		t:       t,
-		h3:      &http3.Transport{EnableDatagrams: true, DisableCompression: true},
-		conns:   make(map[string]*h3ProxyConn),
-		h2conns: make(map[string]*h2tunnel.Conn),
-		noH3:    make(map[string]time.Time),
-		noTCP:   make(map[string]time.Time),
-		noH2:    make(map[string]time.Time),
+		t:          t,
+		h3:         &http3.Transport{EnableDatagrams: true, DisableCompression: true},
+		conns:      make(map[string]*h3ProxyConn),
+		h2conns:    make(map[string]*h2tunnel.Conn),
+		remembered: make(map[string]time.Time),
 	}
 }
 
@@ -190,13 +222,12 @@ func proxyAuthorization(proxy *url.URL) string {
 // connect opens a TCP connection to addr with a CONNECT to the proxy. The CONNECT goes on
 // the connection the dialer has to the proxy, HTTP/3 or HTTP/2, and over TCP otherwise, where
 // TLS negotiates HTTP/2 or HTTP/1.1, and a proxy whose dial over TCP failed is dialed over
-// HTTP/3 for proxyRetry. A refusal the proxy answers is final.
+// HTTP/3 for proxyRetry. A CONNECT answered with 405 or 501 goes over the next version, any
+// other refusal is final.
 func (u *upstreamDialer) connect(ctx context.Context, proxy *url.URL, addr string) (net.Conn, error) {
-	retried := false
-	for {
-		conn, pooled, err := u.connectOnce(ctx, proxy, addr)
-		if retryPooled(ctx, err, pooled, retried) {
-			retried = true
+	for round := 1; ; round++ {
+		conn, again, err := u.connectOnce(ctx, proxy, addr)
+		if again && round < connectRounds && ctx.Err() == nil {
 			continue
 		}
 		if err != nil {
@@ -206,41 +237,46 @@ func (u *upstreamDialer) connect(ctx context.Context, proxy *url.URL, addr strin
 	}
 }
 
-// retryPooled reports whether a tunnel is opened again after failing on a pooled connection,
-// one that was gone, going away or full when the tunnel was opened on it, so the proxy
-// received nothing of the tunnel.
-func retryPooled(ctx context.Context, err error, pooled, retried bool) bool {
-	return err != nil && pooled && !retried && ctx.Err() == nil && !errors.Is(err, errRefused)
-}
+// connectRounds bounds the rounds of one connect, one per connection or version a tunnel may
+// move to after a failure.
+const connectRounds = 4
 
-// connectOnce reports whether the tunnel went on a pooled connection.
+// connectOnce reports whether the tunnel may go on another connection or version after a
+// failure.
 func (u *upstreamDialer) connectOnce(ctx context.Context, proxy *url.URL, addr string) (net.Conn, bool, error) {
-	if proxy.Scheme == "https" {
-		if cc := u.h3Conn(proxy); cc != nil {
+	https := proxy.Scheme == "https"
+	if https {
+		if cc := u.h3Conn(proxy); cc != nil && !u.remembers(noH3Connect, proxy) {
 			conn, err := connectOnH3(ctx, cc, proxy, addr)
-			return conn, true, err
+			if err != nil {
+				return nil, u.h3Failed(proxy, cc, err), err
+			}
+			return conn, false, nil
 		}
-		if cc := u.h2Conn(proxy); cc != nil {
+		if cc := u.h2Conn(proxy); cc != nil && !u.remembers(noH2Connect, proxy) {
 			conn, err := connectOnH2(ctx, cc, proxy, addr)
-			return conn, true, err
+			if err != nil {
+				return nil, u.h2Failed(proxy, cc, err, true), err
+			}
+			return conn, false, nil
 		}
 	}
 	var h3err error
-	if proxy.Scheme == "https" && u.deferred(u.noTCP, proxy) && !u.deferred(u.noH3, proxy) {
-		conn, dialed, err := u.connectH3(ctx, proxy, addr)
+	if https && u.remembers(noTCPDial, proxy) && u.h3ForConnect(proxy) {
+		conn, dialed, again, err := u.connectH3(ctx, proxy, addr)
 		if dialed || ctx.Err() != nil {
-			return conn, false, err
+			return conn, again, err
 		}
 		h3err = err
 	}
 	nc, err := u.t.dialer()(ctx, "tcp", proxyAddr(proxy))
 	if err != nil {
 		err = fmt.Errorf("dial proxy %s: %w", proxy.Redacted(), err)
-		if proxy.Scheme == "https" && h3err == nil && ctx.Err() == nil && !u.deferred(u.noH3, proxy) {
-			u.deferVersion(u.noTCP, proxy)
-			conn, dialed, oerr := u.connectH3(ctx, proxy, addr)
+		if https && h3err == nil && ctx.Err() == nil && u.h3ForConnect(proxy) {
+			u.remember(noTCPDial, proxy)
+			conn, dialed, again, oerr := u.connectH3(ctx, proxy, addr)
 			if dialed {
-				return conn, false, oerr
+				return conn, again, oerr
 			}
 			return nil, false, errors.Join(err, oerr)
 		}
@@ -249,28 +285,85 @@ func (u *upstreamDialer) connectOnce(ctx context.Context, proxy *url.URL, addr s
 		}
 		return nil, false, err
 	}
-	conn, err := overTCP(ctx, u, nc, proxy, true,
+	var cc *h2tunnel.Conn
+	conn, shared, err := overTCP(ctx, u, nc, proxy, !u.remembers(noH2Connect, proxy),
 		func(conn net.Conn) (net.Conn, error) { return connectOn(conn, proxy, addr) },
-		func(cc *h2tunnel.Conn) (net.Conn, error) { return connectOnH2(ctx, cc, proxy, addr) })
+		func(c *h2tunnel.Conn) (net.Conn, error) {
+			cc = c
+			return connectOnH2(ctx, c, proxy, addr)
+		})
+	if err != nil && cc != nil {
+		return nil, u.h2Failed(proxy, cc, err, shared), err
+	}
 	return conn, false, err
 }
 
-// connectH3 opens the tunnel over HTTP/3 and reports whether the dial to the proxy succeeded.
-func (u *upstreamDialer) connectH3(ctx context.Context, proxy *url.URL, addr string) (net.Conn, bool, error) {
+// h3ForConnect reports whether a CONNECT is worth a dial over HTTP/3.
+func (u *upstreamDialer) h3ForConnect(proxy *url.URL) bool {
+	return !u.remembers(noH3Dial, proxy) && !u.remembers(noH3Connect, proxy)
+}
+
+// connectH3 opens the tunnel over HTTP/3 and reports whether the dial to the proxy succeeded,
+// and whether the tunnel may go elsewhere after a failure.
+func (u *upstreamDialer) connectH3(ctx context.Context, proxy *url.URL, addr string) (conn net.Conn, dialed, again bool, err error) {
 	cc, err := u.proxyConn(ctx, proxy)
 	if err != nil {
 		if ctx.Err() == nil {
-			u.deferVersion(u.noH3, proxy)
+			u.remember(noH3Dial, proxy)
 		}
-		return nil, false, fmt.Errorf("over HTTP/3: %w", err)
+		return nil, false, false, fmt.Errorf("over HTTP/3: %w", err)
 	}
-	conn, err := connectOnH3(ctx, cc, proxy, addr)
-	return conn, true, err
+	conn, err = connectOnH3(ctx, cc, proxy, addr)
+	if err != nil {
+		return nil, true, u.h3Failed(proxy, cc, err), err
+	}
+	return conn, true, false, nil
+}
+
+// h3Failed records what a failed CONNECT over HTTP/3 showed of the proxy and reports whether
+// the tunnel may go on another connection or version.
+func (u *upstreamDialer) h3Failed(proxy *url.URL, cc *h3ProxyConn, err error) bool {
+	switch {
+	case notServed(err):
+		u.remember(noH3Connect, proxy)
+	case errors.Is(err, errOpenStream) && !isContextErr(err), requestRejected(err), cc.Context().Err() != nil:
+		// The connection is going away or gone. A connection going away closes itself once
+		// its streams end.
+		u.dropH3Conn(proxy, cc)
+	default:
+		return false
+	}
+	return true
+}
+
+// requestRejected reports whether the proxy reset the stream with H3_REQUEST_REJECTED, a
+// request it did not process, RFC 9114 section 4.1.1.
+func requestRejected(err error) bool {
+	if se, ok := errors.AsType[*quic.StreamError](err); ok {
+		return se.Remote && se.ErrorCode == quic.StreamErrorCode(http3.ErrCodeRequestRejected)
+	}
+	he, ok := errors.AsType[*http3.Error](err)
+	return ok && he.Remote && he.ErrorCode == http3.ErrCodeRequestRejected
+}
+
+// h2Failed is h3Failed for HTTP/2. shared reports that the tunnel went on a connection another
+// one opened, which the next round leaves alone once it can open no stream.
+func (u *upstreamDialer) h2Failed(proxy *url.URL, cc *h2tunnel.Conn, err error, shared bool) bool {
+	if notServed(err) {
+		u.remember(noH2Connect, proxy)
+		return true
+	}
+	return shared && !cc.CanOpen()
+}
+
+func isContextErr(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // overTCP opens a tunnel on nc, a connection to the proxy, with onH2 when TLS negotiates h2
-// and with h1 otherwise.
-func overTCP[T any](ctx context.Context, u *upstreamDialer, nc net.Conn, proxy *url.URL, h2 bool, h1 func(net.Conn) (T, error), onH2 func(*h2tunnel.Conn) (T, error)) (T, error) {
+// and with h1 otherwise. It reports whether the tunnel went on an HTTP/2 connection another
+// tunnel recorded first.
+func overTCP[T any](ctx context.Context, u *upstreamDialer, nc net.Conn, proxy *url.URL, h2 bool, h1 func(net.Conn) (T, error), onH2 func(*h2tunnel.Conn) (T, error)) (T, bool, error) {
 	var zero T
 	_ = nc.SetDeadline(time.Now().Add(proxyConnectTimeout))
 	stop := context.AfterFunc(ctx, func() { _ = nc.Close() })
@@ -286,35 +379,36 @@ func overTCP[T any](ctx context.Context, u *upstreamDialer, nc net.Conn, proxy *
 		if err := tc.HandshakeContext(ctx); err != nil {
 			stop()
 			_ = nc.Close()
-			return zero, fmt.Errorf("tls handshake: %w", err)
+			return zero, false, fmt.Errorf("tls handshake: %w", err)
 		}
 		if tc.ConnectionState().NegotiatedProtocol == "h2" {
 			// The connection outlives this tunnel, so the dial's cancellation and deadline
 			// come off it here, and a tunnel refused on it leaves it shared.
 			if !stop() {
 				_ = nc.Close()
-				return zero, ctx.Err()
+				return zero, false, ctx.Err()
 			}
 			_ = nc.SetDeadline(time.Time{})
-			cc, err := u.shareH2Conn(proxy, tc)
+			cc, shared, err := u.shareH2Conn(proxy, tc)
 			if err != nil {
-				return zero, err
+				return zero, false, err
 			}
-			return onH2(cc)
+			v, err := onH2(cc)
+			return v, shared, err
 		}
 		conn = tc
 	}
 	v, err := h1(conn)
 	if !stop() {
 		_ = conn.Close()
-		return zero, ctx.Err()
+		return zero, false, ctx.Err()
 	}
 	if err != nil {
 		_ = conn.Close()
-		return zero, err
+		return zero, false, err
 	}
 	_ = nc.SetDeadline(time.Time{})
-	return v, nil
+	return v, false, nil
 }
 
 // connectOn sends a CONNECT to the proxy on conn and returns the connection once the proxy
@@ -334,7 +428,7 @@ func connectOn(conn net.Conn, proxy *url.URL, addr string) (net.Conn, error) {
 	}
 	if resp.StatusCode != http.StatusOK {
 		// The body is left unread, the caller closes the connection.
-		return nil, fmt.Errorf("CONNECT %w with %s", errRefused, resp.Status)
+		return nil, fmt.Errorf("CONNECT %w", &refusal{code: resp.StatusCode, status: resp.Status})
 	}
 	if br.Buffered() == 0 {
 		return conn, nil
@@ -359,7 +453,7 @@ func connectOnH2(ctx context.Context, cc *h2tunnel.Conn, proxy *url.URL, addr st
 	}
 	if resp.StatusCode != http.StatusOK {
 		_ = str.Close()
-		return nil, fmt.Errorf("CONNECT %w with %d %s", errRefused, resp.StatusCode, http.StatusText(resp.StatusCode))
+		return nil, fmt.Errorf("CONNECT %w", newRefusal(resp.StatusCode))
 	}
 	return str, nil
 }
@@ -386,7 +480,7 @@ func (u *upstreamDialer) connectUDP(ctx context.Context, proxy *url.URL, addr st
 		return nil, fmt.Errorf("edge: dial udp %q: %w", addr, err)
 	}
 	var h3err error
-	if proxy.Scheme == "https" && !u.deferred(u.noH3, proxy) {
+	if proxy.Scheme == "https" && !u.remembers(noH3Dial, proxy) {
 		cc, cerr := u.proxyConn(ctx, proxy)
 		switch {
 		case cerr == nil:
@@ -402,7 +496,7 @@ func (u *upstreamDialer) connectUDP(ctx context.Context, proxy *url.URL, addr st
 		case ctx.Err() != nil:
 			return nil, fmt.Errorf("dial proxy %s: %w", proxy.Redacted(), cerr)
 		default:
-			u.deferVersion(u.noH3, proxy)
+			u.remember(noH3Dial, proxy)
 			h3err = fmt.Errorf("over HTTP/3: %w", cerr)
 		}
 	}
@@ -416,17 +510,17 @@ func (u *upstreamDialer) connectUDP(ctx context.Context, proxy *url.URL, addr st
 	return &connectUDPConn{pipe: pipe, remote: tunnelTarget(addr)}, nil
 }
 
-func (u *upstreamDialer) deferred(m map[string]time.Time, proxy *url.URL) bool {
+func (u *upstreamDialer) remembers(fact proxyFact, proxy *url.URL) bool {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	until, ok := m[proxyAddr(proxy)]
+	until, ok := u.remembered[proxyAddr(proxy)+" "+string(fact)]
 	return ok && time.Now().Before(until)
 }
 
-func (u *upstreamDialer) deferVersion(m map[string]time.Time, proxy *url.URL) {
+func (u *upstreamDialer) remember(fact proxyFact, proxy *url.URL) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	m[proxyAddr(proxy)] = time.Now().Add(proxyRetry)
+	u.remembered[proxyAddr(proxy)+" "+string(fact)] = time.Now().Add(proxyRetry)
 }
 
 func openTunnelOn(ctx context.Context, cc *http3.ClientConn, proxy *url.URL, host, port string) (tunnelPipe, error) {
@@ -455,7 +549,7 @@ func requestOn(ctx context.Context, cc *http3.ClientConn, req *http.Request, ver
 	defer done()
 	str, err := cc.OpenRequestStream(ctx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", errOpenStream, err)
 	}
 	cancel := func() {
 		str.CancelRead(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
@@ -477,7 +571,7 @@ func requestOn(ctx context.Context, cc *http3.ClientConn, req *http.Request, ver
 	}
 	if resp.StatusCode != http.StatusOK {
 		cancel()
-		return nil, fmt.Errorf("%s %w with %d %s", verb, errRefused, resp.StatusCode, http.StatusText(resp.StatusCode))
+		return nil, fmt.Errorf("%s %w", verb, newRefusal(resp.StatusCode))
 	}
 	return str, nil
 }
@@ -488,7 +582,7 @@ func requestOn(ctx context.Context, cc *http3.ClientConn, req *http.Request, ver
 func (u *upstreamDialer) connectUDPStream(ctx context.Context, proxy *url.URL, host, port string) (tunnelPipe, error) {
 	retried := false
 	for {
-		h2 := proxy.Scheme == "https" && !u.deferred(u.noH2, proxy)
+		h2 := proxy.Scheme == "https" && !u.remembers(noH2Extended, proxy)
 		var pipe tunnelPipe
 		var err error
 		pooled := false
@@ -496,16 +590,19 @@ func (u *upstreamDialer) connectUDPStream(ctx context.Context, proxy *url.URL, h
 			pooled = true
 			pipe, err = openTunnelOnH2(ctx, cc, proxy, host, port)
 		} else {
-			pipe, err = u.dialTunnel(ctx, proxy, host, port, h2)
+			pipe, pooled, err = u.dialTunnel(ctx, proxy, host, port, h2)
 		}
 		switch {
 		case errors.Is(err, h2tunnel.ErrExtendedConnect):
 			// An HTTP/2 proxy without extended CONNECT may still upgrade an HTTP/1.1
 			// connection, so the next one offers nothing else. The connection stays for the
 			// CONNECT tunnels.
-			u.deferVersion(u.noH2, proxy)
+			u.remember(noH2Extended, proxy)
 			continue
-		case retryPooled(ctx, err, pooled, retried):
+		case err != nil && pooled && !retried && ctx.Err() == nil && !isRefusal(err):
+			// The pooled connection was gone, going away or full as the tunnel was opened
+			// on it, and the proxy saw nothing of the tunnel. The next round finds the
+			// connection unusable and opens another.
 			retried = true
 			continue
 		}
@@ -513,10 +610,10 @@ func (u *upstreamDialer) connectUDPStream(ctx context.Context, proxy *url.URL, h
 	}
 }
 
-func (u *upstreamDialer) dialTunnel(ctx context.Context, proxy *url.URL, host, port string, h2 bool) (tunnelPipe, error) {
+func (u *upstreamDialer) dialTunnel(ctx context.Context, proxy *url.URL, host, port string, h2 bool) (tunnelPipe, bool, error) {
 	nc, err := u.t.dialer()(ctx, "tcp", proxyAddr(proxy))
 	if err != nil {
-		return nil, fmt.Errorf("dial proxy %s: %w", proxy.Redacted(), err)
+		return nil, false, fmt.Errorf("dial proxy %s: %w", proxy.Redacted(), err)
 	}
 	return overTCP(ctx, u, nc, proxy, h2,
 		func(conn net.Conn) (tunnelPipe, error) { return upgradeOn(conn, proxy, host, port) },
@@ -534,29 +631,29 @@ func (u *upstreamDialer) h2Conn(proxy *url.URL) *h2tunnel.Conn {
 
 // shareH2Conn records the HTTP/2 connection on tc for the next tunnels. When another tunnel
 // recorded one first, that one is returned and tc closed.
-func (u *upstreamDialer) shareH2Conn(proxy *url.URL, tc net.Conn) (*h2tunnel.Conn, error) {
+func (u *upstreamDialer) shareH2Conn(proxy *url.URL, tc net.Conn) (*h2tunnel.Conn, bool, error) {
 	cc, err := h2tunnel.Client(tc, proxyKeepAlive)
 	if err != nil {
-		return nil, fmt.Errorf("dial proxy %s: %w", proxy.Redacted(), err)
+		return nil, false, fmt.Errorf("dial proxy %s: %w", proxy.Redacted(), err)
 	}
 	key := proxyAddr(proxy)
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	if u.closed {
 		_ = cc.Close()
-		return nil, net.ErrClosed
+		return nil, false, net.ErrClosed
 	}
 	if other := u.h2conns[key]; other != nil {
 		if other.CanOpen() {
 			_ = cc.Close()
-			return other, nil
+			return other, true, nil
 		}
 		other.Retire()
 		u.draining = slices.DeleteFunc(u.draining, func(d *h2tunnel.Conn) bool { return d.Err() != nil })
 		u.draining = append(u.draining, other)
 	}
 	u.h2conns[key] = cc
-	return cc, nil
+	return cc, false, nil
 }
 
 func openTunnelOnH2(ctx context.Context, cc *h2tunnel.Conn, proxy *url.URL, host, port string) (tunnelPipe, error) {
@@ -578,7 +675,7 @@ func openTunnelOnH2(ctx context.Context, cc *h2tunnel.Conn, proxy *url.URL, host
 	}
 	if resp.StatusCode != http.StatusOK {
 		_ = str.Close()
-		return nil, fmt.Errorf("CONNECT-UDP %w with %d %s", errRefused, resp.StatusCode, http.StatusText(resp.StatusCode))
+		return nil, fmt.Errorf("CONNECT-UDP %w", newRefusal(resp.StatusCode))
 	}
 	return newCapsulePipe(str, bufio.NewReader(str)), nil
 }
@@ -605,7 +702,7 @@ func upgradeOn(conn net.Conn, proxy *url.URL, host, port string) (tunnelPipe, er
 	}
 	if resp.StatusCode != http.StatusSwitchingProtocols {
 		// The body is left unread, the caller closes the connection.
-		return nil, fmt.Errorf("CONNECT-UDP %w with %s", errRefused, resp.Status)
+		return nil, fmt.Errorf("CONNECT-UDP %w", &refusal{code: resp.StatusCode, status: resp.Status})
 	}
 	if !strings.EqualFold(resp.Header.Get("Upgrade"), connectUDPUpgrade) {
 		return nil, errors.New("CONNECT-UDP upgraded to " + resp.Header.Get("Upgrade"))
@@ -667,6 +764,15 @@ func (u *upstreamDialer) h3Locked(key string) *h3ProxyConn {
 		return cc
 	}
 	return nil
+}
+
+func (u *upstreamDialer) dropH3Conn(proxy *url.URL, cc *h3ProxyConn) {
+	key := proxyAddr(proxy)
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.conns[key] == cc {
+		delete(u.conns, key)
+	}
 }
 
 func (u *upstreamDialer) openProxyConn(ctx context.Context, proxy *url.URL, addr string) (*h3ProxyConn, error) {
