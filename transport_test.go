@@ -18,19 +18,25 @@ import (
 )
 
 // A destination pool serves one authority, so it keeps at most MaxIdleConnsPerHost idle
-// connections. The shared pool serves every authority the proxy resolves itself and keeps
+// connections. A shared pool serves every authority the proxy resolves itself and keeps
 // MaxIdleConns.
 func TestTransport_DestinationPoolIdleLimit(t *testing.T) {
 	tr := DefaultTransport()
-	shared, err := newUpstreamPool(newUpstreamDialer(tr), "", "")
-	require.NoError(t, err)
-	assert.Equal(t, tr.MaxIdleConns, shared.h1.MaxIdleConns)
-	assert.Equal(t, tr.MaxIdleConns, shared.h2.MaxIdleConns)
+	for _, scheme := range []string{"http", "https"} {
+		shared, err := newUpstreamPool(newUpstreamDialer(tr), scheme, "")
+		require.NoError(t, err)
+		assert.Equal(t, tr.MaxIdleConns, shared.h1.MaxIdleConns, scheme)
+		assert.Equal(t, tr.MaxIdleConns, shared.h2.MaxIdleConns, scheme)
+	}
 
 	pool, err := newUpstreamPool(newUpstreamDialer(tr), "https", "127.0.0.1:443")
 	require.NoError(t, err)
 	assert.Equal(t, tr.MaxIdleConnsPerHost, pool.h1.MaxIdleConns)
 	assert.Equal(t, tr.MaxIdleConnsPerHost, pool.h2.MaxIdleConns)
+
+	pool, err = newUpstreamPool(newUpstreamDialer(tr), "http", "127.0.0.1:80")
+	require.NoError(t, err)
+	assert.Equal(t, tr.MaxIdleConnsPerHost, pool.h2.MaxIdleConns, "the h2c transport")
 
 	tr.MaxIdleConnsPerHost = 0
 	pool, err = newUpstreamPool(newUpstreamDialer(tr), "https", "127.0.0.1:443")

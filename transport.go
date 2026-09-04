@@ -24,7 +24,7 @@ import (
 //
 // Connections are pooled per destination, the address a redirect was headed to or the CONNECT
 // target, and a destination keeps at most MaxIdleConnsPerHost idle connections. Requests with
-// no fixed destination share one pool, bounded by MaxIdleConns.
+// no fixed destination share one pool per scheme, each bounded by MaxIdleConns.
 type Transport struct {
 	// DialContext dials an upstream. It is called with network tcp for a TCP upstream and udp
 	// for a QUIC one, and a QUIC connection runs on the socket it returns. It defaults to a
