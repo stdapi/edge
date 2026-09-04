@@ -969,3 +969,59 @@ func TestChain_FullH2ConnectionOpensAnother(t *testing.T) {
 		t.Fatal("the full connection outlived its last tunnel")
 	}
 }
+
+// An HTTP/2 request with no declared destination, sent to a TLS front without a CONNECT, is
+// forwarded through an https proxy that offers h2. net/http would offer the proxy the h2 pool's
+// ALPN list and write its CONNECT on the HTTP/2 connection the proxy selected.
+func TestChain_H2RequestWithNoDeclaredDestinationThroughTLSProxy(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	origin := namedOrigin(t, ca, "inner.test")
+	_, port, err := net.SplitHostPort(origin.Host)
+	require.NoError(t, err)
+
+	backTr := DefaultTransport()
+	backTr.RootCAs = poolOf(ca)
+	backTr.DialContext = pinnedDialer(origin.Host)
+	back, err := New(WithCA(ca), WithTransport(backTr))
+	require.NoError(t, err)
+	back.MustAdd("inner.test/", forwardHandler)
+	backAddr, _ := startProxyTLS(t, back, ca)
+
+	frontTr := DefaultTransport()
+	frontTr.RootCAs = poolOf(ca)
+	dialed := new(recorder)
+	frontTr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dialed.add(network + " " + addr)
+		return defaultDialer.DialContext(ctx, network, addr)
+	}
+	frontTr.Proxy = fixedProxy("https://" + backAddr)
+	front, err := New(WithCA(ca), WithTransport(frontTr))
+	require.NoError(t, err)
+	front.MustAdd("inner.test/", forwardHandler)
+	frontAddr, frontPool := startProxyTLS(t, front, ca)
+
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			ForceAttemptHTTP2: true,
+			DialTLSContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&tls.Dialer{Config: &tls.Config{
+					ServerName: "127.0.0.1",
+					RootCAs:    frontPool,
+					NextProtos: []string{"h2", "http/1.1"},
+					MinVersion: tls.VersionTLS12,
+				}}).DialContext(ctx, "tcp", frontAddr)
+			},
+		},
+	}
+	resp, err := client.Get("https://inner.test:" + port + "/")
+	require.NoError(t, err)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+	assert.Equal(t, "HTTP/2.0", resp.Proto, "the client must have reached the front over HTTP/2")
+	assert.Equal(t, "origin host=inner.test:"+port, string(body))
+	assert.Equal(t, []string{"tcp " + backAddr}, dialed.all())
+}

@@ -32,9 +32,9 @@ type Transport struct {
 	// force a source address, or route upstream traffic through a tunnel.
 	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 
-	// Proxy specifies a function to return a proxy for a given Request. A TCP, QUIC or UDP
-	// upstream has no request, and the function is called with one for the destination
-	// alone, so [http.ProxyFromEnvironment] applies to it as well.
+	// Proxy specifies a function to return a proxy for a given Request. An upstream reached
+	// through a CONNECT, or one that has no request, calls it with a request for the
+	// destination alone, so [http.ProxyFromEnvironment] applies to it as well.
 	//
 	// The proxy type is determined by the URL scheme. "http" and "https" are supported. A
 	// QUIC or UDP upstream goes through a CONNECT-UDP tunnel, RFC 9298, over HTTP/3 when the

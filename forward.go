@@ -5,6 +5,7 @@
 package edge
 
 import (
+	"cmp"
 	"context"
 	"net"
 	"net/http"
@@ -32,11 +33,11 @@ var hopByHopHeaders = [...]string{
 }
 
 // forwarder pools upstream connections per destination, and requests with no fixed
-// destination share one pool.
+// destination share one pool per scheme.
 type forwarder struct {
 	p      *Proxy
 	up     *upstreamDialer
-	shared *upstreamPool
+	shared struct{ http, https *upstreamPool }
 	fixed  *simplelru.LRU[string, *upstreamPool]
 	mu     sync.Mutex
 }
@@ -50,19 +51,20 @@ type upstreamPool struct {
 func newUpstreamPool(up *upstreamDialer, scheme, fixed string) (*upstreamPool, error) {
 	t := up.t
 	dial, proxy := t.dialer(), t.Proxy
-	if fixed != "" {
-		// The destination is fixed by the CONNECT, so the tunnel to it is opened here and
-		// the transport is given no proxy of its own.
+	if fixed != "" || scheme == "https" {
+		// net/http offers a proxy the ALPN list meant for the origin, so the tunnel is
+		// opened here and the transport is given no proxy of its own. A plaintext request
+		// with no fixed destination keeps net/http's handling, absolute form to the proxy.
 		proxy = nil
-		dial = func(ctx context.Context, network, _ string) (net.Conn, error) {
-			return up.dial(ctx, network, fixed, scheme)
+		dial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return up.dial(ctx, network, cmp.Or(fixed, addr), scheme)
 		}
 	}
 	pool := &upstreamPool{h1: t.httpTransport(false, fixed != "", dial, proxy)}
 	if t.AllowHTTP2 {
 		pool.h2 = t.httpTransport(true, fixed != "", dial, proxy)
 	}
-	if t.AllowHTTP3 {
+	if t.AllowHTTP3 && scheme == "https" {
 		rt, err := newHTTP3Transport(up, fixed)
 		if err != nil {
 			return nil, err
@@ -92,22 +94,26 @@ func (u *upstreamPool) close() {
 
 func newForwarder(p *Proxy) (*forwarder, error) {
 	up := newUpstreamDialer(p.cfg.transport)
-	shared, err := newUpstreamPool(up, "", "")
-	if err != nil {
+	f := &forwarder{p: p, up: up}
+	var err error
+	if f.shared.http, err = newUpstreamPool(up, "http", ""); err != nil {
 		return nil, err
 	}
-	fixed, err := simplelru.NewLRU(maxDestinationPools, func(_ string, pool *upstreamPool) { pool.closeIdle() })
-	if err != nil {
+	if f.shared.https, err = newUpstreamPool(up, "https", ""); err != nil {
 		return nil, err
 	}
-	return &forwarder{p: p, up: up, shared: shared, fixed: fixed}, nil
+	if f.fixed, err = simplelru.NewLRU(maxDestinationPools, func(_ string, pool *upstreamPool) { pool.closeIdle() }); err != nil {
+		return nil, err
+	}
+	return f, nil
 }
 
 func (f *forwarder) close() {
 	f.mu.Lock()
 	pools := f.fixed.Values()
 	f.mu.Unlock()
-	f.shared.close()
+	f.shared.http.close()
+	f.shared.https.close()
 	for _, pool := range pools {
 		pool.close()
 	}
@@ -116,7 +122,10 @@ func (f *forwarder) close() {
 
 func (f *forwarder) poolFor(scheme, fixed string) (*upstreamPool, error) {
 	if fixed == "" {
-		return f.shared, nil
+		if scheme == "https" {
+			return f.shared.https, nil
+		}
+		return f.shared.http, nil
 	}
 	key := scheme + " " + fixed
 	f.mu.Lock()
@@ -145,11 +154,11 @@ func (f *forwarder) roundTrip(req *http.Request, proto Protocol, fixed string) (
 		return nil, err
 	}
 	switch {
-	case proto == HTTP3 && pool.h3 != nil && req.URL.Scheme == "https":
+	case proto == HTTP3 && pool.h3 != nil:
 		return pool.h3.RoundTrip(req)
 	case (proto == HTTP2 || proto == HTTP3) && pool.h2 != nil:
-		// h2 is only reachable through ALPN, so an origin that does not offer it is served
-		// over HTTP/1.1 by the same transport.
+		// Over TLS h2 is reached through ALPN, so an origin that does not offer it is
+		// served over HTTP/1.1 by the same transport.
 		return pool.h2.RoundTrip(req)
 	default:
 		return pool.h1.RoundTrip(req)
