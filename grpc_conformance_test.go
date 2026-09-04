@@ -34,7 +34,20 @@ func requireGRPCurl(t *testing.T) string {
 
 func grpcConformanceOrigin(t *testing.T) *httptest.Server {
 	t.Helper()
-	origin := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	origin := httptest.NewUnstartedServer(grpcEchoHandler(nil))
+	origin.EnableHTTP2 = true
+	origin.StartTLS()
+	t.Cleanup(origin.Close)
+	return origin
+}
+
+// grpcEchoHandler echoes every message, recording the protocol of each call on seen when it is
+// given one.
+func grpcEchoHandler(seen *recorder) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if seen != nil {
+			seen.add(r.Proto)
+		}
 		w.Header().Set("Content-Type", "application/grpc")
 		w.Header().Set("Trailer", "Grpc-Status")
 		w.WriteHeader(http.StatusOK)
@@ -49,11 +62,7 @@ func grpcConformanceOrigin(t *testing.T) *httptest.Server {
 			_ = rc.Flush()
 		}
 		w.Header().Set(http.TrailerPrefix+"Grpc-Status", "0")
-	}))
-	origin.EnableHTTP2 = true
-	origin.StartTLS()
-	t.Cleanup(origin.Close)
-	return origin
+	})
 }
 
 // grpc-go sends nothing to a proxy for a loopback address, so the origin is reached as
@@ -69,7 +78,9 @@ func grpcConformanceProxy(t *testing.T, origin *httptest.Server) (p *Proxy, targ
 	ca, err := GenerateCA()
 	require.NoError(t, err)
 	tr := DefaultTransport()
-	tr.RootCAs = originPool(t, origin)
+	if origin.TLS != nil {
+		tr.RootCAs = originPool(t, origin)
+	}
 	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		if addr == target {
 			addr = originURL.Host
@@ -82,14 +93,19 @@ func grpcConformanceProxy(t *testing.T, origin *httptest.Server) (p *Proxy, targ
 	return p, target, startProxy(t, p), writeCAFile(t, ca)
 }
 
+// runGRPCurl runs grpcurl through the proxy, in the clear when caFile is empty.
 func runGRPCurl(t *testing.T, proxyAddr, caFile string, args ...string) (string, error) {
 	t.Helper()
 	bin := requireGRPCurl(t)
-	full := append([]string{
-		"-cacert", caFile,
+	full := []string{"-cacert", caFile}
+	if caFile == "" {
+		full = []string{"-plaintext"}
+	}
+	full = append(full,
 		"-import-path", "testdata/grpc", "-proto", "echo.proto",
 		"-max-time", "10",
-	}, args...)
+	)
+	full = append(full, args...)
 	cmd := exec.Command(bin, full...)
 	cmd.Env = append(os.Environ(), "HTTPS_PROXY=http://"+proxyAddr)
 	out, err := cmd.CombinedOutput()
@@ -105,6 +121,21 @@ func TestConformanceGRPC_UnaryThroughForward(t *testing.T) {
 	out, err := runGRPCurl(t, proxyAddr, caFile, "-d", `{"text":"hello"}`, target, "pkg.Svc/Method")
 	require.NoError(t, err, out)
 	assert.Contains(t, out, `"text": "hello"`)
+}
+
+// A real client in the clear: grpcurl opens a CONNECT tunnel and speaks HTTP/2 with prior
+// knowledge inside it, and the origin is reached the same way.
+func TestConformanceGRPC_UnaryThroughForwardInTheClear(t *testing.T) {
+	requireGRPCurl(t)
+	seen := new(recorder)
+	origin := h2cOrigin(t, grpcEchoHandler(seen))
+	p, target, proxyAddr, _ := grpcConformanceProxy(t, origin)
+	p.MustAdd("example.com/pkg.Svc/Method", func(c *GRPCCtx) error { return c.Forward() })
+
+	out, err := runGRPCurl(t, proxyAddr, "", "-d", `{"text":"hello"}`, target, "pkg.Svc/Method")
+	require.NoError(t, err, out)
+	assert.Contains(t, out, `"text": "hello"`)
+	assert.Equal(t, []string{"HTTP/2.0"}, seen.all())
 }
 
 // A real client reads the status a handler ends an open call on, after the messages it let

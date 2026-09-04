@@ -65,7 +65,8 @@ type Transport struct {
 	// keeps the proxy from turning a broken upstream certificate into a silent success.
 	InsecureSkipVerify bool
 
-	// AllowHTTP2 lets the proxy negotiate h2 with upstreams. It defaults to true.
+	// AllowHTTP2 lets the proxy negotiate h2 with upstreams, and use h2c with a plaintext
+	// upstream when the client did. It defaults to true.
 	AllowHTTP2 bool
 
 	// AllowHTTP3 lets the proxy speak h3 to upstreams that advertise it. It defaults to
@@ -141,6 +142,15 @@ func (t *Transport) httpTransport(allowH2, fixed bool, dial func(context.Context
 		// A destination serves one authority, so the per host limit is its limit.
 		tr.MaxIdleConns = cmp.Or(t.MaxIdleConnsPerHost, http.DefaultMaxIdleConnsPerHost)
 	}
+	return tr
+}
+
+// h2cTransport builds the transport for h2c. It is given no proxy, net/http would start
+// HTTP/2 with the proxy itself.
+func (t *Transport) h2cTransport(dial func(context.Context, string, string) (net.Conn, error)) *http.Transport {
+	tr := t.httpTransport(true, true, dial, nil)
+	tr.Protocols = new(http.Protocols)
+	tr.Protocols.SetUnencryptedHTTP2(true)
 	return tr
 }
 

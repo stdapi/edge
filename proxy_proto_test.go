@@ -605,3 +605,25 @@ func TestProxy_NonHTTPALPNIsNotHTTP(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "hello", string(buf))
 }
+
+// HTTP/2 with prior knowledge has no fallback, so an origin that speaks HTTP/1.1 alone refuses
+// the connection at its first frame and the client reads a 502. Without the proxy the same
+// client fails against the same origin.
+func TestProto_H2CToAnHTTP11OriginIsRefused(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, "origin")
+	}))
+	defer origin.Close()
+	originURL, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+
+	p := testProxy(t)
+	p.MustAdd(originHost(originURL)+"/*{any}", forwardHandler)
+	client := h2cTunnelClient(t, startProxy(t, p), originURL.Host)
+
+	resp, err := client.Get(origin.URL + "/foo")
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+	assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
+	assert.Equal(t, "HTTP/2.0", resp.Proto)
+}

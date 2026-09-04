@@ -7,6 +7,7 @@ package edge
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
@@ -828,4 +829,42 @@ func TestDecodeBinaryMetadata(t *testing.T) {
 
 	_, err = DecodeBinaryMetadata("!!!")
 	assert.Error(t, err)
+}
+
+// A gRPC call in the clear reaches an h2c origin over HTTP/2. The client spoke HTTP/2 with
+// prior knowledge to a destination it declared, and no ALPN could have asked the origin.
+func TestKindGRPC_CallInTheClearIsForwardedOverHTTP2(t *testing.T) {
+	seen := new(recorder)
+	origin := h2cOrigin(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen.add(fmt.Sprintf("%s tls=%t", r.Proto, r.TLS != nil))
+		src := &msgSource{r: r.Body, max: defaultMaxMessageBytes}
+		payload, _, err := src.next()
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "application/grpc")
+		w.Header().Set("Trailer", "Grpc-Status")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(appendGRPCMessage(nil, false, payload))
+		w.Header().Set(http.TrailerPrefix+"Grpc-Status", "0")
+	}))
+	originURL, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+	host := originHost(originURL)
+
+	p := testProxy(t)
+	p.MustAdd(host+"/pkg.Svc/Method", func(c *GRPCCtx) error { return c.Forward() })
+	client := h2cTunnelClient(t, startProxy(t, p), originURL.Host)
+
+	resp := grpcDo(t, client, origin.URL+"/pkg.Svc/Method", grpcPayload("hello"))
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "HTTP/2.0", resp.Proto)
+	assert.Equal(t, grpcPayload("hello"), body)
+	assert.Equal(t, "0", resp.Trailer.Get("Grpc-Status"))
+	assert.Equal(t, []string{"HTTP/2.0 tls=false"}, seen.all())
 }

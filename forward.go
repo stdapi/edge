@@ -62,7 +62,13 @@ func newUpstreamPool(up *upstreamDialer, scheme, fixed string) (*upstreamPool, e
 	}
 	pool := &upstreamPool{h1: t.httpTransport(false, fixed != "", dial, proxy)}
 	if t.AllowHTTP2 {
-		pool.h2 = t.httpTransport(true, fixed != "", dial, proxy)
+		if scheme == "http" && fixed != "" {
+			// The client used h2c with a destination it declared, and no ALPN can ask the
+			// origin.
+			pool.h2 = t.h2cTransport(dial)
+		} else {
+			pool.h2 = t.httpTransport(true, fixed != "", dial, proxy)
+		}
 	}
 	if t.AllowHTTP3 && scheme == "https" {
 		rt, err := newHTTP3Transport(up, fixed)

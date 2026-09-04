@@ -1,9 +1,13 @@
 package edge
 
 import (
+	"context"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"slices"
 	"testing"
+	"time"
 )
 
 // namedHTTP returns the HTTP entry registered under name, or the zero value.
@@ -83,4 +87,32 @@ func mustFuzzProxy(tb testing.TB) *Proxy {
 		tb.Fatal(err)
 	}
 	return p
+}
+
+// h2cOrigin starts a plaintext origin speaking HTTP/1.1 and HTTP/2 with prior knowledge.
+func h2cOrigin(t *testing.T, h http.Handler) *httptest.Server {
+	t.Helper()
+	origin := httptest.NewUnstartedServer(h)
+	origin.Config.Protocols = new(http.Protocols)
+	origin.Config.Protocols.SetHTTP1(true)
+	origin.Config.Protocols.SetUnencryptedHTTP2(true)
+	origin.Start()
+	t.Cleanup(origin.Close)
+	return origin
+}
+
+// h2cTunnelClient opens a CONNECT tunnel to authority through the proxy at addr and speaks
+// HTTP/2 with prior knowledge inside it.
+func h2cTunnelClient(t *testing.T, addr, authority string) *http.Client {
+	t.Helper()
+	raw := connectRaw(t, addr, authority)
+	protocols := new(http.Protocols)
+	protocols.SetUnencryptedHTTP2(true)
+	return &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			Protocols:   protocols,
+			DialContext: func(context.Context, string, string) (net.Conn, error) { return raw, nil },
+		},
+	}
 }
