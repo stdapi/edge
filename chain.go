@@ -19,6 +19,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fox-toolkit/edge/internal/h2tunnel"
@@ -34,16 +35,16 @@ const (
 	proxyResponseBytes = http.DefaultMaxHeaderBytes
 	// proxyKeepAlive keeps the connection to a proxy open while its tunnels are silent.
 	proxyKeepAlive = 10 * time.Second
-	// proxyRetryHTTP3 is how long a proxy the dialer could not reach over HTTP/3 is reached
-	// over TCP before HTTP/3 is tried again.
-	proxyRetryHTTP3 = 5 * time.Minute
+	// proxyRetry is how long the dialer remembers a failed dial to a proxy, over HTTP/3 or
+	// over TCP.
+	proxyRetry = 5 * time.Minute
 )
 
-// errTunnelEnded ends the reads of a tunnel once its stream or the connection to the proxy
-// has ended.
 var (
-	errTunnelEnded   = errors.New("edge: CONNECT-UDP tunnel ended")
-	errTunnelRefused = errors.New("CONNECT-UDP refused")
+	// errTunnelEnded ends the reads of a tunnel once its stream or the connection to the
+	// proxy has ended.
+	errTunnelEnded = errors.New("edge: tunnel ended")
+	errRefused     = errors.New("refused")
 )
 
 // upstreamDialer opens every connection the proxy makes upstream, through the proxy
@@ -51,12 +52,12 @@ var (
 type upstreamDialer struct {
 	t       *Transport
 	h3      *http3.Transport
-	conns   map[string]*http3.ClientConn
+	conns   map[string]*h3ProxyConn
 	h2conns map[string]*h2tunnel.Conn
-	// noH3 and noH2 record until when HTTP/3, or HTTP/2 for lack of extended CONNECT, is not
-	// tried on a proxy.
-	noH3 map[string]time.Time
-	noH2 map[string]time.Time
+	// noH3 and noTCP record until when a failed dial to a proxy, over HTTP/3 or over TCP, is
+	// remembered, and noH2 until when HTTP/2 is not tried for a CONNECT-UDP, for lack of
+	// extended CONNECT.
+	noH3, noTCP, noH2 map[string]time.Time
 	// draining holds the HTTP/2 connections replaced after a GOAWAY while their last tunnels
 	// end, so that close reaches them.
 	draining []*h2tunnel.Conn
@@ -69,9 +70,10 @@ func newUpstreamDialer(t *Transport) *upstreamDialer {
 	return &upstreamDialer{
 		t:       t,
 		h3:      &http3.Transport{EnableDatagrams: true, DisableCompression: true},
-		conns:   make(map[string]*http3.ClientConn),
+		conns:   make(map[string]*h3ProxyConn),
 		h2conns: make(map[string]*h2tunnel.Conn),
 		noH3:    make(map[string]time.Time),
+		noTCP:   make(map[string]time.Time),
 		noH2:    make(map[string]time.Time),
 	}
 }
@@ -185,39 +187,139 @@ func proxyAuthorization(proxy *url.URL) string {
 	return "Basic " + base64.StdEncoding.EncodeToString([]byte(proxy.User.Username()+":"+pass))
 }
 
-// connect opens a TCP connection to addr with a CONNECT to the proxy.
+// connect opens a TCP connection to addr with a CONNECT to the proxy. The CONNECT goes on
+// the connection the dialer has to the proxy, HTTP/3 or HTTP/2, and over TCP otherwise, where
+// TLS negotiates HTTP/2 or HTTP/1.1, and a proxy whose dial over TCP failed is dialed over
+// HTTP/3 for proxyRetry. A refusal the proxy answers is final.
 func (u *upstreamDialer) connect(ctx context.Context, proxy *url.URL, addr string) (net.Conn, error) {
-	conn, err := u.t.dialer()(ctx, "tcp", proxyAddr(proxy))
-	if err != nil {
-		return nil, fmt.Errorf("dial proxy %s: %w", proxy.Redacted(), err)
+	retried := false
+	for {
+		conn, pooled, err := u.connectOnce(ctx, proxy, addr)
+		if retryPooled(ctx, err, pooled, retried) {
+			retried = true
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("dial %s through %s: %w", addr, proxy.Redacted(), err)
+		}
+		return conn, nil
 	}
-	_ = conn.SetDeadline(time.Now().Add(proxyConnectTimeout))
-	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
-	tunnel, err := u.connectOn(ctx, conn, proxy, addr)
-	if !stop() {
-		_ = conn.Close()
-		return nil, fmt.Errorf("dial %s through %s: %w", addr, proxy.Redacted(), ctx.Err())
-	}
-	if err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("dial %s through %s: %w", addr, proxy.Redacted(), err)
-	}
-	_ = conn.SetDeadline(time.Time{})
-	return tunnel, nil
 }
 
-func (u *upstreamDialer) connectOn(ctx context.Context, conn net.Conn, proxy *url.URL, addr string) (net.Conn, error) {
+// retryPooled reports whether a tunnel is opened again after failing on a pooled connection,
+// one that was gone, going away or full when the tunnel was opened on it, so the proxy
+// received nothing of the tunnel.
+func retryPooled(ctx context.Context, err error, pooled, retried bool) bool {
+	return err != nil && pooled && !retried && ctx.Err() == nil && !errors.Is(err, errRefused)
+}
+
+// connectOnce reports whether the tunnel went on a pooled connection.
+func (u *upstreamDialer) connectOnce(ctx context.Context, proxy *url.URL, addr string) (net.Conn, bool, error) {
+	if proxy.Scheme == "https" {
+		if cc := u.h3Conn(proxy); cc != nil {
+			conn, err := connectOnH3(ctx, cc, proxy, addr)
+			return conn, true, err
+		}
+		if cc := u.h2Conn(proxy); cc != nil {
+			conn, err := connectOnH2(ctx, cc, proxy, addr)
+			return conn, true, err
+		}
+	}
+	var h3err error
+	if proxy.Scheme == "https" && u.deferred(u.noTCP, proxy) && !u.deferred(u.noH3, proxy) {
+		conn, dialed, err := u.connectH3(ctx, proxy, addr)
+		if dialed || ctx.Err() != nil {
+			return conn, false, err
+		}
+		h3err = err
+	}
+	nc, err := u.t.dialer()(ctx, "tcp", proxyAddr(proxy))
+	if err != nil {
+		err = fmt.Errorf("dial proxy %s: %w", proxy.Redacted(), err)
+		if proxy.Scheme == "https" && h3err == nil && ctx.Err() == nil && !u.deferred(u.noH3, proxy) {
+			u.deferVersion(u.noTCP, proxy)
+			conn, dialed, oerr := u.connectH3(ctx, proxy, addr)
+			if dialed {
+				return conn, false, oerr
+			}
+			return nil, false, errors.Join(err, oerr)
+		}
+		if h3err != nil {
+			err = errors.Join(h3err, err)
+		}
+		return nil, false, err
+	}
+	conn, err := overTCP(ctx, u, nc, proxy, true,
+		func(conn net.Conn) (net.Conn, error) { return connectOn(conn, proxy, addr) },
+		func(cc *h2tunnel.Conn) (net.Conn, error) { return connectOnH2(ctx, cc, proxy, addr) })
+	return conn, false, err
+}
+
+// connectH3 opens the tunnel over HTTP/3 and reports whether the dial to the proxy succeeded.
+func (u *upstreamDialer) connectH3(ctx context.Context, proxy *url.URL, addr string) (net.Conn, bool, error) {
+	cc, err := u.proxyConn(ctx, proxy)
+	if err != nil {
+		if ctx.Err() == nil {
+			u.deferVersion(u.noH3, proxy)
+		}
+		return nil, false, fmt.Errorf("over HTTP/3: %w", err)
+	}
+	conn, err := connectOnH3(ctx, cc, proxy, addr)
+	return conn, true, err
+}
+
+// overTCP opens a tunnel on nc, a connection to the proxy, with onH2 when TLS negotiates h2
+// and with h1 otherwise.
+func overTCP[T any](ctx context.Context, u *upstreamDialer, nc net.Conn, proxy *url.URL, h2 bool, h1 func(net.Conn) (T, error), onH2 func(*h2tunnel.Conn) (T, error)) (T, error) {
+	var zero T
+	_ = nc.SetDeadline(time.Now().Add(proxyConnectTimeout))
+	stop := context.AfterFunc(ctx, func() { _ = nc.Close() })
+	conn := nc
 	if proxy.Scheme == "https" {
 		cfg := u.t.upstreamTLSConfig()
 		cfg.ServerName = proxy.Hostname()
 		cfg.NextProtos = []string{"http/1.1"}
-		tc := tls.Client(conn, cfg)
+		if h2 {
+			cfg.NextProtos = []string{"h2", "http/1.1"}
+		}
+		tc := tls.Client(nc, cfg)
 		if err := tc.HandshakeContext(ctx); err != nil {
-			return nil, fmt.Errorf("tls handshake: %w", err)
+			stop()
+			_ = nc.Close()
+			return zero, fmt.Errorf("tls handshake: %w", err)
+		}
+		if tc.ConnectionState().NegotiatedProtocol == "h2" {
+			// The connection outlives this tunnel, so the dial's cancellation and deadline
+			// come off it here, and a tunnel refused on it leaves it shared.
+			if !stop() {
+				_ = nc.Close()
+				return zero, ctx.Err()
+			}
+			_ = nc.SetDeadline(time.Time{})
+			cc, err := u.shareH2Conn(proxy, tc)
+			if err != nil {
+				return zero, err
+			}
+			return onH2(cc)
 		}
 		conn = tc
 	}
+	v, err := h1(conn)
+	if !stop() {
+		_ = conn.Close()
+		return zero, ctx.Err()
+	}
+	if err != nil {
+		_ = conn.Close()
+		return zero, err
+	}
+	_ = nc.SetDeadline(time.Time{})
+	return v, nil
+}
 
+// connectOn sends a CONNECT to the proxy on conn and returns the connection once the proxy
+// answered 200, with the bytes the proxy sent behind its answer.
+func connectOn(conn net.Conn, proxy *url.URL, addr string) (net.Conn, error) {
 	req := &http.Request{Method: http.MethodConnect, URL: &url.URL{Opaque: addr}, Host: addr, Header: make(http.Header)}
 	if auth := proxyAuthorization(proxy); auth != "" {
 		req.Header.Set("Proxy-Authorization", auth)
@@ -232,7 +334,7 @@ func (u *upstreamDialer) connectOn(ctx context.Context, conn net.Conn, proxy *ur
 	}
 	if resp.StatusCode != http.StatusOK {
 		// The body is left unread, the caller closes the connection.
-		return nil, errors.New("CONNECT refused with " + resp.Status)
+		return nil, fmt.Errorf("CONNECT %w with %s", errRefused, resp.Status)
 	}
 	if br.Buffered() == 0 {
 		return conn, nil
@@ -243,9 +345,41 @@ func (u *upstreamDialer) connectOn(ctx context.Context, conn net.Conn, proxy *ur
 	return bufferedConn{Conn: conn, r: io.MultiReader(bytes.NewReader(slices.Clone(early)), conn)}, nil
 }
 
+// connectOnH2 opens the tunnel as a CONNECT stream on the HTTP/2 connection to the proxy.
+func connectOnH2(ctx context.Context, cc *h2tunnel.Conn, proxy *url.URL, addr string) (net.Conn, error) {
+	ctx, done := context.WithTimeout(ctx, proxyConnectTimeout)
+	defer done()
+	var header http.Header
+	if auth := proxyAuthorization(proxy); auth != "" {
+		header = http.Header{"Proxy-Authorization": {auth}}
+	}
+	str, resp, err := cc.Open(ctx, h2tunnel.Request{Authority: addr, Header: header})
+	if err != nil {
+		return nil, fmt.Errorf("CONNECT: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		_ = str.Close()
+		return nil, fmt.Errorf("CONNECT %w with %d %s", errRefused, resp.StatusCode, http.StatusText(resp.StatusCode))
+	}
+	return str, nil
+}
+
+// connectOnH3 opens the tunnel as a CONNECT stream on the HTTP/3 connection to the proxy.
+func connectOnH3(ctx context.Context, cc *h3ProxyConn, proxy *url.URL, addr string) (net.Conn, error) {
+	req := &http.Request{Method: http.MethodConnect, URL: &url.URL{Host: addr}, Host: addr, Header: make(http.Header)}
+	if auth := proxyAuthorization(proxy); auth != "" {
+		req.Header.Set("Proxy-Authorization", auth)
+	}
+	str, err := requestOn(ctx, cc.ClientConn, req, "CONNECT")
+	if err != nil {
+		return nil, err
+	}
+	return newH3StreamConn(str, cc.local, cc.remote), nil
+}
+
 // connectUDP opens a UDP tunnel to addr with a CONNECT-UDP to the proxy, RFC 9298. HTTP/3
-// comes first, and a proxy the dialer cannot reach over it is reached over TCP for
-// proxyRetryHTTP3. A refusal the proxy answers is final.
+// comes first, and a proxy whose dial over HTTP/3 failed is dialed over TCP for proxyRetry.
+// A refusal the proxy answers is final.
 func (u *upstreamDialer) connectUDP(ctx context.Context, proxy *url.URL, addr string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -254,18 +388,23 @@ func (u *upstreamDialer) connectUDP(ctx context.Context, proxy *url.URL, addr st
 	var h3err error
 	if proxy.Scheme == "https" && !u.deferred(u.noH3, proxy) {
 		cc, cerr := u.proxyConn(ctx, proxy)
-		if cerr == nil {
-			pipe, oerr := openTunnelOn(ctx, cc, proxy, host, port)
-			if oerr != nil {
-				return nil, fmt.Errorf("dial udp %s through %s: %w", addr, proxy.Redacted(), oerr)
+		switch {
+		case cerr == nil:
+			if s := cc.Settings(); s.EnableDatagrams && s.EnableExtendedConnect {
+				pipe, oerr := openTunnelOn(ctx, cc.ClientConn, proxy, host, port)
+				if oerr != nil {
+					return nil, fmt.Errorf("dial udp %s through %s: %w", addr, proxy.Redacted(), oerr)
+				}
+				return &connectUDPConn{pipe: pipe, remote: tunnelTarget(addr)}, nil
 			}
-			return &connectUDPConn{pipe: pipe, remote: tunnelTarget(addr)}, nil
-		}
-		if ctx.Err() != nil {
+			// The connection stays for the CONNECT tunnels.
+			h3err = errors.New("over HTTP/3: the proxy does not support CONNECT-UDP")
+		case ctx.Err() != nil:
 			return nil, fmt.Errorf("dial proxy %s: %w", proxy.Redacted(), cerr)
+		default:
+			u.deferVersion(u.noH3, proxy)
+			h3err = fmt.Errorf("over HTTP/3: %w", cerr)
 		}
-		u.deferVersion(u.noH3, proxy)
-		h3err = fmt.Errorf("over HTTP/3: %w", cerr)
 	}
 	pipe, err := u.connectUDPStream(ctx, proxy, host, port)
 	if err != nil {
@@ -287,7 +426,7 @@ func (u *upstreamDialer) deferred(m map[string]time.Time, proxy *url.URL) bool {
 func (u *upstreamDialer) deferVersion(m map[string]time.Time, proxy *url.URL) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	m[proxyAddr(proxy)] = time.Now().Add(proxyRetryHTTP3)
+	m[proxyAddr(proxy)] = time.Now().Add(proxyRetry)
 }
 
 func openTunnelOn(ctx context.Context, cc *http3.ClientConn, proxy *url.URL, host, port string) (tunnelPipe, error) {
@@ -300,7 +439,18 @@ func openTunnelOn(ctx context.Context, cc *http3.ClientConn, proxy *url.URL, hos
 	if auth := proxyAuthorization(proxy); auth != "" {
 		req.Header.Set("Proxy-Authorization", auth)
 	}
+	str, err := requestOn(ctx, cc, req, "CONNECT-UDP")
+	if err != nil {
+		return nil, err
+	}
+	pipe := newDatagramPipe(str, quic.StreamErrorCode(http3.ErrCodeNoError))
+	pipe.run(func() { _ = pipe.close() })
+	return pipe, nil
+}
 
+// requestOn sends req on a new stream of the HTTP/3 connection to a proxy and returns the
+// stream once the proxy answered 200, the errors prefixed with verb.
+func requestOn(ctx context.Context, cc *http3.ClientConn, req *http.Request, verb string) (*http3.RequestStream, error) {
 	ctx, done := context.WithTimeout(ctx, proxyConnectTimeout)
 	defer done()
 	str, err := cc.OpenRequestStream(ctx)
@@ -315,7 +465,7 @@ func openTunnelOn(ctx context.Context, cc *http3.ClientConn, proxy *url.URL, hos
 	if werr := str.SendRequestHeader(req); werr != nil {
 		stop()
 		cancel()
-		return nil, fmt.Errorf("write CONNECT-UDP: %w", werr)
+		return nil, fmt.Errorf("write %s: %w", verb, werr)
 	}
 	resp, err := str.ReadResponse()
 	if !stop() {
@@ -323,15 +473,13 @@ func openTunnelOn(ctx context.Context, cc *http3.ClientConn, proxy *url.URL, hos
 	}
 	if err != nil {
 		cancel()
-		return nil, fmt.Errorf("read CONNECT-UDP response: %w", err)
+		return nil, fmt.Errorf("read %s response: %w", verb, err)
 	}
 	if resp.StatusCode != http.StatusOK {
 		cancel()
-		return nil, errors.New("CONNECT-UDP refused with " + resp.Status)
+		return nil, fmt.Errorf("%s %w with %d %s", verb, errRefused, resp.StatusCode, http.StatusText(resp.StatusCode))
 	}
-	pipe := newDatagramPipe(str, quic.StreamErrorCode(http3.ErrCodeNoError))
-	pipe.run(func() { _ = pipe.close() })
-	return pipe, nil
+	return str, nil
 }
 
 // connectUDPStream opens a tunnel over TCP, an extended CONNECT on the HTTP/2 connection to
@@ -353,14 +501,11 @@ func (u *upstreamDialer) connectUDPStream(ctx context.Context, proxy *url.URL, h
 		switch {
 		case errors.Is(err, h2tunnel.ErrExtendedConnect):
 			// An HTTP/2 proxy without extended CONNECT may still upgrade an HTTP/1.1
-			// connection, so the next one offers nothing else.
+			// connection, so the next one offers nothing else. The connection stays for the
+			// CONNECT tunnels.
 			u.deferVersion(u.noH2, proxy)
-			u.dropH2Conn(proxy)
 			continue
-		case err != nil && pooled && !retried && ctx.Err() == nil && !errors.Is(err, errTunnelRefused):
-			// The pooled connection was gone, going away or full as the tunnel was opened
-			// on it, and the proxy saw nothing of the tunnel. The next round finds the
-			// connection unusable and opens another.
+		case retryPooled(ctx, err, pooled, retried):
 			retried = true
 			continue
 		}
@@ -369,62 +514,13 @@ func (u *upstreamDialer) connectUDPStream(ctx context.Context, proxy *url.URL, h
 }
 
 func (u *upstreamDialer) dialTunnel(ctx context.Context, proxy *url.URL, host, port string, h2 bool) (tunnelPipe, error) {
-	conn, err := u.t.dialer()(ctx, "tcp", proxyAddr(proxy))
+	nc, err := u.t.dialer()(ctx, "tcp", proxyAddr(proxy))
 	if err != nil {
 		return nil, fmt.Errorf("dial proxy %s: %w", proxy.Redacted(), err)
 	}
-	_ = conn.SetDeadline(time.Now().Add(proxyConnectTimeout))
-	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
-	if proxy.Scheme == "https" {
-		cfg := u.t.upstreamTLSConfig()
-		cfg.ServerName = proxy.Hostname()
-		cfg.NextProtos = []string{"http/1.1"}
-		if h2 {
-			cfg.NextProtos = []string{"h2", "http/1.1"}
-		}
-		tc := tls.Client(conn, cfg)
-		if herr := tc.HandshakeContext(ctx); herr != nil {
-			stop()
-			_ = conn.Close()
-			return nil, fmt.Errorf("tls handshake: %w", herr)
-		}
-		if tc.ConnectionState().NegotiatedProtocol == "h2" {
-			// The connection outlives this tunnel, so the dial's cancellation and deadline
-			// come off it here, and a tunnel refused on it leaves it shared.
-			if !stop() {
-				_ = conn.Close()
-				return nil, ctx.Err()
-			}
-			_ = conn.SetDeadline(time.Time{})
-			cc, serr := u.shareH2Conn(proxy, tc)
-			if serr != nil {
-				return nil, serr
-			}
-			return openTunnelOnH2(ctx, cc, proxy, host, port)
-		}
-		conn = tc
-	}
-	pipe, err := upgradeOn(conn, proxy, host, port)
-	if !stop() {
-		_ = conn.Close()
-		return nil, ctx.Err()
-	}
-	if err != nil {
-		_ = conn.Close()
-		return nil, err
-	}
-	return pipe, nil
-}
-
-func (u *upstreamDialer) dropH2Conn(proxy *url.URL) {
-	key := proxyAddr(proxy)
-	u.mu.Lock()
-	cc := u.h2conns[key]
-	delete(u.h2conns, key)
-	u.mu.Unlock()
-	if cc != nil {
-		_ = cc.Close()
-	}
+	return overTCP(ctx, u, nc, proxy, h2,
+		func(conn net.Conn) (tunnelPipe, error) { return upgradeOn(conn, proxy, host, port) },
+		func(cc *h2tunnel.Conn) (tunnelPipe, error) { return openTunnelOnH2(ctx, cc, proxy, host, port) })
 }
 
 func (u *upstreamDialer) h2Conn(proxy *url.URL) *h2tunnel.Conn {
@@ -482,7 +578,7 @@ func openTunnelOnH2(ctx context.Context, cc *h2tunnel.Conn, proxy *url.URL, host
 	}
 	if resp.StatusCode != http.StatusOK {
 		_ = str.Close()
-		return nil, fmt.Errorf("%w with %d %s", errTunnelRefused, resp.StatusCode, http.StatusText(resp.StatusCode))
+		return nil, fmt.Errorf("CONNECT-UDP %w with %d %s", errRefused, resp.StatusCode, http.StatusText(resp.StatusCode))
 	}
 	return newCapsulePipe(str, bufio.NewReader(str)), nil
 }
@@ -509,27 +605,33 @@ func upgradeOn(conn net.Conn, proxy *url.URL, host, port string) (tunnelPipe, er
 	}
 	if resp.StatusCode != http.StatusSwitchingProtocols {
 		// The body is left unread, the caller closes the connection.
-		return nil, errors.New("CONNECT-UDP refused with " + resp.Status)
+		return nil, fmt.Errorf("CONNECT-UDP %w with %s", errRefused, resp.Status)
 	}
 	if !strings.EqualFold(resp.Header.Get("Upgrade"), connectUDPUpgrade) {
 		return nil, errors.New("CONNECT-UDP upgraded to " + resp.Header.Get("Upgrade"))
 	}
-	_ = conn.SetDeadline(time.Time{})
 	// Capsules the proxy sent right behind the 101 may already be in the buffer.
 	early, _ := br.Peek(br.Buffered())
 	return newCapsulePipe(conn, bufio.NewReader(io.MultiReader(bytes.NewReader(slices.Clone(early)), conn))), nil
 }
 
+// h3ProxyConn is the HTTP/3 connection to a proxy. The tunnels on it report the addresses of
+// its QUIC connection.
+type h3ProxyConn struct {
+	*http3.ClientConn
+	local, remote net.Addr
+}
+
 // proxyConn returns the HTTP/3 connection to a proxy, opened on the first tunnel and shared
 // by every later one until it ends.
-func (u *upstreamDialer) proxyConn(ctx context.Context, proxy *url.URL) (*http3.ClientConn, error) {
+func (u *upstreamDialer) proxyConn(ctx context.Context, proxy *url.URL) (*h3ProxyConn, error) {
 	key := proxyAddr(proxy)
 	u.mu.Lock()
 	if u.closed {
 		u.mu.Unlock()
 		return nil, net.ErrClosed
 	}
-	if cc := u.conns[key]; cc != nil && cc.Context().Err() == nil {
+	if cc := u.h3Locked(key); cc != nil {
 		u.mu.Unlock()
 		return cc, nil
 	}
@@ -545,7 +647,7 @@ func (u *upstreamDialer) proxyConn(ctx context.Context, proxy *url.URL) (*http3.
 		_ = cc.CloseWithError(0, "")
 		return nil, net.ErrClosed
 	}
-	if other := u.conns[key]; other != nil && other.Context().Err() == nil {
+	if other := u.h3Locked(key); other != nil {
 		_ = cc.CloseWithError(0, "")
 		return other, nil
 	}
@@ -553,7 +655,21 @@ func (u *upstreamDialer) proxyConn(ctx context.Context, proxy *url.URL) (*http3.
 	return cc, nil
 }
 
-func (u *upstreamDialer) openProxyConn(ctx context.Context, proxy *url.URL, addr string) (*http3.ClientConn, error) {
+func (u *upstreamDialer) h3Conn(proxy *url.URL) *h3ProxyConn {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.h3Locked(proxyAddr(proxy))
+}
+
+// h3Locked is h3Conn with u.mu held.
+func (u *upstreamDialer) h3Locked(key string) *h3ProxyConn {
+	if cc := u.conns[key]; cc != nil && cc.Context().Err() == nil {
+		return cc
+	}
+	return nil
+}
+
+func (u *upstreamDialer) openProxyConn(ctx context.Context, proxy *url.URL, addr string) (*h3ProxyConn, error) {
 	// The proxy itself is dialed directly, it cannot be reached through itself.
 	sock, err := u.t.dialer()(ctx, "udp", addr)
 	if err != nil {
@@ -584,12 +700,94 @@ func (u *upstreamDialer) openProxyConn(ctx context.Context, proxy *url.URL, addr
 	case <-cc.Context().Done():
 		return nil, context.Cause(cc.Context())
 	}
-	if s := cc.Settings(); !s.EnableDatagrams || !s.EnableExtendedConnect {
-		_ = cc.CloseWithError(0, "")
-		return nil, errors.New("the proxy does not support CONNECT-UDP")
-	}
-	return cc, nil
+	return &h3ProxyConn{ClientConn: cc, local: qc.LocalAddr(), remote: qc.RemoteAddr()}, nil
 }
+
+// h3StreamConn is a CONNECT tunnel on an HTTP/3 stream as a net.Conn. The stream frames its
+// bytes in DATA frames and a deadline that cuts a frame short loses the parser's place, so a
+// read waits on a deadlineReader and a write the deadline cut resets the stream.
+type h3StreamConn struct {
+	str    *http3.RequestStream
+	r      *deadlineReader
+	local  net.Addr
+	remote net.Addr
+	wmu    sync.Mutex
+	closed atomic.Bool
+}
+
+func newH3StreamConn(str *http3.RequestStream, local, remote net.Addr) *h3StreamConn {
+	return &h3StreamConn{str: str, r: newDeadlineReader(tunnelReader{str}), local: local, remote: remote}
+}
+
+// tunnelReader reads the stream of a tunnel. The error of a stream or a connection is sticky,
+// and some report themselves as a timeout, which a reader would retry.
+type tunnelReader struct{ str *http3.RequestStream }
+
+func (r tunnelReader) Read(b []byte) (int, error) {
+	n, err := r.str.Read(b)
+	if err != nil && !errors.Is(err, io.EOF) && isTimeout(err) {
+		err = fmt.Errorf("%w: %v", errTunnelEnded, err)
+	}
+	return n, err
+}
+
+func (c *h3StreamConn) Read(b []byte) (int, error) {
+	if c.closed.Load() {
+		return 0, net.ErrClosed
+	}
+	return c.r.Read(b)
+}
+
+func (c *h3StreamConn) Write(b []byte) (int, error) {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	if c.closed.Load() {
+		return 0, net.ErrClosed
+	}
+	n, err := c.str.Write(b)
+	if err != nil && isTimeout(err) {
+		// The deadline may have cut a frame short, and the proxy cannot parse the stream past
+		// it.
+		c.str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+	}
+	return n, err
+}
+
+func (c *h3StreamConn) CloseWrite() error {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	return c.str.Close()
+}
+
+func (c *h3StreamConn) Close() error {
+	if c.closed.Swap(true) {
+		return nil
+	}
+	if c.wmu.TryLock() {
+		_ = c.str.Close()
+		c.wmu.Unlock()
+	} else {
+		// A write blocked on flow control only returns on a reset.
+		c.str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+	}
+	c.str.CancelRead(quic.StreamErrorCode(http3.ErrCodeNoError))
+	return nil
+}
+
+func (c *h3StreamConn) LocalAddr() net.Addr  { return c.local }
+func (c *h3StreamConn) RemoteAddr() net.Addr { return c.remote }
+
+func (c *h3StreamConn) SetDeadline(t time.Time) error {
+	c.r.setDeadline(t)
+	return c.str.SetWriteDeadline(t)
+}
+
+func (c *h3StreamConn) SetReadDeadline(t time.Time) error {
+	c.r.setDeadline(t)
+	return nil
+}
+
+func (c *h3StreamConn) SetWriteDeadline(t time.Time) error { return c.str.SetWriteDeadline(t) }
 
 // connectUDPConn is a CONNECT-UDP tunnel as a connected socket, one datagram per Read and per
 // Write. A datagram too large for the tunnel is dropped.

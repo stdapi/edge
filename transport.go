@@ -37,8 +37,10 @@ type Transport struct {
 	// destination alone, so [http.ProxyFromEnvironment] applies to it as well.
 	//
 	// The proxy type is determined by the URL scheme. "http" and "https" are supported. A
-	// QUIC or UDP upstream goes through a CONNECT-UDP tunnel, RFC 9298, over HTTP/3 when the
-	// proxy answers on UDP and over TCP otherwise. An "http" proxy is reached over HTTP/1.1.
+	// TCP upstream goes through a CONNECT, over the HTTP version an "https" proxy
+	// negotiates, and a QUIC or UDP upstream through a CONNECT-UDP tunnel, RFC 9298, over
+	// HTTP/3 when the proxy answers on UDP and over TCP otherwise. A proxy that answers on
+	// UDP alone is reached over HTTP/3 for both. An "http" proxy is reached over HTTP/1.1.
 	//
 	// If Proxy is nil or returns a nil *URL, no proxy is used.
 	Proxy func(*http.Request) (*url.URL, error)
