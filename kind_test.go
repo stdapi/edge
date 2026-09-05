@@ -979,6 +979,57 @@ func TestKindUDP_SendToRepliesOnTheSameFlow(t *testing.T) {
 	assert.Equal(t, int64(1), fromOrigin.Load())
 }
 
+// The sweep closes the alternates of an idle flow with its upstream socket. Left open, an
+// alternate keeps its reader spinning on an expired deadline.
+func TestKindUDP_SweepClosesTheAlternates(t *testing.T) {
+	origin := udpEchoOrigin(t)
+	other := udpEchoOrigin(t)
+
+	p, err := New()
+	require.NoError(t, err)
+	p.MustAdd("[0.0.0.0/0]:"+fmt.Sprint(origin.Port()), func(d *DatagramCtx) error {
+		if !d.Inbound() {
+			return d.SendTo(other.String(), d.Bytes())
+		}
+		return d.Forward()
+	})
+	_, proxyAddr := startTProxyQUIC(t, p, origin)
+
+	client, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
+	_, err = client.WriteTo([]byte("reroute"), net.UDPAddrFromAddrPort(proxyAddr))
+	require.NoError(t, err)
+	buf := make([]byte, 256)
+	_, _, err = client.ReadFrom(buf)
+	require.NoError(t, err)
+
+	p.srv.mu.Lock()
+	var d *quicDemux
+	for d = range p.srv.quics {
+	}
+	p.srv.mu.Unlock()
+	require.NotNil(t, d)
+
+	var alt net.Conn
+	d.mu.Lock()
+	for _, flow := range d.flows {
+		for _, u := range flow.udp {
+			for _, a := range u.alts {
+				alt = a.conn
+			}
+			u.touch(time.Now().Add(-2 * udpFlowIdle))
+		}
+	}
+	d.mu.Unlock()
+	require.NotNil(t, alt, "the flow reached the other origin through an alternate")
+
+	d.sweepIdle()
+	_, err = alt.Write([]byte("x"))
+	assert.ErrorIs(t, err, net.ErrClosed, "the sweep closes the alternate")
+}
+
 // A flow reaches a bounded number of origins through SendTo, and the next one is refused.
 func TestKindUDP_SendToIsBounded(t *testing.T) {
 	origin := udpEchoOrigin(t)

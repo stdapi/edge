@@ -695,9 +695,9 @@ func (d *quicDemux) serveQUICConn(qc *quic.Conn) {
 		d.mu.Lock()
 		delete(d.h3Conns, qc)
 		d.mu.Unlock()
-		if errors.Is(err, http.ErrServerClosed) {
-			_ = closeNoError(qc)
-		} else if err != nil {
+		// Refused or failed before it was established, the connection is still open.
+		_ = closeNoError(qc)
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			d.p.cfg.logger.Debug("edge: HTTP/3 connection closed", slog.String("error", err.Error()))
 		}
 		return
@@ -1414,26 +1414,36 @@ func (u *udpFlow) lastUse() time.Time { return time.Unix(0, u.lastSeenNano.Load(
 // touch records that a datagram travelled. Both directions call it, from their own goroutine.
 func (u *udpFlow) touch(now time.Time) { u.lastSeenNano.Store(now.UnixNano()) }
 
+// endLocked marks the flow closed and returns its sockets, the upstream one and the
+// alternates, for the caller to close outside the lock. d.mu must be held.
+func (u *udpFlow) endLocked() []net.Conn {
+	u.closed = true
+	if u.cancel != nil {
+		u.cancel()
+	}
+	conns := make([]net.Conn, 0, 1+len(u.alts))
+	conns = append(conns, u.upstream)
+	for _, alt := range u.alts {
+		conns = append(conns, alt.conn)
+	}
+	u.alts = nil
+	return conns
+}
+
 func (d *quicDemux) closeUDPFlow(from flowKey, u *udpFlow) {
 	d.mu.Lock()
 	if u.closed {
 		d.mu.Unlock()
 		return
 	}
-	u.closed = true
 	if flow := d.flows[from]; flow != nil && flow.udp[u.key] == u {
 		delete(flow.udp, u.key)
 		d.udps--
 	}
-	if u.cancel != nil {
-		u.cancel()
-	}
-	alts := u.alts
-	u.alts = nil
+	conns := u.endLocked()
 	d.mu.Unlock()
-	_ = u.upstream.Close()
-	for _, alt := range alts {
-		_ = alt.conn.Close()
+	for _, c := range conns {
+		_ = c.Close()
 	}
 }
 
@@ -1734,7 +1744,7 @@ func (d *quicDemux) rejectConn(from flowKey, conn *quicConn, reason string) {
 func (d *quicDemux) sweepIdle() {
 	now := time.Now()
 	d.mu.Lock()
-	var stale []*udpFlow
+	var stale []net.Conn
 	var tunnels []*connectUDPTunnel
 	for from, flow := range d.flows {
 		for _, conn := range flow.conns {
@@ -1757,13 +1767,9 @@ func (d *quicDemux) sweepIdle() {
 		}
 		for key, u := range flow.udp {
 			if now.Sub(u.lastUse()) > udpFlowIdle {
-				u.closed = true
 				delete(flow.udp, key)
 				d.udps--
-				if u.cancel != nil {
-					u.cancel()
-				}
-				stale = append(stale, u)
+				stale = append(stale, u.endLocked()...)
 			}
 		}
 		if len(flow.conns) == 0 && len(flow.udp) == 0 {
@@ -1785,8 +1791,8 @@ func (d *quicDemux) sweepIdle() {
 	idle := d.sweepInterceptsLocked(now)
 	d.sweepRepliesLocked()
 	d.mu.Unlock()
-	for _, u := range stale {
-		_ = u.upstream.Close()
+	for _, c := range stale {
+		_ = c.Close()
 	}
 	for _, it := range idle {
 		d.closeIntercept(it)
@@ -1903,15 +1909,7 @@ func (d *quicDemux) close() {
 				tunnels = append(tunnels, key.tunnel)
 			}
 			for _, u := range flow.udp {
-				u.closed = true
-				if u.cancel != nil {
-					u.cancel()
-				}
-				sockets = append(sockets, u.upstream)
-				for _, alt := range u.alts {
-					sockets = append(sockets, alt.conn)
-				}
-				u.alts = nil
+				sockets = append(sockets, u.endLocked()...)
 			}
 			for _, conn := range flow.conns {
 				conn.end()

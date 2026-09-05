@@ -267,7 +267,7 @@ func (p *Proxy) ListenAndServeQUIC(addr string, cert tls.Certificate) error {
 // [Proxy.ListenAndServeQUIC]. It always returns a non-nil error. After [Proxy.Shutdown] or
 // [Proxy.Close] has returned, the returned error is [ErrProxyClosed].
 func (p *Proxy) ServeQUIC(pc net.PacketConn, cert tls.Certificate) error {
-	front := &quicFront{conns: make(map[*quic.Conn]struct{})}
+	front := &quicFront{logger: p.cfg.logger, conns: make(map[*quic.Conn]struct{})}
 	if !p.srv.tryTrackFront(front) {
 		return ErrProxyClosed
 	}
@@ -293,6 +293,15 @@ func (p *Proxy) ServeQUIC(pc net.PacketConn, cert tls.Certificate) error {
 		_ = tr.Close()
 		return err
 	}
+	// Accept keeps returning the connections that finished their handshake before the
+	// listener was closed, then the close error.
+	for {
+		c, err := ln.Accept(context.Background())
+		if err != nil {
+			break
+		}
+		_ = closeNoError(c)
+	}
 
 	// Closing the transport ends every connection on it without a CONNECTION_CLOSE, so it
 	// is closed once the shutdown is over and the connections it left open are closed first.
@@ -306,13 +315,14 @@ func (p *Proxy) ServeQUIC(pc net.PacketConn, cert tls.Certificate) error {
 // quicFront records the connections accepted on an HTTP/3 front, so a cut closes them with
 // a CONNECTION_CLOSE before the transport under them.
 type quicFront struct {
-	conns map[*quic.Conn]struct{}
-	mu    sync.Mutex
+	logger *slog.Logger
+	conns  map[*quic.Conn]struct{}
+	mu     sync.Mutex
 }
 
-// accept serves the connections accepted on ln one by one until ctx ends, and returns the
-// error Accept ended on. http3.Server.Close and the return of ServeListener both wait for
-// every handler, and a handler that ignores its cut would keep the socket.
+// accept serves each connection accepted on ln on a goroutine of its own until ctx ends,
+// and returns the error Accept ended on. ServeListener would return only through
+// http3.Server.Close or Shutdown, and a cut calls neither.
 func (f *quicFront) accept(ctx context.Context, ln *quic.Listener, h3 *http3.Server) error {
 	for {
 		c, err := ln.Accept(ctx)
@@ -325,8 +335,11 @@ func (f *quicFront) accept(ctx context.Context, ln *quic.Listener, h3 *http3.Ser
 }
 
 func (f *quicFront) serve(h3 *http3.Server, c *quic.Conn) {
-	if err := h3.ServeQUICConn(c); errors.Is(err, http.ErrServerClosed) {
-		_ = closeNoError(c)
+	err := h3.ServeQUICConn(c)
+	// Refused or failed before it was established, the connection is still open.
+	_ = closeNoError(c)
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
+		f.logger.Debug("edge: HTTP/3 connection closed", slog.String("error", err.Error()))
 	}
 }
 
@@ -360,6 +373,12 @@ func (f *quicFront) Close() error {
 // so it is waited on until ctx is done and cut then, along with anything else still open.
 // Without a deadline on ctx, Shutdown waits indefinitely.
 func (p *Proxy) Shutdown(ctx context.Context) error {
+	// A cut that has ended left nothing to drain.
+	select {
+	case <-p.srv.done:
+		return nil
+	default:
+	}
 	p.srv.beginClose()
 	defer p.srv.endClose()
 

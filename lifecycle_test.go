@@ -755,10 +755,10 @@ func TestLifecycle_ShutdownDeadlineCutsTheHTTP3Front(t *testing.T) {
 	}
 }
 
-// stuckHTTP3Front serves p over HTTP/3 with a handler parked on h3Authority, sends it a
-// request, and returns once the handler has it. The handler is released by the function
-// returned, and on cleanup.
-func stuckHTTP3Front(t *testing.T, serve func(p *Proxy, ca *CA) (netip.AddrPort, <-chan error)) (*Proxy, <-chan error, *quic.Conn, func()) {
+// stuckHTTP3Front serves p over HTTP/3, on the explicit front or the transparent socket,
+// with a handler parked on h3Authority, sends it a request, and returns once the handler has
+// it. The handler is released on cleanup.
+func stuckHTTP3Front(t *testing.T, transparent bool) (*Proxy, <-chan error, *quic.Conn) {
 	t.Helper()
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -768,23 +768,40 @@ func stuckHTTP3Front(t *testing.T, serve func(p *Proxy, ca *CA) (netip.AddrPort,
 	started := make(chan struct{}, 1)
 	release := make(chan struct{})
 	p.MustAdd(h3Authority+"/", blockingHandler(started, release))
-	addr, served := serve(p, ca)
-	releaseHandler := sync.OnceFunc(func() { close(release) })
-	t.Cleanup(releaseHandler)
 
-	pc, err := loopbackUDP()
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = pc.Close() })
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel()
-	conn, err := quic.Dial(ctx, pc, net.UDPAddrFromAddrPort(addr), &tls.Config{
-		RootCAs:    poolOf(ca),
-		ServerName: h3Authority,
-		NextProtos: []string{http3.NextProtoH3},
-		MinVersion: tls.VersionTLS13,
-	}, &quic.Config{MaxIdleTimeout: 30 * time.Second})
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = conn.CloseWithError(0, "") })
+	var addr netip.AddrPort
+	var served <-chan error
+	var conn *quic.Conn
+	if transparent {
+		pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+		require.NoError(t, err)
+		ch := make(chan error, 1)
+		go func() { ch <- p.ServeTransparentUDP(pc) }()
+		t.Cleanup(func() { _ = p.Close() })
+		addr, served = netip.MustParseAddrPort(pc.LocalAddr().String()), ch
+	} else {
+		addr, served = startQUICFront(t, p, ca)
+	}
+	// Registered after Close, so the handler is released before Close waits on it.
+	t.Cleanup(sync.OnceFunc(func() { close(release) }))
+
+	if transparent {
+		udp, err := loopbackUDP()
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = udp.Close() })
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		conn, err = quic.Dial(ctx, udp, net.UDPAddrFromAddrPort(addr), &tls.Config{
+			RootCAs:    poolOf(ca),
+			ServerName: h3Authority,
+			NextProtos: []string{http3.NextProtoH3},
+			MinVersion: tls.VersionTLS13,
+		}, &quic.Config{MaxIdleTimeout: 30 * time.Second})
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = conn.CloseWithError(0, "") })
+	} else {
+		conn = dialQUICFront(t, addr, ca)
+	}
 	tr := &http3.Transport{}
 	t.Cleanup(func() { _ = tr.Close() })
 	cc := tr.NewClientConn(conn)
@@ -804,43 +821,20 @@ func stuckHTTP3Front(t *testing.T, serve func(p *Proxy, ca *CA) (netip.AddrPort,
 	case <-time.After(5 * time.Second):
 		t.Fatal("the request never reached the handler")
 	}
-	return p, served, conn, releaseHandler
-}
-
-func serveQUICFront(t *testing.T) func(p *Proxy, ca *CA) (netip.AddrPort, <-chan error) {
-	return func(p *Proxy, ca *CA) (netip.AddrPort, <-chan error) {
-		cert, err := ca.Leaf(h3Authority)
-		require.NoError(t, err)
-		pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-		require.NoError(t, err)
-		served := make(chan error, 1)
-		go func() { served <- p.ServeQUIC(pc, *cert) }()
-		t.Cleanup(func() { _ = p.Close(); _ = pc.Close() })
-		return netip.MustParseAddrPort(pc.LocalAddr().String()), served
-	}
-}
-
-func serveTransparentUDP(t *testing.T) func(p *Proxy, ca *CA) (netip.AddrPort, <-chan error) {
-	return func(p *Proxy, _ *CA) (netip.AddrPort, <-chan error) {
-		pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-		require.NoError(t, err)
-		served := make(chan error, 1)
-		go func() { served <- p.ServeTransparentUDP(pc) }()
-		t.Cleanup(func() { _ = p.Close() })
-		return netip.MustParseAddrPort(pc.LocalAddr().String()), served
-	}
+	return p, served, conn
 }
 
 // assertCutDoesNotWait runs cut, a Close or a Shutdown already past its deadline, against a
 // parked HTTP/3 handler and checks that it returns at once, that the client is sent a
-// CONNECTION_CLOSE, and that the socket is released before the handler ends.
-func assertCutDoesNotWait(t *testing.T, served <-chan error, conn *quic.Conn, cut func() error, want error) {
+// CONNECTION_CLOSE, and that the socket is released before the handler ends. It returns
+// what cut did.
+func assertCutDoesNotWait(t *testing.T, served <-chan error, conn *quic.Conn, cut func() error) error {
 	t.Helper()
 	done := make(chan error, 1)
 	go func() { done <- cut() }()
+	var err error
 	select {
-	case err := <-done:
-		assert.ErrorIs(t, err, want)
+	case err = <-done:
 	case <-time.After(3 * time.Second):
 		t.Fatal("the cut must not wait for the handler")
 	}
@@ -859,38 +853,50 @@ func assertCutDoesNotWait(t *testing.T, served <-chan error, conn *quic.Conn, cu
 	case <-time.After(5 * time.Second):
 		t.Fatal("the socket was not released before the handler ended")
 	}
+	return err
 }
 
 // Close returns once everything is closed. A handler that ignores its cut ends behind it,
-// on the HTTP/3 front as on the TCP one.
+// on the HTTP/3 front as on the TCP one, and a Shutdown coming after has nothing to drain.
 func TestLifecycle_CloseDoesNotWaitForAStuckHTTP3Handler(t *testing.T) {
-	p, served, conn, _ := stuckHTTP3Front(t, serveQUICFront(t))
-	assertCutDoesNotWait(t, served, conn, p.Close, nil)
+	p, served, conn := stuckHTTP3Front(t, false)
+	require.NoError(t, assertCutDoesNotWait(t, served, conn, p.Close))
+
+	done := make(chan error, 1)
+	go func() { done <- p.Shutdown(context.Background()) }()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("Shutdown after Close must not wait for the handler")
+	}
 }
 
 func TestLifecycle_CloseDoesNotWaitForAStuckTransparentHTTP3Handler(t *testing.T) {
-	p, served, conn, _ := stuckHTTP3Front(t, serveTransparentUDP(t))
-	assertCutDoesNotWait(t, served, conn, p.Close, nil)
+	p, served, conn := stuckHTTP3Front(t, true)
+	require.NoError(t, assertCutDoesNotWait(t, served, conn, p.Close))
 }
 
 // A Shutdown whose context is already done is a cut, and the HTTP/3 front releases its
 // socket the way it does at a live deadline.
 func TestLifecycle_ShutdownExpiredContextCutsTheHTTP3Front(t *testing.T) {
-	p, served, conn, _ := stuckHTTP3Front(t, serveQUICFront(t))
+	p, served, conn := stuckHTTP3Front(t, false)
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	assertCutDoesNotWait(t, served, conn, func() error { return p.Shutdown(ctx) }, context.Canceled)
+	err := assertCutDoesNotWait(t, served, conn, func() error { return p.Shutdown(ctx) })
+	assert.ErrorIs(t, err, context.Canceled)
 }
 
 func TestLifecycle_ShutdownExpiredContextCutsTheTransparentHTTP3(t *testing.T) {
-	p, served, conn, _ := stuckHTTP3Front(t, serveTransparentUDP(t))
+	p, served, conn := stuckHTTP3Front(t, true)
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
-	assertCutDoesNotWait(t, served, conn, func() error { return p.Shutdown(ctx) }, context.Canceled)
+	err := assertCutDoesNotWait(t, served, conn, func() error { return p.Shutdown(ctx) })
+	assert.ErrorIs(t, err, context.Canceled)
 }
 
 // A datagram handler parked on the reply of its origin runs off the read loop, and Close
-// returns without it, the flow's sockets closed.
+// returns without it.
 func TestLifecycle_CloseDoesNotWaitForAStuckDatagramHandler(t *testing.T) {
 	origin := udpEchoOrigin(t)
 	ca, err := GenerateCA()
