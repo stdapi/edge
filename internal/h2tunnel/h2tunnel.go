@@ -76,7 +76,8 @@ var (
 	// ErrExtendedConnect is returned by Open when the peer did not enable the extended
 	// CONNECT protocol, RFC 8441 section 3.
 	ErrExtendedConnect = errors.New("h2tunnel: the peer does not support extended CONNECT")
-	errTooManyStreams  = errors.New("h2tunnel: the peer's concurrent stream limit is reached")
+	// ErrStreamLimit is returned by Open when the peer's concurrent stream limit is reached.
+	ErrStreamLimit     = errors.New("h2tunnel: the peer's concurrent stream limit is reached")
 	errInvalidHeader   = errors.New("h2tunnel: invalid header field")
 	errNoAuthority     = errors.New("h2tunnel: a CONNECT needs an authority")
 	errNoTarget        = errors.New("h2tunnel: an extended CONNECT needs a scheme and a path")
@@ -499,7 +500,7 @@ func (c *Conn) open(s *Stream, req *openReq) {
 	case req.req.Protocol != "" && !c.extendedConnect:
 		refused = ErrExtendedConnect
 	case int64(len(c.streams)) >= c.maxStreams:
-		refused = errTooManyStreams
+		refused = ErrStreamLimit
 	case int64(req.req.headerSize()) > min(maxHeaderBytes, c.maxHeaderList):
 		// The bound comes before the encoder, whose table keeps every field it indexes
 		// whether the block goes out or not.

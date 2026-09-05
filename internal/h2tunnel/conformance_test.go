@@ -526,7 +526,7 @@ var conformance = []conformanceCase{
 			s, _ := p.connect()
 			require.Eventually(t, func() bool { return !p.c.CanOpen() }, wantTimeout, time.Millisecond)
 			_, _, err := p.open(Request{Authority: "origin.test:443"}).wait(t)
-			require.ErrorIs(t, err, errTooManyStreams)
+			require.ErrorIs(t, err, ErrStreamLimit)
 			wantNothing[*http2.MetaHeadersFrame](p, "HEADERS past the stream limit")
 			require.NoError(t, s.Close())
 			p.connect()

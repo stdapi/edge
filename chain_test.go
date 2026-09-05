@@ -1515,7 +1515,7 @@ func TestChain_ConcurrentCONNECTsShareOneHTTP3Dial(t *testing.T) {
 }
 
 // A caller waiting for the dial of a proxy over HTTP/3 dials itself when that dial ended with
-// its caller's context.
+// the context of the caller that started it.
 func TestChain_WaiterDialsWhenTheHTTP3DialWasCancelled(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -1589,14 +1589,22 @@ func TestChain_ConcurrentCONNECTsShareOneHTTP2Dial(t *testing.T) {
 	assert.EqualValues(t, 1, proxies.dials.Load(), "one dial for all")
 }
 
-// fakeProxyTLS is fakeProxy over TLS, offering protos in ALPN.
-func fakeProxyTLS(t *testing.T, ca *CA, protos []string, reply func(w io.Writer)) string {
+// fakeProxyTLS is fakeProxy over TLS, offering protos in ALPN and calling hello, when set, on
+// every ClientHello.
+func fakeProxyTLS(t *testing.T, ca *CA, protos []string, hello func(), reply func(w io.Writer)) string {
 	t.Helper()
 	cert, err := ca.Leaf("127.0.0.1")
 	require.NoError(t, err)
 	raw, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	ln := tls.NewListener(raw, &tls.Config{Certificates: []tls.Certificate{*cert}, NextProtos: protos, MinVersion: tls.VersionTLS12})
+	cfg := &tls.Config{Certificates: []tls.Certificate{*cert}, NextProtos: protos, MinVersion: tls.VersionTLS12}
+	if hello != nil {
+		cfg.GetConfigForClient = func(*tls.ClientHelloInfo) (*tls.Config, error) {
+			hello()
+			return nil, nil
+		}
+	}
+	ln := tls.NewListener(raw, cfg)
 	t.Cleanup(func() { _ = ln.Close() })
 	go func() {
 		for {
@@ -1621,19 +1629,37 @@ func fakeProxyTLS(t *testing.T, ca *CA, protos []string, reply func(w io.Writer)
 func TestChain_HTTP11ProxyIsDialedOncePerCONNECTOnceKnown(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
-	addr := fakeProxyTLS(t, ca, []string{"http/1.1"}, func(w io.Writer) {
+	var firstHello sync.Once
+	var firstDone atomic.Int64
+	addr := fakeProxyTLS(t, ca, []string{"http/1.1"}, func() {
+		firstHello.Do(func() {
+			time.Sleep(200 * time.Millisecond)
+			firstDone.Store(time.Now().UnixNano())
+		})
+	}, func(w io.Writer) {
 		_, _ = io.WriteString(w, "HTTP/1.1 200 Connection Established\r\n\r\n")
 		time.Sleep(time.Second)
 	})
-	front, dialer := chainedFront(t, ca, "https://"+addr)
-	up := front.srv.fwd.up
+	tr := DefaultTransport()
+	tr.RootCAs = poolOf(ca)
+	tr.Proxy = fixedProxy("https://" + addr)
+	var mu sync.Mutex
+	var starts []int64
+	tr.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		mu.Lock()
+		starts = append(starts, time.Now().UnixNano())
+		mu.Unlock()
+		return defaultDialer.DialContext(ctx, network, address)
+	}
+	u := newUpstreamDialer(tr)
+	t.Cleanup(u.close)
 	proxy := &url.URL{Scheme: "https", Host: addr}
 
 	var wg sync.WaitGroup
 	errs := make([]error, 8)
 	for i := range errs {
 		wg.Go(func() {
-			conn, derr := up.dial(t.Context(), "tcp", "192.0.2.1:443", "https")
+			conn, derr := u.connect(t.Context(), proxy, "192.0.2.1:443")
 			if derr == nil {
 				_ = conn.Close()
 			}
@@ -1644,6 +1670,73 @@ func TestChain_HTTP11ProxyIsDialedOncePerCONNECTOnceKnown(t *testing.T) {
 	for i, derr := range errs {
 		require.NoError(t, derr, "dial %d", i)
 	}
-	assert.EqualValues(t, 8, dialer.tcp.Load(), "one connection per CONNECT")
-	assert.True(t, up.remembers(noH2, proxy))
+	require.Len(t, starts, 8, "one connection per CONNECT")
+	var before int
+	for _, at := range starts {
+		if at < firstDone.Load() {
+			before++
+		}
+	}
+	assert.Equal(t, 1, before, "one dial ran alone until TLS negotiated http/1.1")
+	assert.True(t, u.remembers(noH2, proxy))
+}
+
+// Concurrent CONNECTs to a proxy whose TLS handshake fails each get that error, one having
+// waited for the first dial.
+func TestChain_ConcurrentCONNECTsToAFailingProxyEachFail(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, aerr := ln.Accept()
+			if aerr != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+	front, dialer := chainedFront(t, ca, "https://"+ln.Addr().String())
+	up := front.srv.fwd.up
+
+	var wg sync.WaitGroup
+	errs := make([]error, 8)
+	for i := range errs {
+		wg.Go(func() {
+			_, errs[i] = up.dial(t.Context(), "tcp", "192.0.2.1:443", "https")
+		})
+	}
+	wg.Wait()
+	for i, derr := range errs {
+		require.Error(t, derr, "dial %d", i)
+		assert.Contains(t, derr.Error(), "tls handshake", "dial %d", i)
+		assert.NotContains(t, derr.Error(), errDialWaited.Error(), "dial %d", i)
+	}
+	assert.EqualValues(t, 8, dialer.tcp.Load())
+}
+
+// Concurrent CONNECTs to an h2 proxy that allows one stream per connection each get a
+// connection, one having waited for the first dial.
+func TestChain_ConcurrentCONNECTsToAOneStreamProxyEachSucceed(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	proxies := &h2Proxies{t: t, ca: ca, settings: []http2.Setting{{ID: http2.SettingMaxConcurrentStreams, Val: 1}}}
+	u := proxies.dialer(t)
+	proxy, err := url.Parse("https://127.0.0.1:443")
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	conns := make([]net.Conn, 8)
+	errs := make([]error, 8)
+	for i := range errs {
+		wg.Go(func() { conns[i], errs[i] = u.connect(t.Context(), proxy, "192.0.2.1:443") })
+	}
+	wg.Wait()
+	for i, derr := range errs {
+		require.NoError(t, derr, "dial %d", i)
+		defer func() { _ = conns[i].Close() }()
+	}
+	assert.GreaterOrEqual(t, proxies.dials.Load(), int32(8), "one connection per CONNECT at least")
 }
