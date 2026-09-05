@@ -9,10 +9,12 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"net/url"
 	"os"
@@ -20,6 +22,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1084,7 +1087,8 @@ func TestChain_TCPStreamThroughCONNECTOverHTTP2(t *testing.T) {
 }
 
 // A proxy that answers on UDP alone is reached over HTTP/3 once TCP refused the connection,
-// every tunnel shares that connection, and HTTP/3 comes first while the refusal is remembered.
+// and every tunnel shares that connection. The refusal is not remembered, so a tunnel opened
+// after the connection ended tries TCP again.
 func TestChain_TCPStreamThroughCONNECTOverHTTP3(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -1105,11 +1109,11 @@ func TestChain_TCPStreamThroughCONNECTOverHTTP3(t *testing.T) {
 	waitForSessions(t, back, 2)
 	proxy := &url.URL{Scheme: "https", Host: backFront.String()}
 	up := front.srv.fwd.up
-	assert.True(t, up.remembers(noTCPDial, proxy))
+	assert.False(t, up.remembers(noTCPDial, proxy))
 
 	require.NoError(t, up.h3Conn(proxy).CloseWithError(0, ""))
 	getThroughTunnel(t, frontAddr, port, ca)
-	assert.EqualValues(t, 1, dialer.tcp.Load(), "HTTP/3 came first, TCP being remembered as refused")
+	assert.EqualValues(t, 2, dialer.tcp.Load(), "TCP tried again")
 	assert.EqualValues(t, 2, dialer.udp.Load())
 }
 
@@ -1220,7 +1224,7 @@ func TestChain_ProxyDownOnBothIsDialedOverTCPAlone(t *testing.T) {
 	assert.Contains(t, err.Error(), "dial proxy")
 	assert.Contains(t, err.Error(), "over HTTP/3")
 	proxy := &url.URL{Scheme: "https", Host: "127.0.0.1:1"}
-	assert.True(t, up.remembers(noTCPDial, proxy))
+	assert.False(t, up.remembers(noTCPDial, proxy), "a refusal is not remembered")
 	assert.True(t, up.remembers(noH3Dial, proxy))
 
 	_, err = up.dial(t.Context(), "tcp", "192.0.2.1:443", "https")
@@ -1739,4 +1743,197 @@ func TestChain_ConcurrentCONNECTsToAOneStreamProxyEachSucceed(t *testing.T) {
 		defer func() { _ = conns[i].Close() }()
 	}
 	assert.GreaterOrEqual(t, proxies.dials.Load(), int32(8), "one connection per CONNECT at least")
+}
+
+// A request goes through the proxy Transport.Proxy selects for it, so a change of its answer
+// governs the next request whatever connection the last one left idle, and the connections
+// through each proxy stay pooled apart, the one through the first proxy reused once it is
+// selected again.
+func TestChain_RequestFollowsTheProxySwitch(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	tlsOrigin := namedOrigin(t, ca, "inner.test")
+	plainOrigin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "origin host=%s", r.Host)
+	}))
+	t.Cleanup(plainOrigin.Close)
+	plainURL, err := url.Parse(plainOrigin.URL)
+	require.NoError(t, err)
+
+	// chained builds a back proxy in front of origin and a front proxy chained to it, and
+	// returns the front, the address of the back, what the front dialed and what selects
+	// its proxy, nil for a direct connection.
+	chained := func(t *testing.T, origin string) (*Proxy, string, *recorder, *atomic.Pointer[url.URL]) {
+		t.Helper()
+		backTr := DefaultTransport()
+		backTr.RootCAs = poolOf(ca)
+		backTr.DialContext = pinnedDialer(origin)
+		back, err := New(WithCA(ca), WithTransport(backTr))
+		require.NoError(t, err)
+		back.MustAdd("inner.test/", forwardHandler)
+		backAddr := startProxy(t, back)
+
+		frontTr := DefaultTransport()
+		frontTr.RootCAs = poolOf(ca)
+		dialed := new(recorder)
+		frontTr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialed.add(addr)
+			if addr != backAddr {
+				addr = origin
+			}
+			return defaultDialer.DialContext(ctx, network, addr)
+		}
+		selected := new(atomic.Pointer[url.URL])
+		frontTr.Proxy = func(*http.Request) (*url.URL, error) { return selected.Load(), nil }
+		front, err := New(WithCA(ca), WithTransport(frontTr))
+		require.NoError(t, err)
+		front.MustAdd("inner.test/", forwardHandler)
+		return front, backAddr, dialed, selected
+	}
+
+	get := func(t *testing.T, client *http.Client, target string) {
+		t.Helper()
+		resp, err := client.Get(target)
+		require.NoError(t, err)
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		require.NoError(t, resp.Body.Close())
+		require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+		assert.Equal(t, "origin host="+resp.Request.URL.Host, string(body))
+	}
+
+	// through checks the three requests, through the back, direct and through the back
+	// again on the connection the first one left idle.
+	through := func(t *testing.T, client *http.Client, target, dest, backAddr string, dialed *recorder, selected *atomic.Pointer[url.URL]) {
+		t.Helper()
+		back, err := url.Parse("http://" + backAddr)
+		require.NoError(t, err)
+		selected.Store(back)
+		get(t, client, target)
+		assert.Equal(t, []string{backAddr}, dialed.all())
+		selected.Store(nil)
+		get(t, client, target)
+		assert.Equal(t, []string{backAddr, dest}, dialed.all())
+		selected.Store(back)
+		get(t, client, target)
+		assert.Equal(t, []string{backAddr, dest}, dialed.all())
+	}
+
+	_, port, err := net.SplitHostPort(tlsOrigin.Host)
+	require.NoError(t, err)
+	t.Run("declared destination", func(t *testing.T) {
+		front, backAddr, dialed, selected := chained(t, tlsOrigin.Host)
+		frontAddr := startProxy(t, front)
+		client := tunnelClient(t, frontAddr, "inner.test:"+port, "inner.test", ca)
+		through(t, client, "https://inner.test/", "inner.test:"+port, backAddr, dialed, selected)
+	})
+	t.Run("no declared destination over TLS", func(t *testing.T) {
+		front, backAddr, dialed, selected := chained(t, tlsOrigin.Host)
+		frontAddr, frontPool := startProxyTLS(t, front, ca)
+		client := &http.Client{
+			Timeout: 10 * time.Second,
+			Transport: &http.Transport{
+				ForceAttemptHTTP2: true,
+				DialTLSContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+					return (&tls.Dialer{Config: &tls.Config{
+						ServerName: "127.0.0.1",
+						RootCAs:    frontPool,
+						NextProtos: []string{"h2", "http/1.1"},
+						MinVersion: tls.VersionTLS12,
+					}}).DialContext(ctx, "tcp", frontAddr)
+				},
+			},
+		}
+		through(t, client, "https://inner.test:"+port+"/", "inner.test:"+port, backAddr, dialed, selected)
+	})
+	t.Run("no declared destination in plaintext", func(t *testing.T) {
+		front, backAddr, dialed, selected := chained(t, plainURL.Host)
+		frontAddr := startProxy(t, front)
+		client := &http.Client{
+			Timeout:   10 * time.Second,
+			Transport: &http.Transport{Proxy: http.ProxyURL(&url.URL{Scheme: "http", Host: frontAddr})},
+		}
+		_, plainPort, err := net.SplitHostPort(plainURL.Host)
+		require.NoError(t, err)
+		through(t, client, "http://inner.test:"+plainPort+"/", "inner.test:"+plainPort, backAddr, dialed, selected)
+	})
+}
+
+// A pool is keyed on the proxy Transport.Proxy selects, so two proxies never share a
+// connection and no proxy keeps the shared pool.
+func TestChain_PoolPerProxy(t *testing.T) {
+	tr := DefaultTransport()
+	selected := new(atomic.Pointer[url.URL])
+	tr.Proxy = func(*http.Request) (*url.URL, error) { return selected.Load(), nil }
+	p, err := New(WithTransport(tr))
+	require.NoError(t, err)
+	f := p.srv.fwd
+	req := httptest.NewRequest(http.MethodGet, "https://inner.test/", nil)
+
+	direct, err := f.poolFor(req, "")
+	require.NoError(t, err)
+	assert.Same(t, f.shared.https, direct)
+
+	first, err := url.Parse("http://first.test:8080")
+	require.NoError(t, err)
+	selected.Store(first)
+	throughFirst, err := f.poolFor(req, "")
+	require.NoError(t, err)
+	assert.NotSame(t, direct, throughFirst)
+	again, err := f.poolFor(req, "")
+	require.NoError(t, err)
+	assert.Same(t, throughFirst, again)
+	fixedThroughFirst, err := f.poolFor(req, "127.0.0.1:443")
+	require.NoError(t, err)
+	assert.NotSame(t, throughFirst, fixedThroughFirst)
+
+	second, err := url.Parse("http://second.test:8080")
+	require.NoError(t, err)
+	selected.Store(second)
+	throughSecond, err := f.poolFor(req, "")
+	require.NoError(t, err)
+	assert.NotSame(t, throughFirst, throughSecond)
+	assert.Equal(t, 3, f.pools.Len())
+
+	selected.Store(nil)
+	direct, err = f.poolFor(req, "")
+	require.NoError(t, err)
+	assert.Same(t, f.shared.https, direct)
+
+	unsupported, err := url.Parse("socks5://127.0.0.1:1080")
+	require.NoError(t, err)
+	selected.Store(unsupported)
+	_, err = f.poolFor(req, "")
+	require.ErrorContains(t, err, "not supported")
+	assert.Equal(t, 3, f.pools.Len(), "no pool for a proxy that cannot be dialed")
+}
+
+// A proxy whose dial over TCP timed out is dialed over HTTP/3 first for proxyRetry, and one
+// that refused the dial is dialed over TCP again, the refusal having cost nothing.
+func TestChain_RefusedTCPDialIsNotRemembered(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		err        error
+		remembered bool
+	}{
+		{"timed out", &net.OpError{Op: "dial", Net: "tcp", Err: os.ErrDeadlineExceeded}, true},
+		{"refused", &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNREFUSED}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := DefaultTransport()
+			tr.DialContext = func(_ context.Context, network, _ string) (net.Conn, error) {
+				if network == "tcp" {
+					return nil, tc.err
+				}
+				return nil, errors.New("no udp")
+			}
+			proxy, err := url.Parse("https://127.0.0.1:1")
+			require.NoError(t, err)
+			u := newUpstreamDialer(tr)
+			_, err = u.connect(t.Context(), proxy, "127.0.0.1:443")
+			require.ErrorIs(t, err, tc.err)
+			assert.Equal(t, tc.remembered, u.remembers(noTCPDial, proxy))
+			assert.True(t, u.remembers(noH3Dial, proxy))
+		})
+	}
 }

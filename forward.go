@@ -10,13 +10,14 @@ import (
 	"net"
 	"net/http"
 	"net/textproto"
+	"net/url"
 	"strings"
 	"sync"
 
 	"github.com/fox-toolkit/edge/internal/simplelru"
 )
 
-const maxDestinationPools = 1024
+const maxPools = 1024
 
 // hopByHopHeaders are connection-scoped and must not be forwarded to the next hop.
 // See RFC 9110 section 7.6.1.
@@ -32,14 +33,20 @@ var hopByHopHeaders = [...]string{
 	"Upgrade",
 }
 
-// forwarder pools upstream connections per destination, and requests with no fixed
-// destination share one pool per scheme.
+// forwarder pools upstream connections per scheme, destination and proxy, and the requests
+// with neither a fixed destination nor a proxy share one pool per scheme.
 type forwarder struct {
 	p      *Proxy
 	up     *upstreamDialer
 	shared struct{ http, https *upstreamPool }
-	fixed  *simplelru.LRU[string, *upstreamPool]
+	pools  *simplelru.LRU[poolKey, *upstreamPool]
 	mu     sync.Mutex
+}
+
+// poolKey includes the proxy, as the key of net/http does, so a request through another
+// proxy never reuses a connection.
+type poolKey struct {
+	scheme, fixed, proxy string
 }
 
 type upstreamPool struct {
@@ -48,36 +55,34 @@ type upstreamPool struct {
 	h3 http.RoundTripper
 }
 
-func newUpstreamPool(up *upstreamDialer, scheme, fixed string) (*upstreamPool, error) {
+func newUpstreamPool(up *upstreamDialer, scheme, fixed string, proxy *url.URL) *upstreamPool {
 	t := up.t
-	dial, proxy := t.dialer(), t.Proxy
+	dial := t.dialer()
+	var via func(*http.Request) (*url.URL, error)
 	if fixed != "" || scheme == "https" {
 		// net/http offers a proxy the ALPN list meant for the origin, so the tunnel is
 		// opened here and the transport is given no proxy of its own. A plaintext request
 		// with no fixed destination keeps net/http's handling, absolute form to the proxy.
-		proxy = nil
 		dial = func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return up.dial(ctx, network, cmp.Or(fixed, addr), scheme)
+			return up.dialThrough(ctx, network, cmp.Or(fixed, addr), proxy)
 		}
+	} else if proxy != nil {
+		via = http.ProxyURL(proxy)
 	}
-	pool := &upstreamPool{h1: t.httpTransport(false, fixed != "", dial, proxy)}
+	pool := &upstreamPool{h1: t.httpTransport(false, fixed != "", dial, via)}
 	if t.AllowHTTP2 {
 		if scheme == "http" && fixed != "" {
 			// The client used h2c with a destination it declared, and no ALPN can ask the
 			// origin.
 			pool.h2 = t.h2cTransport(dial)
 		} else {
-			pool.h2 = t.httpTransport(true, fixed != "", dial, proxy)
+			pool.h2 = t.httpTransport(true, fixed != "", dial, via)
 		}
 	}
 	if t.AllowHTTP3 && scheme == "https" {
-		rt, err := newHTTP3Transport(up, fixed)
-		if err != nil {
-			return nil, err
-		}
-		pool.h3 = rt
+		pool.h3 = newHTTP3Transport(up, fixed, proxy)
 	}
-	return pool, nil
+	return pool
 }
 
 // closeIdle leaves a connection in flight open until [Transport.IdleConnTimeout].
@@ -101,14 +106,10 @@ func (u *upstreamPool) close() {
 func newForwarder(p *Proxy) (*forwarder, error) {
 	up := newUpstreamDialer(p.cfg.transport)
 	f := &forwarder{p: p, up: up}
+	f.shared.http = newUpstreamPool(up, "http", "", nil)
+	f.shared.https = newUpstreamPool(up, "https", "", nil)
 	var err error
-	if f.shared.http, err = newUpstreamPool(up, "http", ""); err != nil {
-		return nil, err
-	}
-	if f.shared.https, err = newUpstreamPool(up, "https", ""); err != nil {
-		return nil, err
-	}
-	if f.fixed, err = simplelru.NewLRU(maxDestinationPools, func(_ string, pool *upstreamPool) { pool.closeIdle() }); err != nil {
+	if f.pools, err = simplelru.NewLRU(maxPools, func(_ poolKey, pool *upstreamPool) { pool.closeIdle() }); err != nil {
 		return nil, err
 	}
 	return f, nil
@@ -116,7 +117,7 @@ func newForwarder(p *Proxy) (*forwarder, error) {
 
 func (f *forwarder) close() {
 	f.mu.Lock()
-	pools := f.fixed.Values()
+	pools := f.pools.Values()
 	f.mu.Unlock()
 	f.shared.http.close()
 	f.shared.https.close()
@@ -126,24 +127,37 @@ func (f *forwarder) close() {
 	f.up.close()
 }
 
-func (f *forwarder) poolFor(scheme, fixed string) (*upstreamPool, error) {
+// poolFor returns the pool of req, through the proxy [Transport.Proxy] selects, called with
+// req or with the destination alone when the session fixed one.
+func (f *forwarder) poolFor(req *http.Request, fixed string) (*upstreamPool, error) {
+	scheme := req.URL.Scheme
+	var proxy *url.URL
+	var err error
 	if fixed == "" {
+		proxy, err = f.up.selectProxy(req)
+	} else {
+		proxy, err = f.up.proxyFor(fixed, scheme)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if fixed == "" && proxy == nil {
 		if scheme == "https" {
 			return f.shared.https, nil
 		}
 		return f.shared.http, nil
 	}
-	key := scheme + " " + fixed
+	key := poolKey{scheme: scheme, fixed: fixed}
+	if proxy != nil {
+		key.proxy = proxy.String()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if pool, ok := f.fixed.Get(key); ok {
+	if pool, ok := f.pools.Get(key); ok {
 		return pool, nil
 	}
-	pool, err := newUpstreamPool(f.up, scheme, fixed)
-	if err != nil {
-		return nil, err
-	}
-	f.fixed.Add(key, pool)
+	pool := newUpstreamPool(f.up, scheme, fixed, proxy)
+	f.pools.Add(key, pool)
 	return pool, nil
 }
 
@@ -155,7 +169,7 @@ func (f *forwarder) poolFor(scheme, fixed string) (*upstreamPool, error) {
 // failing because a proxy was inserted, and a client that only speaks HTTP/1.1 must not have
 // its request delivered as h2 frames it never asked for.
 func (f *forwarder) roundTrip(req *http.Request, proto Protocol, fixed string) (*http.Response, error) {
-	pool, err := f.poolFor(req.URL.Scheme, fixed)
+	pool, err := f.poolFor(req, fixed)
 	if err != nil {
 		return nil, err
 	}

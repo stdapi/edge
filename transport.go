@@ -175,7 +175,7 @@ func (t *Transport) upstreamTLSConfig() *tls.Config {
 
 // newHTTP3Transport builds the upstream transport used when a client speaks HTTP/3 and
 // [Transport.AllowHTTP3] is on.
-func newHTTP3Transport(up *upstreamDialer, fixed string) (http.RoundTripper, error) {
+func newHTTP3Transport(up *upstreamDialer, fixed string, proxy *url.URL) http.RoundTripper {
 	t := up.t
 	tlsCfg := &tls.Config{MinVersion: tls.VersionTLS13}
 	if t.TLSClientConfig != nil {
@@ -206,9 +206,13 @@ func newHTTP3Transport(up *upstreamDialer, fixed string) (http.RoundTripper, err
 			if fixed != "" {
 				addr = fixed
 			}
-			return up.dialQUIC(ctx, addr, cfg, qcfg)
+			sock, err := up.dialThrough(ctx, "udp", addr, proxy)
+			if err != nil {
+				return nil, err
+			}
+			return quicOn(ctx, sock, addr, cfg, qcfg)
 		},
-	}, nil
+	}
 }
 
 // packetConnOf presents a connected socket as the packet connection quic-go reads and writes.

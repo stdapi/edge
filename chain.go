@@ -135,14 +135,33 @@ func (u *upstreamDialer) close() {
 	_ = u.h3.Close()
 }
 
-// proxyFor returns the proxy selected for a connection to addr, nil for a direct one. scheme
-// is https for TLS and QUIC and http for the clear.
+// selectProxy returns the proxy [Transport.Proxy] selects for req, nil for a direct
+// connection.
+func (u *upstreamDialer) selectProxy(req *http.Request) (*url.URL, error) {
+	if u.t.Proxy == nil {
+		return nil, nil
+	}
+	proxy, err := u.t.Proxy(req)
+	if err != nil {
+		return nil, fmt.Errorf("edge: select a proxy for %s: %w", req.URL.Host, err)
+	}
+	if proxy != nil {
+		switch proxy.Scheme {
+		case "http", "https":
+		default:
+			return nil, fmt.Errorf("edge: dial %s through %s: proxy scheme %q is not supported", req.URL.Host, proxy.Redacted(), proxy.Scheme)
+		}
+	}
+	return proxy, nil
+}
+
+// proxyFor is selectProxy with a request for the destination alone. scheme is https for TLS
+// and QUIC and http for plaintext.
 func (u *upstreamDialer) proxyFor(addr, scheme string) (*url.URL, error) {
 	if u.t.Proxy == nil {
 		return nil, nil
 	}
-	req := &http.Request{URL: &url.URL{Scheme: scheme, Host: addr}, Host: addr, Header: make(http.Header)}
-	return u.t.Proxy(req)
+	return u.selectProxy(&http.Request{URL: &url.URL{Scheme: scheme, Host: addr}, Host: addr, Header: make(http.Header)})
 }
 
 // dial opens a connection to addr on network, through the proxy selected for it when there
@@ -150,15 +169,15 @@ func (u *upstreamDialer) proxyFor(addr, scheme string) (*url.URL, error) {
 func (u *upstreamDialer) dial(ctx context.Context, network, addr, scheme string) (net.Conn, error) {
 	proxy, err := u.proxyFor(addr, scheme)
 	if err != nil {
-		return nil, fmt.Errorf("edge: select a proxy for %s: %w", addr, err)
+		return nil, err
 	}
+	return u.dialThrough(ctx, network, addr, proxy)
+}
+
+// dialThrough opens a connection to addr on network, through proxy when it is not nil.
+func (u *upstreamDialer) dialThrough(ctx context.Context, network, addr string, proxy *url.URL) (net.Conn, error) {
 	if proxy == nil {
 		return u.t.dialer()(ctx, network, addr)
-	}
-	switch proxy.Scheme {
-	case "http", "https":
-	default:
-		return nil, fmt.Errorf("edge: dial %s through %s: proxy scheme %q is not supported", addr, proxy.Redacted(), proxy.Scheme)
 	}
 	switch network {
 	case "tcp":
@@ -228,9 +247,9 @@ func proxyAuthorization(proxy *url.URL) string {
 
 // connect opens a TCP connection to addr with a CONNECT to the proxy. The CONNECT goes on
 // the connection the dialer has to the proxy, HTTP/3 or HTTP/2, and over TCP otherwise, where
-// TLS negotiates HTTP/2 or HTTP/1.1, and a proxy whose dial over TCP failed is dialed over
-// HTTP/3 for proxyRetry. A CONNECT answered with 405 or 501 goes over the next version, any
-// other refusal is final.
+// TLS negotiates HTTP/2 or HTTP/1.1, and a proxy whose dial over TCP timed out is dialed over
+// HTTP/3 first for proxyRetry. A CONNECT answered with 405 or 501 goes over the next version,
+// any other refusal is final.
 func (u *upstreamDialer) connect(ctx context.Context, proxy *url.URL, addr string) (net.Conn, error) {
 	var waited, own bool
 	for round := 1; ; round++ {
@@ -300,7 +319,10 @@ func (u *upstreamDialer) connectOnce(ctx context.Context, proxy *url.URL, addr s
 		return nil, true, err
 	case errors.Is(err, errDialProxy):
 		if https && h3err == nil && ctx.Err() == nil && u.h3ForConnect(proxy) {
-			u.remember(noTCPDial, proxy)
+			// A refusal costs the next dial nothing, a dropped SYN costs it the dial timeout.
+			if ne, ok := errors.AsType[net.Error](err); ok && ne.Timeout() {
+				u.remember(noTCPDial, proxy)
+			}
 			conn, dialed, again, oerr := u.connectH3(ctx, proxy, addr)
 			if dialed {
 				return conn, again, oerr

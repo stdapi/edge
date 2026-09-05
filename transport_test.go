@@ -23,24 +23,20 @@ import (
 func TestTransport_DestinationPoolIdleLimit(t *testing.T) {
 	tr := DefaultTransport()
 	for _, scheme := range []string{"http", "https"} {
-		shared, err := newUpstreamPool(newUpstreamDialer(tr), scheme, "")
-		require.NoError(t, err)
+		shared := newUpstreamPool(newUpstreamDialer(tr), scheme, "", nil)
 		assert.Equal(t, tr.MaxIdleConns, shared.h1.MaxIdleConns, scheme)
 		assert.Equal(t, tr.MaxIdleConns, shared.h2.MaxIdleConns, scheme)
 	}
 
-	pool, err := newUpstreamPool(newUpstreamDialer(tr), "https", "127.0.0.1:443")
-	require.NoError(t, err)
+	pool := newUpstreamPool(newUpstreamDialer(tr), "https", "127.0.0.1:443", nil)
 	assert.Equal(t, tr.MaxIdleConnsPerHost, pool.h1.MaxIdleConns)
 	assert.Equal(t, tr.MaxIdleConnsPerHost, pool.h2.MaxIdleConns)
 
-	pool, err = newUpstreamPool(newUpstreamDialer(tr), "http", "127.0.0.1:80")
-	require.NoError(t, err)
+	pool = newUpstreamPool(newUpstreamDialer(tr), "http", "127.0.0.1:80", nil)
 	assert.Equal(t, tr.MaxIdleConnsPerHost, pool.h2.MaxIdleConns, "the h2c transport")
 
 	tr.MaxIdleConnsPerHost = 0
-	pool, err = newUpstreamPool(newUpstreamDialer(tr), "https", "127.0.0.1:443")
-	require.NoError(t, err)
+	pool = newUpstreamPool(newUpstreamDialer(tr), "https", "127.0.0.1:443", nil)
 	assert.Equal(t, http.DefaultMaxIdleConnsPerHost, pool.h1.MaxIdleConns)
 }
 
