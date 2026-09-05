@@ -315,6 +315,7 @@ type h2Stream struct {
 	local   net.Addr
 	remote  net.Addr
 
+	cmu    sync.Mutex
 	wmu    sync.Mutex
 	closed atomic.Bool
 }
@@ -351,6 +352,8 @@ func (s *h2Stream) Write(b []byte) (int, error) {
 }
 
 func (s *h2Stream) Close() error {
+	s.cmu.Lock()
+	defer s.cmu.Unlock()
 	if s.closed.Swap(true) {
 		return nil
 	}
@@ -385,6 +388,8 @@ func (s *h2Stream) SetReadDeadline(t time.Time) error {
 // SetWriteDeadline bounds the writes that follow. Past it the server resets the stream and a
 // blocked write returns.
 func (s *h2Stream) SetWriteDeadline(t time.Time) error {
+	s.cmu.Lock()
+	defer s.cmu.Unlock()
 	if s.closed.Load() {
 		return net.ErrClosed
 	}

@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/quic-go/quic-go/http3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/net/http2"
@@ -172,9 +173,8 @@ func TestConnect_NameVerificationAppliesToALiteralTarget(t *testing.T) {
 	})
 }
 
-// stalledH2Connect opens a CONNECT over HTTP/2 to an origin that floods, reads nothing back,
-// and returns once the relay has filled the stream's window and stalled in its write.
-func stalledH2Connect(t *testing.T) (*Proxy, *Session, *http.Response) {
+// floodingOrigin is a TCP origin that writes to every connection until it fails.
+func floodingOrigin(t *testing.T) net.Listener {
 	t.Helper()
 	origin, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -196,7 +196,14 @@ func stalledH2Connect(t *testing.T) (*Proxy, *Session, *http.Response) {
 			}()
 		}
 	}()
+	return origin
+}
 
+// stalledH2Connect opens a CONNECT over HTTP/2 to an origin that floods, reads nothing back,
+// and returns once the relay has filled the stream's window and stalled in its write.
+func stalledH2Connect(t *testing.T) (*Proxy, *Session, *http.Response) {
+	t.Helper()
+	origin := floodingOrigin(t)
 	ca, err := GenerateCA()
 	require.NoError(t, err)
 	p, err := New(WithCA(ca))
@@ -226,8 +233,9 @@ func stalledH2Connect(t *testing.T) (*Proxy, *Session, *http.Response) {
 	return p, sess, resp
 }
 
-// assertStreamEnds checks that the client sees the end of its CONNECT stream.
-func assertStreamEnds(t *testing.T, resp *http.Response) {
+// assertStreamReset checks that the client sees its CONNECT stream reset, how a cut reaches
+// it over HTTP/2.
+func assertStreamReset(t *testing.T, resp *http.Response) {
 	t.Helper()
 	ended := make(chan error, 1)
 	go func() {
@@ -236,7 +244,7 @@ func assertStreamEnds(t *testing.T, resp *http.Response) {
 	}()
 	select {
 	case err := <-ended:
-		require.Error(t, err, "the stream ends for the client")
+		require.Error(t, err, "the stream is reset for the client")
 	case <-time.After(5 * time.Second):
 		t.Fatal("the client never saw the stream end")
 	}
@@ -255,7 +263,7 @@ func TestConnect_CloseOnAStalledH2StreamReturns(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("Session.Close waited for the stalled write")
 	}
-	assertStreamEnds(t, resp)
+	assertStreamReset(t, resp)
 }
 
 // The Shutdown deadline cuts a stalled CONNECT stream like any other connection.
@@ -265,7 +273,62 @@ func TestConnect_ShutdownDeadlineCutsAStalledH2Stream(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
 	defer cancel()
 	assert.ErrorIs(t, p.Shutdown(ctx), context.DeadlineExceeded)
-	assertStreamEnds(t, resp)
+	assertStreamReset(t, resp)
+}
+
+// The same close on the HTTP/3 front. The stream ends for the client, which can no longer
+// write on it.
+func TestConnect_CloseOnAStalledH3StreamReturns(t *testing.T) {
+	origin := floodingOrigin(t)
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+	p.MustAdd[TCP](origin.Addr().String(), relayStream)
+	front, _ := startQUICFront(t, p, ca)
+
+	tr := &http3.Transport{}
+	t.Cleanup(func() { _ = tr.Close() })
+	cc := tr.NewClientConn(dialQUICFront(t, front, ca))
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	rstr, err := cc.OpenRequestStream(ctx)
+	require.NoError(t, err)
+	req, err := http.NewRequest(http.MethodConnect, "https://"+origin.Addr().String(), nil)
+	require.NoError(t, err)
+	require.NoError(t, rstr.SendRequestHeader(req))
+	resp, err := rstr.ReadResponse()
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	_, err = rstr.Write([]byte("x"))
+	require.NoError(t, err)
+	sess := waitForSessions(t, p, 1)[0]
+	time.Sleep(300 * time.Millisecond)
+
+	closed := make(chan error, 1)
+	go func() { closed <- sess.Close() }()
+	select {
+	case err := <-closed:
+		require.NoError(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("Session.Close waited for the stalled write")
+	}
+
+	ended := make(chan error, 1)
+	go func() {
+		_, rerr := io.Copy(io.Discard, rstr)
+		ended <- rerr
+	}()
+	select {
+	case <-ended:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the client never saw the stream end")
+	}
+	require.Eventually(t, func() bool {
+		_, werr := rstr.Write([]byte("x"))
+		return werr != nil
+	}, 5*time.Second, 20*time.Millisecond, "the client's send side is canceled")
 }
 
 // Closing the session of a CONNECT carried on an HTTP/2 stream ends that stream and nothing
