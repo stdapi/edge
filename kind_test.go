@@ -979,9 +979,10 @@ func TestKindUDP_SendToRepliesOnTheSameFlow(t *testing.T) {
 	assert.Equal(t, int64(1), fromOrigin.Load())
 }
 
-// The sweep closes the alternates of an idle flow with its upstream socket. Left open, an
-// alternate keeps its reader spinning on an expired deadline.
-func TestKindUDP_SweepClosesTheAlternates(t *testing.T) {
+// flowWithAlternate serves a UDP entry answering through SendTo, drives one datagram through
+// it, and returns the demultiplexer and the alternate socket the flow opened.
+func flowWithAlternate(t *testing.T) (*Proxy, *quicDemux, net.Conn) {
+	t.Helper()
 	origin := udpEchoOrigin(t)
 	other := udpEchoOrigin(t)
 
@@ -997,7 +998,7 @@ func TestKindUDP_SweepClosesTheAlternates(t *testing.T) {
 
 	client, err := net.ListenPacket("udp", "127.0.0.1:0")
 	require.NoError(t, err)
-	defer func() { _ = client.Close() }()
+	t.Cleanup(func() { _ = client.Close() })
 	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
 	_, err = client.WriteTo([]byte("reroute"), net.UDPAddrFromAddrPort(proxyAddr))
 	require.NoError(t, err)
@@ -1019,15 +1020,45 @@ func TestKindUDP_SweepClosesTheAlternates(t *testing.T) {
 			for _, a := range u.alts {
 				alt = a.conn
 			}
-			u.touch(time.Now().Add(-2 * udpFlowIdle))
 		}
 	}
 	d.mu.Unlock()
 	require.NotNil(t, alt, "the flow reached the other origin through an alternate")
+	return p, d, alt
+}
+
+// The sweep closes the alternates of an idle flow with its upstream socket. Left open, an
+// alternate keeps its reader spinning on an expired deadline.
+func TestKindUDP_SweepClosesTheAlternates(t *testing.T) {
+	_, d, alt := flowWithAlternate(t)
+
+	d.mu.Lock()
+	for _, flow := range d.flows {
+		for _, u := range flow.udp {
+			u.touch(time.Now().Add(-2 * udpFlowIdle))
+		}
+	}
+	d.mu.Unlock()
 
 	d.sweepIdle()
-	_, err = alt.Write([]byte("x"))
+	_, err := alt.Write([]byte("x"))
 	assert.ErrorIs(t, err, net.ErrClosed, "the sweep closes the alternate")
+}
+
+// Closing the session of a datagram flow closes its alternates too.
+func TestKindUDP_SessionCloseClosesTheAlternates(t *testing.T) {
+	p, _, alt := flowWithAlternate(t)
+
+	var closed int
+	for s := range p.Sessions() {
+		if s.Kind() == KindUDP {
+			require.NoError(t, s.Close())
+			closed++
+		}
+	}
+	require.Equal(t, 1, closed)
+	_, err := alt.Write([]byte("x"))
+	assert.ErrorIs(t, err, net.ErrClosed, "closing the session closes the alternate")
 }
 
 // A flow reaches a bounded number of origins through SendTo, and the next one is refused.

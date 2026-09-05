@@ -287,20 +287,11 @@ func (p *Proxy) ServeQUIC(pc net.PacketConn, cert tls.Certificate) error {
 	}
 
 	err = front.accept(p.srv.ctx, ln, p.srv.h3)
-	_ = ln.Close()
+	closeListener(ln)
 	if p.srv.ctx.Err() == nil {
 		p.srv.untrackFront(front)
 		_ = tr.Close()
 		return err
-	}
-	// Accept keeps returning the connections that finished their handshake before the
-	// listener was closed, then the close error.
-	for {
-		c, err := ln.Accept(context.Background())
-		if err != nil {
-			break
-		}
-		_ = closeNoError(c)
 	}
 
 	// Closing the transport ends every connection on it without a CONNECTION_CLOSE, so it
@@ -371,7 +362,8 @@ func (f *quicFront) Close() error {
 // connections are told with a GOAWAY, and every request already started runs to completion.
 // A handler serving a whole connection, a stream or a datagram flow, ends when its peers do,
 // so it is waited on until ctx is done and cut then, along with anything else still open.
-// Without a deadline on ctx, Shutdown waits indefinitely.
+// Without a deadline on ctx, Shutdown waits indefinitely. After Shutdown or Close has
+// returned, a further Shutdown returns nil at once.
 func (p *Proxy) Shutdown(ctx context.Context) error {
 	// A cut that has ended left nothing to drain.
 	select {

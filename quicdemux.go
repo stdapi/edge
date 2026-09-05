@@ -350,9 +350,22 @@ func (it *quicIntercept) deliver(addr net.Addr, datagram []byte, owned bool) {
 // closeIntercept tears one stack down. The listener goes first, so the accept loop returns the
 // error it filters, then the packet conn, unblocking the read Transport.Close waits on.
 func (d *quicDemux) closeIntercept(it *quicIntercept) {
-	_ = it.listener.Close()
+	closeListener(it.listener)
 	it.conn.Close()
 	_ = it.transport.Close()
+}
+
+// closeListener closes ln, then the connections that finished their handshake on it without
+// being accepted, which Accept keeps returning before the close error.
+func closeListener(ln *quic.Listener) {
+	_ = ln.Close()
+	for {
+		c, err := ln.Accept(context.Background())
+		if err != nil {
+			return
+		}
+		_ = closeNoError(c)
+	}
 }
 
 // h3NoError is HTTP/3's H3_NO_ERROR, what a peer sends when it closes a connection with
@@ -430,21 +443,17 @@ type udpFlowCloser struct {
 
 func (c *udpFlowCloser) Close() error {
 	c.d.mu.Lock()
-	var sock net.Conn
+	var conns []net.Conn
 	if flow := c.d.flows[c.flow]; flow != nil {
 		if u := flow.udp[c.key]; u != nil && !u.closed {
-			u.closed = true
-			sock = u.upstream
-			if u.cancel != nil {
-				u.cancel()
-			}
 			delete(flow.udp, c.key)
 			c.d.udps--
+			conns = u.endLocked()
 		}
 	}
 	c.d.mu.Unlock()
-	if sock != nil {
-		return sock.Close()
+	for _, conn := range conns {
+		_ = conn.Close()
 	}
 	return nil
 }
