@@ -42,10 +42,12 @@ const (
 )
 
 var (
-	// errTunnelEnded ends the reads of a tunnel once its stream or the connection to the
-	// proxy has ended.
 	errTunnelEnded = errors.New("edge: tunnel ended")
 	errOpenStream  = errors.New("open stream")
+	errDialProxy   = errors.New("dial proxy")
+	// errDialWaited is returned by overTCP after waiting for a dial of the proxy in flight.
+	// The caller should retry.
+	errDialWaited = errors.New("dial in flight")
 )
 
 // refusal is the status a proxy answered a CONNECT or a CONNECT-UDP with.
@@ -78,6 +80,7 @@ type proxyFact string
 const (
 	noH3Dial     proxyFact = "no dial over HTTP/3"
 	noTCPDial    proxyFact = "no dial over TCP"
+	noH2         proxyFact = "no h2 in ALPN"
 	noH2Extended proxyFact = "no extended CONNECT over HTTP/2"
 	noH2Connect  proxyFact = "no CONNECT over HTTP/2"
 	noH3Connect  proxyFact = "no CONNECT over HTTP/3"
@@ -92,6 +95,8 @@ type upstreamDialer struct {
 	h2conns map[string]*h2tunnel.Conn
 	// remembered is when each proxyFact of a proxy expires.
 	remembered map[string]time.Time
+	h3Dialing  map[string]*dialCall
+	tcpDialing map[string]chan struct{}
 	// draining holds the HTTP/2 connections replaced after a GOAWAY while their last tunnels
 	// end, so that close reaches them.
 	draining []*h2tunnel.Conn
@@ -107,6 +112,8 @@ func newUpstreamDialer(t *Transport) *upstreamDialer {
 		conns:      make(map[string]*h3ProxyConn),
 		h2conns:    make(map[string]*h2tunnel.Conn),
 		remembered: make(map[string]time.Time),
+		h3Dialing:  make(map[string]*dialCall),
+		tcpDialing: make(map[string]chan struct{}),
 	}
 }
 
@@ -237,9 +244,9 @@ func (u *upstreamDialer) connect(ctx context.Context, proxy *url.URL, addr strin
 	}
 }
 
-// connectRounds bounds the rounds of one connect, one per connection or version a tunnel may
-// move to after a failure.
-const connectRounds = 4
+// connectRounds bounds the rounds of one connect, one to wait for a dial in flight and one
+// per connection or version a tunnel may move to after a failure.
+const connectRounds = 5
 
 // connectOnce reports whether the tunnel may go on another connection or version after a
 // failure.
@@ -269,9 +276,19 @@ func (u *upstreamDialer) connectOnce(ctx context.Context, proxy *url.URL, addr s
 		}
 		h3err = err
 	}
-	nc, err := u.t.dialer()(ctx, "tcp", proxyAddr(proxy))
-	if err != nil {
-		err = fmt.Errorf("dial proxy %s: %w", proxy.Redacted(), err)
+	var cc *h2tunnel.Conn
+	conn, shared, err := overTCP(ctx, u, proxy, !u.remembers(noH2Connect, proxy),
+		func(conn net.Conn) (net.Conn, error) { return connectOn(conn, proxy, addr) },
+		func(c *h2tunnel.Conn) (net.Conn, error) {
+			cc = c
+			return connectOnH2(ctx, c, proxy, addr)
+		})
+	switch {
+	case err == nil:
+		return conn, false, nil
+	case errors.Is(err, errDialWaited):
+		return nil, true, err
+	case errors.Is(err, errDialProxy):
 		if https && h3err == nil && ctx.Err() == nil && u.h3ForConnect(proxy) {
 			u.remember(noTCPDial, proxy)
 			conn, dialed, again, oerr := u.connectH3(ctx, proxy, addr)
@@ -284,18 +301,10 @@ func (u *upstreamDialer) connectOnce(ctx context.Context, proxy *url.URL, addr s
 			err = errors.Join(h3err, err)
 		}
 		return nil, false, err
-	}
-	var cc *h2tunnel.Conn
-	conn, shared, err := overTCP(ctx, u, nc, proxy, !u.remembers(noH2Connect, proxy),
-		func(conn net.Conn) (net.Conn, error) { return connectOn(conn, proxy, addr) },
-		func(c *h2tunnel.Conn) (net.Conn, error) {
-			cc = c
-			return connectOnH2(ctx, c, proxy, addr)
-		})
-	if err != nil && cc != nil {
+	case cc != nil:
 		return nil, u.h2Failed(proxy, cc, err, shared), err
 	}
-	return conn, false, err
+	return nil, false, err
 }
 
 // h3ForConnect reports whether a CONNECT is worth a dial over HTTP/3.
@@ -360,15 +369,36 @@ func isContextErr(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
-// overTCP opens a tunnel on nc, a connection to the proxy, with onH2 when TLS negotiates h2
-// and with h1 otherwise. It reports whether the tunnel went on an HTTP/2 connection another
-// tunnel recorded first.
-func overTCP[T any](ctx context.Context, u *upstreamDialer, nc net.Conn, proxy *url.URL, h2 bool, h1 func(net.Conn) (T, error), onH2 func(*h2tunnel.Conn) (T, error)) (T, bool, error) {
+// overTCP dials the proxy over TCP and opens a tunnel on the connection, with onH2 when TLS
+// negotiates h2 and with h1 otherwise. It reports whether the tunnel went on an HTTP/2
+// connection another tunnel recorded first.
+func overTCP[T any](ctx context.Context, u *upstreamDialer, proxy *url.URL, h2 bool, h1 func(net.Conn) (T, error), onH2 func(*h2tunnel.Conn) (T, error)) (T, bool, error) {
 	var zero T
+	https := proxy.Scheme == "https"
+	var release func()
+	if h2 && https {
+		var cerr error
+		if release, cerr = u.claimDial(ctx, proxy); cerr != nil {
+			return zero, false, cerr
+		}
+	}
+	// Released once TLS decided the version, and on any earlier exit.
+	known := func() {
+		if release != nil {
+			release()
+			release = nil
+		}
+	}
+	defer known()
+
+	nc, err := u.t.dialer()(ctx, "tcp", proxyAddr(proxy))
+	if err != nil {
+		return zero, false, fmt.Errorf("%w %s: %w", errDialProxy, proxy.Redacted(), err)
+	}
 	_ = nc.SetDeadline(time.Now().Add(proxyConnectTimeout))
 	stop := context.AfterFunc(ctx, func() { _ = nc.Close() })
 	conn := nc
-	if proxy.Scheme == "https" {
+	if https {
 		cfg := u.t.upstreamTLSConfig()
 		cfg.ServerName = proxy.Hostname()
 		cfg.NextProtos = []string{"http/1.1"}
@@ -376,10 +406,10 @@ func overTCP[T any](ctx context.Context, u *upstreamDialer, nc net.Conn, proxy *
 			cfg.NextProtos = []string{"h2", "http/1.1"}
 		}
 		tc := tls.Client(nc, cfg)
-		if err := tc.HandshakeContext(ctx); err != nil {
+		if herr := tc.HandshakeContext(ctx); herr != nil {
 			stop()
 			_ = nc.Close()
-			return zero, false, fmt.Errorf("tls handshake: %w", err)
+			return zero, false, fmt.Errorf("tls handshake: %w", herr)
 		}
 		if tc.ConnectionState().NegotiatedProtocol == "h2" {
 			// The connection outlives this tunnel, so the dial's cancellation and deadline
@@ -389,13 +419,18 @@ func overTCP[T any](ctx context.Context, u *upstreamDialer, nc net.Conn, proxy *
 				return zero, false, ctx.Err()
 			}
 			_ = nc.SetDeadline(time.Time{})
-			cc, shared, err := u.shareH2Conn(proxy, tc)
-			if err != nil {
-				return zero, false, err
+			cc, shared, serr := u.shareH2Conn(proxy, tc)
+			known()
+			if serr != nil {
+				return zero, false, serr
 			}
-			v, err := onH2(cc)
-			return v, shared, err
+			v, oerr := onH2(cc)
+			return v, shared, oerr
 		}
+		if h2 {
+			u.remember(noH2, proxy)
+		}
+		known()
 		conn = tc
 	}
 	v, err := h1(conn)
@@ -513,8 +548,45 @@ func (u *upstreamDialer) connectUDP(ctx context.Context, proxy *url.URL, addr st
 func (u *upstreamDialer) remembers(fact proxyFact, proxy *url.URL) bool {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	until, ok := u.remembered[proxyAddr(proxy)+" "+string(fact)]
+	return u.remembersLocked(fact, proxyAddr(proxy))
+}
+
+// remembersLocked is remembers with u.mu held.
+func (u *upstreamDialer) remembersLocked(fact proxyFact, key string) bool {
+	until, ok := u.remembered[key+" "+string(fact)]
 	return ok && time.Now().Before(until)
+}
+
+// claimDial claims the dial of a proxy whose version is unknown and returns what releases it,
+// nil when the version is known. A caller that finds the dial in flight waits for it and gets
+// errDialWaited.
+func (u *upstreamDialer) claimDial(ctx context.Context, proxy *url.URL) (func(), error) {
+	key := proxyAddr(proxy)
+	u.mu.Lock()
+	if u.closed || u.h2Locked(key) != nil || u.remembersLocked(noH2, key) {
+		u.mu.Unlock()
+		return nil, nil
+	}
+	if done := u.tcpDialing[key]; done != nil {
+		u.mu.Unlock()
+		select {
+		case <-done:
+			return nil, errDialWaited
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	done := make(chan struct{})
+	u.tcpDialing[key] = done
+	u.mu.Unlock()
+	return func() {
+		u.mu.Lock()
+		if u.tcpDialing[key] == done {
+			delete(u.tcpDialing, key)
+		}
+		u.mu.Unlock()
+		close(done)
+	}, nil
 }
 
 func (u *upstreamDialer) remember(fact proxyFact, proxy *url.URL) {
@@ -593,6 +665,8 @@ func (u *upstreamDialer) connectUDPStream(ctx context.Context, proxy *url.URL, h
 			pipe, pooled, err = u.dialTunnel(ctx, proxy, host, port, h2)
 		}
 		switch {
+		case errors.Is(err, errDialWaited):
+			continue
 		case errors.Is(err, h2tunnel.ErrExtendedConnect):
 			// An HTTP/2 proxy without extended CONNECT may still upgrade an HTTP/1.1
 			// connection, so the next one offers nothing else. The connection stays for the
@@ -611,11 +685,7 @@ func (u *upstreamDialer) connectUDPStream(ctx context.Context, proxy *url.URL, h
 }
 
 func (u *upstreamDialer) dialTunnel(ctx context.Context, proxy *url.URL, host, port string, h2 bool) (tunnelPipe, bool, error) {
-	nc, err := u.t.dialer()(ctx, "tcp", proxyAddr(proxy))
-	if err != nil {
-		return nil, false, fmt.Errorf("dial proxy %s: %w", proxy.Redacted(), err)
-	}
-	return overTCP(ctx, u, nc, proxy, h2,
+	return overTCP(ctx, u, proxy, h2,
 		func(conn net.Conn) (tunnelPipe, error) { return upgradeOn(conn, proxy, host, port) },
 		func(cc *h2tunnel.Conn) (tunnelPipe, error) { return openTunnelOnH2(ctx, cc, proxy, host, port) })
 }
@@ -623,7 +693,12 @@ func (u *upstreamDialer) dialTunnel(ctx context.Context, proxy *url.URL, host, p
 func (u *upstreamDialer) h2Conn(proxy *url.URL) *h2tunnel.Conn {
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	if cc := u.h2conns[proxyAddr(proxy)]; cc != nil && cc.CanOpen() {
+	return u.h2Locked(proxyAddr(proxy))
+}
+
+// h2Locked is h2Conn with u.mu held.
+func (u *upstreamDialer) h2Locked(key string) *h2tunnel.Conn {
+	if cc := u.h2conns[key]; cc != nil && cc.CanOpen() {
 		return cc
 	}
 	return nil
@@ -719,37 +794,60 @@ type h3ProxyConn struct {
 	local, remote net.Addr
 }
 
+type dialCall struct {
+	done chan struct{}
+	cc   *h3ProxyConn
+	err  error
+}
+
 // proxyConn returns the HTTP/3 connection to a proxy, opened on the first tunnel and shared
-// by every later one until it ends.
+// by every later one until it ends. A caller that finds the dial in flight waits for it, and
+// dials itself when that dial ended with its own caller's context.
 func (u *upstreamDialer) proxyConn(ctx context.Context, proxy *url.URL) (*h3ProxyConn, error) {
 	key := proxyAddr(proxy)
-	u.mu.Lock()
-	if u.closed {
+	for {
+		u.mu.Lock()
+		if u.closed {
+			u.mu.Unlock()
+			return nil, net.ErrClosed
+		}
+		if cc := u.h3Locked(key); cc != nil {
+			u.mu.Unlock()
+			return cc, nil
+		}
+		call := u.h3Dialing[key]
+		if call == nil {
+			call = &dialCall{done: make(chan struct{})}
+			u.h3Dialing[key] = call
+			u.mu.Unlock()
+			return u.runDial(ctx, proxy, key, call)
+		}
 		u.mu.Unlock()
-		return nil, net.ErrClosed
+		select {
+		case <-call.done:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		if call.err == nil || !isContextErr(call.err) {
+			return call.cc, call.err
+		}
 	}
-	if cc := u.h3Locked(key); cc != nil {
-		u.mu.Unlock()
-		return cc, nil
-	}
-	u.mu.Unlock()
+}
 
-	cc, err := u.openProxyConn(ctx, proxy, key)
-	if err != nil {
-		return nil, err
-	}
+func (u *upstreamDialer) runDial(ctx context.Context, proxy *url.URL, key string, call *dialCall) (*h3ProxyConn, error) {
+	defer close(call.done)
+	call.cc, call.err = u.openProxyConn(ctx, proxy, key)
 	u.mu.Lock()
 	defer u.mu.Unlock()
-	if u.closed {
-		_ = cc.CloseWithError(0, "")
-		return nil, net.ErrClosed
+	delete(u.h3Dialing, key)
+	if call.err == nil && u.closed {
+		_ = call.cc.CloseWithError(0, "")
+		call.cc, call.err = nil, net.ErrClosed
 	}
-	if other := u.h3Locked(key); other != nil {
-		_ = cc.CloseWithError(0, "")
-		return other, nil
+	if call.err == nil {
+		u.conns[key] = call.cc
 	}
-	u.conns[key] = cc
-	return cc, nil
+	return call.cc, call.err
 }
 
 func (u *upstreamDialer) h3Conn(proxy *url.URL) *h3ProxyConn {

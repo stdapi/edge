@@ -1487,3 +1487,163 @@ func TestChain_H3ProxyWithoutCONNECTUDPCarriesCONNECT(t *testing.T) {
 	assert.Equal(t, "ping", string(buf))
 	assert.EqualValues(t, 1, dialer.udp.Load(), "the CONNECT went on the HTTP/3 connection")
 }
+
+// Concurrent CONNECTs to a proxy the dialer has no connection to share one dial over HTTP/3.
+func TestChain_ConcurrentCONNECTsShareOneHTTP3Dial(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	proxyAddr, _ := h3ConnectEcho(t, ca)
+	front, dialer := chainedFront(t, ca, "https://"+proxyAddr.String())
+	up := front.srv.fwd.up
+
+	var wg sync.WaitGroup
+	errs := make([]error, 8)
+	for i := range errs {
+		wg.Go(func() {
+			conn, derr := up.dial(t.Context(), "tcp", "192.0.2.1:443", "https")
+			if derr == nil {
+				_ = conn.Close()
+			}
+			errs[i] = derr
+		})
+	}
+	wg.Wait()
+	for i, derr := range errs {
+		require.NoError(t, derr, "dial %d", i)
+	}
+	assert.EqualValues(t, 1, dialer.udp.Load(), "one dial over HTTP/3 for all")
+}
+
+// A caller waiting for the dial of a proxy over HTTP/3 dials itself when that dial ended with
+// its caller's context.
+func TestChain_WaiterDialsWhenTheHTTP3DialWasCancelled(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	proxyAddr, _ := h3ConnectEcho(t, ca)
+	tr := DefaultTransport()
+	tr.RootCAs = poolOf(ca)
+	tr.Proxy = fixedProxy("https://" + proxyAddr.String())
+	var udpDials atomic.Int32
+	gate := make(chan struct{})
+	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if network == "udp" && udpDials.Add(1) == 1 {
+			select {
+			case <-gate:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+		return defaultDialer.DialContext(ctx, network, addr)
+	}
+	u := newUpstreamDialer(tr)
+	t.Cleanup(u.close)
+	proxy := &url.URL{Scheme: "https", Host: proxyAddr.String()}
+
+	initCtx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	initErr := make(chan error, 1)
+	go func() {
+		_, derr := u.connect(initCtx, proxy, "192.0.2.1:443")
+		initErr <- derr
+	}()
+	require.Eventually(t, func() bool { return udpDials.Load() == 1 }, 5*time.Second, 10*time.Millisecond)
+	waiter := make(chan error, 1)
+	go func() {
+		conn, derr := u.connect(t.Context(), proxy, "192.0.2.1:443")
+		if derr == nil {
+			_ = conn.Close()
+		}
+		waiter <- derr
+	}()
+	time.Sleep(100 * time.Millisecond)
+	cancel()
+	require.ErrorIs(t, <-initErr, context.Canceled)
+	require.NoError(t, <-waiter, "the waiter took the cancellation of another caller")
+	assert.EqualValues(t, 2, udpDials.Load())
+}
+
+// Concurrent CONNECTs to an h2 proxy the dialer has no connection to share one dial over TCP.
+func TestChain_ConcurrentCONNECTsShareOneHTTP2Dial(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	proxies := &h2Proxies{t: t, ca: ca}
+	u := proxies.dialer(t)
+	proxy, err := url.Parse("https://127.0.0.1:443")
+	require.NoError(t, err)
+
+	var wg sync.WaitGroup
+	errs := make([]error, 8)
+	for i := range errs {
+		wg.Go(func() {
+			conn, derr := u.connect(t.Context(), proxy, "192.0.2.1:443")
+			if derr == nil {
+				_ = conn.Close()
+			}
+			errs[i] = derr
+		})
+	}
+	wg.Wait()
+	for i, derr := range errs {
+		require.NoError(t, derr, "dial %d", i)
+	}
+	assert.EqualValues(t, 1, proxies.dials.Load(), "one dial for all")
+}
+
+// fakeProxyTLS is fakeProxy over TLS, offering protos in ALPN.
+func fakeProxyTLS(t *testing.T, ca *CA, protos []string, reply func(w io.Writer)) string {
+	t.Helper()
+	cert, err := ca.Leaf("127.0.0.1")
+	require.NoError(t, err)
+	raw, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	ln := tls.NewListener(raw, &tls.Config{Certificates: []tls.Certificate{*cert}, NextProtos: protos, MinVersion: tls.VersionTLS12})
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, aerr := ln.Accept()
+			if aerr != nil {
+				return
+			}
+			go func() {
+				defer func() { _ = conn.Close() }()
+				if _, rerr := http.ReadRequest(bufio.NewReader(conn)); rerr != nil {
+					return
+				}
+				reply(conn)
+			}()
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// Concurrent CONNECTs to a proxy that negotiates http/1.1 wait for the first dial to find that
+// out, and each dials its own connection from then on.
+func TestChain_HTTP11ProxyIsDialedOncePerCONNECTOnceKnown(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	addr := fakeProxyTLS(t, ca, []string{"http/1.1"}, func(w io.Writer) {
+		_, _ = io.WriteString(w, "HTTP/1.1 200 Connection Established\r\n\r\n")
+		time.Sleep(time.Second)
+	})
+	front, dialer := chainedFront(t, ca, "https://"+addr)
+	up := front.srv.fwd.up
+	proxy := &url.URL{Scheme: "https", Host: addr}
+
+	var wg sync.WaitGroup
+	errs := make([]error, 8)
+	for i := range errs {
+		wg.Go(func() {
+			conn, derr := up.dial(t.Context(), "tcp", "192.0.2.1:443", "https")
+			if derr == nil {
+				_ = conn.Close()
+			}
+			errs[i] = derr
+		})
+	}
+	wg.Wait()
+	for i, derr := range errs {
+		require.NoError(t, derr, "dial %d", i)
+	}
+	assert.EqualValues(t, 8, dialer.tcp.Load(), "one connection per CONNECT")
+	assert.True(t, up.remembers(noH2, proxy))
+}
