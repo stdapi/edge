@@ -600,12 +600,10 @@ func TestLifecycle_ShutdownDrainsTheHTTP3Front(t *testing.T) {
 	releaseHandler := sync.OnceFunc(func() { close(release) })
 	t.Cleanup(releaseHandler)
 
-	tr := &http3.Transport{
-		Dial: func(context.Context, string, *tls.Config, *quic.Config) (*quic.Conn, error) {
-			return dialQUICFront(t, front, ca), nil
-		},
-	}
+	conn := dialQUICFront(t, front, ca)
+	tr := &http3.Transport{}
 	defer func() { _ = tr.Close() }()
+	cc := tr.NewClientConn(conn)
 
 	got := make(chan drainResult, 1)
 	go func() {
@@ -614,7 +612,7 @@ func TestLifecycle_ShutdownDrainsTheHTTP3Front(t *testing.T) {
 			got <- drainResult{err: rerr}
 			return
 		}
-		resp, rerr := tr.RoundTrip(req)
+		resp, rerr := cc.RoundTrip(req)
 		if rerr != nil {
 			got <- drainResult{err: rerr}
 			return
