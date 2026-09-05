@@ -1906,6 +1906,14 @@ func TestChain_PoolPerProxy(t *testing.T) {
 	_, err = f.poolFor(req, "")
 	require.ErrorContains(t, err, "not supported")
 	assert.Equal(t, 3, f.pools.Len(), "no pool for a proxy that cannot be dialed")
+
+	boom := errors.New("boom")
+	f.up.t.Proxy = func(*http.Request) (*url.URL, error) { return nil, boom }
+	_, err = f.poolFor(req, "")
+	require.ErrorIs(t, err, boom)
+	_, err = f.poolFor(req, "127.0.0.1:443")
+	require.ErrorIs(t, err, boom)
+	assert.Equal(t, 3, f.pools.Len())
 }
 
 // A proxy whose dial over TCP timed out is dialed over HTTP/3 first for proxyRetry, and one

@@ -156,6 +156,11 @@ func (f *forwarder) poolFor(req *http.Request, fixed string) (*upstreamPool, err
 	if pool, ok := f.pools.Get(key); ok {
 		return pool, nil
 	}
+	if proxy != nil {
+		// The key is the URL as it was, so the pool keeps a copy of its own.
+		own := *proxy
+		proxy = &own
+	}
 	pool := newUpstreamPool(f.up, scheme, fixed, proxy)
 	f.pools.Add(key, pool)
 	return pool, nil
