@@ -109,7 +109,7 @@ func (p *Proxy) hijackedContext(r *http.Request) (context.Context, context.Cance
 	// has no cancellation, so a shutdown is watched for explicitly.
 	go func() {
 		select {
-		case <-p.srv.closed:
+		case <-p.srv.ctx.Done():
 			cancel()
 		case <-ctx.Done():
 		}

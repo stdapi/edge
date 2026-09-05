@@ -81,13 +81,13 @@ type server struct {
 	// tunnels is the demultiplexer the CONNECT-UDP tunnels feed, brought up on the first
 	// tunnel. It has no socket, so one serves the whole proxy.
 	tunnels *quicDemux
-	closed  chan struct{}
-	// done is closed once Shutdown or Close has returned, when a front may close the socket
-	// its connections run on.
-	done     chan struct{}
-	wg       sync.WaitGroup
-	closeOne sync.Once
-	doneOne  sync.Once
+	// ctx is canceled when the proxy starts closing. done is closed once Shutdown or Close
+	// has returned, when a front may close the socket its connections run on.
+	ctx     context.Context
+	cancel  context.CancelFunc
+	done    chan struct{}
+	wg      sync.WaitGroup
+	doneOne sync.Once
 
 	mu      sync.Mutex
 	closing atomic.Bool
@@ -106,9 +106,9 @@ func newServer(p *Proxy) (*server, error) {
 		active:    make(map[io.Closer]struct{}),
 		sessions:  make(map[*Session]struct{}),
 		quics:     make(map[*quicDemux]struct{}),
-		closed:    make(chan struct{}),
 		done:      make(chan struct{}),
 	}
+	s.ctx, s.cancel = context.WithCancel(context.Background())
 
 	// A client may speak HTTP/2 over plaintext, with the connection preface instead of ALPN.
 	// Without unencrypted HTTP/2 enabled it is answered as if it had sent a request whose
@@ -267,7 +267,8 @@ func (p *Proxy) ListenAndServeQUIC(addr string, cert tls.Certificate) error {
 // [Proxy.ListenAndServeQUIC]. It always returns a non-nil error. After [Proxy.Shutdown] or
 // [Proxy.Close] has returned, the returned error is [ErrProxyClosed].
 func (p *Proxy) ServeQUIC(pc net.PacketConn, cert tls.Certificate) error {
-	if p.srv.closing.Load() {
+	front := &quicFront{conns: make(map[*quic.Conn]struct{})}
+	if !p.srv.tryTrackFront(front) {
 		return ErrProxyClosed
 	}
 	tr := &quic.Transport{Conn: pc}
@@ -280,39 +281,56 @@ func (p *Proxy) ServeQUIC(pc net.PacketConn, cert tls.Certificate) error {
 		MaxIncomingStreams: int64(p.cfg.server.maxConcurrentStreams),
 	})
 	if err != nil {
+		p.srv.untrackFront(front)
 		_ = tr.Close()
 		return err
 	}
-	front := &quicFront{Listener: ln, conns: make(map[*quic.Conn]struct{})}
 
-	// ServeListener returns as soon as a shutdown starts, and the listener is closed then so
-	// nothing is accepted during the drain. Closing the transport ends every connection on it
-	// without a CONNECTION_CLOSE, so it is closed once the shutdown is over.
-	err = p.srv.h3.ServeListener(front)
+	err = front.accept(p.srv.ctx, ln, p.srv.h3)
 	_ = ln.Close()
-	if !errors.Is(err, http.ErrServerClosed) {
+	if p.srv.ctx.Err() == nil {
+		p.srv.untrackFront(front)
 		_ = tr.Close()
 		return err
 	}
+
+	// Closing the transport ends every connection on it without a CONNECTION_CLOSE, so it
+	// is closed once the shutdown is over and the connections it left open are closed first.
 	<-p.srv.done
-	front.closeConns()
+	_ = front.Close()
+	p.srv.untrackFront(front)
 	_ = tr.Close()
 	return ErrProxyClosed
 }
 
-// quicFront records the connections accepted on an HTTP/3 front, so the ones still open at
-// the deadline can be closed with a CONNECTION_CLOSE before the transport under them.
+// quicFront records the connections accepted on an HTTP/3 front, so a cut closes them with
+// a CONNECTION_CLOSE before the transport under them.
 type quicFront struct {
-	*quic.Listener
 	conns map[*quic.Conn]struct{}
 	mu    sync.Mutex
 }
 
-func (f *quicFront) Accept(ctx context.Context) (*quic.Conn, error) {
-	c, err := f.Listener.Accept(ctx)
-	if err != nil {
-		return nil, err
+// accept serves the connections accepted on ln one by one until ctx ends, and returns the
+// error Accept ended on. http3.Server.Close and the return of ServeListener both wait for
+// every handler, and a handler that ignores its cut would keep the socket.
+func (f *quicFront) accept(ctx context.Context, ln *quic.Listener, h3 *http3.Server) error {
+	for {
+		c, err := ln.Accept(ctx)
+		if err != nil {
+			return err
+		}
+		f.add(c)
+		go f.serve(h3, c)
 	}
+}
+
+func (f *quicFront) serve(h3 *http3.Server, c *quic.Conn) {
+	if err := h3.ServeQUICConn(c); errors.Is(err, http.ErrServerClosed) {
+		_ = closeNoError(c)
+	}
+}
+
+func (f *quicFront) add(c *quic.Conn) {
 	f.mu.Lock()
 	f.conns[c] = struct{}{}
 	f.mu.Unlock()
@@ -321,18 +339,18 @@ func (f *quicFront) Accept(ctx context.Context) (*quic.Conn, error) {
 		delete(f.conns, c)
 		f.mu.Unlock()
 	})
-	return c, nil
 }
 
-// closeConns closes every connection still open with a CONNECTION_CLOSE, which is sent
-// before the call returns.
-func (f *quicFront) closeConns() {
+// Close closes every connection still open with a CONNECTION_CLOSE, which is sent before
+// the call returns.
+func (f *quicFront) Close() error {
 	f.mu.Lock()
 	conns := slices.Collect(maps.Keys(f.conns))
 	f.mu.Unlock()
 	for _, c := range conns {
 		_ = closeNoError(c)
 	}
+	return nil
 }
 
 // Shutdown stops accepting new connections, then waits for the requests in flight to finish.
@@ -405,10 +423,13 @@ func (p *Proxy) Shutdown(ctx context.Context) error {
 }
 
 // Close stops the proxy at once, dropping every connection including the traffic in flight.
+// It does not wait for a handler still running.
 func (p *Proxy) Close() error {
 	p.srv.beginClose()
 	defer p.srv.endClose()
-	err := errors.Join(p.srv.closeListeners(), p.srv.h1.Close(), p.srv.h3.Close(), p.srv.term.Close())
+	// http3.Server.Close waits for every handler, so the HTTP/3 fronts are cut with the rest
+	// of what the proxy owns.
+	err := errors.Join(p.srv.closeListeners(), p.srv.h1.Close(), p.srv.term.Close())
 	p.srv.closeActive()
 	p.srv.fwd.close()
 	return err
@@ -578,7 +599,7 @@ func (s *server) beginClose() {
 	s.mu.Lock()
 	s.closing.Store(true)
 	s.mu.Unlock()
-	s.closeOne.Do(func() { close(s.closed) })
+	s.cancel()
 }
 
 // endClose marks the shutdown as over, drained or cut at the deadline.
@@ -642,6 +663,24 @@ func (s *server) tryTrackDemux(d *quicDemux) bool {
 	s.active[d] = struct{}{}
 	s.quics[d] = struct{}{}
 	return true
+}
+
+// tryTrackFront is [server.tryTrack] for an HTTP/3 front. It takes no WaitGroup token, the
+// socket is released after Shutdown has returned.
+func (s *server) tryTrackFront(f *quicFront) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closing.Load() {
+		return false
+	}
+	s.active[f] = struct{}{}
+	return true
+}
+
+func (s *server) untrackFront(f *quicFront) {
+	s.mu.Lock()
+	delete(s.active, f)
+	s.mu.Unlock()
 }
 
 // tunnelDemux returns the demultiplexer the tunnels feed, brought up on first use inside the

@@ -178,9 +178,10 @@ type quicDemux struct {
 	// from the address the client targeted, one per CONNECT-UDP tunnel so a connection stays
 	// with the identity that opened it, and one under the zero key anywhere else.
 	intercepts map[interceptKey]*quicIntercept
-	// raw holds the QUIC connections served by a [QUIC] handler. The HTTP/3 server owns the
-	// ones it serves and drains them itself; these have to be closed by hand.
-	raw map[*quic.Conn]struct{}
+	// raw holds the QUIC connections served by a [QUIC] handler and h3Conns the ones the
+	// HTTP/3 server serves. The server drains the latter, a cut closes both here.
+	raw     map[*quic.Conn]struct{}
+	h3Conns map[*quic.Conn]struct{}
 
 	wg sync.WaitGroup
 
@@ -473,6 +474,7 @@ func newQUICDemux(p *Proxy, pc net.PacketConn) (*quicDemux, error) {
 		pc:        pc,
 		flows:     make(map[flowKey]*quicFlow),
 		raw:       make(map[*quic.Conn]struct{}),
+		h3Conns:   make(map[*quic.Conn]struct{}),
 		done:      make(chan struct{}),
 		maxStacks: maxIntercepts,
 	}
@@ -666,7 +668,8 @@ func (d *quicDemux) acceptLoop(it *quicIntercept) {
 		if err != nil {
 			return
 		}
-		d.wg.Go(func() { d.serveQUICConn(qc) })
+		// Off the WaitGroup, a handler that ignores its cut would otherwise keep the socket.
+		go d.serveQUICConn(qc)
 	}
 }
 
@@ -677,8 +680,24 @@ func (d *quicDemux) serveQUICConn(qc *quic.Conn) {
 	}
 
 	if sess.kind == KindHTTP {
+		d.mu.Lock()
+		draining := d.draining.Load()
+		if !draining {
+			d.h3Conns[qc] = struct{}{}
+		}
+		d.mu.Unlock()
+		if draining {
+			_ = closeNoError(qc)
+			return
+		}
 		sess.setProtocol(HTTP3)
-		if err := d.h3.ServeQUICConn(qc); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		err := d.h3.ServeQUICConn(qc)
+		d.mu.Lock()
+		delete(d.h3Conns, qc)
+		d.mu.Unlock()
+		if errors.Is(err, http.ErrServerClosed) {
+			_ = closeNoError(qc)
+		} else if err != nil {
 			d.p.cfg.logger.Debug("edge: HTTP/3 connection closed", slog.String("error", err.Error()))
 		}
 		return
@@ -1205,7 +1224,8 @@ func (d *quicDemux) publishUDPLocked(from flowKey, client net.Addr, u *udpFlow) 
 	flow.udp[u.key] = u
 	d.udps++
 	u.started = true
-	d.wg.Go(func() { d.runUDPFlow(from, u) })
+	// Off the WaitGroup, a handler that ignores its cut would otherwise keep the socket.
+	go d.runUDPFlow(from, u)
 	return true
 }
 
@@ -1876,7 +1896,6 @@ func (d *quicDemux) close() {
 		// The read loop publishes with no lock held across its dials, so close must refuse a
 		// late publication the way a shutdown does.
 		d.draining.Store(true)
-		h3 := d.h3
 		var sockets []net.Conn
 		var tunnels []*connectUDPTunnel
 		for key, flow := range d.flows {
@@ -1889,14 +1908,21 @@ func (d *quicDemux) close() {
 					u.cancel()
 				}
 				sockets = append(sockets, u.upstream)
+				for _, alt := range u.alts {
+					sockets = append(sockets, alt.conn)
+				}
+				u.alts = nil
 			}
 			for _, conn := range flow.conns {
 				conn.end()
 			}
 		}
-		raw := make([]*quic.Conn, 0, len(d.raw))
+		conns := make([]*quic.Conn, 0, len(d.raw)+len(d.h3Conns))
 		for qc := range d.raw {
-			raw = append(raw, qc)
+			conns = append(conns, qc)
+		}
+		for qc := range d.h3Conns {
+			conns = append(conns, qc)
 		}
 		replies := make([]net.PacketConn, 0, len(d.replySockets))
 		for _, sock := range d.replySockets {
@@ -1910,6 +1936,7 @@ func (d *quicDemux) close() {
 		clear(d.intercepts)
 		clear(d.flows)
 		clear(d.raw)
+		clear(d.h3Conns)
 		d.sniffing = 0
 		d.udps = 0
 		d.mu.Unlock()
@@ -1917,13 +1944,10 @@ func (d *quicDemux) close() {
 		for _, s := range sockets {
 			_ = s.Close()
 		}
-		// http3.Server.Close leaves the connections handed to ServeQUICConn alone, and a raw
-		// one is not its at all, so both kinds are ended here.
-		for _, qc := range raw {
+		// http3.Server.Close would wait for every handler, so the connections it serves are
+		// closed here with the raw ones.
+		for _, qc := range conns {
 			_ = closeNoError(qc)
-		}
-		if h3 != nil {
-			_ = h3.Close()
 		}
 		for _, it := range intercepts {
 			d.closeIntercept(it)

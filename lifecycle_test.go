@@ -517,6 +517,9 @@ func TestLifecycle_ShutdownDeadlineBoundsAStuckHTTP3Handler(t *testing.T) {
 	served := make(chan error, 1)
 	go func() { served <- p.ServeTransparentUDP(pc) }()
 	t.Cleanup(func() { _ = p.Close() })
+	// Registered after Close, so the handler is released before Close waits on it.
+	releaseHandler := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseHandler)
 
 	proxyAddr, err := netip.ParseAddrPort(pc.LocalAddr().String())
 	require.NoError(t, err)
@@ -568,19 +571,19 @@ func TestLifecycle_ShutdownDeadlineBoundsAStuckHTTP3Handler(t *testing.T) {
 
 	assert.ErrorIs(t, err, context.DeadlineExceeded)
 	assert.Less(t, elapsed, 3*time.Second, "the deadline must bound Shutdown, not the handler")
+	select {
+	case err := <-served:
+		assert.ErrorIs(t, err, ErrProxyClosed)
+	case <-time.After(5 * time.Second):
+		t.Fatal("ServeTransparentUDP did not return after the deadline")
+	}
 
 	// Releasing the handler lets everything the deadline left behind unwind.
-	close(release)
+	releaseHandler()
 	select {
 	case <-got:
 	case <-time.After(10 * time.Second):
 		t.Fatal("the client request never returned after the release")
-	}
-	select {
-	case err := <-served:
-		assert.ErrorIs(t, err, ErrProxyClosed)
-	case <-time.After(10 * time.Second):
-		t.Fatal("ServeTransparentUDP did not return after the release")
 	}
 }
 
@@ -749,6 +752,198 @@ func TestLifecycle_ShutdownDeadlineCutsTheHTTP3Front(t *testing.T) {
 	case <-got:
 	case <-time.After(10 * time.Second):
 		t.Fatal("the client request never returned after the release")
+	}
+}
+
+// stuckHTTP3Front serves p over HTTP/3 with a handler parked on h3Authority, sends it a
+// request, and returns once the handler has it. The handler is released by the function
+// returned, and on cleanup.
+func stuckHTTP3Front(t *testing.T, serve func(p *Proxy, ca *CA) (netip.AddrPort, <-chan error)) (*Proxy, <-chan error, *quic.Conn, func()) {
+	t.Helper()
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	p.MustAdd(h3Authority+"/", blockingHandler(started, release))
+	addr, served := serve(p, ca)
+	releaseHandler := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseHandler)
+
+	pc, err := loopbackUDP()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = pc.Close() })
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	conn, err := quic.Dial(ctx, pc, net.UDPAddrFromAddrPort(addr), &tls.Config{
+		RootCAs:    poolOf(ca),
+		ServerName: h3Authority,
+		NextProtos: []string{http3.NextProtoH3},
+		MinVersion: tls.VersionTLS13,
+	}, &quic.Config{MaxIdleTimeout: 30 * time.Second})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.CloseWithError(0, "") })
+	tr := &http3.Transport{}
+	t.Cleanup(func() { _ = tr.Close() })
+	cc := tr.NewClientConn(conn)
+	go func() {
+		req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("https://%s:%d/", h3Authority, addr.Port()), nil)
+		if err != nil {
+			return
+		}
+		resp, err := cc.RoundTrip(req)
+		if err == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+		}
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the request never reached the handler")
+	}
+	return p, served, conn, releaseHandler
+}
+
+func serveQUICFront(t *testing.T) func(p *Proxy, ca *CA) (netip.AddrPort, <-chan error) {
+	return func(p *Proxy, ca *CA) (netip.AddrPort, <-chan error) {
+		cert, err := ca.Leaf(h3Authority)
+		require.NoError(t, err)
+		pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+		require.NoError(t, err)
+		served := make(chan error, 1)
+		go func() { served <- p.ServeQUIC(pc, *cert) }()
+		t.Cleanup(func() { _ = p.Close(); _ = pc.Close() })
+		return netip.MustParseAddrPort(pc.LocalAddr().String()), served
+	}
+}
+
+func serveTransparentUDP(t *testing.T) func(p *Proxy, ca *CA) (netip.AddrPort, <-chan error) {
+	return func(p *Proxy, _ *CA) (netip.AddrPort, <-chan error) {
+		pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+		require.NoError(t, err)
+		served := make(chan error, 1)
+		go func() { served <- p.ServeTransparentUDP(pc) }()
+		t.Cleanup(func() { _ = p.Close() })
+		return netip.MustParseAddrPort(pc.LocalAddr().String()), served
+	}
+}
+
+// assertCutDoesNotWait runs cut, a Close or a Shutdown already past its deadline, against a
+// parked HTTP/3 handler and checks that it returns at once, that the client is sent a
+// CONNECTION_CLOSE, and that the socket is released before the handler ends.
+func assertCutDoesNotWait(t *testing.T, served <-chan error, conn *quic.Conn, cut func() error, want error) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- cut() }()
+	select {
+	case err := <-done:
+		assert.ErrorIs(t, err, want)
+	case <-time.After(3 * time.Second):
+		t.Fatal("the cut must not wait for the handler")
+	}
+	select {
+	case <-conn.Context().Done():
+		var appErr *quic.ApplicationError
+		cause := context.Cause(conn.Context())
+		require.ErrorAs(t, cause, &appErr, "the client is told in QUIC terms: %v", cause)
+		assert.True(t, appErr.Remote, "the close comes from the proxy: %v", cause)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the client never learned of the cut")
+	}
+	select {
+	case err := <-served:
+		assert.ErrorIs(t, err, ErrProxyClosed)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the socket was not released before the handler ended")
+	}
+}
+
+// Close returns once everything is closed. A handler that ignores its cut ends behind it,
+// on the HTTP/3 front as on the TCP one.
+func TestLifecycle_CloseDoesNotWaitForAStuckHTTP3Handler(t *testing.T) {
+	p, served, conn, _ := stuckHTTP3Front(t, serveQUICFront(t))
+	assertCutDoesNotWait(t, served, conn, p.Close, nil)
+}
+
+func TestLifecycle_CloseDoesNotWaitForAStuckTransparentHTTP3Handler(t *testing.T) {
+	p, served, conn, _ := stuckHTTP3Front(t, serveTransparentUDP(t))
+	assertCutDoesNotWait(t, served, conn, p.Close, nil)
+}
+
+// A Shutdown whose context is already done is a cut, and the HTTP/3 front releases its
+// socket the way it does at a live deadline.
+func TestLifecycle_ShutdownExpiredContextCutsTheHTTP3Front(t *testing.T) {
+	p, served, conn, _ := stuckHTTP3Front(t, serveQUICFront(t))
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	assertCutDoesNotWait(t, served, conn, func() error { return p.Shutdown(ctx) }, context.Canceled)
+}
+
+func TestLifecycle_ShutdownExpiredContextCutsTheTransparentHTTP3(t *testing.T) {
+	p, served, conn, _ := stuckHTTP3Front(t, serveTransparentUDP(t))
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	assertCutDoesNotWait(t, served, conn, func() error { return p.Shutdown(ctx) }, context.Canceled)
+}
+
+// A datagram handler parked on the reply of its origin runs off the read loop, and Close
+// returns without it, the flow's sockets closed.
+func TestLifecycle_CloseDoesNotWaitForAStuckDatagramHandler(t *testing.T) {
+	origin := udpEchoOrigin(t)
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	p.MustAdd[UDP](origin.String(), func(c *DatagramCtx) error {
+		if !c.Inbound() {
+			return c.Forward()
+		}
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-release
+		return c.Forward()
+	})
+
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	served := make(chan error, 1)
+	go func() { served <- p.ServeTransparentUDP(newTProxyOriginPacketConn(pc, origin)) }()
+	t.Cleanup(func() { _ = p.Close() })
+	// Registered after Close, so the handler is released before Close waits on it.
+	t.Cleanup(sync.OnceFunc(func() { close(release) }))
+
+	client, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+	_, err = client.WriteTo([]byte("ping"), pc.LocalAddr())
+	require.NoError(t, err)
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the reply never reached the handler")
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- p.Close() }()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close must not wait for the handler")
+	}
+	select {
+	case err := <-served:
+		assert.ErrorIs(t, err, ErrProxyClosed)
+	case <-time.After(5 * time.Second):
+		t.Fatal("ServeTransparentUDP did not return after Close")
 	}
 }
 

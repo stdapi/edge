@@ -85,17 +85,10 @@ func (p *Proxy) ServeConn(conn net.Conn) error {
 		p.srv.untrack(conn)
 	}()
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	// A shutdown aborts the handshake and the dials still in flight on this connection.
 	// Requests being served are not on this context; they drain through the server.
-	go func() {
-		select {
-		case <-p.srv.closed:
-			cancel()
-		case <-ctx.Done():
-		}
-	}()
+	ctx, cancel := context.WithCancel(p.srv.ctx)
+	defer cancel()
 
 	peeked := newPeekConn(conn, nil, clientHelloPeekSize)
 
