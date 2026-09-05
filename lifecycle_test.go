@@ -452,6 +452,8 @@ func TestLifecycle_ShutdownStopsQUIC(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = pc2.Close() }()
 	assert.ErrorIs(t, p.ServeTransparentUDP(pc2), ErrProxyClosed)
+	_, err = pc2.WriteTo([]byte("x"), pc2.LocalAddr())
+	assert.ErrorIs(t, err, net.ErrClosed, "a refused ServeTransparentUDP closes pc")
 }
 
 // A handler that ignores its cancellation cannot hold Shutdown past its deadline. The cut

@@ -103,6 +103,9 @@ func (p *Proxy) ListenAndServeTransparentUDP(addr string) error {
 // [TransparentPacketConn] to place a client by the address it was headed to. Without it a
 // client is placed by its server name alone.
 //
+// ServeTransparentUDP always returns a non-nil error and closes pc. After [Proxy.Shutdown]
+// or [Proxy.Close], the returned error is [ErrProxyClosed].
+//
 // Every QUIC connection is terminated. Its ClientHello names where it was headed and which
 // protocol it asked for: a connection offering h3 is HTTP traffic and its requests are routed
 // one by one, and one offering anything else is served by the [QUIC] entry admitting its
@@ -127,6 +130,7 @@ func (p *Proxy) ListenAndServeTransparentUDP(addr string) error {
 // holding one a connection to a new origin is refused.
 func (p *Proxy) ServeTransparentUDP(pc net.PacketConn) error {
 	if p.srv.closing.Load() {
+		_ = pc.Close()
 		return ErrProxyClosed
 	}
 
@@ -178,10 +182,11 @@ type quicDemux struct {
 	// from the address the client targeted, one per CONNECT-UDP tunnel so a connection stays
 	// with the identity that opened it, and one under the zero key anywhere else.
 	intercepts map[interceptKey]*quicIntercept
-	// raw holds the QUIC connections served by a [QUIC] handler and h3Conns the ones the
-	// HTTP/3 server serves. The server drains the latter, a cut closes both here.
-	raw     map[*quic.Conn]struct{}
-	h3Conns map[*quic.Conn]struct{}
+	// raw holds the QUIC connections a [QUIC] handler is serving, what a shutdown waits on.
+	// accepted holds every connection taken off a listener until it is done with, what a
+	// cut closes.
+	raw      map[*quic.Conn]struct{}
+	accepted map[*quic.Conn]struct{}
 
 	wg sync.WaitGroup
 
@@ -487,7 +492,7 @@ func newQUICDemux(p *Proxy, pc net.PacketConn) (*quicDemux, error) {
 		pc:        pc,
 		flows:     make(map[flowKey]*quicFlow),
 		raw:       make(map[*quic.Conn]struct{}),
-		h3Conns:   make(map[*quic.Conn]struct{}),
+		accepted:  make(map[*quic.Conn]struct{}),
 		done:      make(chan struct{}),
 		maxStacks: maxIntercepts,
 	}
@@ -681,33 +686,37 @@ func (d *quicDemux) acceptLoop(it *quicIntercept) {
 		if err != nil {
 			return
 		}
+		// Recorded on this goroutine, so a cut reaches the connection before anything else
+		// has run for it.
+		d.mu.Lock()
+		draining := d.draining.Load()
+		if !draining {
+			d.accepted[qc] = struct{}{}
+		}
+		d.mu.Unlock()
+		if draining {
+			_ = closeNoError(qc)
+			continue
+		}
 		// Off the WaitGroup, a handler that ignores its cut would otherwise keep the socket.
 		go d.serveQUICConn(qc)
 	}
 }
 
 func (d *quicDemux) serveQUICConn(qc *quic.Conn) {
+	defer func() {
+		d.mu.Lock()
+		delete(d.accepted, qc)
+		d.mu.Unlock()
+	}()
 	sess := d.accept(qc)
 	if sess == nil {
 		return
 	}
 
 	if sess.kind == KindHTTP {
-		d.mu.Lock()
-		draining := d.draining.Load()
-		if !draining {
-			d.h3Conns[qc] = struct{}{}
-		}
-		d.mu.Unlock()
-		if draining {
-			_ = closeNoError(qc)
-			return
-		}
 		sess.setProtocol(HTTP3)
 		err := d.h3.ServeQUICConn(qc)
-		d.mu.Lock()
-		delete(d.h3Conns, qc)
-		d.mu.Unlock()
 		// Refused or failed before it was established, the connection is still open.
 		_ = closeNoError(qc)
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -1928,11 +1937,8 @@ func (d *quicDemux) close() {
 				conn.end()
 			}
 		}
-		conns := make([]*quic.Conn, 0, len(d.raw)+len(d.h3Conns))
-		for qc := range d.raw {
-			conns = append(conns, qc)
-		}
-		for qc := range d.h3Conns {
+		conns := make([]*quic.Conn, 0, len(d.accepted))
+		for qc := range d.accepted {
 			conns = append(conns, qc)
 		}
 		replies := make([]net.PacketConn, 0, len(d.replySockets))
@@ -1947,7 +1953,7 @@ func (d *quicDemux) close() {
 		clear(d.intercepts)
 		clear(d.flows)
 		clear(d.raw)
-		clear(d.h3Conns)
+		clear(d.accepted)
 		d.sniffing = 0
 		d.udps = 0
 		d.mu.Unlock()
@@ -1955,8 +1961,8 @@ func (d *quicDemux) close() {
 		for _, s := range sockets {
 			_ = s.Close()
 		}
-		// http3.Server.Close would wait for every handler, so the connections it serves are
-		// closed here with the raw ones.
+		// http3.Server.Close would wait for every handler, so every accepted connection is
+		// closed here.
 		for _, qc := range conns {
 			_ = closeNoError(qc)
 		}

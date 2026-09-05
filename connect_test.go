@@ -172,6 +172,102 @@ func TestConnect_NameVerificationAppliesToALiteralTarget(t *testing.T) {
 	})
 }
 
+// stalledH2Connect opens a CONNECT over HTTP/2 to an origin that floods, reads nothing back,
+// and returns once the relay has filled the stream's window and stalled in its write.
+func stalledH2Connect(t *testing.T) (*Proxy, *Session, *http.Response) {
+	t.Helper()
+	origin, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = origin.Close() })
+	go func() {
+		chunk := make([]byte, 64<<10)
+		for {
+			c, aerr := origin.Accept()
+			if aerr != nil {
+				return
+			}
+			go func() {
+				defer func() { _ = c.Close() }()
+				for {
+					if _, werr := c.Write(chunk); werr != nil {
+						return
+					}
+				}
+			}()
+		}
+	}()
+
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+	p.MustAdd[TCP](origin.Addr().String(), relayStream)
+	addr := startProxy(t, p)
+
+	raw, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = raw.Close() })
+	cc, err := (&http2.Transport{AllowHTTP: true}).NewClientConn(raw)
+	require.NoError(t, err)
+	pr, pw := io.Pipe()
+	t.Cleanup(func() { _ = pw.Close() })
+	req, err := http.NewRequest(http.MethodConnect, "https://"+origin.Addr().String(), pr)
+	require.NoError(t, err)
+	resp, err := cc.RoundTrip(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	// One byte decides the stream is a plaintext relay. Nothing reads the response, so the
+	// relay fills the stream's window and stalls.
+	_, err = io.WriteString(pw, "x")
+	require.NoError(t, err)
+	sess := waitForSessions(t, p, 1)[0]
+	time.Sleep(300 * time.Millisecond)
+	return p, sess, resp
+}
+
+// assertStreamEnds checks that the client sees the end of its CONNECT stream.
+func assertStreamEnds(t *testing.T, resp *http.Response) {
+	t.Helper()
+	ended := make(chan error, 1)
+	go func() {
+		_, rerr := io.Copy(io.Discard, resp.Body)
+		ended <- rerr
+	}()
+	select {
+	case err := <-ended:
+		require.Error(t, err, "the stream ends for the client")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the client never saw the stream end")
+	}
+}
+
+// Closing the session of a CONNECT carried on an HTTP/2 stream returns while the relay is
+// stalled on a client that stopped reading, and the client sees the stream end.
+func TestConnect_CloseOnAStalledH2StreamReturns(t *testing.T) {
+	_, sess, resp := stalledH2Connect(t)
+
+	closed := make(chan error, 1)
+	go func() { closed <- sess.Close() }()
+	select {
+	case err := <-closed:
+		require.NoError(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("Session.Close waited for the stalled write")
+	}
+	assertStreamEnds(t, resp)
+}
+
+// The Shutdown deadline cuts a stalled CONNECT stream like any other connection.
+func TestConnect_ShutdownDeadlineCutsAStalledH2Stream(t *testing.T) {
+	p, _, resp := stalledH2Connect(t)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+	defer cancel()
+	assert.ErrorIs(t, p.Shutdown(ctx), context.DeadlineExceeded)
+	assertStreamEnds(t, resp)
+}
+
 // Closing the session of a CONNECT carried on an HTTP/2 stream ends that stream and nothing
 // else. The sibling tunnel keeps echoing and the front connection still opens new ones.
 func TestConnect_CloseOnAnH2StreamEndsOnlyThatTunnel(t *testing.T) {

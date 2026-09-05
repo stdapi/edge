@@ -349,7 +349,10 @@ func (f *quicFront) add(c *quic.Conn) {
 // the call returns.
 func (f *quicFront) Close() error {
 	f.mu.Lock()
-	conns := slices.Collect(maps.Keys(f.conns))
+	conns := make([]*quic.Conn, 0, len(f.conns))
+	for c := range f.conns {
+		conns = append(conns, c)
+	}
 	f.mu.Unlock()
 	for _, c := range conns {
 		_ = closeNoError(c)

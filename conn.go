@@ -354,10 +354,13 @@ func (s *h2Stream) Close() error {
 	if s.closed.Swap(true) {
 		return nil
 	}
-	// Wait for a write in flight to finish, so the caller can rely on the response writer
-	// being idle once Close returns.
-	s.wmu.Lock()
-	s.wmu.Unlock() //nolint:staticcheck // acquire and release, this is a barrier not a critical section
+	// A write in flight returns once the stream is reset, which a deadline in the past does
+	// at once. The barrier then leaves the response writer idle for the caller.
+	if !s.wmu.TryLock() {
+		_ = http.NewResponseController(s.w).SetWriteDeadline(time.Now())
+		s.wmu.Lock()
+	}
+	s.wmu.Unlock()
 	return s.body.Close()
 }
 
