@@ -411,11 +411,7 @@ func (t *connectUDPTunnel) close() {
 				d.removeConnLocked(flow, conn)
 			}
 			for key, u := range flow.udp {
-				u.closed = true
-				if u.cancel != nil {
-					u.cancel()
-				}
-				sockets = append(sockets, u.upstream)
+				sockets = append(sockets, u.endLocked()...)
 				delete(flow.udp, key)
 				d.udps--
 			}

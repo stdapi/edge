@@ -393,6 +393,7 @@ var (
 type quicConnCloser struct {
 	flow  flowKey
 	d     *quicDemux
+	conn  *quicConn
 	odcid string
 }
 
@@ -403,8 +404,9 @@ func (c *quicConnCloser) Close() error {
 		c.d.mu.Unlock()
 		return nil
 	}
+	// Compared by identity, the key may be held by a later connection of the same client.
 	conn := flow.conns[c.odcid]
-	if conn == nil {
+	if conn != c.conn {
 		c.d.mu.Unlock()
 		return nil
 	}
@@ -437,6 +439,7 @@ func (c *quicConnCloser) Close() error {
 // client that keeps sending opens a new flow exactly when an entry still admits it.
 type udpFlowCloser struct {
 	d    *quicDemux
+	u    *udpFlow
 	flow flowKey
 	key  netip.AddrPort
 }
@@ -445,7 +448,8 @@ func (c *udpFlowCloser) Close() error {
 	c.d.mu.Lock()
 	var conns []net.Conn
 	if flow := c.d.flows[c.flow]; flow != nil {
-		if u := flow.udp[c.key]; u != nil && !u.closed {
+		// Compared by identity, the key may be held by a later flow of the same client.
+		if u := flow.udp[c.key]; u == c.u && !u.closed {
 			delete(flow.udp, c.key)
 			c.d.udps--
 			conns = u.endLocked()
@@ -1137,7 +1141,7 @@ func (d *quicDemux) openUDPFlow(client net.Addr, from flowKey, origin netip.Addr
 		key:      origin,
 		target:   target,
 	}
-	sess.closer = &udpFlowCloser{d: d, flow: from, key: origin}
+	sess.closer = &udpFlowCloser{d: d, u: u, flow: from, key: origin}
 	u.sink = &udpSink{d: d, u: u}
 	u.out = u.newCtx(false, origin)
 	u.in = u.newCtx(true, origin)
@@ -1680,7 +1684,7 @@ func (d *quicDemux) beginTermination(from flowKey, client net.Addr, conn *quicCo
 	sess.setUpstream(conn.origin)
 	sess.clientHello.Store(hello)
 	sess.servableAs = candidates
-	sess.closer = &quicConnCloser{d: d, flow: from, odcid: conn.odcid}
+	sess.closer = &quicConnCloser{d: d, conn: conn, flow: from, odcid: conn.odcid}
 
 	d.mu.Lock()
 	flow := d.flows[from]

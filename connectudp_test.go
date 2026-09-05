@@ -378,6 +378,63 @@ func TestConnectUDP_RoutesRawDatagramsOnTheDeclaredTarget(t *testing.T) {
 	}
 }
 
+// Closing a tunnel closes the alternates its datagram flows opened with their upstream
+// sockets.
+func TestConnectUDP_TunnelCloseClosesTheAlternates(t *testing.T) {
+	echo := udpEcho(t)
+	other := udpEcho(t)
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	resolver := &fakeResolver{addrs: map[string][]netip.Addr{"echo.udp.test": {echo.Addr()}}}
+	p, err := New(WithCA(ca), WithNameResolver(resolver))
+	require.NoError(t, err)
+	p.MustAdd[UDP](fmt.Sprintf("{name}.udp.test:%d", echo.Port()), func(c *DatagramCtx) error {
+		if !c.Inbound() {
+			return c.SendTo(other.String(), c.Bytes())
+		}
+		return c.Forward()
+	})
+	front, _ := startQUICFront(t, p, ca)
+	cc := masqueClient(t, front, ca)
+
+	pconn, _, err := openTunnel(t, cc, front, fmt.Sprintf("echo.udp.test:%d", echo.Port()), nil)
+	require.NoError(t, err)
+	_, err = pconn.WriteTo([]byte("ping"), nil)
+	require.NoError(t, err)
+	require.NoError(t, pconn.SetReadDeadline(time.Now().Add(5*time.Second)))
+	buf := make([]byte, 64)
+	n, _, err := pconn.ReadFrom(buf)
+	require.NoError(t, err)
+	require.Equal(t, "ping", string(buf[:n]))
+
+	p.srv.mu.Lock()
+	d := p.srv.tunnels
+	p.srv.mu.Unlock()
+	require.NotNil(t, d)
+	var alt net.Conn
+	d.mu.Lock()
+	for _, flow := range d.flows {
+		for _, u := range flow.udp {
+			for _, a := range u.alts {
+				alt = a.conn
+			}
+		}
+	}
+	d.mu.Unlock()
+	require.NotNil(t, alt, "the flow reached the other origin through an alternate")
+
+	var closed int
+	for s := range p.Sessions() {
+		if s.Tunnel() {
+			require.NoError(t, s.Close())
+			closed++
+		}
+	}
+	require.Equal(t, 1, closed)
+	_, err = alt.Write([]byte("x"))
+	assert.ErrorIs(t, err, net.ErrClosed, "closing the tunnel closes the alternate")
+}
+
 // The declared target is admitted before it is resolved, so a refused target is not resolved,
 // and resolution comes before the proxy answers. Neither failure opens anything.
 func TestConnectUDP_RefusesBeforeTheTunnelExists(t *testing.T) {

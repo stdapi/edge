@@ -980,7 +980,7 @@ func TestKindUDP_SendToRepliesOnTheSameFlow(t *testing.T) {
 }
 
 // flowWithAlternate serves a UDP entry answering through SendTo, drives one datagram through
-// it, and returns the demultiplexer and the alternate socket the flow opened.
+// it, and returns the proxy, the demultiplexer and the alternate socket the flow opened.
 func flowWithAlternate(t *testing.T) (*Proxy, *quicDemux, net.Conn) {
 	t.Helper()
 	origin := udpEchoOrigin(t)
@@ -1059,6 +1059,62 @@ func TestKindUDP_SessionCloseClosesTheAlternates(t *testing.T) {
 	require.Equal(t, 1, closed)
 	_, err := alt.Write([]byte("x"))
 	assert.ErrorIs(t, err, net.ErrClosed, "closing the session closes the alternate")
+}
+
+// A session listed before its flow ended does not end the flow the same client opened
+// since, under the same key.
+func TestKindUDP_StaleSessionCloseLeavesTheNewFlow(t *testing.T) {
+	origin := udpEchoOrigin(t)
+	p, err := New()
+	require.NoError(t, err)
+	p.MustAdd("[0.0.0.0/0]:"+fmt.Sprint(origin.Port()), forwardDatagram)
+	_, proxyAddr := startTProxyQUIC(t, p, origin)
+
+	client, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+	ping := func() {
+		t.Helper()
+		require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
+		_, err := client.WriteTo([]byte("ping"), net.UDPAddrFromAddrPort(proxyAddr))
+		require.NoError(t, err)
+		buf := make([]byte, 64)
+		n, _, err := client.ReadFrom(buf)
+		require.NoError(t, err)
+		require.Equal(t, "ping", string(buf[:n]))
+	}
+	ping()
+
+	var stale *Session
+	for s := range p.Sessions() {
+		if s.Kind() == KindUDP {
+			stale = s
+		}
+	}
+	require.NotNil(t, stale)
+
+	p.srv.mu.Lock()
+	var d *quicDemux
+	for d = range p.srv.quics {
+	}
+	p.srv.mu.Unlock()
+	require.NotNil(t, d)
+	d.mu.Lock()
+	for _, flow := range d.flows {
+		for _, u := range flow.udp {
+			u.touch(time.Now().Add(-2 * udpFlowIdle))
+		}
+	}
+	d.mu.Unlock()
+	d.sweepIdle()
+
+	// The client goes on, and its next datagram opens a flow under the same key.
+	ping()
+	require.NoError(t, stale.Close())
+	d.mu.Lock()
+	flows := d.udps
+	d.mu.Unlock()
+	assert.Equal(t, 1, flows, "closing the ended session leaves the new flow")
 }
 
 // A flow reaches a bounded number of origins through SendTo, and the next one is refused.
