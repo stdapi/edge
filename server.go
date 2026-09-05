@@ -80,10 +80,14 @@ type server struct {
 	quics map[*quicDemux]struct{}
 	// tunnels is the demultiplexer the CONNECT-UDP tunnels feed, brought up on the first
 	// tunnel. It has no socket, so one serves the whole proxy.
-	tunnels  *quicDemux
-	closed   chan struct{}
+	tunnels *quicDemux
+	closed  chan struct{}
+	// done is closed once Shutdown or Close has returned, when a front may close the socket
+	// its connections run on.
+	done     chan struct{}
 	wg       sync.WaitGroup
 	closeOne sync.Once
+	doneOne  sync.Once
 
 	mu      sync.Mutex
 	closing atomic.Bool
@@ -103,6 +107,7 @@ func newServer(p *Proxy) (*server, error) {
 		sessions:  make(map[*Session]struct{}),
 		quics:     make(map[*quicDemux]struct{}),
 		closed:    make(chan struct{}),
+		done:      make(chan struct{}),
 	}
 
 	// A client may speak HTTP/2 over plaintext, with the connection preface instead of ALPN.
@@ -259,8 +264,8 @@ func (p *Proxy) ListenAndServeQUIC(addr string, cert tls.Certificate) error {
 }
 
 // ServeQUIC serves as an explicit forward proxy on the QUIC connections arriving on pc, see
-// [Proxy.ListenAndServeQUIC]. It always returns a non-nil error, [ErrProxyClosed] after
-// [Proxy.Shutdown] or [Proxy.Close].
+// [Proxy.ListenAndServeQUIC]. It always returns a non-nil error. After [Proxy.Shutdown] or
+// [Proxy.Close] has returned, the returned error is [ErrProxyClosed].
 func (p *Proxy) ServeQUIC(pc net.PacketConn, cert tls.Certificate) error {
 	if p.srv.closing.Load() {
 		return ErrProxyClosed
@@ -278,18 +283,56 @@ func (p *Proxy) ServeQUIC(pc net.PacketConn, cert tls.Certificate) error {
 		_ = tr.Close()
 		return err
 	}
-	// The server leaves a listener it was handed alone, so both are closed here once it is
-	// done with them.
-	defer func() {
-		_ = ln.Close()
-		_ = tr.Close()
-	}()
+	front := &quicFront{Listener: ln, conns: make(map[*quic.Conn]struct{})}
 
-	err = p.srv.h3.ServeListener(ln)
-	if errors.Is(err, http.ErrServerClosed) {
-		return ErrProxyClosed
+	// ServeListener returns as soon as a shutdown starts, and the listener is closed then so
+	// nothing is accepted during the drain. Closing the transport ends every connection on it
+	// without a CONNECTION_CLOSE, so it is closed once the shutdown is over.
+	err = p.srv.h3.ServeListener(front)
+	_ = ln.Close()
+	if !errors.Is(err, http.ErrServerClosed) {
+		_ = tr.Close()
+		return err
 	}
-	return err
+	<-p.srv.done
+	front.closeConns()
+	_ = tr.Close()
+	return ErrProxyClosed
+}
+
+// quicFront records the connections accepted on an HTTP/3 front, so the ones still open at
+// the deadline can be closed with a CONNECTION_CLOSE before the transport under them.
+type quicFront struct {
+	*quic.Listener
+	conns map[*quic.Conn]struct{}
+	mu    sync.Mutex
+}
+
+func (f *quicFront) Accept(ctx context.Context) (*quic.Conn, error) {
+	c, err := f.Listener.Accept(ctx)
+	if err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	f.conns[c] = struct{}{}
+	f.mu.Unlock()
+	context.AfterFunc(c.Context(), func() {
+		f.mu.Lock()
+		delete(f.conns, c)
+		f.mu.Unlock()
+	})
+	return c, nil
+}
+
+// closeConns closes every connection still open with a CONNECTION_CLOSE, which is sent
+// before the call returns.
+func (f *quicFront) closeConns() {
+	f.mu.Lock()
+	conns := slices.Collect(maps.Keys(f.conns))
+	f.mu.Unlock()
+	for _, c := range conns {
+		_ = closeNoError(c)
+	}
 }
 
 // Shutdown stops accepting new connections, then waits for the requests in flight to finish.
@@ -300,6 +343,7 @@ func (p *Proxy) ServeQUIC(pc net.PacketConn, cert tls.Certificate) error {
 // Without a deadline on ctx, Shutdown waits indefinitely.
 func (p *Proxy) Shutdown(ctx context.Context) error {
 	p.srv.beginClose()
+	defer p.srv.endClose()
 
 	err := p.srv.closeListeners()
 
@@ -363,6 +407,7 @@ func (p *Proxy) Shutdown(ctx context.Context) error {
 // Close stops the proxy at once, dropping every connection including the traffic in flight.
 func (p *Proxy) Close() error {
 	p.srv.beginClose()
+	defer p.srv.endClose()
 	err := errors.Join(p.srv.closeListeners(), p.srv.h1.Close(), p.srv.h3.Close(), p.srv.term.Close())
 	p.srv.closeActive()
 	p.srv.fwd.close()
@@ -534,6 +579,11 @@ func (s *server) beginClose() {
 	s.closing.Store(true)
 	s.mu.Unlock()
 	s.closeOne.Do(func() { close(s.closed) })
+}
+
+// endClose marks the shutdown as over, drained or cut at the deadline.
+func (s *server) endClose() {
+	s.doneOne.Do(func() { close(s.done) })
 }
 
 // tryTrack registers a connection the proxy owns outside of http.Server and reports whether

@@ -16,6 +16,7 @@ import (
 	"net/netip"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -580,6 +581,176 @@ func TestLifecycle_ShutdownDeadlineBoundsAStuckHTTP3Handler(t *testing.T) {
 		assert.ErrorIs(t, err, ErrProxyClosed)
 	case <-time.After(10 * time.Second):
 		t.Fatal("ServeTransparentUDP did not return after the release")
+	}
+}
+
+// The HTTP/3 front drains like the TCP one: the request in flight completes, no connection is
+// accepted meanwhile, and the socket is released once Shutdown has returned.
+func TestLifecycle_ShutdownDrainsTheHTTP3Front(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	p.MustAdd(h3Authority+"/", blockingHandler(started, release))
+	front, served := startQUICFront(t, p, ca)
+	// Registered after the front, so the handler is released before Close waits on it.
+	releaseHandler := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseHandler)
+
+	tr := &http3.Transport{
+		Dial: func(context.Context, string, *tls.Config, *quic.Config) (*quic.Conn, error) {
+			return dialQUICFront(t, front, ca), nil
+		},
+	}
+	defer func() { _ = tr.Close() }()
+
+	got := make(chan drainResult, 1)
+	go func() {
+		req, rerr := http.NewRequest(http.MethodGet, "https://"+h3Authority+"/", nil)
+		if rerr != nil {
+			got <- drainResult{err: rerr}
+			return
+		}
+		resp, rerr := tr.RoundTrip(req)
+		if rerr != nil {
+			got <- drainResult{err: rerr}
+			return
+		}
+		defer func() { _ = resp.Body.Close() }()
+		b, rerr := io.ReadAll(resp.Body)
+		got <- drainResult{body: string(b), err: rerr}
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the request never reached the handler")
+	}
+
+	shutdownErr := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		defer cancel()
+		shutdownErr <- p.Shutdown(ctx)
+	}()
+	select {
+	case err := <-shutdownErr:
+		t.Fatalf("Shutdown returned while a request was in flight: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	pc, err := loopbackUDP()
+	require.NoError(t, err)
+	defer func() { _ = pc.Close() }()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	_, err = quic.Dial(ctx, pc, net.UDPAddrFromAddrPort(front), &tls.Config{
+		RootCAs:    poolOf(ca),
+		ServerName: "127.0.0.1",
+		NextProtos: []string{http3.NextProtoH3},
+		MinVersion: tls.VersionTLS13,
+	}, &quic.Config{HandshakeIdleTimeout: 500 * time.Millisecond})
+	require.Error(t, err, "a handshake during the drain is not accepted")
+	select {
+	case <-served:
+		t.Fatal("ServeQUIC returned before Shutdown did")
+	default:
+	}
+
+	releaseHandler()
+	var r drainResult
+	select {
+	case r = <-got:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the in-flight request never completed")
+	}
+	require.NoError(t, r.err, "a graceful shutdown must not cut a request in flight")
+	assert.Equal(t, "drained over HTTP/3.0", r.body)
+	select {
+	case err := <-shutdownErr:
+		require.NoError(t, err, "a drain finished before the deadline reports no error")
+	case <-time.After(5 * time.Second):
+		t.Fatal("Shutdown did not return after the drain")
+	}
+	select {
+	case err := <-served:
+		assert.ErrorIs(t, err, ErrProxyClosed)
+	case <-time.After(5 * time.Second):
+		t.Fatal("ServeQUIC did not return after Shutdown")
+	}
+}
+
+// The deadline cuts the HTTP/3 front like everything else. Shutdown returns, the client is
+// sent a CONNECTION_CLOSE, and the socket is released before the handler ends.
+func TestLifecycle_ShutdownDeadlineCutsTheHTTP3Front(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	p.MustAdd(h3Authority+"/", blockingHandler(started, release))
+	front, served := startQUICFront(t, p, ca)
+	// Registered after the front, so the handler is released before Close waits on it.
+	releaseHandler := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseHandler)
+
+	conn := dialQUICFront(t, front, ca)
+	tr := &http3.Transport{}
+	defer func() { _ = tr.Close() }()
+	cc := tr.NewClientConn(conn)
+
+	got := make(chan error, 1)
+	go func() {
+		req, rerr := http.NewRequest(http.MethodGet, "https://"+h3Authority+"/", nil)
+		if rerr != nil {
+			got <- rerr
+			return
+		}
+		resp, rerr := cc.RoundTrip(req)
+		if rerr == nil {
+			_, _ = io.Copy(io.Discard, resp.Body)
+			_ = resp.Body.Close()
+		}
+		got <- rerr
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the request never reached the handler")
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err = p.Shutdown(ctx)
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Less(t, time.Since(start), 3*time.Second, "the deadline must bound Shutdown, not the handler")
+
+	select {
+	case <-conn.Context().Done():
+		var appErr *quic.ApplicationError
+		cause := context.Cause(conn.Context())
+		require.ErrorAs(t, cause, &appErr, "the client is told in QUIC terms: %v", cause)
+		assert.True(t, appErr.Remote, "the close comes from the proxy: %v", cause)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the client never learned of the cut")
+	}
+	select {
+	case err := <-served:
+		assert.ErrorIs(t, err, ErrProxyClosed)
+	case <-time.After(5 * time.Second):
+		t.Fatal("ServeQUIC did not return after the deadline")
+	}
+
+	releaseHandler()
+	select {
+	case <-got:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the client request never returned after the release")
 	}
 }
 
