@@ -16,6 +16,7 @@ import (
 	"net/netip"
 	"net/url"
 	"slices"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -567,7 +568,10 @@ func TestTransparent_PlaintextWithOriginalDestination(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "origin got host=api.example.test", string(body))
 
-	assert.Empty(t, slices.Collect(p.Sessions()), "a connection decided per request is not reported")
+	sessions := slices.Collect(p.Sessions())
+	require.Len(t, sessions, 1, "a connection decided on the authority of its first request is reported")
+	assert.Equal(t, KindHTTP, sessions[0].Kind())
+	assert.Equal(t, "api.example.test", sessions[0].Target().Host)
 }
 
 // tcpEchoOrigin starts a TCP echo server and returns its address.
@@ -668,31 +672,48 @@ func TestTransparent_RawTCPRejectedWithoutTunnel(t *testing.T) {
 
 // A tunnel entry says to leave the connection alone, so bytes that would parse as HTTP go
 // through untouched rather than being intercepted on their Host header.
-func TestTransparent_StreamEntryWinsOverHTTPParsing(t *testing.T) {
+// A plaintext request is routed on its authority, so a stream entry takes it when it admits
+// that authority, and an entry on the destination alone takes only a request whose authority
+// is the destination.
+func TestTransparent_StreamEntryOnTheAuthorityWinsOverHTTPParsing(t *testing.T) {
 	origin := tcpEchoOrigin(t)
 
-	ca, err := GenerateCA()
-	require.NoError(t, err)
-	p, err := New(WithCA(ca))
-	require.NoError(t, err)
-	p.MustAdd[TCP](origin.String(), relayStream)
+	send := func(t *testing.T, p *Proxy, request string) string {
+		t.Helper()
+		addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) {
+			return origin, nil
+		})
+		client, err := net.Dial("tcp", addr)
+		require.NoError(t, err)
+		defer func() { _ = client.Close() }()
+		_, err = client.Write([]byte(request))
+		require.NoError(t, err)
+		require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
+		buf := make([]byte, len(request))
+		n, _ := io.ReadFull(client, buf)
+		return string(buf[:n])
+	}
 
-	addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) {
-		return origin, nil
+	t.Run("on the name", func(t *testing.T) {
+		p := testProxy(t)
+		p.MustAdd[TCP]("bytes.test", relayStream)
+		request := "GET /secret HTTP/1.1\r\nHost: bytes.test\r\n\r\n"
+		assert.Equal(t, request, send(t, p, request), "the origin must receive the request byte for byte")
 	})
 
-	client, err := net.Dial("tcp", addr)
-	require.NoError(t, err)
-	defer func() { _ = client.Close() }()
+	t.Run("on the destination, for a request whose Host is the destination", func(t *testing.T) {
+		p := testProxy(t)
+		p.MustAdd[TCP](origin.String(), relayStream)
+		request := "GET /secret HTTP/1.1\r\nHost: " + origin.String() + "\r\n\r\n"
+		assert.Equal(t, request, send(t, p, request))
+	})
 
-	request := "GET /secret HTTP/1.1\r\nHost: never-consulted.test\r\n\r\n"
-	_, err = client.Write([]byte(request))
-	require.NoError(t, err)
-	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
-	buf := make([]byte, len(request))
-	_, err = io.ReadFull(client, buf)
-	require.NoError(t, err)
-	assert.Equal(t, request, string(buf), "the origin must receive the request byte for byte")
+	t.Run("on the destination, a request whose Host is a hostname is refused", func(t *testing.T) {
+		p := testProxy(t)
+		p.MustAdd[TCP](origin.String(), relayStream)
+		request := "GET /secret HTTP/1.1\r\nHost: some.test\r\n\r\n"
+		assert.True(t, strings.HasPrefix(send(t, p, request), "HTTP/1.1 403 "), "a request with a hostname is not admitted by an entry on an address")
+	})
 }
 
 func TestDivertedOrigin(t *testing.T) {
@@ -877,4 +898,374 @@ func TestTransparent_PlainPoolIsKeyedOnTheDestination(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	assert.Equal(t, "A", get(a))
 	assert.EqualValues(t, 1, toA.accepted.Load(), "two clients headed to A share one upstream connection")
+}
+
+// A redirected plaintext connection is decided on the authority of its first request, as a TLS
+// connection is decided on its server name, so an entry on that host takes it ahead of a stream
+// entry on every address. A connection opening with the HTTP/2 preface has no authority
+// before the server sends its SETTINGS, so its destination decides it.
+func TestTransparent_PlaintextIsDecidedOnItsFirstAuthority(t *testing.T) {
+	type counters struct {
+		served, streamed atomic.Int32
+		servableAs       chan []Kind
+	}
+	setup := func(t *testing.T, streamEntry bool) (*Proxy, string, netip.AddrPort, *counters) {
+		t.Helper()
+		origin := h2cOrigin(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprintf(w, "origin got host=%s proto=%d", r.Host, r.ProtoMajor)
+		}))
+		originURL, err := url.Parse(origin.URL)
+		require.NoError(t, err)
+		originAddr, err := netip.ParseAddrPort(originURL.Host)
+		require.NoError(t, err)
+
+		tr := DefaultTransport()
+		tr.DialContext = pinnedDialer(originURL.Host)
+		p := testProxy(t, WithTransport(tr))
+
+		n := &counters{servableAs: make(chan []Kind, 1)}
+		p.MustAdd("api.example.test/ping", func(c *HTTPCtx) (*http.Response, error) {
+			n.served.Add(1)
+			select {
+			case n.servableAs <- c.Session().ServableAs():
+			default:
+			}
+			return c.Forward()
+		})
+		if streamEntry {
+			p.MustAdd[TCP]("[0.0.0.0/0]", func(c *TCPCtx) error {
+				n.streamed.Add(1)
+				return c.Relay()
+			})
+		}
+		addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) {
+			return originAddr, nil
+		})
+		return p, addr, originAddr, n
+	}
+	body := func(t *testing.T, resp *http.Response) string {
+		t.Helper()
+		b, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		_ = resp.Body.Close()
+		return string(b)
+	}
+	h2cClient := func(addr string) *http.Client {
+		return &http.Client{Timeout: 10 * time.Second, Transport: &http2.Transport{
+			AllowHTTP: true,
+			DialTLSContext: func(ctx context.Context, network, _ string, _ *tls.Config) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, network, addr)
+			},
+		}}
+	}
+
+	t.Run("HTTP/1.1 goes to the entry on its name", func(t *testing.T) {
+		p, addr, _, n := setup(t, true)
+		client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{DialContext: pinnedDialer(addr)}}
+		resp, err := client.Get("http://api.example.test/ping")
+		require.NoError(t, err)
+		assert.Equal(t, "origin got host=api.example.test proto=1", body(t, resp))
+		assert.EqualValues(t, 1, n.served.Load())
+		assert.Zero(t, n.streamed.Load(), "the stream entry on the address does not receive a connection routed on a hostname")
+
+		sessions := slices.Collect(p.Sessions())
+		require.Len(t, sessions, 1)
+		assert.Equal(t, KindHTTP, sessions[0].Kind())
+		assert.Equal(t, "api.example.test", sessions[0].Target().Host)
+		assert.False(t, sessions[0].Stale())
+	})
+
+	t.Run("h2c goes to the stream entry on its destination", func(t *testing.T) {
+		p, addr, originAddr, n := setup(t, true)
+		resp, err := h2cClient(addr).Get("http://api.example.test/ping")
+		require.NoError(t, err)
+		assert.Equal(t, "origin got host=api.example.test proto=2", body(t, resp))
+		assert.Zero(t, n.served.Load())
+		assert.EqualValues(t, 1, n.streamed.Load(), "the preface has no authority, the destination decided")
+
+		sessions := slices.Collect(p.Sessions())
+		require.Len(t, sessions, 1)
+		assert.Equal(t, KindTCP, sessions[0].Kind())
+		assert.Equal(t, originAddr.Addr().String(), sessions[0].Target().Host)
+	})
+
+	t.Run("h2c with nothing on its destination is routed request by request", func(t *testing.T) {
+		p, addr, _, n := setup(t, false)
+		resp, err := h2cClient(addr).Get("http://api.example.test/ping")
+		require.NoError(t, err)
+		assert.Equal(t, "origin got host=api.example.test proto=2", body(t, resp))
+		assert.EqualValues(t, 1, n.served.Load())
+		assert.Equal(t, []Kind{KindHTTP, KindTCP}, <-n.servableAs, "the first bytes fixed the kinds, whatever decided the connection")
+		assert.Empty(t, slices.Collect(p.Sessions()), "nothing decided the connection, so nothing reports it")
+	})
+}
+
+// A CONNECT reaching a terminated connection is a client that takes the origin for a proxy.
+// Its target has no path, and a lookup without one reaches the admission of its authority.
+func TestTransparent_PlaintextConnectIsRefused(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, "origin reached")
+	}))
+	defer origin.Close()
+	originURL, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+	originAddr, err := netip.ParseAddrPort(originURL.Host)
+	require.NoError(t, err)
+
+	p := testProxy(t)
+	p.MustAdd("api.example.test/probe", forwardHandler)
+	addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) {
+		return originAddr, nil
+	})
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+	require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+
+	_, err = fmt.Fprint(conn, "CONNECT api.example.test:443 HTTP/1.1\r\nHost: api.example.test:443\r\n\r\n")
+	require.NoError(t, err)
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodConnect})
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+	assert.Equal(t, http.StatusNotImplemented, resp.StatusCode)
+}
+
+// gRPC over plaintext opens with the HTTP/2 preface, so its connection is decided on the
+// destination and its calls on their authority.
+func TestTransparent_PlaintextGRPCIsDecidedOnItsDestination(t *testing.T) {
+	setup := func(t *testing.T, streamEntry bool) (*http.Client, *atomic.Int32, *atomic.Int32, *atomic.Int32) {
+		t.Helper()
+		reached := new(atomic.Int32)
+		origin := h2cOrigin(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			reached.Add(1)
+			_, _ = io.Copy(io.Discard, r.Body)
+			w.Header().Set("Content-Type", "application/grpc")
+			w.Header().Set("Trailer", "Grpc-Status")
+			w.WriteHeader(http.StatusOK)
+			w.Header().Set("Grpc-Status", "0")
+		}))
+		originURL, err := url.Parse(origin.URL)
+		require.NoError(t, err)
+		originAddr, err := netip.ParseAddrPort(originURL.Host)
+		require.NoError(t, err)
+
+		p := testProxy(t)
+		called, streamed := new(atomic.Int32), new(atomic.Int32)
+		p.MustAdd("api.example.test/billing.v1.Billing/Charge", func(c *GRPCCtx) error {
+			called.Add(1)
+			return c.Fail(CodeUnavailable, "held by the proxy")
+		})
+		if streamEntry {
+			p.MustAdd[TCP]("[0.0.0.0/0]", func(c *TCPCtx) error {
+				streamed.Add(1)
+				return c.Relay()
+			})
+		}
+		addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) {
+			return originAddr, nil
+		})
+		client := &http.Client{Timeout: 10 * time.Second, Transport: &http2.Transport{
+			AllowHTTP: true,
+			DialTLSContext: func(ctx context.Context, network, _ string, _ *tls.Config) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, network, addr)
+			},
+		}}
+		return client, reached, called, streamed
+	}
+	call := func(t *testing.T, client *http.Client) (code, msg string) {
+		t.Helper()
+		resp := grpcDo(t, client, "http://api.example.test/billing.v1.Billing/Charge", []byte{0, 0, 0, 0, 0})
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		return grpcStatus(resp)
+	}
+
+	t.Run("a stream entry on the destination takes the connection", func(t *testing.T) {
+		client, reached, called, streamed := setup(t, true)
+		code, _ := call(t, client)
+		assert.Equal(t, "0", code, "the origin answered through the stream handler")
+		assert.EqualValues(t, 1, reached.Load())
+		assert.EqualValues(t, 1, streamed.Load())
+		assert.Zero(t, called.Load())
+	})
+
+	t.Run("with nothing on the destination the entry on the method serves the call", func(t *testing.T) {
+		client, reached, called, streamed := setup(t, false)
+		code, msg := call(t, client)
+		assert.Equal(t, "14", code)
+		assert.Equal(t, "held by the proxy", msg)
+		assert.Zero(t, reached.Load())
+		assert.EqualValues(t, 1, called.Load())
+		assert.Zero(t, streamed.Load())
+	})
+}
+
+// Name verification stands between the authority a plaintext connection is decided on and
+// its destination, as it does for a server name. A name confirmed routes, a name refused
+// under VerifyReject is admitted by nothing, whatever admits the destination, and a name
+// dropped under VerifyLoose leaves the destination to decide.
+func TestTransparent_PlaintextAuthorityIsVerified(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, "origin reached")
+	}))
+	defer origin.Close()
+	originURL, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+	originAddr, err := netip.ParseAddrPort(originURL.Host)
+	require.NoError(t, err)
+
+	run := func(t *testing.T, mode NameVerification, resolvesTo string) (int, string, int32, int32, int) {
+		t.Helper()
+		tr := DefaultTransport()
+		tr.DialContext = pinnedDialer(originURL.Host)
+		resolver := &fakeResolver{addrs: map[string][]netip.Addr{"api.example.test": addrsOf(resolvesTo)}}
+		p := testProxy(t, WithTransport(tr), WithNameVerification(mode), WithNameResolver(resolver))
+
+		var served, streamed atomic.Int32
+		p.MustAdd("api.example.test/probe", func(c *HTTPCtx) (*http.Response, error) {
+			served.Add(1)
+			return c.Forward()
+		})
+		p.MustAdd[TCP]("[0.0.0.0/0]", func(c *TCPCtx) error {
+			streamed.Add(1)
+			return c.Relay()
+		})
+		addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) {
+			return originAddr, nil
+		})
+		client := &http.Client{Timeout: 10 * time.Second, Transport: &http.Transport{DialContext: pinnedDialer(addr), DisableKeepAlives: true}}
+		resp, err := client.Get("http://api.example.test/probe")
+		require.NoError(t, err)
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		_ = resp.Body.Close()
+		return resp.StatusCode, string(body), served.Load(), streamed.Load(), len(slices.Collect(p.Sessions()))
+	}
+
+	t.Run("confirmed under VerifyReject", func(t *testing.T) {
+		status, body, served, streamed, _ := run(t, VerifyReject, "127.0.0.1")
+		assert.Equal(t, http.StatusOK, status)
+		assert.Equal(t, "origin reached", body)
+		assert.EqualValues(t, 1, served)
+		assert.Zero(t, streamed)
+	})
+
+	t.Run("refused under VerifyReject", func(t *testing.T) {
+		status, _, served, streamed, sessions := run(t, VerifyReject, "10.0.0.1")
+		assert.Equal(t, http.StatusForbidden, status)
+		assert.Zero(t, served)
+		assert.Zero(t, streamed, "a refused name is not handed to whatever admits the destination")
+		assert.Zero(t, sessions)
+	})
+
+	t.Run("dropped under VerifyLoose", func(t *testing.T) {
+		status, body, served, streamed, _ := run(t, VerifyLoose, "10.0.0.1")
+		assert.Equal(t, http.StatusOK, status)
+		assert.Equal(t, "origin reached", body)
+		assert.Zero(t, served)
+		assert.EqualValues(t, 1, streamed, "the name dropped, the destination decided")
+	})
+}
+
+// The peek for the authority is bounded by the header size the server accepts and by the
+// header timeout. Past the size the destination decides and the server answers 431, past the
+// timeout the proxy answers 408.
+func TestTransparent_PlaintextAuthorityPeekIsBounded(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, "origin reached")
+	}))
+	defer origin.Close()
+	originURL, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+	originAddr, err := netip.ParseAddrPort(originURL.Host)
+	require.NoError(t, err)
+
+	setup := func(t *testing.T, opts ...ProxyOption) (net.Conn, *bufio.Reader, *atomic.Int32) {
+		t.Helper()
+		p := testProxy(t, opts...)
+		byAddress := new(atomic.Int32)
+		p.MustAdd("[0.0.0.0/0]/+{rest}", func(c *HTTPCtx) (*http.Response, error) {
+			byAddress.Add(1)
+			return c.Forward()
+		})
+		addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) {
+			return originAddr, nil
+		})
+		conn, err := net.Dial("tcp", addr)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = conn.Close() })
+		require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+		return conn, bufio.NewReader(conn), byAddress
+	}
+
+	t.Run("a header block past the limit", func(t *testing.T) {
+		conn, br, byAddress := setup(t, WithMaxHeaderBytes(1024))
+		_, err := fmt.Fprintf(conn, "GET /probe HTTP/1.1\r\n%sHost: api.example.test\r\n\r\n", strings.Repeat("X-Pad: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n", 300))
+		require.NoError(t, err)
+		resp, err := http.ReadResponse(br, nil)
+		require.NoError(t, err)
+		_ = resp.Body.Close()
+		assert.Equal(t, http.StatusRequestHeaderFieldsTooLarge, resp.StatusCode)
+		assert.Zero(t, byAddress.Load())
+	})
+
+	t.Run("a client that stalls in its headers", func(t *testing.T) {
+		const timeout = 500 * time.Millisecond
+		conn, br, _ := setup(t, WithReadHeaderTimeout(timeout))
+		start := time.Now()
+		_, err := fmt.Fprint(conn, "GET /probe HTTP/1.1\r\nX-A: a\r\n")
+		require.NoError(t, err)
+		resp, err := http.ReadResponse(br, nil)
+		require.NoError(t, err)
+		_ = resp.Body.Close()
+		assert.Equal(t, http.StatusRequestTimeout, resp.StatusCode)
+		assert.Less(t, time.Since(start), 2*timeout-100*time.Millisecond, "one header timeout in all")
+	})
+}
+
+// The name the first request gives replaces the host of the connection's authority and nothing
+// else. The port stays the destination's, as it does under a server name, so a request with a
+// port is routed on that port alone and a later one without is routed on the connection's.
+func TestTransparent_PlaintextPortStaysTheDestinations(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, "origin reached")
+	}))
+	defer origin.Close()
+	originURL, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+	originAddr, err := netip.ParseAddrPort(originURL.Host)
+	require.NoError(t, err)
+
+	tr := DefaultTransport()
+	tr.DialContext = pinnedDialer(originURL.Host)
+	p := testProxy(t, WithTransport(tr))
+	ports := make(chan string, 2)
+	p.MustAdd("b.test/probe", func(c *HTTPCtx) (*http.Response, error) {
+		ports <- c.Port()
+		return c.Forward()
+	})
+	addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) {
+		return originAddr, nil
+	})
+
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+	require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+	br := bufio.NewReader(conn)
+	for _, host := range []string{"b.test:8443", "b.test"} {
+		_, err = fmt.Fprintf(conn, "GET /probe HTTP/1.1\r\nHost: %s\r\n\r\n", host)
+		require.NoError(t, err)
+		resp, err := http.ReadResponse(br, nil)
+		require.NoError(t, err)
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+	}
+	assert.Equal(t, "8443", <-ports)
+	assert.Equal(t, originURL.Port(), <-ports)
+
+	sessions := waitForSessions(t, p, 1)
+	assert.Equal(t, "b.test", sessions[0].Target().Host)
+	assert.Equal(t, originURL.Port(), sessions[0].Target().Port)
 }

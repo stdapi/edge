@@ -35,10 +35,12 @@ func (p *Proxy) ListenAndServeTransparent(addr string) error {
 
 // ServeTransparent accepts redirected connections on ln and serves them.
 //
-// The destination of a connection is resolved from what an [OriginalDestination] connection
-// reports, then the server name of a TLS ClientHello, then the Host header of a plaintext
-// request. A connection with none of the three cannot be placed and is closed. Wrap ln in
-// [TransparentListener] for the first of them.
+// A connection is routed on the server name of its TLS ClientHello, or on the authority of
+// the first request of a plaintext HTTP connection, and dialed to the destination an
+// [OriginalDestination] connection reports. A connection opening with the HTTP/2 preface is
+// routed on that destination, each of its requests on its own authority. A connection with
+// neither a name nor a destination cannot be placed and is closed. Wrap ln in
+// [TransparentListener] for the destination.
 func (p *Proxy) ServeTransparent(ln net.Listener) error {
 	// A refused registration means a shutdown started; accepting would run a loop nothing
 	// ever closes.
@@ -137,12 +139,7 @@ func (p *Proxy) serveTransparentTLS(ctx context.Context, conn *peekConn, origin 
 	return p.terminate(ctx, conn, sess)
 }
 
-// serveTransparentPlain serves a redirected connection that is not TLS. What it carries is
-// already in the clear, so the first bytes name what it is, and the destination is the only
-// authority the connection has for an admission to answer on.
-//
-// HTTP is the residual: its requests each name an authority of their own, so a connection the
-// destination cannot place is still parsed and every request placed on its own.
+// serveTransparentPlain serves a redirected connection that is not TLS.
 func (p *Proxy) serveTransparentPlain(ctx context.Context, conn *peekConn, origin netip.AddrPort) error {
 	target := Target{Scheme: "http", Port: "80"}
 	if origin.IsValid() {
@@ -156,9 +153,7 @@ func (p *Proxy) serveTransparentPlain(ctx context.Context, conn *peekConn, origi
 	sess := newSession(p, ctx, conn, target, 0, 0)
 	sess.transparent = true
 	sess.setUpstream(origin)
-	sess.perRequest = true
-
-	return p.serveCandidates(ctx, conn, sess, sniffStreamCandidates(conn, p.cfg.server.sniffTimeout), nil)
+	return p.servePlain(ctx, conn, sess)
 }
 
 // redirectedTo reports where a redirected connection was headed, or the zero value. A lookup

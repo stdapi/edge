@@ -496,8 +496,9 @@ func plainRequest(t *testing.T, conn net.Conn, br *bufio.Reader, host string) (i
 	return resp.StatusCode, string(body)
 }
 
-// A plaintext connection has no server name, so the Host of each request is checked against
-// the destination, with the same modes and one resolution per connection as a handshake.
+// A plaintext connection has no server name, so the host of its first request is checked
+// against the destination as a server name is, and the Host of each later request the same
+// way, one resolution per Host.
 func TestTransparent_NameVerificationAppliesToPlaintext(t *testing.T) {
 	setup := func(t *testing.T, opts ...ProxyOption) (*Proxy, netip.AddrPort, *countingListener, net.Conn, *bufio.Reader) {
 		t.Helper()
@@ -514,13 +515,18 @@ func TestTransparent_NameVerificationAppliesToPlaintext(t *testing.T) {
 		return p, origin, accepted, conn, bufio.NewReader(conn)
 	}
 
-	t.Run("strict refuses a lying host and resolves it once", func(t *testing.T) {
+	t.Run("strict refuses a lying host once for all", func(t *testing.T) {
 		r := &fakeResolver{addrs: map[string][]netip.Addr{"example.test": addrsOf("9.9.9.9")}}
 		_, _, accepted, conn, br := setup(t, WithNameVerification(VerifyReject), WithNameResolver(r))
-		for range 2 {
-			status, _ := plainRequest(t, conn, br, "example.test")
-			assert.Equal(t, http.StatusForbidden, status)
+		status, _ := plainRequest(t, conn, br, "example.test")
+		assert.Equal(t, http.StatusForbidden, status)
+		// The host of the first request was refused, so the connection ends with the refusal,
+		// as a handshake does.
+		_, err := fmt.Fprint(conn, "GET / HTTP/1.1\r\nHost: example.test\r\n\r\n")
+		if err == nil {
+			_, err = http.ReadResponse(br, nil)
 		}
+		assert.Error(t, err)
 		assert.EqualValues(t, 1, r.calls.Load(), "one Host, one resolution")
 		assert.Zero(t, accepted.accepted.Load(), "a refused request must not reach the origin")
 	})

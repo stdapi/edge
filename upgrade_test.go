@@ -149,8 +149,9 @@ func dialThroughProxy(t *testing.T, proxyAddr, authority string, ca *CA) (*tls.C
 
 const upgradeRequest = "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\n"
 
-// A redirected plaintext connection is decided request by request and is never reported. The
-// pipe an upgrade leaves on it is, because past the 101 nothing on it is routed again.
+// A redirected plaintext connection is reported under the authority of its first request,
+// and so is the pipe an upgrade leaves on it, because past the 101 nothing on it is routed
+// again.
 func TestUpgrade_TransparentPlaintextPipeIsListedAndClosed(t *testing.T) {
 	origin := plainUpgradeOrigin(t)
 	originURL, _ := url.Parse(origin.URL)
@@ -181,12 +182,14 @@ func TestUpgrade_TransparentPlaintextPipeIsListedAndClosed(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
 
-	sessions := waitForSessions(t, p, 1)
-	assert.Equal(t, KindTCP, sessions[0].Kind())
-	assert.Equal(t, "ws.example.test", sessions[0].Target().Host)
-	assert.True(t, sessions[0].Transparent())
+	sessions := waitForSessions(t, p, 2)
+	i := slices.IndexFunc(sessions, func(s *Session) bool { return s.Kind() == KindTCP })
+	require.GreaterOrEqual(t, i, 0, "the connection is HTTP, the pipe is the stream")
+	pipe := sessions[i]
+	assert.Equal(t, "ws.example.test", pipe.Target().Host)
+	assert.True(t, pipe.Transparent())
 
-	require.NoError(t, sessions[0].Close())
+	require.NoError(t, pipe.Close())
 	_, _ = raw.Write([]byte("ping\n"))
 	_, err = br.ReadString('\n')
 	assert.Error(t, err, "the pipe is cut, nothing echoes back")

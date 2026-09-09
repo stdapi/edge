@@ -5,6 +5,7 @@
 package edge
 
 import (
+	"bytes"
 	"errors"
 	"net"
 	"os"
@@ -203,6 +204,132 @@ func isTokenByte(b byte) bool {
 	}
 	return false
 }
+
+// peekAuthority returns the authority of the request opening conn, found within limit bytes
+// and consuming nothing, and the read error that cut the scan short. The HTTP/2 preface has no
+// authority, and the client may send no request before it receives the server's SETTINGS, RFC
+// 9113 section 3.4, which nothing sends while its bytes are peeked.
+func peekAuthority(conn *peekConn, limit int) (string, error) {
+	s := lineScanner{conn: conn, limit: min(limit, conn.max)}
+	s.b, _ = conn.Peek(min(conn.Buffered(), s.limit))
+
+	line, ok := s.next()
+	if !ok {
+		return "", s.err
+	}
+	method, target, ok := splitRequestLine(line)
+	if !ok {
+		return "", nil
+	}
+	if string(method) == "CONNECT" && target[0] != '/' {
+		return string(target), nil
+	}
+	if authority, absolute := absoluteFormAuthority(target); absolute && len(authority) > 0 {
+		return string(authority), nil
+	}
+	for {
+		if line, ok = s.next(); !ok {
+			return "", s.err
+		}
+		if len(line) == 0 {
+			return "", nil
+		}
+		if line[0] == ' ' || line[0] == '\t' {
+			// Obsolete line folding, the tail of the line before.
+			continue
+		}
+		name, value, ok := splitHeader(line)
+		if !ok {
+			return "", nil
+		}
+		if bytes.EqualFold(name, []byte("host")) {
+			return string(value), nil
+		}
+	}
+}
+
+// lineScanner returns the lines of a header block as they arrive, never scanning a byte twice.
+type lineScanner struct {
+	conn  *peekConn
+	err   error
+	b     []byte
+	off   int
+	limit int
+}
+
+func (s *lineScanner) next() ([]byte, bool) {
+	from := s.off
+	for {
+		if i := bytes.IndexByte(s.b[from:], '\n'); i >= 0 {
+			line := s.b[s.off : from+i]
+			s.off = from + i + 1
+			if n := len(line); n > 0 && line[n-1] == '\r' {
+				line = line[:n-1]
+			}
+			return line, true
+		}
+		from = len(s.b)
+		if s.err != nil || from >= s.limit {
+			return nil, false
+		}
+		b, err := s.conn.Peek(min(max(from+1, s.conn.Buffered()), s.limit))
+		// What arrived before an error is all of the buffer, past the limit included.
+		s.b, s.err = b[:min(len(b), s.limit)], err
+	}
+}
+
+func splitRequestLine(line []byte) (method, target []byte, ok bool) {
+	i := bytes.IndexByte(line, ' ')
+	if i <= 0 {
+		return nil, nil, false
+	}
+	rest := line[i+1:]
+	j := bytes.IndexByte(rest, ' ')
+	if j <= 0 {
+		return nil, nil, false
+	}
+	return line[:i], rest[:j], true
+}
+
+// absoluteFormAuthority returns the authority of an absolute-form target, RFC 9112 section
+// 3.2.2, userinfo dropped.
+func absoluteFormAuthority(target []byte) ([]byte, bool) {
+	i := bytes.IndexByte(target, ':')
+	if i <= 0 || len(target) < i+3 || target[i+1] != '/' || target[i+2] != '/' || !isAlpha(target[0]) {
+		return nil, false
+	}
+	for _, c := range target[1:i] {
+		if !isAlpha(c) && !isDigit(c) && c != '+' && c != '-' && c != '.' {
+			return nil, false
+		}
+	}
+	authority := target[i+3:]
+	if j := bytes.IndexAny(authority, "/?#"); j >= 0 {
+		authority = authority[:j]
+	}
+	if j := bytes.LastIndexByte(authority, '@'); j >= 0 {
+		authority = authority[j+1:]
+	}
+	return authority, true
+}
+
+// splitHeader returns the name and the value of a header line, false for one the server would
+// refuse.
+func splitHeader(line []byte) (name, value []byte, ok bool) {
+	i := bytes.IndexByte(line, ':')
+	if i <= 0 {
+		return nil, nil, false
+	}
+	name = line[:i]
+	for _, c := range name {
+		if !isTokenByte(c) {
+			return nil, nil, false
+		}
+	}
+	return name, bytes.Trim(line[i+1:], " \t"), true
+}
+
+func isAlpha(b byte) bool { return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' }
 
 // isTimeout reports whether err is a deadline rather than a failure.
 func isTimeout(err error) bool {

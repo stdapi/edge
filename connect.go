@@ -5,10 +5,10 @@
 package edge
 
 import (
-	"bufio"
 	"cmp"
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -177,7 +177,7 @@ func targetFromConnect(r *http.Request) (Target, error) {
 
 // writeRawStatus writes a status line on a hijacked connection, where the http.Server
 // response machinery is no longer available, with the status text as the body of an error.
-func writeRawStatus(brw *bufio.ReadWriter, code int) error {
+func writeRawStatus(w io.Writer, code int) error {
 	reason := http.StatusText(code)
 	if code == http.StatusOK {
 		reason = "Connection established"
@@ -204,8 +204,11 @@ func writeRawStatus(brw *bufio.ReadWriter, code int) error {
 	sb = append(sb, "\r\n"...)
 	sb = append(sb, body...)
 
-	if _, err := brw.Write(sb); err != nil {
+	if _, err := w.Write(sb); err != nil {
 		return err
 	}
-	return brw.Flush()
+	if f, ok := w.(interface{ Flush() error }); ok {
+		return f.Flush()
+	}
+	return nil
 }

@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	"slices"
+	"time"
 
 	"github.com/fox-toolkit/edge/internal/stringsutil"
 )
@@ -36,9 +37,9 @@ func (p *Proxy) terminate(ctx context.Context, conn *peekConn, sess *Session) er
 	}
 
 	if head[0] != tlsHandshakeRecord {
-		// A CONNECT to a plaintext port, or a redirected connection carrying clear traffic.
+		// A CONNECT to a plaintext port.
 		sess.target.Scheme = "http"
-		return p.serveCandidates(ctx, conn, sess, sniffStreamCandidates(conn, p.cfg.server.sniffTimeout), nil)
+		return p.servePlain(ctx, conn, sess)
 	}
 
 	if p.cfg.ca == nil {
@@ -125,6 +126,72 @@ func (p *Proxy) peekClientHello(conn *peekConn) (*ClientHello, error) {
 	return clientHelloFromRecords(raw), nil
 }
 
+// servePlain serves a connection without TLS, routed on the authority of its first request.
+func (p *Proxy) servePlain(ctx context.Context, conn *peekConn, sess *Session) error {
+	candidates := sniffStreamCandidates(conn, p.cfg.server.sniffTimeout)
+	sess.servableAs = candidates
+	if !slices.Contains(candidates, KindHTTP) {
+		return p.serveCandidates(ctx, conn, sess, candidates, nil)
+	}
+	placed := p.placePlain(ctx, conn, sess)
+	if placed == plainTimedOut {
+		return writeRawStatus(conn, http.StatusRequestTimeout)
+	}
+	if placed != plainRefused && p.admitsAny(sess.target, candidates...) {
+		return p.serveCandidates(ctx, conn, sess, candidates, nil)
+	}
+	// Refused in HTTP, once for all when the first request has a host, as a handshake ends on a
+	// server name nothing admits. Without a host, each request is routed on its own.
+	sess.kind = KindHTTP
+	sess.perRequest = true
+	sess.refused = placed != plainNameless
+	return p.serveHTTPConnection(conn, sess, nil)
+}
+
+// plainPlacement is the outcome of placePlain.
+type plainPlacement uint8
+
+const (
+	plainNameless plainPlacement = iota
+	plainNamed
+	plainRefused
+	plainTimedOut
+)
+
+// placePlain routes a plaintext HTTP connection on the host of its first request, as placeTLS
+// does on the server name, verification included. The port stays the connection's, and nothing
+// is consumed, the server reads the same bytes after.
+func (p *Proxy) placePlain(ctx context.Context, conn *peekConn, sess *Session) plainPlacement {
+	if d := p.cfg.server.readHeaderTimeout; d > 0 {
+		_ = conn.SetReadDeadline(time.Now().Add(d))
+		defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
+	}
+	// The read-ahead was sized for a ClientHello, and a header block runs to what the server
+	// accepts.
+	limit := p.cfg.server.maxHeaderBytes
+	conn.max = max(conn.max, limit)
+
+	authority, err := peekAuthority(conn, limit)
+	if isTimeout(err) {
+		return plainTimedOut
+	}
+	host, _ := splitHostPort(authority)
+	if host == "" {
+		return plainNameless
+	}
+	target := sess.target
+	target.Host = stringsutil.ToLowerASCIIString(host)
+	verified, ok := p.verifyRequestHost(ctx, sess, target, KindHTTP, KindTCP)
+	if !ok {
+		return plainRefused
+	}
+	sess.target = verified
+	if verified.Host != target.Host {
+		return plainNameless
+	}
+	return plainNamed
+}
+
 // serveCandidates serves the connection at the finest granularity its authority admits, and
 // closes it when none is admitted.
 func (p *Proxy) serveCandidates(ctx context.Context, conn net.Conn, sess *Session, candidates []Kind, state *tls.ConnectionState) error {
@@ -137,13 +204,6 @@ func (p *Proxy) serveCandidates(ctx context.Context, conn net.Conn, sess *Sessio
 		return p.serveTerminatedStream(ctx, conn, sess, state, e, params)
 	}
 
-	// The residual, only for a connection whose requests each have their own authority. It
-	// has none of its own for an admission to answer on, so each request is admitted or
-	// refused alone.
-	if sess.perRequest && slices.Contains(candidates, KindHTTP) {
-		sess.kind = KindHTTP
-		return p.serveHTTPConnection(conn, sess, state)
-	}
 	return ErrConnectionRejected
 }
 
@@ -273,6 +333,12 @@ func (p *Proxy) serveTerminatedRequest(w http.ResponseWriter, r *http.Request) {
 	// read a connection preface. The request knows what was negotiated.
 	sess.setProtocol(protoOfRequest(r))
 
+	if sess.refused {
+		w.Header().Set("Connection", "close")
+		p.writeStatus(w, r, http.StatusForbidden, "no entry admits this authority")
+		return
+	}
+
 	if state := sess.tlsState.Load(); r.TLS == nil && state != nil {
 		// http.Server only recognizes an unwrapped *tls.Conn, and the connection it was
 		// handed is wrapped. Handlers still expect Request.TLS to describe the handshake.
@@ -286,7 +352,7 @@ func (p *Proxy) serveTerminatedRequest(w http.ResponseWriter, r *http.Request) {
 	}
 	if sess.upstream.IsValid() && sess.TLS() == nil {
 		// The server name of a TLS connection was checked in placeTLS.
-		if target, ok = p.verifyRequestHost(r.Context(), sess, target); !ok {
+		if target, ok = p.verifyRequestHost(r.Context(), sess, target, KindHTTP); !ok {
 			p.writeStatus(w, r, http.StatusForbidden, "the host does not resolve to the destination")
 			return
 		}

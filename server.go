@@ -455,8 +455,7 @@ func (p *Proxy) Close() error {
 // multiplexed on it. A protocol upgrade is reported as a session of its own, under the
 // authority its request was routed on, and so is a CONNECT-UDP tunnel, beside the
 // connections and datagram flows inside it. Connections addressed to the proxy itself are
-// not reported, and neither is a redirected plaintext connection decided on the Host header
-// of each request.
+// not reported, and neither is a plaintext connection nothing admits.
 //
 // Changing an entry does not close the connections already open. Use Sessions with
 // [Session.Stale] and [Session.Close] to end the ones that would be served differently now.
@@ -747,10 +746,9 @@ func (s *server) trackSession(sess *Session, add bool) {
 // so it also came after the commit, and this replay sees that commit. A registration after
 // the replay would reopen the window.
 func (s *server) admitSession(sess *Session) bool {
-	// A connection served request by request is not decided as a connection at all, so there
-	// is nothing to register and nothing a sweep could act on. Only the kind actually serving
-	// it says whether that is what happened.
-	if sess.perRequest && sess.kind == KindHTTP {
+	// A connection nothing decided as a connection has nothing to register and nothing a sweep
+	// could act on.
+	if sess.perRequest {
 		return true
 	}
 

@@ -168,9 +168,11 @@ type Session struct {
 	// once a request has been read, from a goroutine serving one of them.
 	proto atomic.Uint32
 	kind  Kind
-	// perRequest marks a redirected plaintext connection, decided on the Host header of each
-	// request rather than once at the connection. It is not reported by [Proxy.Sessions].
+	// perRequest marks a plaintext connection nothing decided as a connection, which
+	// [Proxy.Sessions] does not report. Each request is routed alone, or refused when the host
+	// of the first request is admitted by nothing, which sets refused.
 	perRequest  bool
+	refused     bool
 	transparent bool
 	// tunnel marks a CONNECT-UDP tunnel, a session that serves nothing itself.
 	tunnel bool
@@ -221,12 +223,12 @@ func (s *Session) RemoteAddr() netip.AddrPort { return addrPort(s.remoteAddr) }
 func (s *Session) LocalAddr() netip.AddrPort { return addrPort(s.localAddr) }
 
 // Target returns the authority the session is routed on. It is the TLS server name when the
-// client sent one, and otherwise the CONNECT target, the Host header or the destination the
-// connection was headed to.
+// client sent one, the host of the first request on a plaintext connection, and otherwise the
+// CONNECT target or the destination the connection was headed to.
 //
-// A client sending plain requests through the proxy can ask for a different authority on each
-// one, so a session shared by several of them reports none. A handler reads the authority it is
-// serving from the [Context], which always has it.
+// A client sending requests with an absolute target to the proxy itself can address a
+// different authority on each one, so the session of that connection reports none. A handler
+// reads the authority it is serving from the [Context], which always has it.
 func (s *Session) Target() Target { return s.target }
 
 // Protocol returns the HTTP version spoken on the connection, or the zero value when it
@@ -335,7 +337,7 @@ func (s *Session) ServableAs() []Kind {
 //		}
 //	}
 func (s *Session) Stale() bool {
-	if s.p == nil || s.target.Host == "" || (s.perRequest && s.kind == KindHTTP) {
+	if s.p == nil || s.target.Host == "" || s.perRequest {
 		return false
 	}
 	return s.p.stale(s)

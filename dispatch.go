@@ -29,6 +29,14 @@ func (p *Proxy) dispatchRequest(w http.ResponseWriter, r *http.Request, sess *Se
 		return
 	}
 
+	if r.Method == http.MethodConnect {
+		// The front answers a CONNECT before anything is routed, so one reaching here was sent
+		// to a terminated connection. Its target has no path, and a lookup without one reaches
+		// the admission of its authority.
+		p.writeStatus(w, r, http.StatusNotImplemented, "CONNECT is not served on a terminated connection")
+		return
+	}
+
 	c.reset(sess, r, target.Scheme, target.Host, target.Port)
 	c.identity = identity
 

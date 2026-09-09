@@ -132,10 +132,11 @@ func (p *Proxy) nameResolvesTo(ctx context.Context, name string, origin netip.Ad
 	return nameMismatch
 }
 
-// verifyRequestHost checks the Host of a plaintext request against the destination its
-// connection fixed, the way placeTLS checks a server name, and returns the target the request
-// is routed on. The decision is kept on the session per Host, refusals included.
-func (p *Proxy) verifyRequestHost(ctx context.Context, sess *Session, target Target) (Target, bool) {
+// verifyRequestHost checks the authority of a plaintext request against the destination its
+// connection fixed, the way placeTLS checks a server name, and returns the target it is routed
+// on. The kinds decide whether a name is resolved at all, and the decision is kept on the
+// session per Host, refusals included.
+func (p *Proxy) verifyRequestHost(ctx context.Context, sess *Session, target Target, kinds ...Kind) (Target, bool) {
 	if p.cfg.verifyNames == VerifyOff || !sess.upstream.IsValid() {
 		return target, true
 	}
@@ -145,7 +146,7 @@ func (p *Proxy) verifyRequestHost(ctx context.Context, sess *Session, target Tar
 	if v := sess.verified.Load(); v != nil && v.host == target.Host && v.target.Port == target.Port {
 		return v.target, !v.refused
 	}
-	verified, _, verdict := p.targetForTransparent(ctx, target, sess.upstream, true, KindHTTP)
+	verified, _, verdict := p.targetForTransparent(ctx, target, sess.upstream, true, kinds...)
 	refused := verdict == nameMismatch || verdict == nameUnresolved
 	sess.verified.Store(&verifiedHost{host: target.Host, target: verified, refused: refused})
 	return verified, !refused

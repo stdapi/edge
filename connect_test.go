@@ -5,8 +5,10 @@
 package edge
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +17,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
+	"slices"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -524,4 +527,99 @@ func TestTargetFromConnect_PortIsCanonical(t *testing.T) {
 	r.URL.Host, r.Host = "example.test:65536", "example.test:65536"
 	_, err = targetFromConnect(r)
 	require.Error(t, err)
+}
+
+// The plaintext inside a CONNECT is placed on the authority of its first request, as the TLS
+// inside one is placed on its server name. A host nothing admits refuses the connection,
+// so no later request on it is served unreported.
+func TestConnect_PlaintextIsPlacedOnItsFirstAuthority(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "origin got host=%s", r.Host)
+	}))
+	defer origin.Close()
+	originURL, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+
+	tr := DefaultTransport()
+	tr.DialContext = pinnedDialer(originURL.Host)
+	const headerTimeout = 500 * time.Millisecond
+	p := testProxy(t, WithProxyAuth(testBasic()), WithTransport(tr), WithReadHeaderTimeout(headerTimeout))
+	p.MustAdd("allowed.test/*{rest}", forwardHandler)
+	streamed := new(atomic.Int32)
+	p.MustAdd[TCP]("internal.test:80", func(c *TCPCtx) error {
+		streamed.Add(1)
+		return c.Relay()
+	})
+	addr := startProxy(t, p)
+
+	connect := func(t *testing.T) (net.Conn, *bufio.Reader) {
+		t.Helper()
+		conn, err := net.Dial("tcp", addr)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = conn.Close() })
+		require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+		credentials := "Basic " + base64.StdEncoding.EncodeToString([]byte("alice:secret"))
+		_, err = fmt.Fprintf(conn, "CONNECT allowed.test:80 HTTP/1.1\r\nHost: allowed.test:80\r\n%s: %s\r\n\r\n", HeaderProxyAuthorization, credentials)
+		require.NoError(t, err)
+		br := bufio.NewReader(conn)
+		resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		return conn, br
+	}
+	get := func(t *testing.T, conn net.Conn, br *bufio.Reader, host string) (*http.Response, string) {
+		t.Helper()
+		_, err := fmt.Fprintf(conn, "GET /probe HTTP/1.1\r\nHost: %s\r\n\r\n", host)
+		require.NoError(t, err)
+		resp, err := http.ReadResponse(br, nil)
+		require.NoError(t, err)
+		body, err := io.ReadAll(resp.Body)
+		require.NoError(t, err)
+		_ = resp.Body.Close()
+		return resp, string(body)
+	}
+
+	t.Run("a host nothing admits refuses the connection", func(t *testing.T) {
+		conn, br := connect(t)
+		resp, _ := get(t, conn, br, "nothing.test")
+		assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+		_, err := fmt.Fprint(conn, "GET /probe HTTP/1.1\r\nHost: allowed.test\r\n\r\n")
+		if err == nil {
+			_, err = http.ReadResponse(br, nil)
+		}
+		assert.Error(t, err, "the refusal ends the connection, a later request on it is not served")
+		assert.Empty(t, slices.Collect(p.Sessions()))
+	})
+
+	t.Run("an admitted host is reported with the identity", func(t *testing.T) {
+		conn, br := connect(t)
+		resp, body := get(t, conn, br, "allowed.test")
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "origin got host=allowed.test", body)
+		sessions := waitForSessions(t, p, 1)
+		assert.Equal(t, KindHTTP, sessions[0].Kind())
+		assert.Equal(t, "allowed.test", sessions[0].Target().Host)
+		assert.Equal(t, "alice", sessions[0].Identity())
+	})
+
+	t.Run("a stream entry on the host takes the bytes", func(t *testing.T) {
+		waitForSessions(t, p, 0)
+		conn, br := connect(t)
+		resp, body := get(t, conn, br, "internal.test")
+		assert.Equal(t, http.StatusOK, resp.StatusCode)
+		assert.Equal(t, "origin got host=internal.test", body)
+		assert.EqualValues(t, 1, streamed.Load())
+	})
+
+	t.Run("a client that stalls in its headers gets 408 through the tunnel", func(t *testing.T) {
+		conn, br := connect(t)
+		start := time.Now()
+		_, err := fmt.Fprint(conn, "GET /probe HTTP/1.1\r\nX-A: a\r\n")
+		require.NoError(t, err)
+		resp, err := http.ReadResponse(br, nil)
+		require.NoError(t, err)
+		_ = resp.Body.Close()
+		assert.Equal(t, http.StatusRequestTimeout, resp.StatusCode)
+		assert.Less(t, time.Since(start), 2*headerTimeout-100*time.Millisecond)
+	})
 }

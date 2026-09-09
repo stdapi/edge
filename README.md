@@ -251,7 +251,7 @@ Transparent means the client is not configured, not that a particular mechanism 
 - **Resolve the authority to the proxy**, with a dedicated resolver, a hosts entry or a split-horizon zone, and listen on the port the client expects. Costs no privilege and works from another machine.
 - **Redirect the packets**, with an iptables or nftables `REDIRECT` on Linux or an `rdr` rule in pf on macOS. Needs the rule and the proxy on the same host, and an exclusion for the proxy's own user so its upstream connections are not redirected back into it.
 
-The destination of a connection is resolved from the address it was headed to before the redirect, then the server name of a TLS ClientHello, then the Host header of a plaintext request. The first is only needed to recover the port, to reach the exact address the client had resolved, or to place a client that sends no server name.
+A connection is routed on the server name of its TLS ClientHello, or on the authority of the first request of a plaintext HTTP connection, and dialed to the address it was headed to before the redirect. That address is only needed to recover the port, to reach the exact address the client had resolved, or to place a client that sends no name, which a connection opening with the HTTP/2 preface is until the server has sent its SETTINGS.
 
 The two `ListenAndServe` calls above set that up on the sockets they open. Bring your own and you wrap them yourself:
 
