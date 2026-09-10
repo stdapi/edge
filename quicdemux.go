@@ -1167,7 +1167,8 @@ func (d *quicDemux) dispatchDatagram(client net.Addr, from flowKey, datagram []b
 	d.openUDPFlow(client, from, origin, datagram, owned)
 }
 
-// openUDPFlow admits the first datagram of a flow and opens the socket carrying it.
+// openUDPFlow admits the first datagram of a flow and publishes the flow, whose goroutine
+// dials the origin.
 func (d *quicDemux) openUDPFlow(client net.Addr, from flowKey, origin netip.AddrPort, datagram []byte, owned bool) {
 	target := d.declaredTarget(client, origin)
 
@@ -1181,25 +1182,17 @@ func (d *quicDemux) openUDPFlow(client net.Addr, from flowKey, origin netip.Addr
 		return
 	}
 
-	upstream, err := d.dialUDP(origin.String())
-	if err != nil {
-		d.p.cfg.logger.Debug("edge: cannot reach the origin",
-			slog.String("origin", origin.String()), slog.String("error", err.Error()))
-		return
-	}
-
 	ctx, cancel := context.WithCancel(d.ctx)
 	sess := newSession(d.p, ctx, nil, target, KindUDP, 0)
 	d.fillSession(sess, client)
 	sess.setUpstream(origin)
 	u := &udpFlow{
-		upstream: upstream,
-		sess:     sess,
-		cancel:   cancel,
-		client:   client,
-		key:      origin,
-		target:   target,
-		outQ:     make(chan udpDatagram, udpQueue),
+		sess:   sess,
+		cancel: cancel,
+		client: client,
+		key:    origin,
+		target: target,
+		outQ:   make(chan udpDatagram, udpQueue),
 	}
 	sess.closer = &udpFlowCloser{d: d, u: u, flow: from, key: origin}
 	u.sink = &udpSink{d: d, u: u}
@@ -1212,7 +1205,6 @@ func (d *quicDemux) openUDPFlow(client net.Addr, from flowKey, origin netip.Addr
 	d.mu.Unlock()
 	if !ok {
 		cancel()
-		_ = upstream.Close()
 		d.p.cfg.logger.Debug("edge: datagram dropped",
 			slog.String("client", from.String()),
 			slog.String("origin", origin.String()),
@@ -1238,8 +1230,8 @@ func (u *udpFlow) newCtx(inbound bool, origin netip.AddrPort) DatagramCtx {
 }
 
 // dialUDP opens the socket a datagram flow sends through, with the transport's dialer.
-func (d *quicDemux) dialUDP(addr string) (net.Conn, error) {
-	ctx, cancel := context.WithTimeout(d.ctx, 10*time.Second)
+func (d *quicDemux) dialUDP(ctx context.Context, addr string) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	sock, err := d.p.srv.fwd.up.dial(ctx, "udp", addr, "https")
 	if err != nil {
@@ -1297,13 +1289,35 @@ func (d *quicDemux) publishUDPLocked(from flowKey, client net.Addr, u *udpFlow) 
 	flow.udp[u.key] = u
 	d.udps++
 	// Off the WaitGroup, a handler that ignores its cut would otherwise keep the socket.
-	go d.runUDPFlow(from, u)
-	go d.runOutbound(u)
+	go d.runOutbound(from, u)
 	return true
 }
 
-// runOutbound serves the queued outbound datagrams of the flow, in the order they arrived.
-func (d *quicDemux) runOutbound(u *udpFlow) {
+// runOutbound dials the origin, then serves the queued outbound datagrams of the flow in the
+// order they arrived.
+func (d *quicDemux) runOutbound(from flowKey, u *udpFlow) {
+	defer func() {
+		for len(u.outQ) > 0 {
+			(<-u.outQ).release()
+		}
+	}()
+	upstream, err := d.dialUDP(u.sess.Context(), u.key.String())
+	if err != nil {
+		d.p.cfg.logger.Debug("edge: cannot reach the origin",
+			slog.String("origin", u.key.String()), slog.String("error", err.Error()))
+		d.closeUDPFlow(from, u)
+		return
+	}
+	d.mu.Lock()
+	if u.closed {
+		d.mu.Unlock()
+		_ = upstream.Close()
+		return
+	}
+	u.upstream = upstream
+	d.mu.Unlock()
+	go d.runUDPFlow(from, u)
+
 	done := u.sess.Context().Done()
 	for {
 		select {
@@ -1312,9 +1326,6 @@ func (d *quicDemux) runOutbound(u *udpFlow) {
 			d.serveDatagram(u, dg.b, false)
 			dg.release()
 		case <-done:
-			for len(u.outQ) > 0 {
-				(<-u.outQ).release()
-			}
 			return
 		}
 	}
@@ -1409,7 +1420,7 @@ func (d *quicDemux) alternate(u *udpFlow, addr string) (*udpAlt, error) {
 		return alt, err
 	}
 
-	conn, err := d.dialUDP(addr)
+	conn, err := d.dialUDP(u.sess.Context(), addr)
 	if err != nil {
 		return nil, err
 	}
@@ -1513,7 +1524,9 @@ func (u *udpFlow) endLocked() []net.Conn {
 		u.cancel()
 	}
 	conns := make([]net.Conn, 0, 1+len(u.alts))
-	conns = append(conns, u.upstream)
+	if u.upstream != nil {
+		conns = append(conns, u.upstream)
+	}
 	for _, alt := range u.alts {
 		conns = append(conns, alt.conn)
 	}

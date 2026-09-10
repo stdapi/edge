@@ -11,6 +11,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -1602,4 +1603,115 @@ func TestTransparentUDP_FlowKeepsOrder(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, fmt.Sprintf("%03d", i), got)
 	}
+}
+
+// gatedDialer parks the first UDP dial until released, or fails it with err when set, and
+// dials the rest itself.
+type gatedDialer struct {
+	entered chan struct{}
+	release chan struct{}
+	ctxErr  chan error
+	err     error
+	calls   atomic.Int64
+}
+
+func newGatedDialer(err error) *gatedDialer {
+	return &gatedDialer{entered: make(chan struct{}, 1), release: make(chan struct{}), ctxErr: make(chan error, 1), err: err}
+}
+
+func (g *gatedDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	if network == "udp" && g.calls.Add(1) == 1 {
+		if g.err != nil {
+			return nil, g.err
+		}
+		g.entered <- struct{}{}
+		select {
+		case <-g.release:
+		case <-ctx.Done():
+			g.ctxErr <- ctx.Err()
+			return nil, ctx.Err()
+		}
+	}
+	return (&net.Dialer{}).DialContext(ctx, network, addr)
+}
+
+func gatedUDPProxy(t *testing.T, origin netip.AddrPort, dialErr error) (*Proxy, netip.AddrPort, *gatedDialer, func()) {
+	t.Helper()
+	g := newGatedDialer(dialErr)
+	tr := DefaultTransport()
+	tr.DialContext = g.DialContext
+	p, err := New(WithTransport(tr))
+	require.NoError(t, err)
+	p.MustAdd[UDP](origin.String(), func(c *DatagramCtx) error { return c.Forward() })
+	_, addr := startTProxyQUIC(t, p, origin)
+	release := sync.OnceFunc(func() { close(g.release) })
+	t.Cleanup(release)
+	return p, addr, g, release
+}
+
+// A dial in flight for one client does not delay another client on the same socket, and the
+// datagram that opened the flow is served once the dial returns.
+func TestTransparentUDP_DialInFlightDoesNotDelayAnotherClient(t *testing.T) {
+	origin := udpEchoOrigin(t)
+	_, proxyAddr, g, release := gatedUDPProxy(t, origin, nil)
+	slow, _ := udpClient(t)
+	fast, _ := udpClient(t)
+
+	sendTo(t, slow, proxyAddr, "slow")
+	waitEntered(t, g.entered)
+
+	sendTo(t, fast, proxyAddr, "fast")
+	got, err := readDatagram(t, fast, 2*time.Second)
+	require.NoError(t, err, "the other client must be served while the dial is in flight")
+	assert.Equal(t, "fast", got)
+
+	release()
+	got, err = readDatagram(t, slow, 3*time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, "slow", got)
+}
+
+// A flow is a session from its first datagram, and closing it cancels the dial in flight.
+func TestTransparentUDP_CloseCancelsTheDialInFlight(t *testing.T) {
+	origin := udpEchoOrigin(t)
+	p, proxyAddr, g, _ := gatedUDPProxy(t, origin, nil)
+	client, _ := udpClient(t)
+
+	sendTo(t, client, proxyAddr, "first")
+	waitEntered(t, g.entered)
+
+	var sess *Session
+	for s := range p.Sessions() {
+		if s.Kind() == KindUDP {
+			sess = s
+		}
+	}
+	require.NotNil(t, sess, "the flow must be a session while its dial is in flight")
+	require.NoError(t, sess.Close())
+	select {
+	case err := <-g.ctxErr:
+		assert.ErrorIs(t, err, context.Canceled)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close must cancel the dial")
+	}
+
+	sendTo(t, client, proxyAddr, "second")
+	got, err := readDatagram(t, client, 3*time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, "second", got)
+}
+
+// A failed dial drops the datagram that opened the flow, and the next one dials again.
+func TestTransparentUDP_FailedDialIsRetriedByTheNextDatagram(t *testing.T) {
+	origin := udpEchoOrigin(t)
+	_, proxyAddr, g, _ := gatedUDPProxy(t, origin, errors.New("no route"))
+	client, _ := udpClient(t)
+
+	sendTo(t, client, proxyAddr, "first")
+	require.Eventually(t, func() bool { return g.calls.Load() == 1 }, 2*time.Second, 5*time.Millisecond)
+	sendTo(t, client, proxyAddr, "second")
+	got, err := readDatagram(t, client, 3*time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, "second", got)
+	assert.Equal(t, int64(2), g.calls.Load())
 }
