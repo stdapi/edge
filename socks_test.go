@@ -372,6 +372,35 @@ func (c *socksUDPClient) SetWriteDeadline(t time.Time) error { return c.conn.Set
 func (c *socksUDPClient) SetReadBuffer(int) error            { return nil }
 func (c *socksUDPClient) SetWriteBuffer(int) error           { return nil }
 
+type socksEcho struct {
+	body string
+	from string
+}
+
+// readAllThroughSOCKS reads up to n replies, stopping early when none arrives for a while.
+func readAllThroughSOCKS(t *testing.T, c *socksUDPClient, n int) []socksEcho {
+	t.Helper()
+	var got []socksEcho
+	buf := make([]byte, 64)
+	for len(got) < n {
+		require.NoError(t, c.SetReadDeadline(time.Now().Add(2*time.Second)))
+		m, from, err := c.ReadFrom(buf)
+		if err != nil {
+			break
+		}
+		got = append(got, socksEcho{body: string(buf[:m]), from: from.String()})
+	}
+	return got
+}
+
+func bodies(echoes []socksEcho) []string {
+	out := make([]string, 0, len(echoes))
+	for _, e := range echoes {
+		out = append(out, e.body)
+	}
+	return out
+}
+
 // echoThroughSOCKS sends msg to dest through the association and returns what came back with
 // the address it came from.
 func echoThroughSOCKS(t *testing.T, c *socksUDPClient, dest net.Addr, msg string) (string, net.Addr) {
@@ -509,6 +538,109 @@ func TestSOCKS5_AssociationDropsOtherSources(t *testing.T) {
 
 	body, _ = echoThroughSOCKS(t, client, net.UDPAddrFromAddrPort(echo), "second")
 	assert.Equal(t, "second", body)
+}
+
+// heldResolver answers once released, and reports each lookup as it starts.
+type heldResolver struct {
+	addrs   map[string][]netip.Addr
+	entered chan string
+	release chan struct{}
+}
+
+func (r *heldResolver) LookupNetIP(ctx context.Context, _ string, host string) ([]netip.Addr, error) {
+	r.entered <- host
+	select {
+	case <-r.release:
+		return r.addrs[host], nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+// A name is resolved off the goroutine feeding the association, so the datagrams to other
+// destinations keep flowing meanwhile, and the ones waiting on the name follow once it is.
+func TestSOCKS5_AssociationResolvesNamesOffItsLoop(t *testing.T) {
+	echo := udpEcho(t)
+	byHost := udpEcho(t)
+	resolver := &heldResolver{
+		addrs:   map[string][]netip.Addr{"echo.udp.test": {byHost.Addr()}},
+		entered: make(chan string, 1),
+		release: make(chan struct{}),
+	}
+	p := testProxy(t, WithNameResolver(resolver))
+	p.MustAdd[UDP]("[127.0.0.0/8]", forwardDatagram)
+	p.MustAdd[UDP]("echo.udp.test", forwardDatagram)
+	addr := startSOCKS5(t, p)
+	client := associate(t, addr, "", "")
+	name := hostDest(fmt.Sprintf("echo.udp.test:%d", byHost.Port()))
+
+	_, err := client.WriteTo([]byte("held"), name)
+	require.NoError(t, err)
+	select {
+	case host := <-resolver.entered:
+		assert.Equal(t, "echo.udp.test", host)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the name was not looked up")
+	}
+	_, err = client.WriteTo([]byte("held too"), name)
+	require.NoError(t, err)
+
+	body, _ := echoThroughSOCKS(t, client, net.UDPAddrFromAddrPort(echo), "meanwhile")
+	assert.Equal(t, "meanwhile", body, "an address flows while the name resolves")
+
+	close(resolver.release)
+	got := readAllThroughSOCKS(t, client, 2)
+	assert.Equal(t, []string{"held", "held too"}, bodies(got), "released in arrival order")
+	assert.Equal(t, byHost.String(), got[0].from, "answered from the resolved address")
+
+	body, _ = echoThroughSOCKS(t, client, name, "cached")
+	assert.Equal(t, "cached", body)
+	select {
+	case host := <-resolver.entered:
+		t.Fatalf("%s was looked up again", host)
+	default:
+	}
+}
+
+// The datagrams waiting on a name are bounded as the ones waiting on a QUIC connection being
+// placed are, and so are the lookups in flight.
+func TestSOCKS5_AssociationBoundsWhatWaitsOnAName(t *testing.T) {
+	echo := udpEcho(t)
+	byHost := udpEcho(t)
+	resolver := &heldResolver{
+		addrs:   map[string][]netip.Addr{},
+		entered: make(chan string, socks5NameResolving+1),
+		release: make(chan struct{}),
+	}
+	p := testProxy(t, WithNameResolver(resolver))
+	p.MustAdd[UDP]("+{any}.udp.test", forwardDatagram)
+	p.MustAdd[UDP]("[127.0.0.0/8]", forwardDatagram)
+	addr := startSOCKS5(t, p)
+	client := associate(t, addr, "", "")
+
+	for i := range socks5NameResolving + 1 {
+		host := fmt.Sprintf("n%d.udp.test", i)
+		resolver.addrs[host] = []netip.Addr{byHost.Addr()}
+		name := hostDest(fmt.Sprintf("%s:%d", host, byHost.Port()))
+		for range maxPendingDatagrams + 1 {
+			_, err := client.WriteTo([]byte(host), name)
+			require.NoError(t, err)
+		}
+	}
+	for range socks5NameResolving {
+		select {
+		case <-resolver.entered:
+		case <-time.After(5 * time.Second):
+			t.Fatal("a name was not looked up")
+		}
+	}
+	// The relay reads in order, so once the probe is answered every datagram above is queued
+	// or dropped.
+	body, _ := echoThroughSOCKS(t, client, net.UDPAddrFromAddrPort(echo), "probe")
+	require.Equal(t, "probe", body)
+	close(resolver.release)
+	got := readAllThroughSOCKS(t, client, socks5NameResolving*maxPendingDatagrams+1)
+	assert.Len(t, got, socks5NameResolving*maxPendingDatagrams, "every name within the bound came back up to its own bound")
 }
 
 // An association nothing has lived in for udpFlowIdle is closed by the sweep, and the client

@@ -12,8 +12,10 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"os"
 	"slices"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -22,8 +24,9 @@ import (
 )
 
 const (
-	socks5NameCache = 64
-	socks5NameRetry = 5 * time.Second
+	socks5NameCache     = 64
+	socks5NameResolving = 8
+	socks5NameRetry     = 5 * time.Second
 )
 
 // ListenAndServeSOCKS5 listens on addr and serves as a SOCKS5 proxy, RFC 1928. Clients point
@@ -204,11 +207,9 @@ func (p *Proxy) serveSOCKS5Associate(ctx context.Context, conn net.Conn, from so
 	sess.identity = identity
 	sess.tunnel = true
 
-	framing := &socksFraming{p: p, ctx: ctx}
-	framing.names, _ = simplelru.NewLRU[string, socksName](socks5NameCache, nil)
-	tun := newConnectUDPTunnel(d, sess, framing, cancel)
+	assoc := newSOCKSAssociation(ctx, p, relay, from, addrPort(conn.RemoteAddr()).Addr())
+	tun := newConnectUDPTunnel(d, sess, assoc, cancel)
 	sess.closer = tun
-	pipe := newSOCKS5Pipe(relay, from, addrPort(conn.RemoteAddr()).Addr())
 	if !d.publishTunnel(tun) {
 		_ = relay.Close()
 		_ = socks5.WriteReply(conn, socks5.GeneralFailure, bound)
@@ -237,7 +238,8 @@ func (p *Proxy) serveSOCKS5Associate(ctx context.Context, conn net.Conn, from so
 		_, _ = io.Copy(io.Discard, conn)
 		cancel()
 	}()
-	tun.serve(ctx, pipe)
+	tun.serve(ctx, assoc)
+	assoc.wg.Wait()
 	return nil
 }
 
@@ -247,73 +249,153 @@ type socksName struct {
 	host  string
 }
 
-// socksFraming is the framing of RFC 1928 section 7, a destination ahead of every payload. A
-// name is resolved once per association, on the goroutine feeding it.
-type socksFraming struct {
-	ip    netip.Addr
-	ctx   context.Context
-	p     *Proxy
-	names *simplelru.LRU[string, socksName]
-	host  string
-	port  uint16
+// socksResolution is one name being resolved and the datagrams waiting on it.
+type socksResolution struct {
+	name    string
+	host    string
+	entry   socksName
+	pending [][]byte
+	bytes   int
 }
 
-func (f *socksFraming) unwrap(b []byte) ([]byte, netip.AddrPort, bool) {
+func (r *socksResolution) hold(b []byte) {
+	if len(r.pending) >= maxPendingDatagrams || r.bytes+len(b) > maxPendingBytes {
+		return
+	}
+	r.pending = append(r.pending, b)
+	r.bytes += len(b)
+}
+
+// socksAssociation is one UDP association, the relay socket as the pipe of a tunnel and the
+// framing of RFC 1928 section 7, a destination ahead of every payload. A name is resolved off
+// the goroutine feeding the tunnel, and the resolver wakes recv with a read deadline in the
+// past, so the relay's read deadline is its alone.
+type socksAssociation struct {
+	ip        netip.Addr
+	ctx       context.Context
+	conn      *net.UDPConn
+	p         *Proxy
+	names     *simplelru.LRU[string, socksName]
+	resolving map[string]*socksResolution
+	bound     atomic.Pointer[netip.AddrPort]
+	expect    netip.AddrPort
+	host      string
+	queued    [][]byte
+	ready     []*socksResolution
+	wg        sync.WaitGroup
+	mu        sync.Mutex
+	port      uint16
+}
+
+// The datagrams must come from the address of the control connection, whatever the client
+// declared, on the port it declared when it declared one.
+func newSOCKSAssociation(ctx context.Context, p *Proxy, conn *net.UDPConn, from socks5.Addr, client netip.Addr) *socksAssociation {
+	a := &socksAssociation{
+		conn:      conn,
+		ctx:       ctx,
+		p:         p,
+		resolving: make(map[string]*socksResolution),
+		expect:    netip.AddrPortFrom(client, from.Port),
+	}
+	a.names, _ = simplelru.NewLRU[string, socksName](socks5NameCache, nil)
+	return a
+}
+
+func (a *socksAssociation) unwrap(b []byte) ([]byte, netip.AddrPort, bool) {
 	dg, err := socks5.ParseDatagram(b)
 	if err != nil || dg.Port == 0 {
 		return nil, netip.AddrPort{}, false
 	}
-	f.port = dg.Port
+	a.port = dg.Port
 	if dg.Name == nil {
-		f.host, f.ip = "", dg.IP.Unmap()
-		return dg.Payload, netip.AddrPortFrom(f.ip, dg.Port), true
+		a.host, a.ip = "", dg.IP.Unmap()
+		return dg.Payload, netip.AddrPortFrom(a.ip, dg.Port), true
+	}
+	if r := a.resolving[string(dg.Name)]; r != nil {
+		r.hold(b)
+		return nil, netip.AddrPort{}, false
 	}
 	name := string(dg.Name)
-	entry, ok := f.names.Get(name)
+	entry, ok := a.names.Get(name)
 	if !ok || (!entry.addr.IsValid() && time.Now().After(entry.retry)) {
-		entry = f.resolve(name)
-		f.names.Add(name, entry)
+		if entry, ok = a.resolve(name, b); !ok {
+			return nil, netip.AddrPort{}, false
+		}
 	}
 	if !entry.addr.IsValid() {
 		return nil, netip.AddrPort{}, false
 	}
-	f.host, f.ip = entry.host, netip.Addr{}
+	a.host, a.ip = entry.host, netip.Addr{}
 	return dg.Payload, netip.AddrPortFrom(entry.addr, dg.Port), true
 }
 
-func (f *socksFraming) resolve(name string) socksName {
+// resolve returns the entry of a name decided without a lookup. Otherwise it queues b, starts
+// the lookup off the feeding goroutine and returns false.
+func (a *socksAssociation) resolve(name string, b []byte) (socksName, bool) {
 	entry := socksName{host: name, retry: time.Now().Add(socks5NameRetry)}
 	target, err := targetFromWire(name, "1")
 	if err != nil {
-		return entry
+		a.names.Add(name, entry)
+		return entry, true
 	}
 	entry.host = target.Host
 	if ip, perr := netip.ParseAddr(target.Host); perr == nil {
 		entry.addr = ip.Unmap()
-		return entry
+		a.names.Add(name, entry)
+		return entry, true
 	}
-	rctx, cancel := context.WithTimeout(f.ctx, nameVerifyTimeout)
-	defer cancel()
-	addrs, err := f.p.cfg.resolver.LookupNetIP(rctx, "ip", target.Host)
-	if err != nil || len(addrs) == 0 {
-		return entry
+	if len(a.resolving) >= socks5NameResolving {
+		return socksName{}, false
 	}
-	entry.addr = addrs[0].Unmap()
-	return entry
+	r := &socksResolution{name: name, host: target.Host}
+	r.hold(b)
+	a.resolving[name] = r
+	a.wg.Go(func() {
+		r.entry = socksName{host: r.host, addr: a.lookup(r.host), retry: time.Now().Add(socks5NameRetry)}
+		a.mu.Lock()
+		a.ready = append(a.ready, r)
+		a.mu.Unlock()
+		_ = a.conn.SetReadDeadline(time.Now())
+	})
+	return socksName{}, false
 }
 
-func (f *socksFraming) declaredName() string { return f.host }
+func (a *socksAssociation) lookup(host string) netip.Addr {
+	rctx, cancel := context.WithTimeout(a.ctx, nameVerifyTimeout)
+	defer cancel()
+	addrs, err := a.p.cfg.resolver.LookupNetIP(rctx, "ip", host)
+	if err != nil || len(addrs) == 0 {
+		return netip.Addr{}
+	}
+	return addrs[0].Unmap()
+}
 
-func (f *socksFraming) declared() Target {
-	port := strconv.Itoa(int(f.port))
-	host := f.host
+func (a *socksAssociation) drainReady() {
+	a.mu.Lock()
+	ready := a.ready
+	a.ready = nil
+	a.mu.Unlock()
+	for _, r := range ready {
+		delete(a.resolving, r.name)
+		a.names.Add(r.name, r.entry)
+		if r.entry.addr.IsValid() {
+			a.queued = append(a.queued, r.pending...)
+		}
+	}
+}
+
+func (a *socksAssociation) declaredName() string { return a.host }
+
+func (a *socksAssociation) declared() Target {
+	port := strconv.Itoa(int(a.port))
+	host := a.host
 	if host == "" {
-		host = f.ip.String()
+		host = a.ip.String()
 	}
 	return Target{Scheme: schemeForPort(port), Host: host, Port: port}
 }
 
-func (*socksFraming) wrap(origin netip.AddrPort, b []byte) []byte {
+func (*socksAssociation) wrap(origin netip.AddrPort, b []byte) []byte {
 	from := socks5.Addr{IP: origin.Addr(), Port: origin.Port()}
 	n := socks5.DatagramHeaderLen(from)
 	out := tunnelBuf(capsuleHeadroom + n + len(b))
@@ -322,54 +404,57 @@ func (*socksFraming) wrap(origin netip.AddrPort, b []byte) []byte {
 	return out
 }
 
-// socks5Pipe binds to the first source it accepts, and replies go there.
-type socks5Pipe struct {
-	conn   *net.UDPConn
-	bound  atomic.Pointer[netip.AddrPort]
-	expect netip.AddrPort
-}
-
-// The datagrams must come from the address of the control connection, whatever the client
-// declared, on the port it declared when it declared one.
-func newSOCKS5Pipe(conn *net.UDPConn, from socks5.Addr, client netip.Addr) *socks5Pipe {
-	return &socks5Pipe{conn: conn, expect: netip.AddrPortFrom(client, from.Port)}
-}
-
-func (p *socks5Pipe) accepts(from netip.AddrPort) bool {
-	if bound := p.bound.Load(); bound != nil {
+// accepts binds the association to the first source it accepts, and replies go there.
+func (a *socksAssociation) accepts(from netip.AddrPort) bool {
+	if bound := a.bound.Load(); bound != nil {
 		return from == *bound
 	}
-	if from.Addr() != p.expect.Addr() || (p.expect.Port() != 0 && from.Port() != p.expect.Port()) {
+	if from.Addr() != a.expect.Addr() || (a.expect.Port() != 0 && from.Port() != a.expect.Port()) {
 		return false
 	}
-	p.bound.Store(&from)
+	a.bound.Store(&from)
 	return true
 }
 
-func (p *socks5Pipe) recv(context.Context) ([]byte, error) {
+// A resolver queues its result before it sets the deadline, and recv clears the deadline
+// before it drains the queue, so a wake is never lost.
+func (a *socksAssociation) recv(context.Context) ([]byte, error) {
 	buf := socks5ReadPool.Get().(*[maxUDPPayload]byte)
 	defer socks5ReadPool.Put(buf)
 	for {
-		n, from, err := p.conn.ReadFromUDPAddrPort(buf[:])
+		if len(a.queued) == 0 {
+			a.drainReady()
+		}
+		if len(a.queued) > 0 {
+			b := a.queued[0]
+			a.queued[0] = nil
+			a.queued = a.queued[1:]
+			return b, nil
+		}
+		n, from, err := a.conn.ReadFromUDPAddrPort(buf[:])
 		if err != nil {
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				_ = a.conn.SetReadDeadline(time.Time{})
+				continue
+			}
 			return nil, err
 		}
-		if !p.accepts(netip.AddrPortFrom(from.Addr().Unmap(), from.Port())) {
+		if !a.accepts(netip.AddrPortFrom(from.Addr().Unmap(), from.Port())) {
 			continue
 		}
 		return slices.Clone(buf[:n]), nil
 	}
 }
 
-func (p *socks5Pipe) send(b []byte) error {
-	bound := p.bound.Load()
+func (a *socksAssociation) send(b []byte) error {
+	bound := a.bound.Load()
 	if bound == nil {
 		return errors.New("no datagram received yet")
 	}
-	_, err := p.conn.WriteToUDPAddrPort(b[capsuleHeadroom:], *bound)
+	_, err := a.conn.WriteToUDPAddrPort(b[capsuleHeadroom:], *bound)
 	return err
 }
 
-func (p *socks5Pipe) setReadDeadline(t time.Time) error  { return p.conn.SetReadDeadline(t) }
-func (p *socks5Pipe) setWriteDeadline(t time.Time) error { return p.conn.SetWriteDeadline(t) }
-func (p *socks5Pipe) close() error                       { return p.conn.Close() }
+func (a *socksAssociation) setReadDeadline(t time.Time) error  { return a.conn.SetReadDeadline(t) }
+func (a *socksAssociation) setWriteDeadline(t time.Time) error { return a.conn.SetWriteDeadline(t) }
+func (a *socksAssociation) close() error                       { return a.conn.Close() }
