@@ -1045,3 +1045,33 @@ func TestLifecycle_CloseDropsTheQueuedDatagrams(t *testing.T) {
 	defer mu.Unlock()
 	assert.Equal(t, 1, calls, "nothing queued is served after Close")
 }
+
+// Close returns while a resolution is in flight, and the lookup sees its context canceled.
+func TestLifecycle_CloseCancelsTheResolutionInFlight(t *testing.T) {
+	origin := udpEchoOrigin(t)
+	p, ca, wrapper, proxyAddr, r, _ := verifiedQUICProxy(t, origin, "example.test")
+
+	parked := dialQUICAsync(t, wrapper, origin, proxyAddr, "example.test", ca)
+	waitEntered(t, r.entered)
+
+	done := make(chan error, 1)
+	go func() { done <- p.Close() }()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close must not wait for the resolution")
+	}
+	select {
+	case err := <-r.ctxErr:
+		assert.ErrorIs(t, err, context.Canceled)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close must cancel the lookup")
+	}
+	select {
+	case err := <-parked:
+		assert.Error(t, err)
+	case <-time.After(15 * time.Second):
+		t.Fatal("the parked handshake never ended")
+	}
+}

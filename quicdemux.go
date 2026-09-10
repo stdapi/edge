@@ -125,9 +125,7 @@ func (p *Proxy) ListenAndServeTransparentUDP(addr string) error {
 // cannot read is one it refuses rather than one it passes on.
 //
 // A [UDP] handler serves the datagrams of a flow one at a time, in the order they arrived.
-// While it blocks, up to 64 datagrams of that flow wait and the rest are dropped. The name
-// resolution [WithNameVerification] asks for runs on the goroutine reading the socket, on the
-// connection being placed, and holds up every other client on it.
+// While it blocks, up to 64 datagrams of that flow wait and the rest are dropped.
 //
 // Under Encrypted Client Hello the decision sees the outer server name only, unless
 // [WithRejectECH] refuses such connections. QUIC versions other than v1 and v2 are rejected.
@@ -264,9 +262,13 @@ type quicConnState uint8
 
 const (
 	connSniffing quicConnState = iota
+	connPlacing
 	connTerminated
 	connRejected
 )
+
+// sniffing reports whether a connection in state s still counts against maxSniffingConns.
+func (s quicConnState) sniffing() bool { return s == connSniffing || s == connPlacing }
 
 // quicConn is one QUIC connection being placed. The kind it belongs to is read off its
 // ClientHello, and the entry serving each of its units is looked up as the units arrive.
@@ -1020,6 +1022,10 @@ func (d *quicDemux) dispatchLong(addr net.Addr, from flowKey, datagram []byte, o
 				stack := conn.stack
 				d.mu.Unlock()
 				stack.deliver(addr, datagram, owned)
+			case connPlacing:
+				conn.lastSeen = now
+				d.pendLocked(conn, datagram, owned)
+				d.mu.Unlock()
 			case connRejected:
 				conn.lastSeen = now
 				d.mu.Unlock()
@@ -1604,7 +1610,7 @@ func (d *quicDemux) admitConnLocked(from flowKey, client net.Addr, odcid string,
 // setStateLocked keeps the sniffing count and the stack references in step with the state
 // changes.
 func (d *quicDemux) setStateLocked(conn *quicConn, s quicConnState) {
-	if conn.state == connSniffing && s != connSniffing {
+	if conn.state.sniffing() && !s.sniffing() {
 		d.sniffing--
 	}
 	if conn.state == connTerminated && s != connTerminated {
@@ -1614,7 +1620,7 @@ func (d *quicDemux) setStateLocked(conn *quicConn, s quicConnState) {
 }
 
 func (d *quicDemux) removeConnLocked(flow *quicFlow, conn *quicConn) {
-	if conn.state == connSniffing {
+	if conn.state.sniffing() {
 		d.sniffing--
 	}
 	if conn.state == connTerminated {
@@ -1632,9 +1638,9 @@ func (d *quicDemux) releaseInterceptLocked(conn *quicConn) {
 	}
 }
 
-// sniff feeds a datagram to the reassembler and decides the connection once its ClientHello is
-// complete. A first flight datagram with no Initial in it, 0-RTT typically, still joins the
-// pending ones, so the terminating stack receives the flight whole.
+// sniff feeds a datagram to the reassembler and starts placing the connection once its
+// ClientHello is complete. A first flight datagram with no Initial in it, 0-RTT typically,
+// still joins the pending ones, so the terminating stack receives the flight whole.
 func (d *quicDemux) sniff(from flowKey, conn *quicConn, datagram []byte, owned bool) {
 	kept := datagram
 	if !owned {
@@ -1662,14 +1668,40 @@ func (d *quicDemux) sniff(from flowKey, conn *quicConn, datagram []byte, owned b
 	}
 	conn.pending = append(conn.pending, kept)
 	conn.pendingBytes += len(kept)
-	client := flow.client
-	pending := conn.pending
-	d.mu.Unlock()
-
 	if hello == nil {
+		d.mu.Unlock()
 		return // still arriving
 	}
+	// Spawned under the lock close sets draining under, so this Add cannot race the Wait in
+	// close.
+	if d.draining.Load() {
+		d.mu.Unlock()
+		d.rejectConn(from, conn, "the proxy is shutting down")
+		return
+	}
+	client := flow.client
+	d.setStateLocked(conn, connPlacing)
+	conn.sniffer = nil
+	d.wg.Go(func() { d.place(from, client, conn, hello) })
+	d.mu.Unlock()
+}
 
+// pendLocked keeps a datagram of a connection being placed for its stack, within the pending
+// bounds. d.mu must be held.
+func (d *quicDemux) pendLocked(conn *quicConn, datagram []byte, owned bool) {
+	if len(conn.pending) >= maxPendingDatagrams || conn.pendingBytes+len(datagram) > maxPendingBytes {
+		return
+	}
+	if !owned {
+		datagram = bytes.Clone(datagram)
+	}
+	conn.pending = append(conn.pending, datagram)
+	conn.pendingBytes += len(datagram)
+}
+
+// place decides a connection whose ClientHello is complete and hands it to a stack or rejects
+// it. It runs off the goroutine reading the datagrams, which keeps appending to pending.
+func (d *quicDemux) place(from flowKey, client net.Addr, conn *quicConn, hello []byte) {
 	if d.p.cfg.rejectECH {
 		offered, ok := offersECH(hello)
 		if !ok {
@@ -1705,6 +1737,9 @@ func (d *quicDemux) sniff(from flowKey, conn *quicConn, datagram []byte, owned b
 
 	named := ch.ServerName != ""
 	target, _, verdict := d.p.targetForTransparent(d.ctx, target, conn.origin, named, candidates...)
+	if d.ctx.Err() != nil {
+		return
+	}
 	switch verdict {
 	case nameMismatch:
 		d.rejectConn(from, conn, "the server name does not resolve to the destination")
@@ -1720,7 +1755,7 @@ func (d *quicDemux) sniff(from flowKey, conn *quicConn, datagram []byte, owned b
 		return
 	}
 
-	d.beginTermination(from, client, conn, target, ch, kind, candidates, pending)
+	d.beginTermination(from, client, conn, target, ch, kind, candidates)
 }
 
 // targetFor is the authority a QUIC connection is routed on, its server name when it offered
@@ -1759,7 +1794,7 @@ func (d *quicDemux) originalDst(client net.Addr) netip.AddrPort {
 }
 
 func (d *quicDemux) beginTermination(from flowKey, client net.Addr, conn *quicConn,
-	target Target, hello *ClientHello, kind Kind, candidates []Kind, pending [][]byte,
+	target Target, hello *ClientHello, kind Kind, candidates []Kind,
 ) {
 	if err := d.startTermination(); err != nil {
 		if !errors.Is(err, ErrProxyClosed) {
@@ -1779,7 +1814,7 @@ func (d *quicDemux) beginTermination(from flowKey, client net.Addr, conn *quicCo
 
 	d.mu.Lock()
 	flow := d.flows[from]
-	if flow == nil || flow.conns[conn.odcid] != conn || conn.state != connSniffing {
+	if flow == nil || flow.conns[conn.odcid] != conn || conn.state != connPlacing {
 		d.mu.Unlock()
 		cancel()
 		return
@@ -1801,6 +1836,7 @@ func (d *quicDemux) beginTermination(from flowKey, client net.Addr, conn *quicCo
 		return
 	}
 	d.setStateLocked(conn, connTerminated)
+	pending := conn.pending
 	conn.pending = nil
 	conn.pendingBytes = 0
 	conn.sess = sess
@@ -1808,21 +1844,25 @@ func (d *quicDemux) beginTermination(from flowKey, client net.Addr, conn *quicCo
 	conn.kind = kind
 	conn.stack = it
 	it.conns++
+	// The session is published, so a sweep started after the tree changed either found it or
+	// ran before this check, which then observes the change. Refused under the same lock, so
+	// nothing reaches the stack and no handshake completes.
+	withdrawn := !d.p.Admits(target, kind)
+	if withdrawn {
+		d.rejectConnLocked(conn)
+	} else {
+		// Delivered under the lock, so a datagram read once the state is terminated follows
+		// the first flight into the stack.
+		for _, dg := range pending {
+			it.deliver(client, dg, true)
+		}
+	}
 	d.mu.Unlock()
 	if evicted != nil {
 		d.closeIntercept(evicted)
 	}
-
-	// The session is published, so a sweep started after the tree changed either found it or
-	// ran before this read, which then observes the change. Nothing has been handed to the
-	// QUIC server yet, so a connection refused here never completes a handshake.
-	if !d.p.Admits(target, kind) {
-		d.rejectConn(from, conn, "the authority was withdrawn while the connection was starting")
-		return
-	}
-
-	for _, dg := range pending {
-		it.deliver(client, dg, true)
+	if withdrawn {
+		d.logRejected(from, "the authority was withdrawn while the connection was starting")
 	}
 }
 
@@ -1832,15 +1872,23 @@ func (d *quicDemux) beginTermination(from flowKey, client net.Addr, conn *quicCo
 func (d *quicDemux) rejectConn(from flowKey, conn *quicConn, reason string) {
 	d.mu.Lock()
 	if flow := d.flows[from]; flow != nil && flow.conns[conn.odcid] == conn {
-		d.setStateLocked(conn, connRejected)
-		conn.lastSeen = time.Now()
-		conn.sniffer = nil
-		conn.pending = nil
-		conn.pendingBytes = 0
-		conn.sess = nil
-		conn.end()
+		d.rejectConnLocked(conn)
 	}
 	d.mu.Unlock()
+	d.logRejected(from, reason)
+}
+
+func (d *quicDemux) rejectConnLocked(conn *quicConn) {
+	d.setStateLocked(conn, connRejected)
+	conn.lastSeen = time.Now()
+	conn.sniffer = nil
+	conn.pending = nil
+	conn.pendingBytes = 0
+	conn.sess = nil
+	conn.end()
+}
+
+func (d *quicDemux) logRejected(from flowKey, reason string) {
 	d.p.cfg.logger.Debug("edge: QUIC connection dropped",
 		slog.String("client", from.String()), slog.String("reason", reason))
 }
@@ -1853,7 +1901,7 @@ func (d *quicDemux) sweepIdle() {
 	for from, flow := range d.flows {
 		for _, conn := range flow.conns {
 			switch conn.state {
-			case connSniffing:
+			case connSniffing, connPlacing:
 				if now.Sub(conn.lastSeen) > quicSniffTTL {
 					d.removeConnLocked(flow, conn)
 				}

@@ -1715,3 +1715,143 @@ func TestTransparentUDP_FailedDialIsRetriedByTheNextDatagram(t *testing.T) {
 	assert.Equal(t, "second", got)
 	assert.Equal(t, int64(2), g.calls.Load())
 }
+
+// gatedResolver parks its first lookup until released and answers every lookup with addr.
+type gatedResolver struct {
+	addr    netip.Addr
+	entered chan struct{}
+	release chan struct{}
+	ctxErr  chan error
+	once    sync.Once
+}
+
+func newGatedResolver(addr netip.Addr) *gatedResolver {
+	return &gatedResolver{addr: addr, entered: make(chan struct{}, 1), release: make(chan struct{}), ctxErr: make(chan error, 1)}
+}
+
+func (r *gatedResolver) LookupNetIP(ctx context.Context, _, _ string) ([]netip.Addr, error) {
+	first := false
+	r.once.Do(func() { first = true })
+	if first {
+		r.entered <- struct{}{}
+		select {
+		case <-r.release:
+		case <-ctx.Done():
+			r.ctxErr <- ctx.Err()
+			return nil, ctx.Err()
+		}
+	}
+	return []netip.Addr{r.addr}, nil
+}
+
+// verifiedQUICProxy serves origin behind a gated resolver, with a QUIC entry on sni and a
+// UDP entry on the origin.
+func verifiedQUICProxy(t *testing.T, origin netip.AddrPort, sni string) (*Proxy, *CA, *tproxyOriginPacketConn, netip.AddrPort, *gatedResolver, func()) {
+	t.Helper()
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	r := newGatedResolver(origin.Addr())
+	p, err := New(WithCA(ca), WithNameVerification(VerifyReject), WithNameResolver(r))
+	require.NoError(t, err)
+	p.MustAdd[QUIC](sni, func(*QUICCtx) error { return nil })
+	p.MustAdd[UDP](origin.String(), func(c *DatagramCtx) error { return c.Forward() })
+	wrapper, addr := startTProxyQUIC(t, p, origin)
+	release := sync.OnceFunc(func() { close(r.release) })
+	t.Cleanup(release)
+	return p, ca, wrapper, addr, r, release
+}
+
+// dialQUICAsync starts a handshake to the proxy and reports its outcome on the returned channel.
+func dialQUICAsync(t *testing.T, wrapper *tproxyOriginPacketConn, origin, proxyAddr netip.AddrPort, sni string, ca *CA) <-chan error {
+	t.Helper()
+	pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	wrapper.perClient.Store(pc.LocalAddr().String(), origin)
+	tr := &quic.Transport{Conn: pc}
+	t.Cleanup(func() { _ = tr.Close(); _ = pc.Close() })
+	done := make(chan error, 1)
+	go func() {
+		conn, err := tr.Dial(t.Context(), net.UDPAddrFromAddrPort(proxyAddr), &tls.Config{
+			ServerName: sni,
+			RootCAs:    poolOf(ca),
+			NextProtos: []string{"h3"},
+			MinVersion: tls.VersionTLS13,
+		}, &quic.Config{HandshakeIdleTimeout: 10 * time.Second})
+		if err == nil {
+			_ = closeNoError(conn)
+		}
+		done <- err
+	}()
+	return done
+}
+
+func awaitHandshake(t *testing.T, done <-chan error, timeout time.Duration, msg string) {
+	t.Helper()
+	select {
+	case err := <-done:
+		require.NoError(t, err, msg)
+	case <-time.After(timeout):
+		t.Fatal(msg)
+	}
+}
+
+// A name resolution in flight for one QUIC connection delays neither a datagram nor another
+// QUIC connection on the same socket.
+func TestTransparentQUIC_ResolutionInFlightDoesNotDelayOtherClients(t *testing.T) {
+	origin := udpEchoOrigin(t)
+	_, ca, wrapper, proxyAddr, r, release := verifiedQUICProxy(t, origin, "example.test")
+
+	parked := dialQUICAsync(t, wrapper, origin, proxyAddr, "example.test", ca)
+	waitEntered(t, r.entered)
+
+	client, _ := udpClient(t)
+	sendTo(t, client, proxyAddr, "ping")
+	got, err := readDatagram(t, client, 2*time.Second)
+	require.NoError(t, err, "a datagram must be served while the resolution is in flight")
+	assert.Equal(t, "ping", got)
+
+	other := dialQUICAsync(t, wrapper, origin, proxyAddr, "example.test", ca)
+	awaitHandshake(t, other, 3*time.Second, "another connection must be placed while the resolution is in flight")
+
+	release()
+	awaitHandshake(t, parked, 5*time.Second, "the parked connection must be placed once the name resolves")
+}
+
+// initialDatagram builds a datagram with an Initial long header addressed to dcid.
+func initialDatagram(dcid []byte) []byte {
+	b := make([]byte, 0, 1200)
+	b = append(b, 0xC3, 0, 0, 0, 1, byte(len(dcid)))
+	b = append(b, dcid...)
+	b = append(b, 0)
+	return b[:1200]
+}
+
+// The datagrams of a connection being placed wait for its stack, within the pending bounds,
+// and none of them rejects it.
+func TestQUICDemux_PlacingConnectionKeepsItsDatagrams(t *testing.T) {
+	p := testProxy(t)
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	d, err := newQUICDemux(p, fixedOriginPacketConn{pc, netip.MustParseAddrPort("127.0.0.1:4433")})
+	require.NoError(t, err)
+	t.Cleanup(d.close)
+
+	client := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40000}
+	dcid := []byte{1, 2, 3, 4, 5, 6, 7, 8}
+	d.mu.Lock()
+	conn := d.admitConnLocked(flowKeyOf(client), client, string(dcid), time.Now())
+	require.NotNil(t, conn)
+	d.setStateLocked(conn, connPlacing)
+	d.mu.Unlock()
+
+	for range maxPendingDatagrams + 4 {
+		d.dispatch(client, initialDatagram(dcid), false)
+	}
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	assert.Equal(t, connPlacing, conn.state)
+	assert.Len(t, conn.pending, maxPendingDatagrams)
+	assert.Equal(t, maxPendingDatagrams*1200, conn.pendingBytes)
+	assert.Equal(t, 1, d.sniffing, "a connection being placed still counts against the sniffing cap")
+}
