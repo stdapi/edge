@@ -719,3 +719,43 @@ func TestSession_UpgradeRefusedAfterAChangeInTheWindow(t *testing.T) {
 	assert.Equal(t, http.StatusText(http.StatusForbidden)+"\n", string(body))
 	assert.Empty(t, slices.Collect(p.Sessions()), "a refused upgrade is not reported")
 }
+
+func TestSession_StaleLeavesTheNoEntryHandler(t *testing.T) {
+	p := testProxy(t, WithNoEntry(relayStream))
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(origin.Close)
+	originURL, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+	p.cfg.transport.RootCAs = originPool(t, origin)
+
+	client := proxyClient(startProxy(t, p), p.cfg.ca.CertPool())
+	resp, err := client.Get(origin.URL)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	sess := waitForSessions(t, p, 1)[0]
+	require.Equal(t, KindTCP, sess.Kind())
+	assert.False(t, sess.Stale())
+
+	_, port := splitHostPort(originURL.Host)
+	p.MustAdd[TCP](originHost(originURL)+":"+port, relayStream)
+	assert.True(t, sess.Stale())
+}
+
+func TestSession_StaleWebSocketLeavesTheNoEntryHandler(t *testing.T) {
+	origin, originURL := wsOrigin(t, nil)
+	p := testProxy(t, WithNoEntry(forwardHandler), WithNoEntry(func(c *WebSocketCtx) error { return c.Relay() }))
+
+	resp := wsUpgrade(t, startProxy(t, p), origin, "")
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+
+	sess := waitForSessions(t, p, 1)[0]
+	require.Equal(t, KindWebSocket, sess.Kind())
+	assert.False(t, sess.Stale())
+
+	p.MustAdd(originHost(originURL)+"/ws", func(c *WebSocketCtx) error { return c.Relay() })
+	assert.True(t, sess.Stale())
+}

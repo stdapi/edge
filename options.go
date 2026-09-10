@@ -119,12 +119,26 @@ func WithErrorHandler(handler ErrorHandler) ProxyOption {
 	})
 }
 
+// WithNoEntry registers a catch-all handler for one kind of traffic. It is called when no
+// entry of that kind matches.
+func WithNoEntry[H Handler](handler H) ProxyOption {
+	kind := kindOf[H]()
+	return proxyOption(func(s sealedOption) error {
+		if isNilHandler(handler) {
+			return fmt.Errorf("%w: nil %s handler", ErrInvalidConfig, kind)
+		}
+		s.proxy.cfg.noEntry[kind] = &entry{handler: handler, kind: kind}
+		return nil
+	})
+}
+
 // WithMiddleware registers middleware, proxy-wide or on a single entry depending on where it
 // is passed. Middleware runs in registration order, outermost first, and the proxy-wide ones
 // wrap the entry's.
 //
 // The kind a middleware wraps is its own signature, so a proxy-wide registration only reaches
-// the entries of that kind, and an entry only takes the middleware of its own.
+// the entries of that kind, the handler set with [WithNoEntry] included, and an entry only
+// takes the middleware of its own.
 //
 //	edge.New(edge.WithCA(ca), edge.WithMiddleware(logHTTP))          // every HTTP entry
 //	p.Add("api.test/v1", h, edge.WithMiddleware(retry))              // this one only

@@ -66,10 +66,11 @@ type Proxy struct {
 
 // config holds the resolved configuration of a [Proxy], read-only once it is built.
 type config struct {
+	noEntry [KindUDP + 1]*entry
+
 	ca        *CA
 	logger    *slog.Logger
 	proxyAuth ProxyAuthenticator
-
 	transport *Transport
 	resolver  NameResolver
 
@@ -114,7 +115,8 @@ func Must(opts ...ProxyOption) *Proxy {
 // anything carried over TLS. An [HTTP] or [QUIC] entry is refused without one, with
 // [ErrNoCertificateAuthority]: QUIC is always TLS, and HTTP is in practice, so a registration
 // that could not be served is reported at once rather than at the first handshake. That holds
-// even for a deployment that only ever sees cleartext.
+// even for a deployment that only ever sees cleartext, and for a handler set with
+// [WithNoEntry] for [HTTP], [GRPC], [WebSocket] or [QUIC].
 //
 // A [TCP] or [UDP] entry needs none, a stream being often in the clear and a datagram carrying
 // no handshake at all; a stream that turns out to carry TLS fails at that handshake instead.
@@ -132,6 +134,9 @@ func New(opts ...ProxyOption) (*Proxy, error) {
 
 	// Clip so newEntry's append(p.mws, e.mws...) can never write into the shared backing array.
 	p.mws = slices.Clip(p.mws)
+	if err := p.buildNoEntry(); err != nil {
+		return nil, err
+	}
 
 	p.tree.Store(p.newTree())
 
@@ -159,6 +164,34 @@ func (p *Proxy) newTree() *iTree {
 }
 
 func (p *Proxy) getTree() *iTree { return p.tree.Load() }
+
+// buildNoEntry runs after every option is applied, so a middleware registered after the
+// handler wraps it.
+func (p *Proxy) buildNoEntry() error {
+	cfg := p.cfg
+	for _, e := range cfg.noEntry {
+		if e == nil {
+			continue
+		}
+		if cfg.ca == nil && (e.kind.admittedAs() == KindHTTP || e.kind == KindQUIC) {
+			return fmt.Errorf("%w: %s admits every authority, which carries TLS", ErrNoCertificateAuthority, e.kind)
+		}
+		e.serve = chainAny(p.mws, e.handler)
+	}
+	if cfg.noEntry[KindHTTP] == nil && (cfg.noEntry[KindGRPC] != nil || cfg.noEntry[KindWebSocket] != nil) {
+		cfg.noEntry[KindHTTP] = &entry{kind: KindHTTP, implied: true}
+	}
+	return nil
+}
+
+func (cfg *config) noEntryFor(c *routeCtx) *entry {
+	for _, k := range [...]Kind{KindWebSocket, KindGRPC, KindHTTP} {
+		if e := cfg.noEntry[k]; e != nil && e.handler != nil && e.kindAccepts(c) {
+			return e
+		}
+	}
+	return nil
+}
 
 // MustAdd registers handler for pattern and panics on error. It is a convenience wrapper for
 // [Proxy.Add].
@@ -403,6 +436,26 @@ func isNilHandler[H Handler](h H) bool {
 		return v == nil
 	default:
 		return true
+	}
+}
+
+func chainAny(mws []middleware, handler any) any {
+	switch h := handler.(type) {
+	case HTTP:
+		return chain(mws, h)
+	case GRPC:
+		return chain(mws, h)
+	case WebSocket:
+		return chain(mws, h)
+	case TCP:
+		return chain(mws, h)
+	case QUIC:
+		return chain(mws, h)
+	case UDP:
+		return chain(mws, h)
+	default:
+		// Unreachable: Handler has no other term.
+		panic("edge: unknown handler kind")
 	}
 }
 

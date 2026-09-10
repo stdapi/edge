@@ -333,3 +333,12 @@ func TestUpgrade_CloseEndsAPipeOnAFrontConnection(t *testing.T) {
 	_, err = br.ReadString('\n')
 	assert.Error(t, err, "Close must reach a pipe http.Server no longer owns")
 }
+
+func TestUpgrade_ReachesTheNoEntryTCPHandler(t *testing.T) {
+	origin, _ := wsOrigin(t, nil)
+	p := testProxy(t, WithNoEntry(forwardHandler), WithNoEntry(relayStream))
+
+	resp := wsUpgrade(t, startProxy(t, p), origin, "")
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+	require.Equal(t, KindTCP, waitForSessions(t, p, 1)[0].Kind())
+}

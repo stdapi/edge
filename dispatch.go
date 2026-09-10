@@ -40,15 +40,11 @@ func (p *Proxy) dispatchRequest(w http.ResponseWriter, r *http.Request, sess *Se
 	c.reset(sess, r, target.Scheme, target.Host, target.Port)
 	c.identity = identity
 
-	idx, n := tree.lookup(target.Host, routingPath(r), c, false)
-	if n == nil {
-		// A lookup that failed may have left captures behind from a branch it backtracked
-		// out of, and no entry means no names to read them under.
-		*c.params = (*c.params)[:0]
+	c.entry = tree.route(c, false)
+	if c.entry == nil {
 		p.writeStatus(w, r, http.StatusForbidden, "no entry matches this request")
 		return
 	}
-	c.entry = n.entries[idx]
 
 	switch c.entry.kind {
 	case KindGRPC:

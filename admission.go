@@ -54,8 +54,7 @@ func (p *Proxy) stale(s *Session) bool {
 	r := s.upgrade
 	c.reset(s, r, s.target.Scheme, s.target.Host, s.target.Port)
 	c.identity = s.identity
-	idx, n := tree.lookup(s.target.Host, routingPath(r), c, true)
-	return n == nil || n.entries[idx] != decided
+	return tree.route(c, true) != decided
 }
 
 func (p *Proxy) admission(target Target, kind Kind) *entry {
@@ -75,7 +74,7 @@ func (t *iTree) admission(c *routeCtx, target Target, kind Kind) *entry {
 // With capture set the walk records what the pattern's parameters matched, which only a
 // caller about to hand the entry to a handler pays for.
 func resolveAdmission(patterns, addrs *node, total int, c *routeCtx, target Target, kind Kind, capture bool) *entry {
-	if total == 0 || kind == 0 {
+	if kind == 0 || kind > KindUDP {
 		return nil
 	}
 	// A refinement is admitted by what carries it: a WebSocket connection and a gRPC call are
@@ -93,11 +92,15 @@ func resolveAdmission(patterns, addrs *node, total int, c *routeCtx, target Targ
 	}
 	c.resetForAdmission(nil, scheme, target.Host, port)
 
-	idx, n := lookupTarget(patterns, addrs, target.Host, "", c, !capture, kind)
-	if n == nil {
+	if total > 0 {
+		if idx, n := lookupTarget(patterns, addrs, target.Host, "", c, !capture, kind); n != nil {
+			return n.entries[idx]
+		}
+	}
+	if canonicalHost(target.Host) == "" {
 		return nil
 	}
-	return n.entries[idx]
+	return c.p.cfg.noEntry[kind]
 }
 
 // admitWith resolves the entry admitting kind on target and copies out the parameters its

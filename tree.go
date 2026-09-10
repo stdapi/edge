@@ -42,6 +42,24 @@ func (t *iTree) lookup(host, path string, c *routeCtx, lazy bool) (int, *node) {
 	return lookupTarget(t.patterns, t.addrs, host, path, c, lazy, 0)
 }
 
+// route returns the entry serving the request c was reset with. A failed walk may leave
+// captures behind, and every reader bounds them on entry.params, empty for a [WithNoEntry]
+// handler.
+func (t *iTree) route(c *routeCtx, lazy bool) *entry {
+	idx, n := t.lookup(c.host, routingPath(c.req), c, lazy)
+	if n != nil {
+		return n.entries[idx]
+	}
+	if canonicalHost(c.host) == "" {
+		return nil
+	}
+	return t.p.cfg.noEntryFor(c)
+}
+
+func canonicalHost(host string) string {
+	return strings.TrimSuffix(host, ".")
+}
+
 // lookupTarget is the single entry of both lookups, the request routing and the admission
 // decision. It canonicalizes the host and routes it to the root of its kind: an address
 // consults addrs, a name consults patterns, and neither ever falls back to the other. Both
@@ -53,9 +71,7 @@ func (t *iTree) lookup(host, path string, c *routeCtx, lazy bool) (int, *node) {
 func lookupTarget(patterns, addrs *node, host, path string, c *routeCtx, lazy bool, admit Kind) (int, *node) {
 	*c.skipStack = (*c.skipStack)[:0]
 	// The canonical form exists only inside the lookup, like the routing path of a request.
-	if len(host) > 0 && host[len(host)-1] == '.' {
-		host = host[:len(host)-1]
-	}
+	host = canonicalHost(host)
 	if maybeRoutingAddr(host) {
 		if addr, ok := routingAddr(host); ok {
 			var buf [maxAddrKey]byte

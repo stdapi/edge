@@ -6,9 +6,12 @@ package edge
 
 import (
 	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -273,4 +276,78 @@ func TestOptions_MiddlewareIsComposable(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"proxy", "interceptor", "handler"}, seen,
 		"the proxy-wide middleware wraps the entry's")
+}
+
+func TestOptions_NoEntryRejected(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+
+	_, err = New(WithCA(ca), WithNoEntry[HTTP](nil))
+	require.ErrorIs(t, err, ErrInvalidConfig)
+
+	for _, opt := range []ProxyOption{
+		WithNoEntry(forwardHandler),
+		WithNoEntry(func(c *GRPCCtx) error { return c.Forward() }),
+		WithNoEntry(func(c *WebSocketCtx) error { return c.Relay() }),
+		WithNoEntry(relayQUIC),
+	} {
+		_, err = New(opt)
+		require.ErrorIs(t, err, ErrNoCertificateAuthority)
+	}
+	_, err = New(WithNoEntry(relayStream), WithNoEntry(forwardDatagram))
+	require.NoError(t, err)
+}
+
+func TestOptions_NoEntryTakesTheProxyMiddlewareOnly(t *testing.T) {
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(origin.Close)
+	originURL, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+
+	var pattern, entryMW, noEntryMW, params string
+	noEntry := func(c *HTTPCtx) (*http.Response, error) {
+		pattern = c.Pattern()
+		for range c.Params() {
+			params += "x"
+		}
+		return Status(http.StatusTeapot), nil
+	}
+	mw := func(next HTTP) HTTP {
+		return func(c *HTTPCtx) (*http.Response, error) {
+			noEntryMW += "g"
+			return next(c)
+		}
+	}
+	p := testProxy(t, WithNoEntry(noEntry), WithMiddleware(mw))
+	p.cfg.transport.RootCAs = originPool(t, origin)
+	host := originHost(originURL)
+	p.MustAdd("+{sub}.corp.test/v1", forwardHandler)
+	p.MustAdd(host+"/v1", forwardHandler, WithMiddleware(func(next HTTP) HTTP {
+		return func(c *HTTPCtx) (*http.Response, error) {
+			entryMW += "e"
+			return next(c)
+		}
+	}))
+
+	client := proxyClient(startProxy(t, p), p.cfg.ca.CertPool())
+	get := func(target string) int {
+		resp, err := client.Get(target)
+		require.NoError(t, err)
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	assert.Equal(t, http.StatusOK, get(origin.URL+"/v1"))
+	assert.Equal(t, "e", entryMW)
+	assert.Equal(t, "g", noEntryMW)
+
+	assert.Equal(t, http.StatusTeapot, get(origin.URL+"/v2"))
+	assert.Equal(t, http.StatusTeapot, get("https://a.corp.test/v2"))
+	assert.Equal(t, "e", entryMW, "the middleware of an entry does not apply")
+	assert.Equal(t, "ggg", noEntryMW, "the proxy-wide middleware applies")
+	assert.Empty(t, pattern)
+	assert.Empty(t, params)
 }

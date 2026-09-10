@@ -5,6 +5,8 @@
 package edge
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -443,4 +445,48 @@ func TestAdmission_FirstAdmittedWithPicksTheFinestKind(t *testing.T) {
 	kind, _, params = p.firstAdmittedWith(target, kinds)
 	assert.Equal(t, KindHTTP, kind)
 	assert.Equal(t, []Param{{Key: "name", Value: "api"}}, params)
+}
+
+func TestAdmission_NoEntryAdmitsEveryHostAndStaysOutOfTheTree(t *testing.T) {
+	p := testProxy(t, WithNoEntry(forwardHandler), WithNoEntry(relayStream), WithNoEntry(relayQUIC), WithNoEntry(forwardDatagram))
+
+	for _, host := range []string{"api.test", "api.test.", "127.0.0.1", "[::1]"} {
+		for _, kind := range []Kind{KindHTTP, KindGRPC, KindWebSocket, KindTCP, KindQUIC, KindUDP} {
+			assert.True(t, p.Admits(Target{Host: host, Port: "443"}, kind), "%s %s", host, kind)
+		}
+	}
+	assert.False(t, p.Admits(Target{Host: "", Port: "443"}, KindHTTP))
+	assert.False(t, p.Admits(Target{Host: ".", Port: "443"}, KindHTTP))
+	assert.False(t, p.Admits(Target{Host: "api.test", Port: "443"}, Kind(0)))
+	assert.False(t, p.Admits(Target{Host: "api.test", Port: "443"}, KindUDP+1))
+
+	txn := p.Txn(true)
+	defer txn.Abort()
+	assert.True(t, txn.Admits(Target{Host: "api.test", Port: "443"}, KindTCP))
+	_, err := txn.Add[TCP]("api.test", relayStream)
+	require.NoError(t, err)
+	assert.True(t, txn.Admits(Target{Host: "api.test", Port: "443"}, KindTCP))
+	assert.Equal(t, 1, txn.Len())
+
+	assert.Equal(t, 0, p.Len())
+	assert.Zero(t, admissionsLen(p))
+	assert.False(t, p.Has[HTTP]("+{any}/*{any}"))
+}
+
+func TestAdmission_NoEntryGRPCAloneAdmitsHTTPWithoutServingIt(t *testing.T) {
+	p := testProxy(t, WithNoEntry(func(c *GRPCCtx) error { return c.Forward() }))
+	assert.True(t, p.Admits(Target{Host: "api.test", Port: "443"}, KindHTTP))
+	assert.False(t, p.Admits(Target{Host: "api.test", Port: "443"}, KindTCP))
+
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(origin.Close)
+	p.cfg.transport.RootCAs = originPool(t, origin)
+
+	client := proxyClient(startProxy(t, p), p.cfg.ca.CertPool())
+	resp, err := client.Get(origin.URL)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
 }

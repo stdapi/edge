@@ -247,9 +247,9 @@ func (r *grpcRoute) admitted() bool {
 	tree := r.p.getTree()
 	c := tree.pool.Get().(*routeCtx)
 	c.reset(r.sess, r.req, r.scheme, r.host, r.port)
-	_, n := tree.lookup(r.host, routingPath(r.req), c, false)
+	admitted := tree.route(c, false) != nil
 	tree.pool.Put(c)
-	return n != nil
+	return admitted
 }
 
 // markRefused puts the status of a refused call in the trailers of a response being relayed,
