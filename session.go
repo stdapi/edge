@@ -299,16 +299,19 @@ func (s *Session) Transparent() bool { return s.transparent }
 //
 // A CONNECT-UDP tunnel reports the most specific kind an entry admitted it for, HTTP, QUIC or
 // UDP in that order. The tunnel serves nothing itself. Each connection and datagram flow
-// inside it is a session of its own, see [Session.Via].
+// inside it is a session of its own, see [Session.Via]. A SOCKS5 UDP association declares no
+// destination, so it is admitted by nothing and reports no kind, and every datagram inside it
+// is admitted on its own.
 func (s *Session) Kind() Kind { return s.kind }
 
-// Tunnel reports whether the session is a CONNECT-UDP tunnel. Closing one ends every session
-// inside it, and the client has to ask for a new tunnel, which is authenticated and admitted
-// again.
+// Tunnel reports whether the session is a CONNECT-UDP tunnel or a SOCKS5 UDP association.
+// Closing one ends every session inside it, and the client has to open a new one, which is
+// authenticated and admitted again.
 func (s *Session) Tunnel() bool { return s.tunnel }
 
-// Via returns the CONNECT-UDP tunnel the session arrived through, or nil when its datagrams
-// arrived off a socket. A session reports the identity of its tunnel.
+// Via returns the CONNECT-UDP tunnel or the SOCKS5 UDP association the session arrived
+// through, or nil when its datagrams arrived off a socket. A session reports the identity of
+// its tunnel.
 func (s *Session) Via() *Session { return s.via }
 
 // ServableAs returns the kinds that can serve this connection, from the most specific to the

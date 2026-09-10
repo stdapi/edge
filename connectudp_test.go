@@ -482,7 +482,7 @@ func TestConnectUDP_ClosedTunnelOwnsNoFlow(t *testing.T) {
 	target := Target{Scheme: "https", Host: h3Authority, Port: "443"}
 	sess := newSession(p, ctx, nil, target, KindHTTP, HTTP3)
 	sess.remoteAddr = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 4242}
-	tun := newConnectUDPTunnel(d, sess, target, netip.MustParseAddrPort("127.0.0.1:443"), cancel)
+	tun := newConnectUDPTunnel(d, sess, &contextFraming{target: target, upstream: netip.MustParseAddrPort("127.0.0.1:443")}, cancel)
 	require.True(t, d.publishTunnel(tun))
 	tun.close()
 

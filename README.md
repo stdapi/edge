@@ -52,6 +52,8 @@ Point the application at it with `HTTPS_PROXY=http://localhost:8080` and install
 
 A classic proxy setting sends an HTTP/3 client back to TCP, since `CONNECT` tunnels a stream and HTTP/3 needs datagrams. `CONNECT-UDP` (RFC 9298, the MASQUE tunnel) tunnels them. `ListenAndServeQUIC` serves it over an HTTP/3 front, and the TCP fronts serve it as capsules on the stream, an extended CONNECT over HTTP/2 or a GET the proxy upgrades over HTTP/1.1, for a client that cannot reach the proxy over UDP. A client that speaks it reaches HTTP/3 origins and any other UDP through a proxy setting, and the tunnel and everything inside it show up in `Sessions()`. A client that does not is reached by routing it to the transparent listener instead. Go's HTTP/2 server accepts an extended CONNECT only with `GODEBUG=http2xconnect=1` in the environment.
 
+A client with no notion of an HTTP proxy, `ssh -D`, git, a database driver, a JVM with `socksProxyHost`, reaches the same entries through `ListenAndServeSOCKS5` (RFC 1928). A `CONNECT` there is terminated and routed as an HTTP `CONNECT` is, and a `UDP ASSOCIATE` is a tunnel routing every datagram on the destination it is addressed to, an address or a hostname the proxy resolves. Upstream, a `socks5://` value in `Transport.Proxy` chains through a SOCKS5 proxy, `CONNECT` for TCP and `UDP ASSOCIATE` for QUIC and UDP.
+
 Protocol upgrades, including WebSocket, are spliced through in both modes. Server-sent events and other streamed bodies are relayed as they are produced, not buffered. Trailers are forwarded.
 
 ## Two axes, not one
@@ -223,6 +225,8 @@ for s := range p.Sessions() {
 ```
 
 Implementing `ProxyAuthenticator` yourself covers Bearer or anything else: `Authenticate` reads the request, `Challenges` says what a 407 should offer.
+
+The same option serves the SOCKS5 front, where a client presents a username and a password (RFC 1929). `BasicAuth` is a `PasswordAuthenticator` as well, so the callback above verifies both fronts. An authenticator of your own serves SOCKS5 once it implements `AuthenticatePassword`, and `ServeSOCKS5` refuses to start with one that does not.
 
 A transparently redirected client does not know a proxy exists and can carry no proxy credentials, so this applies to the explicit listeners only. That is the limit of the protocol, not of the proxy. There, a client is identified by where it comes from.
 

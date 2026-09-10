@@ -277,7 +277,7 @@ func TestChain_H3UpstreamThroughCONNECTUDP(t *testing.T) {
 // What the selected proxy cannot serve fails the dial, and nothing goes around it.
 func TestChain_RefusesWhatTheProxyCannotCarry(t *testing.T) {
 	tr := DefaultTransport()
-	tr.Proxy = fixedProxy("socks5://127.0.0.1:1")
+	tr.Proxy = fixedProxy("ftp://127.0.0.1:1")
 	_, err := newUpstreamDialer(tr).dial(t.Context(), "tcp", "127.0.0.1:443", "https")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not supported")
@@ -1900,7 +1900,7 @@ func TestChain_PoolPerProxy(t *testing.T) {
 	require.NoError(t, err)
 	assert.Same(t, f.shared.https, direct)
 
-	unsupported, err := url.Parse("socks5://127.0.0.1:1080")
+	unsupported, err := url.Parse("ftp://127.0.0.1:1080")
 	require.NoError(t, err)
 	selected.Store(unsupported)
 	_, err = f.poolFor(req, "")
@@ -1944,4 +1944,306 @@ func TestChain_RefusedTCPDialIsNotRemembered(t *testing.T) {
 			assert.True(t, u.remembers(noH3Dial, proxy))
 		})
 	}
+}
+
+// A TCP stream reaches its origin with a CONNECT to a SOCKS5 proxy, the destination sent as
+// the hostname for the proxy to resolve, and the proxy is the only address the front dials.
+func TestChain_TCPStreamThroughSOCKS5(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	origin := namedOrigin(t, ca, "inner.test")
+	_, port, err := net.SplitHostPort(origin.Host)
+	require.NoError(t, err)
+
+	backTr := DefaultTransport()
+	backTr.RootCAs = poolOf(ca)
+	backTr.DialContext = pinnedDialer(origin.Host)
+	back, err := New(WithCA(ca), WithTransport(backTr))
+	require.NoError(t, err)
+	back.MustAdd[TCP]("inner.test", relayStream)
+	backAddr := startSOCKS5(t, back)
+
+	for _, scheme := range []string{"socks5", "socks5h"} {
+		t.Run(scheme, func(t *testing.T) {
+			frontTr := DefaultTransport()
+			frontTr.RootCAs = poolOf(ca)
+			dialed := new(recorder)
+			frontTr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				dialed.add(network + " " + addr)
+				return defaultDialer.DialContext(ctx, network, addr)
+			}
+			frontTr.Proxy = fixedProxy(scheme + "://" + backAddr)
+			front, err := New(WithCA(ca), WithTransport(frontTr))
+			require.NoError(t, err)
+			front.MustAdd[TCP]("inner.test", relayStream)
+			frontAddr := startProxy(t, front)
+
+			client := tunnelClient(t, frontAddr, "inner.test:"+port, "inner.test", ca)
+			resp, err := client.Get("https://inner.test/")
+			require.NoError(t, err)
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			require.NoError(t, resp.Body.Close())
+			assert.Equal(t, "origin host=inner.test", string(body))
+			assert.Equal(t, []string{"tcp " + backAddr}, dialed.all())
+
+			sess := waitForSessions(t, back, 1)[0]
+			assert.Equal(t, "inner.test", sess.Target().Host)
+			assert.Equal(t, KindTCP, sess.Kind())
+			require.NoError(t, sess.Close())
+			waitForSessions(t, back, 0)
+		})
+	}
+}
+
+// An HTTP request with a declared destination reaches its origin through a SOCKS5 proxy as
+// well, the fixed pools dialing through the same dialer.
+func TestChain_HTTPWithDeclaredDestinationThroughSOCKS5(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	origin := namedOrigin(t, ca, "inner.test")
+	_, port, err := net.SplitHostPort(origin.Host)
+	require.NoError(t, err)
+
+	backTr := DefaultTransport()
+	backTr.RootCAs = poolOf(ca)
+	backTr.DialContext = pinnedDialer(origin.Host)
+	back, err := New(WithCA(ca), WithTransport(backTr))
+	require.NoError(t, err)
+	back.MustAdd("inner.test/", forwardHandler)
+	backAddr := startSOCKS5(t, back)
+
+	frontTr := DefaultTransport()
+	frontTr.RootCAs = poolOf(ca)
+	dialed := new(recorder)
+	frontTr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dialed.add(network + " " + addr)
+		return defaultDialer.DialContext(ctx, network, addr)
+	}
+	frontTr.Proxy = fixedProxy("socks5://" + backAddr)
+	front, err := New(WithCA(ca), WithTransport(frontTr))
+	require.NoError(t, err)
+	front.MustAdd("inner.test/", forwardHandler)
+	frontAddr := startProxy(t, front)
+
+	client := tunnelClient(t, frontAddr, "inner.test:"+port, "inner.test", ca)
+	resp, err := client.Get("https://inner.test/")
+	require.NoError(t, err)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	assert.Equal(t, "origin host=inner.test", string(body))
+	assert.Equal(t, []string{"tcp " + backAddr}, dialed.all())
+}
+
+// The credentials of a socks5 URL are sent with the username/password method, and a proxy
+// that refuses them, or offers no method the dialer has, fails the dial.
+func TestChain_SOCKS5CarriesTheCredentials(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	origin := namedOrigin(t, ca, "inner.test")
+	_, port, err := net.SplitHostPort(origin.Host)
+	require.NoError(t, err)
+
+	backTr := DefaultTransport()
+	backTr.RootCAs = poolOf(ca)
+	backTr.DialContext = pinnedDialer(origin.Host)
+	back, err := New(WithCA(ca), WithTransport(backTr), WithProxyAuth(BasicAuth("edge", func(user, pass string) bool {
+		return user == "alice" && pass == "s3cret"
+	})))
+	require.NoError(t, err)
+	back.MustAdd[TCP]("inner.test", relayStream)
+	backAddr := startSOCKS5(t, back)
+
+	frontTr := DefaultTransport()
+	frontTr.RootCAs = poolOf(ca)
+	frontTr.Proxy = fixedProxy("socks5://alice:s3cret@" + backAddr)
+	front, err := New(WithCA(ca), WithTransport(frontTr))
+	require.NoError(t, err)
+	front.MustAdd[TCP]("inner.test", relayStream)
+	frontAddr := startProxy(t, front)
+
+	client := tunnelClient(t, frontAddr, "inner.test:"+port, "inner.test", ca)
+	resp, err := client.Get("https://inner.test/")
+	require.NoError(t, err)
+	_, _ = io.Copy(io.Discard, resp.Body)
+	require.NoError(t, resp.Body.Close())
+	assert.Equal(t, "alice", waitForSessions(t, back, 1)[0].Identity())
+
+	frontTr.Proxy = fixedProxy("socks5://alice:wrong@" + backAddr)
+	_, err = newUpstreamDialer(frontTr).dial(t.Context(), "tcp", "inner.test:"+port, "https")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "authentication failed")
+
+	frontTr.Proxy = fixedProxy("socks5://" + backAddr)
+	_, err = newUpstreamDialer(frontTr).dial(t.Context(), "tcp", "inner.test:"+port, "https")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "none of the authentication methods")
+}
+
+// fakeSOCKS5 answers every CONNECT with rep, written by hand so the test shares nothing with
+// the codec the dialer reads with.
+func fakeSOCKS5(t *testing.T, rep byte) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer func() { _ = conn.Close() }()
+				var greeting [2]byte
+				if _, err := io.ReadFull(conn, greeting[:]); err != nil || greeting[0] != 5 {
+					return
+				}
+				methods := make([]byte, greeting[1])
+				if _, err := io.ReadFull(conn, methods); err != nil {
+					return
+				}
+				if _, err := conn.Write([]byte{5, 0}); err != nil {
+					return
+				}
+				var head [4]byte
+				if _, err := io.ReadFull(conn, head[:]); err != nil {
+					return
+				}
+				var rest []byte
+				switch head[3] {
+				case 1:
+					rest = make([]byte, 4+2)
+				case 4:
+					rest = make([]byte, 16+2)
+				case 3:
+					var l [1]byte
+					if _, err := io.ReadFull(conn, l[:]); err != nil {
+						return
+					}
+					rest = make([]byte, int(l[0])+2)
+				}
+				if _, err := io.ReadFull(conn, rest); err != nil {
+					return
+				}
+				_, _ = conn.Write([]byte{5, rep, 0, 1, 0, 0, 0, 0, 0, 0})
+				time.Sleep(10 * time.Second)
+			}()
+		}
+	}()
+	return ln.Addr().String()
+}
+
+// A refused CONNECT fails the dial with the reply of the proxy.
+func TestChain_RefusedSOCKS5CONNECTReportsTheReply(t *testing.T) {
+	proxy := fakeSOCKS5(t, 2)
+	tr := DefaultTransport()
+	tr.Proxy = fixedProxy("socks5://" + proxy)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	start := time.Now()
+	_, err := newUpstreamDialer(tr).dial(ctx, "tcp", "example.test:443", "https")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not allowed by ruleset")
+	assert.Less(t, time.Since(start), time.Second)
+}
+
+// A datagram flow reaches its origin through a UDP ASSOCIATE with a SOCKS5 proxy, one
+// association per flow, and the proxy is the only address the front dials.
+func TestChain_DatagramFlowThroughSOCKS5(t *testing.T) {
+	echo := udpEcho(t)
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+
+	back, err := New(WithCA(ca))
+	require.NoError(t, err)
+	back.MustAdd[UDP]("127.0.0.1", forwardDatagram)
+	backAddr := startSOCKS5(t, back)
+
+	front, dialer := chainedFront(t, ca, "socks5://"+backAddr)
+	frontAddr := startQUICRedirected(t, front, echo)
+	echoThrough(t, frontAddr, "ping", "pong")
+
+	var tunnels, flows int
+	for _, s := range waitForSessions(t, back, 4) {
+		if s.Tunnel() {
+			tunnels++
+			assert.Equal(t, Protocol(0), s.Protocol())
+		} else {
+			flows++
+			assert.Equal(t, KindUDP, s.Kind())
+		}
+	}
+	assert.Equal(t, 2, tunnels, "one association per flow")
+	assert.Equal(t, 2, flows, "one flow inside each association")
+	assert.EqualValues(t, 2, dialer.tcp.Load(), "one control connection per association")
+	assert.EqualValues(t, 2, dialer.udp.Load(), "one relay socket per association")
+}
+
+// An HTTP/3 upstream runs inside a UDP ASSOCIATE with a SOCKS5 proxy, which terminates the
+// connection on its own stack.
+func TestChain_H3UpstreamThroughSOCKS5(t *testing.T) {
+	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
+	require.NoError(t, err)
+	origin := h3Origin(t, originCA)
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+
+	backTr := DefaultTransport()
+	backTr.RootCAs = poolOf(originCA)
+	back, err := New(WithCA(ca), WithTransport(backTr))
+	require.NoError(t, err)
+	back.MustAdd[UDP]("127.0.0.1", forwardDatagram)
+	back.MustAdd[QUIC](h3Authority, relayQUIC)
+	backAddr := startSOCKS5(t, back)
+
+	frontTr := DefaultTransport()
+	frontTr.AllowHTTP3 = true
+	frontTr.RootCAs = poolOf(ca)
+	frontTr.Proxy = fixedProxy("socks5://" + backAddr)
+	front, err := New(WithCA(ca), WithTransport(frontTr))
+	require.NoError(t, err)
+	front.MustAdd(h3Authority+"/+{any}", forwardHandler)
+	frontAddr := startQUICRedirected(t, front, origin)
+
+	tr := dialQUICTo(frontAddr, poolOf(ca))
+	defer func() { _ = tr.Close() }()
+	req, err := http.NewRequest(http.MethodGet,
+		fmt.Sprintf("https://%s:%d/echo", h3Authority, frontAddr.Port()), nil)
+	require.NoError(t, err)
+	resp, err := tr.RoundTrip(req)
+	require.NoError(t, err)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	assert.Contains(t, string(body), "path=/echo")
+	assert.Contains(t, string(body), "proto=HTTP/3.0", "the origin was reached over HTTP/3")
+
+	var assoc, inner *Session
+	for _, s := range waitForSessions(t, back, 2) {
+		if s.Tunnel() {
+			assoc = s
+		} else {
+			inner = s
+		}
+	}
+	require.NotNil(t, assoc)
+	require.NotNil(t, inner)
+	assert.Equal(t, KindQUIC, inner.Kind())
+	assert.Equal(t, h3Authority, inner.Target().Host)
+	assert.Equal(t, origin, inner.Upstream())
+	assert.Same(t, assoc, inner.Via())
+}
+
+// A proxy answering a UDP ASSOCIATE with a refusal fails the dial with its reply.
+func TestChain_RefusedSOCKS5AssociateReportsTheReply(t *testing.T) {
+	proxy := fakeSOCKS5(t, 7)
+	tr := DefaultTransport()
+	tr.Proxy = fixedProxy("socks5://" + proxy)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	_, err := newUpstreamDialer(tr).dial(ctx, "udp", "127.0.0.1:443", "https")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "command not supported")
 }

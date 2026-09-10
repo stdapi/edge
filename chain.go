@@ -147,7 +147,7 @@ func (u *upstreamDialer) selectProxy(req *http.Request) (*url.URL, error) {
 	}
 	if proxy != nil {
 		switch proxy.Scheme {
-		case "http", "https":
+		case "http", "https", "socks5", "socks5h":
 		default:
 			return nil, fmt.Errorf("edge: dial %s through %s: proxy scheme %q is not supported", req.URL.Host, proxy.Redacted(), proxy.Scheme)
 		}
@@ -179,10 +179,15 @@ func (u *upstreamDialer) dialThrough(ctx context.Context, network, addr string, 
 	if proxy == nil {
 		return u.t.dialer()(ctx, network, addr)
 	}
-	switch network {
-	case "tcp":
+	socks := isSOCKS5(proxy)
+	switch {
+	case network == "tcp" && socks:
+		return u.connectSOCKS5(ctx, proxy, addr)
+	case network == "tcp":
 		return u.connect(ctx, proxy, addr)
-	case "udp":
+	case network == "udp" && socks:
+		return u.associateSOCKS5(ctx, proxy, addr)
+	case network == "udp":
 		return u.connectUDP(ctx, proxy, addr)
 	}
 	return nil, fmt.Errorf("edge: dial %s %s through %s: network not supported", network, addr, proxy.Redacted())
@@ -204,9 +209,10 @@ func quicOn(ctx context.Context, sock net.Conn, addr string, tlsCfg *tls.Config,
 		_ = sock.Close()
 		return nil, fmt.Errorf("edge: dial %s: the dialer returned a socket with no peer", addr)
 	}
-	if _, ok := sock.(*connectUDPConn); ok {
-		// Each packet goes inside one QUIC datagram of the proxy connection, so the packets
-		// stay at the size every path accepts.
+	switch sock.(type) {
+	case *connectUDPConn, *socks5UDPConn:
+		// Each packet goes inside one QUIC datagram of the proxy connection, or behind a
+		// SOCKS5 header, so the packets stay at the size every path accepts.
 		qcfg = qcfg.Clone()
 		qcfg.InitialPacketSize = 1200
 		qcfg.DisablePathMTUDiscovery = true
@@ -231,6 +237,9 @@ func quicOn(ctx context.Context, sock net.Conn, addr string, tlsCfg *tls.Config,
 func proxyAddr(proxy *url.URL) string {
 	if proxy.Port() != "" {
 		return proxy.Host
+	}
+	if isSOCKS5(proxy) {
+		return joinHostPort(proxy.Hostname(), "1080")
 	}
 	return joinHostPort(proxy.Hostname(), defaultPort(proxy.Scheme))
 }

@@ -37,11 +37,15 @@ type Transport struct {
 	// through a CONNECT, or one that has no request, calls it with a request for the
 	// destination alone, so [http.ProxyFromEnvironment] applies to it as well.
 	//
-	// The proxy type is determined by the URL scheme. "http" and "https" are supported. A
-	// TCP upstream goes through a CONNECT, over HTTP/3 or over TCP, where TLS negotiates
-	// HTTP/2 or HTTP/1.1, and a QUIC or UDP upstream through a CONNECT-UDP tunnel, RFC 9298,
-	// over HTTP/3 when the proxy answers on UDP and over TCP otherwise. An "http" proxy is
-	// reached over HTTP/1.1.
+	// The proxy type is determined by the URL scheme. "http", "https", "socks5" and "socks5h"
+	// are supported. Through an HTTP proxy a TCP upstream goes through a CONNECT, over HTTP/3
+	// or over TCP, where TLS negotiates HTTP/2 or HTTP/1.1, and a QUIC or UDP upstream
+	// through a CONNECT-UDP tunnel, RFC 9298, over HTTP/3 when the proxy answers on UDP and
+	// over TCP otherwise. An "http" proxy is reached over HTTP/1.1. Through a SOCKS5 proxy a
+	// TCP upstream goes through a CONNECT and a QUIC or UDP upstream through a UDP
+	// ASSOCIATE, RFC 1928, and a hostname is sent for the proxy to resolve under both
+	// schemes. The credentials of the URL are sent with the Basic scheme to an HTTP proxy
+	// and with the username/password method of RFC 1929 to a SOCKS5 one.
 	//
 	// If Proxy is nil or returns a nil *URL, no proxy is used.
 	Proxy func(*http.Request) (*url.URL, error)

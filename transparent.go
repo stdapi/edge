@@ -42,6 +42,10 @@ func (p *Proxy) ListenAndServeTransparent(addr string) error {
 // neither a name nor a destination cannot be placed and is closed. Wrap ln in
 // [TransparentListener] for the destination.
 func (p *Proxy) ServeTransparent(ln net.Listener) error {
+	return p.acceptEach(ln, p.ServeConn, "transparent connection closed")
+}
+
+func (p *Proxy) acceptEach(ln net.Listener, serve func(net.Conn) error, closed string) error {
 	// A refused registration means a shutdown started; accepting would run a loop nothing
 	// ever closes.
 	if !p.srv.tryTrackListener(&ln) {
@@ -68,8 +72,8 @@ func (p *Proxy) ServeTransparent(ln net.Listener) error {
 		delay = 0
 
 		p.srv.wg.Go(func() {
-			if err := p.ServeConn(conn); err != nil {
-				p.cfg.logger.Debug("edge: transparent connection closed", slog.String("error", err.Error()))
+			if err := serve(conn); err != nil {
+				p.cfg.logger.Debug("edge: "+closed, slog.String("error", err.Error()))
 			}
 		})
 	}

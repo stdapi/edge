@@ -96,7 +96,7 @@ func (p *Proxy) serveConnectUDP(w http.ResponseWriter, r *http.Request, identity
 		}
 	}
 
-	tun := newConnectUDPTunnel(d, sess, target, upstream, cancel)
+	tun := newConnectUDPTunnel(d, sess, &contextFraming{target: target, upstream: upstream}, cancel)
 	sess.closer = tun
 	if !d.publishTunnel(tun) {
 		p.writeStatus(w, r, http.StatusServiceUnavailable, "the proxy is at capacity or shutting down")
@@ -203,23 +203,28 @@ func targetFromConnectUDP(r *http.Request) (Target, error) {
 	if err != nil {
 		return Target{}, fmt.Errorf("CONNECT-UDP target host: %w", err)
 	}
+	return targetFromWire(host, segments[1])
+}
+
+// targetFromWire builds a target from a host and a port read off the wire, the host a
+// hostname or an address, an IPv6 one unbracketed. The pair must survive a rejoin, or the
+// authority written back would not be the one routed on.
+func targetFromWire(host, port string) (Target, error) {
 	host = stringsutil.ToLowerASCIIString(host)
 	if strings.ContainsAny(host, "/[] ") {
-		return Target{}, errors.New("CONNECT-UDP target host is not a hostname or an address")
+		return Target{}, errors.New("target host is not a hostname or an address")
 	}
 	if strings.Contains(host, ":") {
 		if _, perr := netip.ParseAddr(host); perr != nil {
-			return Target{}, errors.New("CONNECT-UDP target host is not an IPv6 address")
+			return Target{}, errors.New("target host is not an IPv6 address")
 		}
 	}
-	port, ok := canonicalPort(segments[1])
+	port, ok := canonicalPort(port)
 	if !ok {
-		return Target{}, errors.New("CONNECT-UDP target port is not a port")
+		return Target{}, errors.New("target port is not a port")
 	}
-	// The pair must survive a rejoin, or the authority written back would not be the one
-	// routed on.
 	if h, p := splitHostPort(joinHostPort(host, port)); h != host || p != port {
-		return Target{}, errors.New("CONNECT-UDP target host is not a hostname or an address")
+		return Target{}, errors.New("target host is not a hostname or an address")
 	}
 	return Target{Scheme: schemeForPort(port), Host: host, Port: port}, nil
 }
@@ -245,19 +250,63 @@ func (p *Proxy) resolveTarget(ctx context.Context, t Target) (netip.AddrPort, er
 	return netip.AddrPortFrom(addrs[0].Unmap(), uint16(port)), nil
 }
 
-// connectUDPTunnel is one CONNECT-UDP tunnel. To the demultiplexer it is a client socket with
-// one destination, keyed on the tunnel itself.
+// tunnelFraming is how the datagrams of a tunnel are framed on its pipe, and where each is
+// headed.
+type tunnelFraming interface {
+	// unwrap returns the payload of a datagram read off the pipe and where it is headed, ok
+	// false for one dropped.
+	unwrap(b []byte) (payload []byte, upstream netip.AddrPort, ok bool)
+	// declared returns the target of the datagram unwrap last returned, and declaredName its
+	// host when that is a name, allocating nothing.
+	declared() Target
+	declaredName() string
+	// wrap returns b framed as a datagram from origin, in a buffer from tunnelBuf with
+	// capsuleHeadroom ahead of the frame.
+	wrap(origin netip.AddrPort, b []byte) []byte
+}
+
+type contextFraming struct {
+	target   Target
+	upstream netip.AddrPort
+}
+
+func (f *contextFraming) unwrap(b []byte) ([]byte, netip.AddrPort, bool) {
+	// Context ID 0 is a UDP payload, RFC 9298 section 5. Anything else is dropped.
+	id, n, err := quicvarint.Parse(b)
+	if err != nil || id != 0 || n >= len(b) {
+		return nil, netip.AddrPort{}, false
+	}
+	return b[n:], f.upstream, true
+}
+
+func (f *contextFraming) declared() Target { return f.target }
+
+// One destination per tunnel, so the key of its flows needs no name to be distinct.
+func (*contextFraming) declaredName() string { return "" }
+
+func (*contextFraming) wrap(_ netip.AddrPort, b []byte) []byte {
+	// The stack reuses its buffer once the write returns, and the context ID goes first.
+	out := tunnelBuf(capsuleHeadroom + 1 + len(b))
+	out[capsuleHeadroom] = 0
+	copy(out[capsuleHeadroom+1:], b)
+	return out
+}
+
+// connectUDPTunnel is one CONNECT-UDP tunnel or SOCKS5 association. To the demultiplexer it
+// is a client socket keyed on the tunnel itself. upstream is the destination of the datagram
+// being dispatched, written by the goroutine feeding the tunnel and read on the dispatch
+// path alone.
 type connectUDPTunnel struct {
 	key       flowKey
 	d         *quicDemux
 	sess      *Session
+	framing   tunnelFraming
 	pipe      atomic.Pointer[tunnelPipe]
 	addr      *tunnelAddr
 	cancel    context.CancelFunc
 	sendCh    chan []byte
 	done      chan struct{}
 	sent      chan struct{}
-	target    Target
 	upstream  netip.AddrPort
 	closeOnce sync.Once
 	// closed refuses datagrams that reach the demultiplexer after the tunnel ended, so a
@@ -265,16 +314,15 @@ type connectUDPTunnel struct {
 	closed atomic.Bool
 }
 
-func newConnectUDPTunnel(d *quicDemux, sess *Session, target Target, upstream netip.AddrPort, cancel context.CancelFunc) *connectUDPTunnel {
+func newConnectUDPTunnel(d *quicDemux, sess *Session, framing tunnelFraming, cancel context.CancelFunc) *connectUDPTunnel {
 	t := &connectUDPTunnel{
-		d:        d,
-		sess:     sess,
-		target:   target,
-		upstream: upstream,
-		cancel:   cancel,
-		sendCh:   make(chan []byte, tunnelSendQueue),
-		done:     make(chan struct{}),
-		sent:     make(chan struct{}),
+		d:       d,
+		sess:    sess,
+		framing: framing,
+		cancel:  cancel,
+		sendCh:  make(chan []byte, tunnelSendQueue),
+		done:    make(chan struct{}),
+		sent:    make(chan struct{}),
 	}
 	client := addrPort(sess.remoteAddr)
 	t.addr = &tunnelAddr{
@@ -312,23 +360,20 @@ func (t *connectUDPTunnel) serve(ctx context.Context, pipe tunnelPipe) {
 		if err != nil {
 			break
 		}
-		// Context ID 0 is a UDP payload, RFC 9298 section 5. Anything else is dropped.
-		id, n, perr := quicvarint.Parse(b)
-		if perr != nil || id != 0 || n >= len(b) {
+		payload, upstream, ok := t.framing.unwrap(b)
+		if !ok {
 			continue
 		}
-		t.d.dispatch(t.addr, b[n:], true)
+		t.upstream = upstream
+		t.d.dispatch(t.addr, payload, true)
 	}
 	t.close()
 	<-t.sent
 }
 
-// send queues b for the client and drops it when the queue is full.
-func (t *connectUDPTunnel) send(b []byte) {
-	// The stack reuses its buffer once the write returns, and the context ID goes first.
-	out := tunnelBuf(capsuleHeadroom + 1 + len(b))
-	out[capsuleHeadroom] = 0
-	copy(out[capsuleHeadroom+1:], b)
+// send queues b, from origin, for the client and drops it when the queue is full.
+func (t *connectUDPTunnel) send(origin netip.AddrPort, b []byte) {
+	out := t.framing.wrap(origin, b)
 	select {
 	case t.sendCh <- out:
 	default:
@@ -381,7 +426,7 @@ func (t *connectUDPTunnel) sendDatagram(pipe tunnelPipe, b []byte) {
 	if err != nil {
 		if tooLarge, ok := errors.AsType[*quic.DatagramTooLargeError](err); ok {
 			t.d.p.cfg.logger.Debug("edge: datagram larger than the tunnel carries",
-				slog.String("target", t.target.String()),
+				slog.String("tunnel", t.addr.String()),
 				slog.Int("size", len(b)-capsuleHeadroom),
 				slog.Int64("max", tooLarge.MaxDatagramPayloadSize))
 		}
@@ -417,9 +462,12 @@ func (t *connectUDPTunnel) close() {
 			}
 			delete(d.flows, t.key)
 		}
-		stack := d.intercepts[interceptKey{tunnel: t}]
-		if stack != nil {
-			delete(d.intercepts, interceptKey{tunnel: t})
+		var stacks []*quicIntercept
+		for key, it := range d.intercepts {
+			if key.tunnel == t {
+				stacks = append(stacks, it)
+				delete(d.intercepts, key)
+			}
 		}
 		d.mu.Unlock()
 
@@ -431,8 +479,8 @@ func (t *connectUDPTunnel) close() {
 		for _, s := range sockets {
 			_ = s.Close()
 		}
-		if stack != nil {
-			d.closeIntercept(stack)
+		for _, it := range stacks {
+			d.closeIntercept(it)
 		}
 		if pipe := t.pipe.Load(); pipe != nil {
 			_ = (*pipe).setWriteDeadline(time.Now().Add(tunnelDrainTimeout))
@@ -456,8 +504,8 @@ func (d *quicDemux) publishTunnel(t *connectUDPTunnel) bool {
 }
 
 // tunnelPacketConn stands in for the socket of a demultiplexer fed by tunnels. Nothing is
-// read from it, the tunnels dispatch their datagrams themselves, and a write goes back into
-// the tunnel its address names.
+// read from it, the tunnels dispatch their datagrams themselves, and nothing is written to
+// it, a reply into a tunnel needs the origin it comes from and goes through the tunnel.
 type tunnelPacketConn struct {
 	closed chan struct{}
 	once   sync.Once
@@ -472,13 +520,8 @@ func (c *tunnelPacketConn) ReadFrom([]byte) (int, net.Addr, error) {
 	return 0, nil, net.ErrClosed
 }
 
-func (c *tunnelPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
-	ta, ok := addr.(*tunnelAddr)
-	if !ok {
-		return 0, errors.New("edge: write to an address no tunnel carries")
-	}
-	ta.tunnel.send(b)
-	return len(b), nil
+func (c *tunnelPacketConn) WriteTo([]byte, net.Addr) (int, error) {
+	return 0, errors.New("edge: write to a tunnel without its origin")
 }
 
 func (c *tunnelPacketConn) Close() error {

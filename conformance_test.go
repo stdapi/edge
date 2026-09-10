@@ -507,3 +507,65 @@ func TestConformance_CurlProxyAuth(t *testing.T) {
 		}
 	})
 }
+
+// curl reaches the origin through the SOCKS5 front, sending its hostname when asked to let
+// the proxy resolve and the address it resolved itself otherwise. Either way the server name
+// inside routes and the certificate the proxy mints is what curl checks.
+func TestConformance_CurlThroughSOCKS5(t *testing.T) {
+	ca, err := GenerateCA()
+	if err != nil {
+		t.Fatalf("generate CA: %v", err)
+	}
+	origin := namedOrigin(t, ca, "example.test")
+	_, port, _ := net.SplitHostPort(origin.Host)
+
+	tr := DefaultTransport()
+	tr.RootCAs = poolOf(ca)
+	tr.DialContext = pinnedDialer(origin.Host)
+	p, err := New(WithCA(ca), WithTransport(tr), WithProxyAuth(BasicAuth("edge", func(user, pass string) bool {
+		return user == "alice" && pass == "secret"
+	})))
+	if err != nil {
+		t.Fatalf("new proxy: %v", err)
+	}
+	p.MustAdd("example.test/*{any}", func(c *HTTPCtx) (*http.Response, error) {
+		return Text(http.StatusOK, "identity="+c.Identity()+" authority="+c.Authority()), nil
+	})
+	p.MustAdd[TCP]("[127.0.0.0/8]", relayStream)
+
+	addr := startSOCKS5(t, p)
+	caFile := writeCAFile(t, ca)
+	target := "https://example.test:" + port + "/echo"
+
+	cases := []struct {
+		name  string
+		flags []string
+	}{
+		{name: "the proxy resolves", flags: []string{"--socks5-hostname", addr}},
+		{name: "curl resolves", flags: []string{"--socks5", addr, "--resolve", "example.test:" + port + ":127.0.0.1"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := runCurl(t, append(tc.flags, "--proxy-user", "alice:secret", "--cacert", caFile, target)...)
+			if res.status != "200" {
+				t.Fatalf("status = %s, body %q", res.status, res.body)
+			}
+			want := "identity=alice authority=example.test:" + port
+			if res.body != want {
+				t.Fatalf("handler saw %q, want %q", res.body, want)
+			}
+		})
+	}
+
+	t.Run("wrong credentials", func(t *testing.T) {
+		bin := requireCurl(t)
+		out, err := exec.Command(bin, "--silent", "--show-error", "--max-time", "10",
+			"--socks5-hostname", addr, "--proxy-user", "alice:wrong", "--cacert", caFile, target).CombinedOutput()
+		if err == nil {
+			t.Fatalf("curl succeeded with wrong credentials: %s", out)
+		}
+		if !strings.Contains(string(out), "rejected by the SOCKS5 server") {
+			t.Fatalf("curl failed for another reason: %s", out)
+		}
+	})
+}

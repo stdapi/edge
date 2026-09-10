@@ -240,8 +240,8 @@ func (k flowKey) String() string {
 }
 
 // interceptKey identifies one terminating stack: the origin it replies from under TPROXY, the
-// tunnel it serves behind CONNECT-UDP, and the zero value for the stack every other path
-// shares.
+// tunnel and the origin it serves behind a tunnel, and the zero value for the stack every
+// other path shares.
 type interceptKey struct {
 	tunnel *connectUDPTunnel
 	origin netip.AddrPort
@@ -255,7 +255,15 @@ type quicFlow struct {
 	// conns is keyed by the DCID of each connection's first Initial.
 	conns map[string]*quicConn
 	// udp holds the datagram flows of this socket, one per destination.
-	udp map[netip.AddrPort]*udpFlow
+	udp map[udpKey]*udpFlow
+}
+
+// udpKey identifies a datagram flow inside one client socket, its origin and, behind a tunnel
+// addressing every datagram, the hostname of its destination. Two hostnames resolving to one
+// address are two flows, each decided on its own.
+type udpKey struct {
+	name   string
+	origin netip.AddrPort
 }
 
 type quicConnState uint8
@@ -324,6 +332,7 @@ type udpFlow struct {
 	outQ   chan udpDatagram
 	target Target
 	key    netip.AddrPort
+	id     udpKey
 	// out and in are the per direction contexts. A single goroutine serves each direction,
 	// so at most one datagram is ever in flight on a context.
 	out DatagramCtx
@@ -516,7 +525,7 @@ type udpFlowCloser struct {
 	d    *quicDemux
 	u    *udpFlow
 	flow flowKey
-	key  netip.AddrPort
+	key  udpKey
 }
 
 func (c *udpFlowCloser) Close() error {
@@ -658,7 +667,8 @@ func (d *quicDemux) interceptForLocked(client net.Addr, origin netip.AddrPort) (
 	key := interceptKey{}
 	if ta, ok := client.(*tunnelAddr); ok {
 		key.tunnel = ta.tunnel
-	} else if d.replier != nil {
+	}
+	if key.tunnel != nil || d.replier != nil {
 		if !origin.IsValid() {
 			return nil, nil, errNoReplyDestination
 		}
@@ -686,9 +696,9 @@ func (d *quicDemux) interceptForLocked(client net.Addr, origin netip.AddrPort) (
 	cfg := d.quicConfig()
 	switch {
 	case key.tunnel != nil:
-		tun := key.tunnel
+		tun, origin := key.tunnel, key.origin
 		dpc.reply = func(b []byte, _ net.Addr) (int, error) {
-			tun.send(b)
+			tun.send(origin, b)
 			return len(b), nil
 		}
 		// The front connection carries about 1200 bytes of payload at its initial MTU, which
@@ -1124,7 +1134,8 @@ func (d *quicDemux) lookupInterceptLocked(client net.Addr) (it *quicIntercept, o
 	key := interceptKey{}
 	if ta, isTunnel := client.(*tunnelAddr); isTunnel {
 		key.tunnel = ta.tunnel
-	} else if d.replier != nil {
+	}
+	if key.tunnel != nil || d.replier != nil {
 		key.origin = d.originalDst(client)
 		if !key.origin.IsValid() {
 			return nil, netip.AddrPort{}, false
@@ -1155,6 +1166,10 @@ func (d *quicDemux) statelessReset(client net.Addr, origin netip.AddrPort, datag
 	mac.Write(datagram[1:9])
 	copy(pkt[quicResetSize-16:], mac.Sum(nil)[:16])
 
+	if ta, ok := client.(*tunnelAddr); ok {
+		ta.tunnel.send(origin, pkt)
+		return
+	}
 	if origin.IsValid() {
 		d.mu.Lock()
 		sock := d.replySockets[origin]
@@ -1176,11 +1191,12 @@ func (d *quicDemux) dispatchDatagram(client net.Addr, from flowKey, datagram []b
 		return
 	}
 
+	id := udpKey{origin: origin, name: d.declaredName(client)}
 	d.mu.Lock()
 	flow := d.flows[from]
 	var u *udpFlow
 	if flow != nil {
-		u = flow.udp[origin]
+		u = flow.udp[id]
 	}
 	d.mu.Unlock()
 
@@ -1215,18 +1231,22 @@ func (d *quicDemux) openUDPFlow(client net.Addr, from flowKey, origin netip.Addr
 		cancel: cancel,
 		client: client,
 		key:    origin,
+		id:     udpKey{origin: origin, name: d.declaredName(client)},
 		target: target,
 		outQ:   make(chan udpDatagram, udpQueue),
 	}
-	sess.closer = &udpFlowCloser{d: d, u: u, flow: from, key: origin}
+	sess.closer = &udpFlowCloser{d: d, u: u, flow: from, key: u.id}
 	u.sink = &udpSink{d: d, u: u}
 	u.out = u.newCtx(false, origin)
 	u.in = u.newCtx(true, origin)
 	u.touch(time.Now())
 
 	d.mu.Lock()
-	ok := d.publishUDPLocked(from, client, u)
+	evicted, ok := d.publishUDPLocked(from, client, u)
 	d.mu.Unlock()
+	for _, c := range evicted {
+		_ = c.Close()
+	}
 	if !ok {
 		cancel()
 		d.p.cfg.logger.Debug("edge: datagram dropped",
@@ -1268,13 +1288,22 @@ func (d *quicDemux) dialUDP(ctx context.Context, addr string) (net.Conn, error) 
 // or the address the datagram was headed to.
 func (d *quicDemux) declaredTarget(client net.Addr, origin netip.AddrPort) Target {
 	if ta, ok := client.(*tunnelAddr); ok {
-		return ta.tunnel.target
+		return ta.tunnel.framing.declared()
 	}
 	return Target{
 		Scheme: schemeForPort(fmt.Sprint(origin.Port())),
 		Host:   origin.Addr().Unmap().String(),
 		Port:   fmt.Sprint(origin.Port()),
 	}
+}
+
+// declaredName is the name the datagram being dispatched was addressed to behind a tunnel,
+// empty for an address and off a socket.
+func (d *quicDemux) declaredName(client net.Addr) string {
+	if ta, ok := client.(*tunnelAddr); ok {
+		return ta.tunnel.framing.declaredName()
+	}
+	return ""
 }
 
 // fillSession sets the addresses and the identity of a session from the socket, or from the
@@ -1292,29 +1321,42 @@ func (d *quicDemux) fillSession(sess *Session, client net.Addr) {
 	sess.transparent = true
 }
 
-// publishUDPLocked places a datagram flow in its client's flow. It shares the draining
-// critical section with shutdown, so the flow is either refused or in the snapshot a shutdown
-// sweeps.
-func (d *quicDemux) publishUDPLocked(from flowKey, client net.Addr, u *udpFlow) bool {
+// publishUDPLocked places a datagram flow in its client's flow, and returns the sockets of
+// the flow it evicted to make room, the least recently used, for the caller to close off the
+// lock. It shares the draining critical section with shutdown, so the flow is either refused
+// or in the snapshot a shutdown sweeps.
+func (d *quicDemux) publishUDPLocked(from flowKey, client net.Addr, u *udpFlow) ([]net.Conn, bool) {
 	if d.draining.Load() || d.udps >= maxUDPFlows {
-		return false
+		return nil, false
 	}
 	flow := d.flowLocked(from, client, time.Now())
-	if flow == nil || len(flow.udp) >= maxUDPPerFlow || flow.udp[u.key] != nil {
-		return false
+	if flow == nil || flow.udp[u.id] != nil {
+		return nil, false
 	}
 	if d.replier != nil {
 		reply, err := d.replySocketLocked(u.key)
 		if err != nil {
-			return false
+			return nil, false
 		}
 		u.reply = reply
 	}
-	flow.udp[u.key] = u
+	var evicted []net.Conn
+	if len(flow.udp) >= maxUDPPerFlow {
+		var victim *udpFlow
+		for _, other := range flow.udp {
+			if victim == nil || other.lastUse().Before(victim.lastUse()) {
+				victim = other
+			}
+		}
+		delete(flow.udp, victim.id)
+		d.udps--
+		evicted = victim.endLocked()
+	}
+	flow.udp[u.id] = u
 	d.udps++
 	// Off the WaitGroup, a handler that ignores its cut would otherwise keep the socket.
 	go d.runOutbound(from, u)
-	return true
+	return evicted, true
 }
 
 // runOutbound dials the origin, then serves the queued outbound datagrams of the flow in the
@@ -1419,6 +1461,10 @@ func (s *udpSink) toOrigin(b []byte) error {
 }
 
 func (s *udpSink) toClient(b []byte) error {
+	if ta, ok := s.u.client.(*tunnelAddr); ok {
+		ta.tunnel.send(s.u.key, b)
+		return nil
+	}
 	if s.u.reply != nil {
 		_, err := s.u.reply.WriteTo(b, s.u.client)
 		return err
@@ -1566,8 +1612,8 @@ func (d *quicDemux) closeUDPFlow(from flowKey, u *udpFlow) {
 		d.mu.Unlock()
 		return
 	}
-	if flow := d.flows[from]; flow != nil && flow.udp[u.key] == u {
-		delete(flow.udp, u.key)
+	if flow := d.flows[from]; flow != nil && flow.udp[u.id] == u {
+		delete(flow.udp, u.id)
 		d.udps--
 	}
 	conns := u.endLocked()
@@ -1594,7 +1640,7 @@ func (d *quicDemux) flowLocked(from flowKey, client net.Addr, now time.Time) *qu
 			lastSeen: now,
 			client:   client,
 			conns:    make(map[string]*quicConn),
-			udp:      make(map[netip.AddrPort]*udpFlow),
+			udp:      make(map[udpKey]*udpFlow),
 		}
 		d.flows[from] = flow
 	}
@@ -1620,7 +1666,7 @@ func (d *quicDemux) admitConnLocked(from flowKey, client net.Addr, odcid string,
 		state:    connSniffing,
 	}
 	if from.tunnel != nil {
-		conn.declared = from.tunnel.target
+		conn.declared = from.tunnel.framing.declared()
 	}
 	flow.conns[odcid] = conn
 	d.sniffing++
@@ -1997,7 +2043,7 @@ func (d *quicDemux) sweepRepliesLocked() {
 	for _, flow := range d.flows {
 		for key, u := range flow.udp {
 			if u.reply != nil {
-				used[key] = true
+				used[key.origin] = true
 			}
 		}
 	}

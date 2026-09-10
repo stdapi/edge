@@ -27,12 +27,21 @@ type ProxyAuthenticator interface {
 	Challenges(r *http.Request) []string
 }
 
+// PasswordAuthenticator authenticates a username and password pair, which is all a SOCKS5
+// client can present, RFC 1929. The [ProxyAuthenticator] given to [WithProxyAuth] serves a
+// SOCKS5 front only when it implements this too, and [Proxy.ServeSOCKS5] refuses to start
+// otherwise. [BasicAuth] returns one.
+type PasswordAuthenticator interface {
+	AuthenticatePassword(username, password string) (identity string, ok bool)
+}
+
 // BasicAuth returns a [ProxyAuthenticator] for the Basic scheme of RFC 7617, reporting the
 // username as the identity. The proxy holds no credential of its own: verify looks them up
 // wherever they live, so a password can stay hashed. A nil verify refuses every client.
 //
 // Basic sends the credentials on every request, encoded rather than encrypted, so reach the
-// proxy with [Proxy.ListenAndServeTLS] or they cross the network in the clear.
+// proxy with [Proxy.ListenAndServeTLS] or they cross the network in the clear. The value
+// returned is a [PasswordAuthenticator] as well, so the same verify serves a SOCKS5 front.
 func BasicAuth(realm string, verify func(username, password string) bool) ProxyAuthenticator {
 	return basicAuth{
 		// The realm is a quoted-string, so a quote or a backslash in it would end the header
@@ -48,11 +57,15 @@ type basicAuth struct {
 }
 
 func (a basicAuth) Authenticate(r *http.Request) (string, bool) {
-	if a.verify == nil {
+	username, password, ok := parseBasicCredentials(r.Header.Get(HeaderProxyAuthorization))
+	if !ok {
 		return "", false
 	}
-	username, password, ok := parseBasicCredentials(r.Header.Get(HeaderProxyAuthorization))
-	if !ok || !a.verify(username, password) {
+	return a.AuthenticatePassword(username, password)
+}
+
+func (a basicAuth) AuthenticatePassword(username, password string) (string, bool) {
+	if a.verify == nil || !a.verify(username, password) {
 		return "", false
 	}
 	return username, true

@@ -403,7 +403,8 @@ func tunnelBench(b *testing.B) (*quicDemux, *connectUDPTunnel, *demuxPacketConn,
 	target := Target{Scheme: "https", Host: "bench.test", Port: "443"}
 	sess := newSession(p, ctx, nil, target, KindHTTP, HTTP3)
 	sess.remoteAddr = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 4242}
-	tun := newConnectUDPTunnel(d, sess, target, netip.MustParseAddrPort("127.0.0.1:443"), cancel)
+	origin := netip.MustParseAddrPort("127.0.0.1:443")
+	tun := newConnectUDPTunnel(d, sess, &contextFraming{target: target, upstream: origin}, cancel)
 	if !d.publishTunnel(tun) {
 		b.Fatal("publish")
 	}
@@ -441,10 +442,11 @@ func BenchmarkTunnelInbound(b *testing.B) {
 // One packet the stack writes back into the tunnel, queued for the sender.
 func BenchmarkTunnelOutbound(b *testing.B) {
 	_, tun, _, pkt := tunnelBench(b)
+	origin := netip.MustParseAddrPort("127.0.0.1:443")
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		tun.send(pkt)
+		tun.send(origin, pkt)
 		out := <-tun.sendCh
 		putTunnelBuf(out)
 	}

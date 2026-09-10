@@ -1075,3 +1075,50 @@ func TestLifecycle_CloseCancelsTheResolutionInFlight(t *testing.T) {
 		t.Fatal("the parked handshake never ended")
 	}
 }
+
+func TestLifecycle_CloseEndsASOCKS5Connection(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "ok")
+	}))
+	defer origin.Close()
+	originURL, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+
+	tr := DefaultTransport()
+	tr.DialContext = pinnedDialer(originURL.Host)
+	p := testProxy(t, WithTransport(tr))
+	p.MustAdd("allowed.test/*{rest}", forwardHandler)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	served := make(chan error, 1)
+	go func() { served <- p.ServeSOCKS5(ln) }()
+
+	d := socksDialer(t, ln.Addr().String(), nil)
+	conn, err := d.DialContext(t.Context(), "tcp", "allowed.test:80")
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+	require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+	_, err = fmt.Fprint(conn, "GET /probe HTTP/1.1\r\nHost: allowed.test\r\n\r\n")
+	require.NoError(t, err)
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	require.NoError(t, err)
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+
+	sess := waitForSessions(t, p, 1)[0]
+	assert.Equal(t, "allowed.test", sess.Target().Host)
+	require.NoError(t, sess.Close())
+	_, err = br.ReadByte()
+	assert.ErrorIs(t, err, io.EOF, "Close ends the connection the SOCKS5 CONNECT opened")
+	waitForSessions(t, p, 0)
+
+	require.NoError(t, p.Close())
+	select {
+	case err := <-served:
+		assert.ErrorIs(t, err, ErrProxyClosed)
+	case <-time.After(5 * time.Second):
+		t.Fatal("ServeSOCKS5 did not return after Close")
+	}
+}
