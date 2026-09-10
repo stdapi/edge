@@ -56,10 +56,6 @@ const (
 	udpFlowIdle = 2 * time.Minute
 	// maxUDPAlternates bounds the origins one datagram flow may reach through SendTo.
 	maxUDPAlternates = 8
-	// udpQueue and udpQueueBytes bound the outbound datagrams one flow queues behind its
-	// handler, in datagrams and in bytes.
-	udpQueue      = 64
-	udpQueueBytes = 256 << 10
 	// udpBufSize is the pooled buffer a queued datagram fits in. A larger one is allocated
 	// for itself.
 	udpBufSize = 2048
@@ -72,6 +68,10 @@ const (
 	// connection, so nothing else bounds them.
 	maxUDPPerFlow = 16
 	maxUDPFlows   = 1024
+	// udpQueue and udpQueueBytes bound the outbound datagrams one flow queues behind its
+	// handler, in datagrams and in bytes.
+	udpQueue      = 64
+	udpQueueBytes = 256 << 10
 	// maxIntercepts bounds the terminating stacks, one per origin under TPROXY, each queueing
 	// up to interceptQueue datagrams of maxUDPPayload (the shared stack of the other paths
 	// four times as many). quicInterceptTTL reaps a stack no connection has fed for a while.
@@ -125,7 +125,7 @@ func (p *Proxy) ListenAndServeTransparentUDP(addr string) error {
 // cannot read is one it refuses rather than one it passes on.
 //
 // A [UDP] handler serves the datagrams of a flow one at a time, in the order they arrived.
-// While it blocks, up to 64 datagrams of that flow wait and the rest are dropped.
+// While it blocks, up to 64 datagrams or 256 KiB of that flow wait and the rest are dropped.
 //
 // Under Encrypted Client Hello the decision sees the outer server name only, unless
 // [WithRejectECH] refuses such connections. QUIC versions other than v1 and v2 are rejected.
@@ -336,6 +336,8 @@ type udpFlow struct {
 	// queued counts the bytes waiting in outQ.
 	queued atomic.Int64
 	closed bool
+	// overflowed records that the queue dropped a datagram, so the first drop is logged.
+	overflowed bool
 }
 
 // udpDatagram is a queued outbound datagram. buf is the pooled buffer b was copied into, nil
@@ -356,9 +358,11 @@ func (dg udpDatagram) release() {
 // enqueue copies datagram unless owned and queues it for the handler, dropping it when the
 // flow's queue is full.
 func (u *udpFlow) enqueue(datagram []byte, owned bool) {
+	u.touch(time.Now())
 	n := int64(len(datagram))
 	if u.queued.Add(n) > udpQueueBytes {
 		u.queued.Add(-n)
+		u.overflow()
 		return
 	}
 	dg := udpDatagram{b: datagram}
@@ -375,7 +379,21 @@ func (u *udpFlow) enqueue(datagram []byte, owned bool) {
 	default:
 		u.queued.Add(-n)
 		dg.release()
+		u.overflow()
 	}
+}
+
+// overflow logs the first datagram the queue drops. Only the goroutine feeding the flow calls
+// it, so overflowed needs no lock.
+func (u *udpFlow) overflow() {
+	if u.overflowed {
+		return
+	}
+	u.overflowed = true
+	u.sink.d.p.cfg.logger.Debug("edge: datagram dropped",
+		slog.String("client", u.client.String()),
+		slog.String("origin", u.key.String()),
+		slog.String("reason", "the handler is behind and the flow's queue is full"))
 }
 
 // udpAlt is one origin a datagram flow reaches through SendTo. Its reader serves the replies
@@ -1357,7 +1375,9 @@ func (d *quicDemux) serveDatagramOn(u *udpFlow, c *DatagramCtx, payload []byte) 
 	if closed {
 		return
 	}
-	u.touch(time.Now())
+	if c.inbound {
+		u.touch(time.Now())
+	}
 
 	seq := &u.outSeq
 	if c.inbound {

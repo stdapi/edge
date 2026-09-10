@@ -1447,7 +1447,7 @@ func readDatagram(t *testing.T, conn *net.UDPConn, timeout time.Duration) (strin
 
 // blockingUDPProxy serves origin with a handler that parks the outbound datagrams of blocked
 // until release is closed, and forwards everything else.
-func blockingUDPProxy(t *testing.T, origin, blocked netip.AddrPort) (proxyAddr netip.AddrPort, entered <-chan struct{}, release func()) {
+func blockingUDPProxy(t *testing.T, origin, blocked netip.AddrPort) (p *Proxy, proxyAddr netip.AddrPort, entered <-chan struct{}, release func()) {
 	t.Helper()
 	p, err := New()
 	require.NoError(t, err)
@@ -1467,7 +1467,7 @@ func blockingUDPProxy(t *testing.T, origin, blocked netip.AddrPort) (proxyAddr n
 	// Registered after the serve helper's Close, so the handler is released before Close waits.
 	once := sync.OnceFunc(func() { close(rel) })
 	t.Cleanup(once)
-	return addr, in, once
+	return p, addr, in, once
 }
 
 func waitEntered(t *testing.T, entered <-chan struct{}) {
@@ -1490,7 +1490,7 @@ func TestTransparentUDP_ParkedHandlerDoesNotDelayAnotherClient(t *testing.T) {
 	origin := udpEchoOrigin(t)
 	slow, slowAddr := udpClient(t)
 	fast, _ := udpClient(t)
-	proxyAddr, entered, release := blockingUDPProxy(t, origin, slowAddr)
+	_, proxyAddr, entered, release := blockingUDPProxy(t, origin, slowAddr)
 
 	sendTo(t, slow, proxyAddr, "slow")
 	waitEntered(t, entered)
@@ -1512,7 +1512,7 @@ func TestTransparentUDP_FullQueueDropsForThatClientOnly(t *testing.T) {
 	origin, received := udpSinkOrigin(t)
 	slow, slowAddr := udpClient(t)
 	other, _ := udpClient(t)
-	proxyAddr, entered, release := blockingUDPProxy(t, origin, slowAddr)
+	_, proxyAddr, entered, release := blockingUDPProxy(t, origin, slowAddr)
 
 	sendTo(t, slow, proxyAddr, "slow-0")
 	waitEntered(t, entered)
@@ -1556,7 +1556,7 @@ func TestTransparentUDP_FullQueueDropsForThatClientOnly(t *testing.T) {
 func TestTransparentUDP_QueueIsBoundedInBytes(t *testing.T) {
 	origin, received := udpSinkOrigin(t)
 	slow, slowAddr := udpClient(t)
-	proxyAddr, entered, release := blockingUDPProxy(t, origin, slowAddr)
+	_, proxyAddr, entered, release := blockingUDPProxy(t, origin, slowAddr)
 
 	const size = 8000
 	fits := udpQueueBytes / size
@@ -1701,14 +1701,58 @@ func TestTransparentUDP_CloseCancelsTheDialInFlight(t *testing.T) {
 	assert.Equal(t, "second", got)
 }
 
+func hasSession(p *Proxy, kind Kind) bool {
+	for s := range p.Sessions() {
+		if s.Kind() == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// onlyUDPFlow returns the one datagram flow the proxy serves.
+func onlyUDPFlow(t *testing.T, p *Proxy) *udpFlow {
+	t.Helper()
+	p.srv.mu.Lock()
+	defer p.srv.mu.Unlock()
+	var found *udpFlow
+	for d := range p.srv.quics {
+		d.mu.Lock()
+		for _, flow := range d.flows {
+			for _, u := range flow.udp {
+				require.Nil(t, found, "more than one datagram flow")
+				found = u
+			}
+		}
+		d.mu.Unlock()
+	}
+	require.NotNil(t, found, "no datagram flow")
+	return found
+}
+
+// A datagram arriving behind a parked handler keeps its flow in use, so the idle sweep does
+// not reap a flow whose client is sending.
+func TestTransparentUDP_ArrivalKeepsTheFlowInUse(t *testing.T) {
+	origin := udpEchoOrigin(t)
+	slow, slowAddr := udpClient(t)
+	p, proxyAddr, entered, _ := blockingUDPProxy(t, origin, slowAddr)
+
+	sendTo(t, slow, proxyAddr, "0")
+	waitEntered(t, entered)
+	u := onlyUDPFlow(t, p)
+	time.Sleep(300 * time.Millisecond)
+	sendTo(t, slow, proxyAddr, "1")
+	require.Eventually(t, func() bool { return time.Since(u.lastUse()) < 200*time.Millisecond }, 2*time.Second, 10*time.Millisecond)
+}
+
 // A failed dial drops the datagram that opened the flow, and the next one dials again.
 func TestTransparentUDP_FailedDialIsRetriedByTheNextDatagram(t *testing.T) {
 	origin := udpEchoOrigin(t)
-	_, proxyAddr, g, _ := gatedUDPProxy(t, origin, errors.New("no route"))
+	p, proxyAddr, g, _ := gatedUDPProxy(t, origin, errors.New("no route"))
 	client, _ := udpClient(t)
 
 	sendTo(t, client, proxyAddr, "first")
-	require.Eventually(t, func() bool { return g.calls.Load() == 1 }, 2*time.Second, 5*time.Millisecond)
+	require.Eventually(t, func() bool { return g.calls.Load() == 1 && !hasSession(p, KindUDP) }, 2*time.Second, 5*time.Millisecond)
 	sendTo(t, client, proxyAddr, "second")
 	got, err := readDatagram(t, client, 3*time.Second)
 	require.NoError(t, err)

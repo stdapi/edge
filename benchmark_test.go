@@ -324,6 +324,42 @@ func BenchmarkDatagramAdmission(b *testing.B) {
 	}
 }
 
+// BenchmarkDatagramOutbound measures one outbound datagram from the socket's read loop to the
+// handler of its flow, the queue hand-off included.
+func BenchmarkDatagramOutbound(b *testing.B) {
+	p, err := New()
+	if err != nil {
+		b.Fatal(err)
+	}
+	served := make(chan struct{}, 1)
+	if _, err := p.Add("[0.0.0.0/0]", func(c *DatagramCtx) error {
+		served <- struct{}{}
+		return c.Drop()
+	}); err != nil {
+		b.Fatal(err)
+	}
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		b.Fatal(err)
+	}
+	d, err := newQUICDemux(p, fixedOriginPacketConn{pc, netip.MustParseAddrPort("127.0.0.1:4433")})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(d.close)
+
+	client := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40000}
+	pkt := make([]byte, 1200)
+	d.dispatch(client, pkt, false)
+	<-served
+
+	b.ReportAllocs()
+	for b.Loop() {
+		d.dispatch(client, pkt, false)
+		<-served
+	}
+}
+
 // BenchmarkDatagramAdmissionCaptured is the same walk on a hostname target whose entry
 // captures a parameter, with the buffer a flow keeps across its datagrams.
 func BenchmarkDatagramAdmissionCaptured(b *testing.B) {
