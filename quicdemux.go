@@ -56,6 +56,13 @@ const (
 	udpFlowIdle = 2 * time.Minute
 	// maxUDPAlternates bounds the origins one datagram flow may reach through SendTo.
 	maxUDPAlternates = 8
+	// udpQueue and udpQueueBytes bound the outbound datagrams one flow queues behind its
+	// handler, in datagrams and in bytes.
+	udpQueue      = 64
+	udpQueueBytes = 256 << 10
+	// udpBufSize is the pooled buffer a queued datagram fits in. A larger one is allocated
+	// for itself.
+	udpBufSize = 2048
 	// The state caps. Everything below is allocated for an unauthenticated peer on a
 	// spoofable transport, so the worst case is the product of these bounds.
 	maxQUICFlows     = 4096
@@ -117,10 +124,10 @@ func (p *Proxy) ListenAndServeTransparentUDP(addr string) error {
 // datagrams belonging to a QUIC connection are never served that way: a connection the proxy
 // cannot read is one it refuses rather than one it passes on.
 //
-// A [UDP] handler runs on the goroutine reading the socket, so one that blocks holds up every
-// other client on it. So does the name resolution [WithNameVerification] asks for, on the
-// connection being placed. Neither is true of the connection-level kinds, which run on a
-// goroutine of their own.
+// A [UDP] handler serves the datagrams of a flow one at a time, in the order they arrived.
+// While it blocks, up to 64 datagrams of that flow wait and the rest are dropped. The name
+// resolution [WithNameVerification] asks for runs on the goroutine reading the socket, on the
+// connection being placed, and holds up every other client on it.
 //
 // Under Encrypted Client Hello the decision sees the outer server name only, unless
 // [WithRejectECH] refuses such connections. QUIC versions other than v1 and v2 are rejected.
@@ -308,11 +315,13 @@ type udpFlow struct {
 	sink   *udpSink
 	sess   *Session
 	cancel context.CancelFunc
-	target Target
-	key    netip.AddrPort
 	// alts are the origins reached through SendTo, keyed on the address as the handler wrote
 	// it. Guarded by the demux mutex.
 	alts map[string]*udpAlt
+	// outQ is the outbound datagrams waiting for the handler.
+	outQ   chan udpDatagram
+	target Target
+	key    netip.AddrPort
 	// out and in are the per direction contexts. A single goroutine serves each direction,
 	// so at most one datagram is ever in flight on a context.
 	out DatagramCtx
@@ -322,8 +331,49 @@ type udpFlow struct {
 	lastSeenNano atomic.Int64
 	outSeq       atomic.Uint64
 	inSeq        atomic.Uint64
-	closed       bool
-	started      bool
+	// queued counts the bytes waiting in outQ.
+	queued atomic.Int64
+	closed bool
+}
+
+// udpDatagram is a queued outbound datagram. buf is the pooled buffer b was copied into, nil
+// when b came owned.
+type udpDatagram struct {
+	buf *[udpBufSize]byte
+	b   []byte
+}
+
+var udpBufPool = sync.Pool{New: func() any { return new([udpBufSize]byte) }}
+
+func (dg udpDatagram) release() {
+	if dg.buf != nil {
+		udpBufPool.Put(dg.buf)
+	}
+}
+
+// enqueue copies datagram unless owned and queues it for the handler, dropping it when the
+// flow's queue is full.
+func (u *udpFlow) enqueue(datagram []byte, owned bool) {
+	n := int64(len(datagram))
+	if u.queued.Add(n) > udpQueueBytes {
+		u.queued.Add(-n)
+		return
+	}
+	dg := udpDatagram{b: datagram}
+	if !owned {
+		if len(datagram) <= udpBufSize {
+			dg.buf = udpBufPool.Get().(*[udpBufSize]byte)
+			dg.b = dg.buf[:copy(dg.buf[:], datagram)]
+		} else {
+			dg.b = bytes.Clone(datagram)
+		}
+	}
+	select {
+	case u.outQ <- dg:
+	default:
+		u.queued.Add(-n)
+		dg.release()
+	}
 }
 
 // udpAlt is one origin a datagram flow reaches through SendTo. Its reader serves the replies
@@ -954,7 +1004,7 @@ func (d *quicDemux) dispatchLong(addr net.Addr, from flowKey, datagram []byte, o
 	if !ok {
 		// Arbitrary bytes are free to set the high bit, so failing the parse places the
 		// datagram by its destination rather than dropping it.
-		d.dispatchDatagram(addr, from, datagram)
+		d.dispatchDatagram(addr, from, datagram, owned)
 		return
 	}
 
@@ -1002,7 +1052,7 @@ func (d *quicDemux) dispatchLong(addr net.Addr, from flowKey, datagram []byte, o
 		return
 	}
 	d.mu.Unlock()
-	d.dispatchDatagram(addr, from, datagram)
+	d.dispatchDatagram(addr, from, datagram, owned)
 }
 
 // dispatchShort places a short header datagram. Only the connection IDs the proxy minted are
@@ -1025,7 +1075,7 @@ func (d *quicDemux) dispatchShort(addr net.Addr, from flowKey, datagram []byte, 
 		return
 	}
 	d.mu.Unlock()
-	d.dispatchDatagram(addr, from, datagram)
+	d.dispatchDatagram(addr, from, datagram, owned)
 }
 
 // replySocketLocked returns the sending socket of one origin, opened on first use. The bind is
@@ -1096,7 +1146,7 @@ func (d *quicDemux) statelessReset(client net.Addr, origin netip.AddrPort, datag
 // dispatchDatagram is the terminal step, for a datagram no QUIC connection could claim. It is
 // its own unit: the flow it belongs to is looked up, the entry serving it is resolved on the
 // tree as it stands, and the handler decides what happens to it.
-func (d *quicDemux) dispatchDatagram(client net.Addr, from flowKey, datagram []byte) {
+func (d *quicDemux) dispatchDatagram(client net.Addr, from flowKey, datagram []byte, owned bool) {
 	origin := d.originalDst(client)
 	if !origin.IsValid() {
 		return
@@ -1111,14 +1161,14 @@ func (d *quicDemux) dispatchDatagram(client net.Addr, from flowKey, datagram []b
 	d.mu.Unlock()
 
 	if u != nil {
-		d.serveDatagram(u, datagram, false)
+		u.enqueue(datagram, owned)
 		return
 	}
-	d.openUDPFlow(client, from, origin, datagram)
+	d.openUDPFlow(client, from, origin, datagram, owned)
 }
 
 // openUDPFlow admits the first datagram of a flow and opens the socket carrying it.
-func (d *quicDemux) openUDPFlow(client net.Addr, from flowKey, origin netip.AddrPort, datagram []byte) {
+func (d *quicDemux) openUDPFlow(client net.Addr, from flowKey, origin netip.AddrPort, datagram []byte, owned bool) {
 	target := d.declaredTarget(client, origin)
 
 	// Admitted before the socket is opened, so a destination nothing names costs no dial. The
@@ -1149,6 +1199,7 @@ func (d *quicDemux) openUDPFlow(client net.Addr, from flowKey, origin netip.Addr
 		client:   client,
 		key:      origin,
 		target:   target,
+		outQ:     make(chan udpDatagram, udpQueue),
 	}
 	sess.closer = &udpFlowCloser{d: d, u: u, flow: from, key: origin}
 	u.sink = &udpSink{d: d, u: u}
@@ -1169,7 +1220,7 @@ func (d *quicDemux) openUDPFlow(client net.Addr, from flowKey, origin netip.Addr
 		return
 	}
 
-	d.serveDatagram(u, datagram, false)
+	u.enqueue(datagram, owned)
 }
 
 // newCtx builds the context of one direction of the flow, for datagrams exchanged with origin.
@@ -1245,10 +1296,28 @@ func (d *quicDemux) publishUDPLocked(from flowKey, client net.Addr, u *udpFlow) 
 	}
 	flow.udp[u.key] = u
 	d.udps++
-	u.started = true
 	// Off the WaitGroup, a handler that ignores its cut would otherwise keep the socket.
 	go d.runUDPFlow(from, u)
+	go d.runOutbound(u)
 	return true
+}
+
+// runOutbound serves the queued outbound datagrams of the flow, in the order they arrived.
+func (d *quicDemux) runOutbound(u *udpFlow) {
+	done := u.sess.Context().Done()
+	for {
+		select {
+		case dg := <-u.outQ:
+			u.queued.Add(-int64(len(dg.b)))
+			d.serveDatagram(u, dg.b, false)
+			dg.release()
+		case <-done:
+			for len(u.outQ) > 0 {
+				(<-u.outQ).release()
+			}
+			return
+		}
+	}
 }
 
 // serveDatagram routes one datagram and runs the handler that serves it. The entry is resolved

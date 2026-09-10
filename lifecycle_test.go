@@ -990,3 +990,58 @@ func TestLifecycle_ShutdownCutsTunnelsAtTheDeadline(t *testing.T) {
 	_, err = conn.Read(make([]byte, 1))
 	assert.Error(t, err, "the tunnel must be cut")
 }
+
+// Close returns while datagrams wait behind a parked handler, and none of them is served after.
+func TestLifecycle_CloseDropsTheQueuedDatagrams(t *testing.T) {
+	origin, _ := udpSinkOrigin(t)
+	slow, _ := udpClient(t)
+	p, err := New()
+	require.NoError(t, err)
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var mu sync.Mutex
+	calls := 0
+	p.MustAdd[UDP](origin.String(), func(c *DatagramCtx) error {
+		mu.Lock()
+		calls++
+		mu.Unlock()
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-release
+		return c.Forward()
+	})
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	served := make(chan error, 1)
+	go func() { served <- p.ServeTransparentUDP(newTProxyOriginPacketConn(pc, origin)) }()
+	proxyAddr := netip.MustParseAddrPort(pc.LocalAddr().String())
+
+	sendTo(t, slow, proxyAddr, "0")
+	waitEntered(t, entered)
+	for i := 1; i <= 20; i++ {
+		sendTo(t, slow, proxyAddr, fmt.Sprint(i))
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	done := make(chan error, 1)
+	go func() { done <- p.Close() }()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close must not wait for the parked handler")
+	}
+	close(release)
+	select {
+	case err := <-served:
+		assert.ErrorIs(t, err, ErrProxyClosed)
+	case <-time.After(5 * time.Second):
+		t.Fatal("ServeTransparentUDP did not return after Close")
+	}
+	time.Sleep(200 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, 1, calls, "nothing queued is served after Close")
+}

@@ -1393,3 +1393,213 @@ func TestQUIC_DialReleasesASocketWithoutDeadlines(t *testing.T) {
 		return true
 	}, 5*time.Second, 20*time.Millisecond, "the socket the connection ran on is still open")
 }
+
+// udpSinkOrigin records every datagram it receives, in arrival order.
+func udpSinkOrigin(t *testing.T) (netip.AddrPort, func() []string) {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	var mu sync.Mutex
+	var got []string
+	go func() {
+		buf := make([]byte, maxUDPPayload)
+		for {
+			n, _, rerr := pc.ReadFrom(buf)
+			if rerr != nil {
+				return
+			}
+			mu.Lock()
+			got = append(got, string(buf[:n]))
+			mu.Unlock()
+		}
+	}()
+	t.Cleanup(func() { _ = pc.Close() })
+	addr, err := netip.ParseAddrPort(pc.LocalAddr().String())
+	require.NoError(t, err)
+	return addr, func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), got...)
+	}
+}
+
+func udpClient(t *testing.T) (*net.UDPConn, netip.AddrPort) {
+	t.Helper()
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	addr, err := netip.ParseAddrPort(conn.LocalAddr().String())
+	require.NoError(t, err)
+	return conn, addr
+}
+
+func readDatagram(t *testing.T, conn *net.UDPConn, timeout time.Duration) (string, error) {
+	t.Helper()
+	buf := make([]byte, maxUDPPayload)
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(timeout)))
+	n, _, err := conn.ReadFrom(buf)
+	if err != nil {
+		return "", err
+	}
+	return string(buf[:n]), nil
+}
+
+// blockingUDPProxy serves origin with a handler that parks the outbound datagrams of blocked
+// until release is closed, and forwards everything else.
+func blockingUDPProxy(t *testing.T, origin, blocked netip.AddrPort) (proxyAddr netip.AddrPort, entered <-chan struct{}, release func()) {
+	t.Helper()
+	p, err := New()
+	require.NoError(t, err)
+	in := make(chan struct{}, 1)
+	rel := make(chan struct{})
+	p.MustAdd[UDP](origin.String(), func(c *DatagramCtx) error {
+		if !c.Inbound() && c.Client() == blocked {
+			select {
+			case in <- struct{}{}:
+			default:
+			}
+			<-rel
+		}
+		return c.Forward()
+	})
+	_, addr := startTProxyQUIC(t, p, origin)
+	// Registered after the serve helper's Close, so the handler is released before Close waits.
+	once := sync.OnceFunc(func() { close(rel) })
+	t.Cleanup(once)
+	return addr, in, once
+}
+
+func waitEntered(t *testing.T, entered <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the datagram never reached the handler")
+	}
+}
+
+func sendTo(t *testing.T, conn *net.UDPConn, to netip.AddrPort, payload string) {
+	t.Helper()
+	_, err := conn.WriteToUDPAddrPort([]byte(payload), to)
+	require.NoError(t, err)
+}
+
+// A handler parked on one client's datagram does not delay another client on the same socket.
+func TestTransparentUDP_ParkedHandlerDoesNotDelayAnotherClient(t *testing.T) {
+	origin := udpEchoOrigin(t)
+	slow, slowAddr := udpClient(t)
+	fast, _ := udpClient(t)
+	proxyAddr, entered, release := blockingUDPProxy(t, origin, slowAddr)
+
+	sendTo(t, slow, proxyAddr, "slow")
+	waitEntered(t, entered)
+
+	sendTo(t, fast, proxyAddr, "fast")
+	got, err := readDatagram(t, fast, 2*time.Second)
+	require.NoError(t, err, "the other client must be served while the handler is parked")
+	assert.Equal(t, "fast", got)
+
+	release()
+	got, err = readDatagram(t, slow, 3*time.Second)
+	require.NoError(t, err)
+	assert.Equal(t, "slow", got)
+}
+
+// While the handler is parked, the flow keeps udpQueue datagrams and drops the rest. Another
+// client loses nothing.
+func TestTransparentUDP_FullQueueDropsForThatClientOnly(t *testing.T) {
+	origin, received := udpSinkOrigin(t)
+	slow, slowAddr := udpClient(t)
+	other, _ := udpClient(t)
+	proxyAddr, entered, release := blockingUDPProxy(t, origin, slowAddr)
+
+	sendTo(t, slow, proxyAddr, "slow-0")
+	waitEntered(t, entered)
+	const extra = udpQueue + 10
+	for i := 1; i <= extra; i++ {
+		sendTo(t, slow, proxyAddr, fmt.Sprintf("slow-%d", i))
+	}
+	for i := range 10 {
+		sendTo(t, other, proxyAddr, fmt.Sprintf("other-%d", i))
+	}
+	// Long enough for the socket to be read empty before the handler resumes.
+	time.Sleep(300 * time.Millisecond)
+	release()
+
+	var slowGot, otherGot []string
+	require.Eventually(t, func() bool {
+		slowGot, otherGot = slowGot[:0], otherGot[:0]
+		for _, s := range received() {
+			if len(s) > 5 && s[:5] == "slow-" {
+				slowGot = append(slowGot, s)
+			} else {
+				otherGot = append(otherGot, s)
+			}
+		}
+		return len(otherGot) == 10 && len(slowGot) >= 1+udpQueue
+	}, 3*time.Second, 10*time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
+	slowGot = nil
+	for _, s := range received() {
+		if len(s) > 5 && s[:5] == "slow-" {
+			slowGot = append(slowGot, s)
+		}
+	}
+	assert.Len(t, slowGot, 1+udpQueue, "one in the handler and udpQueue behind it")
+	for i, s := range slowGot {
+		assert.Equal(t, fmt.Sprintf("slow-%d", i), s, "the queued datagrams keep their order")
+	}
+}
+
+// The queue is bounded in bytes as well, so large datagrams fill it before udpQueue of them.
+func TestTransparentUDP_QueueIsBoundedInBytes(t *testing.T) {
+	origin, received := udpSinkOrigin(t)
+	slow, slowAddr := udpClient(t)
+	proxyAddr, entered, release := blockingUDPProxy(t, origin, slowAddr)
+
+	const size = 8000
+	fits := udpQueueBytes / size
+	require.Less(t, fits, udpQueue)
+	payload := func(i int) string {
+		b := make([]byte, size)
+		copy(b, fmt.Sprintf("big-%d", i))
+		return string(b)
+	}
+	sendTo(t, slow, proxyAddr, payload(0))
+	waitEntered(t, entered)
+	for i := 1; i <= fits+8; i++ {
+		sendTo(t, slow, proxyAddr, payload(i))
+	}
+	time.Sleep(300 * time.Millisecond)
+	release()
+
+	require.Eventually(t, func() bool { return len(received()) >= 1+fits }, 3*time.Second, 10*time.Millisecond)
+	time.Sleep(100 * time.Millisecond)
+	got := received()
+	assert.Len(t, got, 1+fits)
+	for i, s := range got {
+		assert.Len(t, s, size)
+		assert.Equal(t, payload(i)[:8], s[:8])
+	}
+}
+
+// Datagrams of one flow are served in the order they arrived, in both directions.
+func TestTransparentUDP_FlowKeepsOrder(t *testing.T) {
+	origin := udpEchoOrigin(t)
+	p, err := New()
+	require.NoError(t, err)
+	p.MustAdd[UDP](origin.String(), func(c *DatagramCtx) error { return c.Forward() })
+	_, proxyAddr := startTProxyQUIC(t, p, origin)
+	client, _ := udpClient(t)
+
+	const count = 200
+	for i := range count {
+		sendTo(t, client, proxyAddr, fmt.Sprintf("%03d", i))
+		time.Sleep(100 * time.Microsecond)
+	}
+	for i := range count {
+		got, err := readDatagram(t, client, 3*time.Second)
+		require.NoError(t, err)
+		require.Equal(t, fmt.Sprintf("%03d", i), got)
+	}
+}
