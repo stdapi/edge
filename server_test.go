@@ -213,15 +213,15 @@ func TestServeQUIC_ConnectStream(t *testing.T) {
 func TestProxyTarget_PortIsCanonical(t *testing.T) {
 	u, err := url.Parse("http://example.test:0080/x")
 	require.NoError(t, err)
-	target, err := proxyTarget(&http.Request{URL: u, Host: u.Host, ProtoMajor: 1})
+	target, err := proxyTarget(&http.Request{URL: u, Host: u.Host, ProtoMajor: 1}, "")
 	require.NoError(t, err)
 	assert.Equal(t, "80", target.Port)
 
-	target, err = proxyTarget(&http.Request{URL: &url.URL{Path: "/x"}, Host: "example.test:08080", ProtoMajor: 2})
+	target, err = proxyTarget(&http.Request{URL: &url.URL{Path: "/x"}, Host: "example.test:08080", ProtoMajor: 2}, "http")
 	require.NoError(t, err)
 	assert.Equal(t, "8080", target.Port)
 
-	_, err = proxyTarget(&http.Request{URL: &url.URL{Path: "/x"}, Host: "example.test:70000", ProtoMajor: 2})
+	_, err = proxyTarget(&http.Request{URL: &url.URL{Path: "/x"}, Host: "example.test:70000", ProtoMajor: 2}, "http")
 	require.Error(t, err)
 }
 

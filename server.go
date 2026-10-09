@@ -122,8 +122,9 @@ func newServer(p *Proxy) (*server, error) {
 	protocols.SetUnencryptedHTTP2(true)
 
 	http2Cfg := &http.HTTP2Config{
-		MaxConcurrentStreams: p.cfg.server.maxConcurrentStreams,
-		MaxReadFrameSize:     1 << 20,
+		MaxConcurrentStreams:      p.cfg.server.maxConcurrentStreams,
+		MaxReadFrameSize:          h2MaxReadFrameSize,
+		MaxDecoderHeaderTableSize: h2HeaderTableSize,
 	}
 
 	s.h1 = &http.Server{
@@ -135,7 +136,9 @@ func newServer(p *Proxy) (*server, error) {
 		WriteTimeout:      p.cfg.server.writeTimeout,
 		IdleTimeout:       p.cfg.server.idleTimeout,
 		MaxHeaderBytes:    p.cfg.server.maxHeaderBytes,
-		ErrorLog:          log.New(slogWriter{p.cfg.logger}, "", 0),
+		// One value more for the field a schemeConn adds.
+		MaxHeaderValueCount: http.DefaultMaxHeaderValueCount + 1,
+		ErrorLog:            log.New(slogWriter{p.cfg.logger}, "", 0),
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
 			// A connection without a wrapper keeps the server context, since a cancel
 			// nothing ever calls would leak.
@@ -220,7 +223,9 @@ func (p *Proxy) serveFront(ln net.Listener) error {
 	}
 	// The listener is not tracked. http.Server closes the one it serves on every return path,
 	// and closing it here as well would make its own Shutdown report the second close.
-	err := p.srv.h1.Serve(ln)
+	// The limit on a field the schemeConn decodes is above the server's, which refuses the
+	// request first.
+	err := p.srv.h1.Serve(schemeListener{ln, p.cfg.server.maxHeaderBytes + 64<<10})
 	if errors.Is(err, http.ErrServerClosed) {
 		return ErrProxyClosed
 	}
@@ -503,6 +508,9 @@ var _ http.Handler = (*Proxy)(nil)
 // serveProxyRequest is the explicit forward proxy entry point: a CONNECT opens a connection,
 // anything else is a plain HTTP request carrying an absolute target.
 func (p *Proxy) serveProxyRequest(w http.ResponseWriter, r *http.Request) {
+	// Taken from every request, so the field never outlives the front.
+	scheme := takeScheme(r)
+
 	// Before anything else, including the origin-form refusal below, so that an
 	// unauthenticated client learns nothing from the answer it gets.
 	identity, ok := p.authenticate(w, r)
@@ -532,7 +540,7 @@ func (p *Proxy) serveProxyRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	target, err := proxyTarget(r)
+	target, err := proxyTarget(r, scheme)
 	if err != nil {
 		p.writeStatus(w, r, http.StatusBadRequest, err.Error())
 		return
@@ -798,15 +806,15 @@ func (s *server) closeActive() {
 	wg.Wait()
 }
 
-// proxyTarget resolves the authority of an explicit proxy request, reporting false when the
-// request gives none.
+// proxyTarget resolves the target of an explicit proxy request, scheme being what takeScheme
+// returned for it.
 //
 // HTTP/1.1 puts it in an absolute-form request target. HTTP/2 has no absolute form. RFC
 // 9113 splits the target across :scheme, :authority and :path, which reach a handler as a
-// relative URL, Host, and a TLS state net/http fills in only when :scheme is https. So an
-// HTTP/2 request is indistinguishable from an origin-form one, and since a proxy connection
-// carries nothing but proxy requests, it is read as one rather than refused.
-func proxyTarget(r *http.Request) (Target, error) {
+// relative URL and Host, :scheme left to takeScheme. So an HTTP/2 request is
+// indistinguishable from an origin-form one, and a proxy connection has proxy requests only,
+// so it is read as one.
+func proxyTarget(r *http.Request, scheme string) (Target, error) {
 	if r.URL != nil && r.URL.IsAbs() {
 		return targetFromURL(r.URL)
 	}
@@ -816,9 +824,8 @@ func proxyTarget(r *http.Request) (Target, error) {
 		return Target{}, errors.New("expected an absolute request target or CONNECT, this is a forward proxy")
 	}
 
-	scheme := "http"
-	if r.TLS != nil {
-		scheme = "https"
+	if scheme == "" {
+		return Target{}, errors.New("the request has no scheme")
 	}
 	host, port := splitHostPort(r.Host)
 	port, ok := canonicalPort(port)

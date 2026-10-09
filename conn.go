@@ -539,17 +539,18 @@ func getCopyBuf() []byte  { return copyBufPool.Get().(*[copyBufSize]byte)[:] }
 func putCopyBuf(b []byte) { copyBufPool.Put((*[copyBufSize]byte)(b[:copyBufSize])) }
 
 // cancelConnOf finds the wrapper under a connection, reaching through the TLS layer
-// [Proxy.ServeTLS] adds.
+// [Proxy.ServeTLS] adds and the schemeConn over it.
 func cancelConnOf(c net.Conn) *cancelConn {
-	if cc, ok := c.(*cancelConn); ok {
-		return cc
-	}
-	if tc, ok := c.(*tls.Conn); ok {
-		if cc, ok := tc.NetConn().(*cancelConn); ok {
+	for {
+		switch cc := c.(type) {
+		case *cancelConn:
 			return cc
+		case interface{ NetConn() net.Conn }:
+			c = cc.NetConn()
+		default:
+			return nil
 		}
 	}
-	return nil
 }
 
 // writeError is an error of the destination of a copy, which is how the end of a copy is

@@ -176,6 +176,9 @@ type Session struct {
 	transparent bool
 	// tunnel marks a CONNECT-UDP tunnel, a session that serves nothing itself.
 	tunnel bool
+	// hasSchemeField marks a front connection whose HTTP/2 requests have their :scheme in
+	// schemeHeader.
+	hasSchemeField bool
 }
 
 func newSession(p *Proxy, ctx context.Context, c net.Conn, target Target, kind Kind, proto Protocol) *Session {
@@ -191,6 +194,10 @@ func newSession(p *Proxy, ctx context.Context, c net.Conn, target Target, kind K
 	if c != nil {
 		s.remoteAddr = c.RemoteAddr()
 		s.localAddr = c.LocalAddr()
+		if sc := schemeConnOf(c); sc != nil {
+			s.hasSchemeField = true
+			c = sc.Conn
+		}
 		if tc, ok := c.(*tls.Conn); ok {
 			if state := tc.ConnectionState(); state.HandshakeComplete {
 				s.tlsState.Store(&state)

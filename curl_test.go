@@ -373,6 +373,45 @@ func TestCurl_OverHTTPSProxy(t *testing.T) {
 	}
 }
 
+func TestCurl_PlainHTTPOverHTTPSProxy(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "path=%s", r.URL.Path)
+	}))
+	t.Cleanup(origin.Close)
+	originURL, _ := url.Parse(origin.URL)
+
+	ca, _ := GenerateCA()
+	p, err := New(WithCA(ca))
+	if err != nil {
+		t.Fatalf("new proxy: %v", err)
+	}
+	p.MustAdd(originHost(originURL)+"/*{any}", forwardHandler)
+
+	proxyCert := selfSignedFor(t, ca, "localhost")
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	go func() { _ = p.ServeTLS(ln, proxyCert) }()
+	t.Cleanup(func() { _ = p.Close() })
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+	caFile := writeCAFile(t, ca)
+
+	for _, flags := range [][]string{{"--http1.1"}, {"--proxy-http2"}} {
+		t.Run(flags[0], func(t *testing.T) {
+			res := runCurl(t, append(flags,
+				"--proxy", "https://localhost:"+port,
+				"--proxy-cacert", caFile,
+				"--resolve", "localhost:"+port+":127.0.0.1",
+				origin.URL+"/plain",
+			)...)
+			if res.status != "200" || res.body != "path=/plain" {
+				t.Fatalf("status = %s, body %q", res.status, res.body)
+			}
+		})
+	}
+}
+
 func TestCurl_ProxyAuth(t *testing.T) {
 	origin := curlOrigin(t)
 	originURL, _ := url.Parse(origin.URL)

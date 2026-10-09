@@ -33,6 +33,8 @@ import (
 	"github.com/fox-toolkit/edge/internal/netutil"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
+	h3qlog "github.com/quic-go/quic-go/http3/qlog"
+	"github.com/quic-go/quic-go/qlogwriter"
 	"github.com/quic-go/quic-go/quicvarint"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -2192,8 +2194,30 @@ func exitTunnel(t *testing.T, u *upstreamDialer, version, addr, target string) (
 }
 
 type h3Upstream struct {
-	reqs chan *http.Request
-	addr string
+	reqs  chan *http.Request
+	heads chan []h3qlog.HeaderField
+	addr  string
+}
+
+// headTrace sends to heads the header fields of every HEADERS frame the server parses. The
+// request quic-go builds has no :scheme.
+type headTrace chan []h3qlog.HeaderField
+
+func (h headTrace) AddProducer() qlogwriter.Recorder { return h }
+func (h headTrace) SupportsSchemas(s string) bool    { return s == h3qlog.EventSchema }
+func (h headTrace) Close() error                     { return nil }
+
+func (h headTrace) RecordEvent(ev qlogwriter.Event) {
+	fp, ok := ev.(h3qlog.FrameParsed)
+	if !ok {
+		return
+	}
+	if hf, ok := fp.Frame.Frame.(h3qlog.HeadersFrame); ok {
+		select {
+		case h <- hf.HeaderFields:
+		default:
+		}
+	}
 }
 
 func startH3Upstream(t *testing.T, ca *CA, pc net.PacketConn, datagrams bool, serve http.HandlerFunc) *h3Upstream {
@@ -2204,10 +2228,13 @@ func startH3Upstream(t *testing.T, ca *CA, pc net.PacketConn, datagrams bool, se
 		pc, err = net.ListenPacket("udp", "127.0.0.1:0")
 		require.NoError(t, err)
 	}
-	up := &h3Upstream{addr: pc.LocalAddr().String(), reqs: make(chan *http.Request, 8)}
+	up := &h3Upstream{addr: pc.LocalAddr().String(), reqs: make(chan *http.Request, 8), heads: make(chan []h3qlog.HeaderField, 8)}
 	srv := &http3.Server{
 		EnableDatagrams: datagrams,
-		TLSConfig:       &tls.Config{Certificates: []tls.Certificate{*cert}, MinVersion: tls.VersionTLS13},
+		QUICConfig: &quic.Config{
+			Tracer: func(context.Context, bool, quic.ConnectionID) qlogwriter.Trace { return headTrace(up.heads) },
+		},
+		TLSConfig: &tls.Config{Certificates: []tls.Certificate{*cert}, MinVersion: tls.VersionTLS13},
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			up.reqs <- r
 			serve(w, r)
@@ -2219,6 +2246,21 @@ func startH3Upstream(t *testing.T, ca *CA, pc net.PacketConn, datagrams bool, se
 		_ = pc.Close()
 	})
 	return up
+}
+
+func (up *h3Upstream) head(t *testing.T) map[string][]string {
+	t.Helper()
+	select {
+	case fields := <-up.heads:
+		out := make(map[string][]string)
+		for _, f := range fields {
+			out[f.Name] = append(out[f.Name], f.Value)
+		}
+		return out
+	case <-time.After(5 * time.Second):
+		t.Fatal("no request reached the upstream proxy")
+		return nil
+	}
 }
 
 func (up *h3Upstream) request(t *testing.T) *http.Request {
@@ -2914,8 +2956,9 @@ var connectUDPConformance = []connectUDPCase{
 					r := up.request(t)
 					assert.Equal(t, http.MethodConnect, r.Method)
 					assert.Equal(t, connectUDPUpgrade, r.Proto)
-					assert.Equal(t, "https", r.URL.Scheme)
-					assert.Equal(t, path, r.URL.EscapedPath())
+					head := up.head(t)
+					assert.Equal(t, []string{"https"}, head[":scheme"])
+					assert.Equal(t, []string{path}, head[":path"])
 					assert.Equal(t, up.addr, r.Host)
 					assert.Equal(t, "?1", r.Header.Get(http3.CapsuleProtocolHeader))
 					return
