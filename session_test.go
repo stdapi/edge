@@ -403,6 +403,7 @@ func TestSession_FrontConnectionsAreNotListed(t *testing.T) {
 }
 
 func TestSession_CloseUnderTraffic(t *testing.T) {
+	// The race detector checks this test.
 	ca, err := GenerateCA()
 	require.NoError(t, err)
 	p := testProxyWithCA(t, ca)

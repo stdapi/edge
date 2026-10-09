@@ -1654,6 +1654,7 @@ func wantCutWriteReported(t *testing.T, s *Stream, close func() error) {
 }
 
 func TestConn_SettingsWhileOpening(t *testing.T) {
+	// The race detector checks this test.
 	cli, srv := tcpPair(t)
 	stop := make(chan struct{})
 	go func() {
@@ -1741,6 +1742,7 @@ func TestConn_ConcurrentStreams(t *testing.T) {
 }
 
 func TestStream_ConcurrentAPI(t *testing.T) {
+	// The race detector checks this test.
 	srv := echoServer(t, nil)
 	c := dial(t, srv)
 	s, _ := open(t, c, nil)

@@ -568,6 +568,7 @@ func TestTCP_StartTLS_NameVerification(t *testing.T) {
 }
 
 func TestTCP_StartTLS_ClientHelloIsReadConcurrently(t *testing.T) {
+	// The race detector checks this test.
 	ca, err := GenerateCA()
 	require.NoError(t, err)
 	origin := startTLSOrigin(t, selfSignedFor(t, ca, "db.test"))

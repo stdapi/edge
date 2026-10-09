@@ -203,6 +203,7 @@ func TestQUIC_CloseCarriesTheProtocolsNoErrorCode(t *testing.T) {
 }
 
 func TestQUIC_SessionALPNDuringHandshake(t *testing.T) {
+	// The race detector checks this test.
 	proxyCA, err := GenerateCA()
 	require.NoError(t, err)
 	p, err := New(WithCA(proxyCA))
