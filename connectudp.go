@@ -56,6 +56,13 @@ func (p *Proxy) serveConnectUDP(w http.ResponseWriter, r *http.Request, identity
 		p.writeStatus(w, r, http.StatusBadRequest, err.Error())
 		return
 	}
+	if hasContentFields(r.Header, r.TransferEncoding) {
+		// net/http drains the body of a request it keeps the connection of before answering,
+		// and the body of a GET may never end.
+		w.Header().Set("Connection", "close")
+		p.writeStatus(w, r, http.StatusBadRequest, "CONNECT-UDP request with content fields")
+		return
+	}
 
 	// The tunnel is recorded under the most specific kind admitted. Admission comes before
 	// resolution, and a refused target is not resolved.
@@ -117,11 +124,24 @@ func (p *Proxy) serveConnectUDP(w http.ResponseWriter, r *http.Request, identity
 	}
 	defer p.srv.trackSession(sess, false)
 
-	pipe := p.openTunnel(w, r, tun)
+	pipe := p.openTunnel(ctx, w, r, tun)
 	if pipe == nil {
 		return
 	}
 	tun.serve(ctx, pipe)
+	if cp, isCapsules := pipe.(*capsulePipe); isCapsules {
+		if stream, isStream := cp.conn.(*h2Stream); isStream && stream.aborted.Load() {
+			// A return ends the stream cleanly.
+			panic(http.ErrAbortHandler)
+		}
+	}
+}
+
+// hasContentFields reports whether a message of the Capsule Protocol has a field RFC 9297
+// section 3.2 forbids on it.
+func hasContentFields(h http.Header, transferEncoding []string) bool {
+	return len(transferEncoding) > 0 || h["Content-Length"] != nil || h["Content-Type"] != nil ||
+		h["Transfer-Encoding"] != nil
 }
 
 // tunnelContext returns the context a tunnel lives under. A stream ends with its request. A
@@ -135,8 +155,9 @@ func (p *Proxy) tunnelContext(r *http.Request) (context.Context, context.CancelF
 
 // openTunnel answers the request and returns the pipe of the tunnel, nil once the client was
 // answered with an error. Over HTTP/3 the datagrams are QUIC datagrams, over HTTP/2 capsules
-// on the CONNECT stream, over HTTP/1.1 capsules on the connection the 101 leaves behind.
-func (p *Proxy) openTunnel(w http.ResponseWriter, r *http.Request, tun *connectUDPTunnel) tunnelPipe {
+// on the CONNECT stream, over HTTP/1.1 capsules on the connection the 101 leaves behind. The
+// tunnel lives under ctx.
+func (p *Proxy) openTunnel(ctx context.Context, w http.ResponseWriter, r *http.Request, tun *connectUDPTunnel) tunnelPipe {
 	switch r.ProtoMajor {
 	case 3:
 		streamer, ok := w.(http3.HTTPStreamer)
@@ -144,9 +165,14 @@ func (p *Proxy) openTunnel(w http.ResponseWriter, r *http.Request, tun *connectU
 			p.writeStatus(w, r, http.StatusInternalServerError, "the stream has no datagram support")
 			return nil
 		}
+		// A tunnel closed while the SETTINGS are awaited is answered, and serve ends it.
+		capsules := peerWithoutDatagrams(ctx, w)
+		if r.Context().Err() != nil {
+			return nil
+		}
 		w.Header().Set(http3.CapsuleProtocolHeader, "?1")
 		w.WriteHeader(http.StatusOK)
-		pipe := newDatagramPipe(streamer.HTTPStream(), quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+		pipe := newDatagramPipe(streamer.HTTPStream(), quic.StreamErrorCode(http3.ErrCodeRequestCanceled), capsules)
 		pipe.run(tun.close)
 		return pipe
 	case 2:
@@ -170,6 +196,21 @@ func (p *Proxy) openTunnel(w http.ResponseWriter, r *http.Request, tun *connectU
 	}
 }
 
+// peerWithoutDatagrams waits for the SETTINGS of the client until ctx ends, and reports
+// whether it did not send SETTINGS_H3_DATAGRAM, true when they did not arrive.
+func peerWithoutDatagrams(ctx context.Context, w http.ResponseWriter) bool {
+	s, isSettingser := w.(http3.Settingser)
+	if !isSettingser {
+		return false
+	}
+	select {
+	case <-s.ReceivedSettings():
+		return !s.Settings().EnableDatagrams
+	case <-ctx.Done():
+		return true
+	}
+}
+
 func writeConnectUDPUpgrade(brw *bufio.ReadWriter) error {
 	if _, err := brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: " +
 		connectUDPUpgrade + "\r\n" + http3.CapsuleProtocolHeader + ": ?1\r\n\r\n"); err != nil {
@@ -183,9 +224,9 @@ func isConnectUDPUpgrade(r *http.Request) bool {
 		strings.EqualFold(upgradeType(r.Header), connectUDPUpgrade)
 }
 
-// targetFromConnectUDP reads the target out of the request path. The host arrives
-// percent-encoded, an IPv6 literal without brackets, and is returned unbracketed like every
-// Target.
+// targetFromConnectUDP reads the target out of the request path. The host and the port arrive
+// percent-encoded, an IPv6 literal without brackets, and the host is returned unbracketed like
+// every Target.
 func targetFromConnectUDP(r *http.Request) (Target, error) {
 	if r.URL == nil {
 		return Target{}, errors.New("CONNECT-UDP carries no target")
@@ -203,7 +244,11 @@ func targetFromConnectUDP(r *http.Request) (Target, error) {
 	if err != nil {
 		return Target{}, fmt.Errorf("CONNECT-UDP target host: %w", err)
 	}
-	return targetFromWire(host, segments[1])
+	port, err := url.PathUnescape(segments[1])
+	if err != nil {
+		return Target{}, fmt.Errorf("CONNECT-UDP target port: %w", err)
+	}
+	return targetFromWire(host, port)
 }
 
 // targetFromWire builds a target from a host and a port read off the wire, the host a
@@ -273,7 +318,7 @@ type contextFraming struct {
 func (f *contextFraming) unwrap(b []byte) ([]byte, netip.AddrPort, bool) {
 	// Context ID 0 is a UDP payload, RFC 9298 section 5. Anything else is dropped.
 	id, n, err := quicvarint.Parse(b)
-	if err != nil || id != 0 || n >= len(b) {
+	if err != nil || id != 0 {
 		return nil, netip.AddrPort{}, false
 	}
 	return b[n:], f.upstream, true

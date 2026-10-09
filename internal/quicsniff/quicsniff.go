@@ -17,6 +17,7 @@
 package quicsniff
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/hkdf"
@@ -34,7 +35,7 @@ var (
 	ErrNotInitial = errors.New("quicsniff: no QUIC Initial packet in datagram")
 	// ErrUnsupportedVersion is returned for a QUIC version whose initial keys are not known.
 	ErrUnsupportedVersion = errors.New("quicsniff: unsupported QUIC version")
-	// ErrMalformed is returned when a packet cannot be parsed or authenticated.
+	// ErrMalformed is returned when an authenticated packet violates the protocol.
 	ErrMalformed = errors.New("quicsniff: malformed QUIC Initial packet")
 )
 
@@ -70,6 +71,8 @@ var (
 // carries is complete. A Reassembler follows a single client and is not safe for concurrent
 // use.
 type Reassembler struct {
+	// dcid is the destination connection ID of the first Initial, the only one read.
+	dcid   []byte
 	crypto []byte
 	// received marks the bytes of crypto that have arrived, one bit each, so tracking a
 	// hostile offset costs a sixty-fourth of the buffer it grows.
@@ -91,6 +94,10 @@ func New() *Reassembler {
 // The returned bytes are the TLS handshake message, starting with the ClientHello type byte,
 // with no record layer around it: QUIC carries handshake messages in CRYPTO frames rather
 // than in TLS records.
+//
+// A packet that cannot be authenticated, one with the fixed bit cleared and one of another
+// destination connection ID are discarded and the rest of the datagram is read, RFC 9000
+// sections 12.2 and 17.2 and RFC 9001 section 5.5.
 func (r *Reassembler) Feed(datagram []byte) ([]byte, error) {
 	if r.done {
 		return nil, nil
@@ -101,13 +108,11 @@ func (r *Reassembler) Feed(datagram []byte) ([]byte, error) {
 	for len(rest) > 0 {
 		pkt, remainder, err := splitPacket(rest)
 		if err != nil {
-			if sawInitial || errors.Is(err, ErrNotInitial) {
-				// Either the Initial was already found, or what follows is a short header
-				// packet. Coalesced packets past a malformed one cannot be located, so the
-				// datagram ends here.
-				break
+			if !sawInitial && errors.Is(err, ErrUnsupportedVersion) {
+				return nil, err
 			}
-			return nil, err
+			// Past a packet that cannot be located, nothing else in the datagram can be.
+			break
 		}
 		rest = remainder
 
@@ -115,10 +120,18 @@ func (r *Reassembler) Feed(datagram []byte) ([]byte, error) {
 			continue
 		}
 		sawInitial = true
+		if !pkt.fixed {
+			continue
+		}
+		if r.dcid == nil {
+			r.dcid = append([]byte(nil), pkt.dcid...)
+		} else if !bytes.Equal(pkt.dcid, r.dcid) {
+			continue
+		}
 
 		payload, err := decryptInitial(pkt)
 		if err != nil {
-			return nil, err
+			continue
 		}
 		if err := r.collect(payload); err != nil {
 			return nil, err
@@ -211,12 +224,19 @@ func (r *Reassembler) store(offset uint64, data []byte) error {
 		r.received = seen
 	}
 
-	copy(r.crypto[offset:end], data)
 	for i := offset; i < end; i++ {
-		if r.received[i/64]&(1<<(i%64)) == 0 {
-			r.received[i/64] |= 1 << (i % 64)
-			r.filled++
+		b := data[i-offset]
+		if r.received[i/64]&(1<<(i%64)) != 0 {
+			// RFC 9000 section 2.2 lets the receiver refuse data changed at an offset already
+			// received, and the terminating stack keeps the first copy.
+			if r.crypto[i] != b {
+				return fmt.Errorf("%w: CRYPTO data changed at offset %d", ErrMalformed, i)
+			}
+			continue
 		}
+		r.received[i/64] |= 1 << (i % 64)
+		r.crypto[i] = b
+		r.filled++
 	}
 
 	if r.total == 0 && r.filled >= 4 && r.received[0]&0b1111 == 0b1111 {
@@ -242,6 +262,7 @@ type packet struct {
 	pnOffset  int
 	version   uint32
 	isInitial bool
+	fixed     bool
 }
 
 // splitPacket locates the first QUIC packet in b and returns what follows it. Datagrams
@@ -314,6 +335,7 @@ func splitPacket(b []byte) (packet, []byte, error) {
 
 	return packet{
 		isInitial: isInitial,
+		fixed:     b[0]&0x40 != 0,
 		version:   version,
 		dcid:      dcid,
 		raw:       b[:end],

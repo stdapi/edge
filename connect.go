@@ -104,9 +104,13 @@ func (p *Proxy) hijackedContext(r *http.Request) (context.Context, context.Cance
 	if s := sessionFromRequest(r); s != nil {
 		base = s.Context()
 	}
+	return p.untilShutdown(base)
+}
+
+// untilShutdown returns a child of base that also ends with the proxy. Mounted in a server of
+// its own the proxy has no ConnContext, so a shutdown is watched for explicitly.
+func (p *Proxy) untilShutdown(base context.Context) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(base)
-	// Mounted in a server of its own the proxy has no ConnContext, and the fallback above
-	// has no cancellation, so a shutdown is watched for explicitly.
 	go func() {
 		select {
 		case <-p.srv.ctx.Done():
@@ -140,6 +144,11 @@ func (p *Proxy) connectStream(w http.ResponseWriter, r *http.Request, target Tar
 	defer func() {
 		_ = stream.Close()
 		p.srv.untrack(stream)
+		if stream.aborted.Load() {
+			// A return ends the stream cleanly, where the relay failed, and an HTTP/2 handler
+			// has no other way to reset it.
+			panic(http.ErrAbortHandler)
+		}
 	}()
 
 	w.WriteHeader(http.StatusOK)
@@ -198,7 +207,8 @@ func writeRawStatus(w io.Writer, code int) error {
 		sb = append(sb, "Content-Type: text/plain; charset=utf-8\r\nContent-Length: "...)
 		sb = strconv.AppendInt(sb, int64(len(body)), 10)
 		sb = append(sb, "\r\n"...)
-	} else {
+	} else if code < 200 || code > 299 {
+		// RFC 9110 9.3.6, a 2xx answer to CONNECT has no framing fields.
 		sb = append(sb, "Content-Length: 0\r\n"...)
 	}
 	sb = append(sb, "\r\n"...)

@@ -78,6 +78,28 @@ func TestRelay_CountersAndHalfClose(t *testing.T) {
 	assert.Equal(t, int64(4), bToA)
 }
 
+// A reset on one side reaches the other side as a reset, where a FIN would read as a clean
+// end of the stream.
+func TestRelay_ResetCrossesAsReset(t *testing.T) {
+	clientA, a := tcpPair(t)
+	clientB, b := tcpPair(t)
+
+	go func() { _, _, _ = Relay(a, b) }()
+
+	require.NoError(t, clientB.SetDeadline(time.Now().Add(3*time.Second)))
+	_, err := clientA.Write([]byte("up"))
+	require.NoError(t, err)
+	buf := make([]byte, 16)
+	_, err = io.ReadFull(clientB, buf[:2])
+	require.NoError(t, err)
+
+	require.NoError(t, clientA.SetLinger(0))
+	require.NoError(t, clientA.Close())
+	_, err = clientB.Read(buf)
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, io.EOF, "the reset reached the far side as a FIN")
+}
+
 // A relay with an idle bound ends on its own once neither direction moves a byte.
 func TestRelayer_IdleTimeoutEndsASilentRelay(t *testing.T) {
 	_, a := tcpPair(t)

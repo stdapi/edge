@@ -27,6 +27,7 @@ import (
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/quic-go/quic-go/quicvarint"
+	"golang.org/x/net/http/httpguts"
 )
 
 const (
@@ -48,6 +49,9 @@ var (
 	// errDialWaited is returned by overTCP after waiting for a dial of the proxy in flight.
 	// The caller should retry.
 	errDialWaited = errors.New("dial in flight")
+	// errMalformedAnswer is a CONNECT-UDP answer RFC 9297 section 3.2 treats as malformed, a
+	// 204, 205 or 206 or a success with a content field.
+	errMalformedAnswer = errors.New("malformed answer")
 )
 
 // refusal is the status a proxy answered a CONNECT or a CONNECT-UDP with.
@@ -559,7 +563,7 @@ func connectOnH3(ctx context.Context, cc *h3ProxyConn, proxy *url.URL, addr stri
 	if auth := proxyAuthorization(proxy); auth != "" {
 		req.Header.Set("Proxy-Authorization", auth)
 	}
-	str, err := requestOn(ctx, cc.ClientConn, req, "CONNECT")
+	str, err := requestOn(ctx, cc.ClientConn, req, "CONNECT", connectAnswer)
 	if err != nil {
 		return nil, err
 	}
@@ -660,8 +664,36 @@ func (u *upstreamDialer) remember(fact proxyFact, proxy *url.URL) {
 	u.remembered[proxyAddr(proxy)+" "+string(fact)] = time.Now().Add(proxyRetry)
 }
 
+// connectUDPTargetPath expands the default template of RFC 9298 section 3, the colons of an
+// IPv6 literal percent-encoded.
+func connectUDPTargetPath(host, port string) string {
+	return connectUDPPath + strings.ReplaceAll(url.PathEscape(host), ":", "%3A") + "/" + port + "/"
+}
+
+// connectAnswer returns the error of a CONNECT answer other than 200.
+func connectAnswer(code int, _ http.Header) error {
+	if code != http.StatusOK {
+		return newRefusal(code)
+	}
+	return nil
+}
+
+// connectUDPAnswer returns why a CONNECT-UDP answer over HTTP/2 or HTTP/3 fails, nil for a
+// 2xx other than the 204, 205 and 206 RFC 9297 section 3.2 forbids.
+func connectUDPAnswer(code int, header http.Header) error {
+	switch {
+	case code < 200 || code > 299:
+		return newRefusal(code)
+	case code == http.StatusNoContent || code == http.StatusResetContent || code == http.StatusPartialContent:
+		return fmt.Errorf("%w with status %d", errMalformedAnswer, code)
+	case hasContentFields(header, nil):
+		return fmt.Errorf("%w with content fields", errMalformedAnswer)
+	}
+	return nil
+}
+
 func openTunnelOn(ctx context.Context, cc *http3.ClientConn, proxy *url.URL, host, port string) (tunnelPipe, error) {
-	target, err := url.Parse(fmt.Sprintf("https://%s%s%s/%s/", proxyAddr(proxy), connectUDPPath, url.PathEscape(host), port))
+	target, err := url.Parse("https://" + proxyAddr(proxy) + connectUDPTargetPath(host, port))
 	if err != nil {
 		return nil, err
 	}
@@ -670,28 +702,32 @@ func openTunnelOn(ctx context.Context, cc *http3.ClientConn, proxy *url.URL, hos
 	if auth := proxyAuthorization(proxy); auth != "" {
 		req.Header.Set("Proxy-Authorization", auth)
 	}
-	str, err := requestOn(ctx, cc, req, "CONNECT-UDP")
+	str, err := requestOn(ctx, cc, req, "CONNECT-UDP", connectUDPAnswer)
 	if err != nil {
 		return nil, err
 	}
-	pipe := newDatagramPipe(str, quic.StreamErrorCode(http3.ErrCodeNoError))
+	pipe := newDatagramPipe(str, quic.StreamErrorCode(http3.ErrCodeNoError), false)
 	pipe.run(func() { _ = pipe.close() })
 	return pipe, nil
 }
 
 // requestOn sends req on a new stream of the HTTP/3 connection to a proxy and returns the
-// stream once the proxy answered 200, the errors prefixed with verb.
-func requestOn(ctx context.Context, cc *http3.ClientConn, req *http.Request, verb string) (*http3.RequestStream, error) {
+// stream once check accepts the answer. Its errors start with verb, and a malformed answer
+// resets the stream with H3_MESSAGE_ERROR, RFC 9114 section 4.1.2.
+func requestOn(ctx context.Context, cc *http3.ClientConn, req *http.Request, verb string,
+	check func(code int, header http.Header) error,
+) (*http3.RequestStream, error) {
 	ctx, done := context.WithTimeout(ctx, proxyConnectTimeout)
 	defer done()
 	str, err := cc.OpenRequestStream(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", errOpenStream, err)
 	}
-	cancel := func() {
-		str.CancelRead(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
-		str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+	reset := func(code http3.ErrCode) {
+		str.CancelRead(quic.StreamErrorCode(code))
+		str.CancelWrite(quic.StreamErrorCode(code))
 	}
+	cancel := func() { reset(http3.ErrCodeRequestCanceled) }
 	stop := context.AfterFunc(ctx, cancel)
 	if werr := str.SendRequestHeader(req); werr != nil {
 		stop()
@@ -706,9 +742,13 @@ func requestOn(ctx context.Context, cc *http3.ClientConn, req *http.Request, ver
 		cancel()
 		return nil, fmt.Errorf("read %s response: %w", verb, err)
 	}
-	if resp.StatusCode != http.StatusOK {
-		cancel()
-		return nil, fmt.Errorf("%s %w", verb, newRefusal(resp.StatusCode))
+	if err := check(resp.StatusCode, resp.Header); err != nil {
+		if errors.Is(err, errMalformedAnswer) {
+			reset(http3.ErrCodeMessageError)
+		} else {
+			cancel()
+		}
+		return nil, fmt.Errorf("%s %w", verb, err)
 	}
 	return str, nil
 }
@@ -742,7 +782,7 @@ func (u *upstreamDialer) connectUDPStream(ctx context.Context, proxy *url.URL, h
 			// CONNECT tunnels.
 			u.remember(noH2Extended, proxy)
 			continue
-		case err != nil && pooled && !retried && ctx.Err() == nil && !isRefusal(err):
+		case err != nil && pooled && !retried && ctx.Err() == nil && !isRefusal(err) && !errors.Is(err, errMalformedAnswer):
 			// The pooled connection was gone, going away or full as the tunnel was opened
 			// on it, and the proxy saw nothing of the tunnel. The next round finds the
 			// connection unusable and opens another.
@@ -826,21 +866,25 @@ func openTunnelOnH2(ctx context.Context, cc *h2tunnel.Conn, proxy *url.URL, host
 		Protocol:  connectUDPUpgrade,
 		Scheme:    "https",
 		Authority: proxyAddr(proxy),
-		Path:      connectUDPPath + url.PathEscape(host) + "/" + port + "/",
+		Path:      connectUDPTargetPath(host, port),
 		Header:    header,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("CONNECT-UDP: %w", err)
 	}
-	if resp.StatusCode != http.StatusOK {
-		_ = str.Close()
-		return nil, fmt.Errorf("CONNECT-UDP %w", newRefusal(resp.StatusCode))
+	if err := connectUDPAnswer(resp.StatusCode, resp.Header); err != nil {
+		if errors.Is(err, errMalformedAnswer) {
+			str.Abort()
+		} else {
+			_ = str.Close()
+		}
+		return nil, fmt.Errorf("CONNECT-UDP %w", err)
 	}
 	return newCapsulePipe(str, bufio.NewReader(str)), nil
 }
 
 func upgradeOn(conn net.Conn, proxy *url.URL, host, port string) (tunnelPipe, error) {
-	target, err := url.Parse(fmt.Sprintf("%s://%s%s%s/%s/", proxy.Scheme, proxyAddr(proxy), connectUDPPath, url.PathEscape(host), port))
+	target, err := url.Parse(proxy.Scheme + "://" + proxyAddr(proxy) + connectUDPTargetPath(host, port))
 	if err != nil {
 		return nil, err
 	}
@@ -863,8 +907,15 @@ func upgradeOn(conn net.Conn, proxy *url.URL, host, port string) (tunnelPipe, er
 		// The body is left unread, the caller closes the connection.
 		return nil, fmt.Errorf("CONNECT-UDP %w", &refusal{code: resp.StatusCode, status: resp.Status})
 	}
-	if !strings.EqualFold(resp.Header.Get("Upgrade"), connectUDPUpgrade) {
-		return nil, errors.New("CONNECT-UDP upgraded to " + resp.Header.Get("Upgrade"))
+	// RFC 9298 section 3.3 requires one Upgrade value and the upgrade option in Connection.
+	if upgrade := resp.Header.Values("Upgrade"); len(upgrade) != 1 || !strings.EqualFold(upgrade[0], connectUDPUpgrade) {
+		return nil, errors.New("CONNECT-UDP upgraded to " + strings.Join(upgrade, ", "))
+	}
+	if !httpguts.HeaderValuesContainsToken(resp.Header["Connection"], "upgrade") {
+		return nil, errors.New("CONNECT-UDP upgraded without the upgrade option in Connection")
+	}
+	if hasContentFields(resp.Header, resp.TransferEncoding) {
+		return nil, fmt.Errorf("CONNECT-UDP %w with content fields", errMalformedAnswer)
 	}
 	// Capsules the proxy sent right behind the 101 may already be in the buffer.
 	early, _ := br.Peek(br.Buffered())
@@ -1062,6 +1113,15 @@ func (c *h3StreamConn) Close() error {
 	return nil
 }
 
+// Abort resets both directions with H3_CONNECT_ERROR, RFC 9114 section 4.4.
+func (c *h3StreamConn) Abort() {
+	if c.closed.Swap(true) {
+		return
+	}
+	c.str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeConnectError))
+	c.str.CancelRead(quic.StreamErrorCode(http3.ErrCodeConnectError))
+}
+
 func (c *h3StreamConn) LocalAddr() net.Addr  { return c.local }
 func (c *h3StreamConn) RemoteAddr() net.Addr { return c.remote }
 
@@ -1078,7 +1138,8 @@ func (c *h3StreamConn) SetReadDeadline(t time.Time) error {
 func (c *h3StreamConn) SetWriteDeadline(t time.Time) error { return c.str.SetWriteDeadline(t) }
 
 // connectUDPConn is a CONNECT-UDP tunnel as a connected socket, one datagram per Read and per
-// Write. A datagram too large for the tunnel is dropped.
+// Write. A datagram too large for the tunnel is dropped, and one past the 65527 bytes of
+// RFC 9298 section 5 is refused.
 type connectUDPConn struct {
 	pipe      tunnelPipe
 	remote    tunnelTarget
@@ -1107,6 +1168,9 @@ func (c *connectUDPConn) Read(b []byte) (int, error) {
 }
 
 func (c *connectUDPConn) Write(b []byte) (int, error) {
+	if len(b) > maxCapsuleDatagram {
+		return 0, fmt.Errorf("edge: a UDP payload of %d bytes exceeds the %d bytes of a tunnel", len(b), maxCapsuleDatagram)
+	}
 	out := tunnelBuf(capsuleHeadroom + 1 + len(b))
 	out[capsuleHeadroom] = 0
 	copy(out[capsuleHeadroom+1:], b)

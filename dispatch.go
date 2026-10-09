@@ -64,6 +64,12 @@ func (p *Proxy) serveHTTPEntry(c *routeCtx, w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	if r.ProtoAtLeast(1, 1) {
+		// RFC 9110 15.2, an HTTP/1.0 client is sent no 1xx, and net/http would send one.
+		c.w = w
+		// The HTTP/1.1 server answers any other expectation with a 417 before the handler runs.
+		c.expectContinue = r.ProtoMajor == 1 && r.ContentLength != 0 && len(r.Header["Expect"]) > 0
+	}
 	resp, err := runHTTPHandler(&c.http, handler)
 	if err != nil {
 		resp = p.onError(&c.http, err)
@@ -85,6 +91,7 @@ func (p *Proxy) serveHTTPEntry(c *routeCtx, w http.ResponseWriter, r *http.Reque
 
 	if werr := writeResponse(w, r, resp); werr != nil {
 		p.logf(r.Context(), slog.LevelDebug, "write response", sess, werr)
+		abortIfCut(werr)
 	}
 }
 
@@ -101,10 +108,14 @@ func (p *Proxy) serveGRPC(c *routeCtx, w http.ResponseWriter, r *http.Request, s
 	gc.ctx = r.Context()
 	gc.w = w
 	err := runKindHandler(p, sess, func() error { return handler(gc) })
-	if gc.finishOpenCall(err) {
+	if opened, cut := gc.finishOpenCall(err); opened {
 		// The response of an open call was written while the handler ran.
 		if err != nil {
 			p.logf(r.Context(), slog.LevelDebug, "grpc handler", sess, err)
+		}
+		if cut != nil {
+			p.logf(r.Context(), slog.LevelDebug, "grpc response", sess, cut)
+			abortIfCut(cut)
 		}
 		return
 	}
@@ -113,6 +124,7 @@ func (p *Proxy) serveGRPC(c *routeCtx, w http.ResponseWriter, r *http.Request, s
 		if resp, err = gc.response(); err == nil {
 			if werr := writeResponse(w, r, resp); werr != nil {
 				p.logf(r.Context(), slog.LevelDebug, "write gRPC response", sess, werr)
+				abortIfCut(werr)
 			}
 			return
 		}
@@ -194,6 +206,10 @@ func writeResponse(w http.ResponseWriter, r *http.Request, resp *http.Response) 
 	for k, vv := range resp.Header {
 		dst[k] = append(dst[k][:0:0], vv...)
 	}
+	if _, ok := dst["Content-Type"]; !ok {
+		// A nil value is how a server is told not to sniff a type the response never declared.
+		dst["Content-Type"] = nil
+	}
 
 	// Trailers must be announced before the header block is written, and their values only
 	// exist once the body has been fully read.
@@ -206,10 +222,7 @@ func writeResponse(w http.ResponseWriter, r *http.Request, resp *http.Response) 
 	}
 
 	rc := http.NewResponseController(w)
-	buf := getCopyBuf()
-	defer putCopyBuf(buf)
-
-	_, err := io.CopyBuffer(flushWriter{w: w, rc: rc}, resp.Body, buf)
+	_, err := copyStream(flushWriter{w: w, rc: rc}, resp.Body, nil)
 
 	for k, vv := range resp.Trailer {
 		for _, v := range vv {
@@ -217,10 +230,28 @@ func writeResponse(w http.ResponseWriter, r *http.Request, resp *http.Response) 
 		}
 	}
 
-	if err != nil && !isClientGone(err) {
+	switch {
+	case err == nil:
+		return nil
+	case errors.As(err, new(writeError)):
+		if isClientGone(err) {
+			return nil
+		}
 		return fmt.Errorf("copy response body: %w", err)
+	default:
+		return fmt.Errorf("%w: %w", errBodyCut, err)
 	}
-	return nil
+}
+
+// errBodyCut is returned by writeResponse when the body it relays failed before its end.
+var errBodyCut = errors.New("response body cut short")
+
+// abortIfCut resets the response when err is errBodyCut. A return would end it cleanly and the
+// client would read a complete body.
+func abortIfCut(err error) {
+	if errors.Is(err, errBodyCut) {
+		panic(http.ErrAbortHandler)
+	}
 }
 
 // announceTrailers copies the trailer names the upstream declared into the response header, so

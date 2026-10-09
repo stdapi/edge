@@ -175,6 +175,8 @@ func newServer(p *Proxy) (*server, error) {
 		IdleTimeout:       p.cfg.server.idleTimeout,
 		MaxHeaderBytes:    p.cfg.server.maxHeaderBytes,
 		ErrorLog:          log.New(slogWriter{p.cfg.logger}, "", 0),
+		// An OPTIONS * through a tunnel is about the origin, so it is routed like any request.
+		DisableGeneralOptionsHandler: true,
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
 			if sc, ok := c.(*servedConn); ok {
 				return context.WithValue(ctx, sessionKey{}, sc.sess)

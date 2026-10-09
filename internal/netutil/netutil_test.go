@@ -5,6 +5,8 @@
 package netutil
 
 import (
+	"errors"
+	"net"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -144,6 +146,33 @@ func TestParsePrefix(t *testing.T) {
 			}
 			require.NoError(t, err)
 			assert.Equal(t, tc.wantPrefix, prefix.String())
+		})
+	}
+}
+
+func TestSetDontFragment(t *testing.T) {
+	for _, network := range []string{"udp4", "udp6"} {
+		t.Run(network, func(t *testing.T) {
+			addr := "127.0.0.1:9"
+			if network == "udp6" {
+				addr = "[::1]:9"
+			}
+			c, err := net.Dial(network, addr)
+			if err != nil && network == "udp6" {
+				t.Skipf("no IPv6 loopback, %v", err)
+			}
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = c.Close() })
+			set, err := DontFragment(c)
+			if errors.Is(err, errors.ErrUnsupported) {
+				t.Skip("the Don't Fragment bit is set on Linux and darwin alone")
+			}
+			require.NoError(t, err)
+			require.False(t, set, "a new socket has the bit set")
+			require.NoError(t, SetDontFragment(c))
+			set, err = DontFragment(c)
+			require.NoError(t, err)
+			assert.True(t, set)
 		})
 	}
 }

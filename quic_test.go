@@ -5,12 +5,18 @@
 package edge
 
 import (
+	"bytes"
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/hkdf"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -27,8 +33,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fox-toolkit/edge/internal/netutil"
+	"github.com/fox-toolkit/edge/internal/quicsniff"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
+	"github.com/quic-go/quic-go/quicvarint"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -971,6 +980,163 @@ func TestQUICDemux_EvictInterceptPrefersIdleLRU(t *testing.T) {
 	assert.Contains(t, d.intercepts, busy.key)
 }
 
+// The terminating stack refuses a handshake whose ClientHello differs from the one the
+// connection was placed on, which would terminate a name no entry admits.
+func TestQUICDemux_HandshakeRefusesAChangedClientHello(t *testing.T) {
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(proxyCA))
+	require.NoError(t, err)
+
+	client := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40000}
+	sess := newSession(p, t.Context(), nil, Target{Host: "allowed.test", Port: "443"}, KindQUIC, 0)
+	sess.clientHello.Store(&ClientHello{ServerName: "allowed.test", ALPN: []string{"raw"}})
+	d := &quicDemux{p: p, flows: map[flowKey]*quicFlow{
+		flowKeyOf(client): {client: client, conns: map[string]*quicConn{"odcid": {sess: sess}}},
+	}}
+	ctx := context.WithValue(t.Context(), quicCarrierKey{}, &quicCarrier{client: client, odcid: "odcid"})
+
+	handshake := func(name string, protos ...string) error {
+		c, s := net.Pipe()
+		defer func() { _ = c.Close(); _ = s.Close() }()
+		go func() {
+			_ = tls.Client(c, &tls.Config{ServerName: name, NextProtos: protos, RootCAs: poolOf(proxyCA)}).Handshake()
+			_ = c.Close()
+		}()
+		return tls.Server(s, d.quicTLSConfig()).HandshakeContext(ctx)
+	}
+	require.NoError(t, handshake("allowed.test", "raw"))
+	require.ErrorIs(t, handshake("blocked.test", "raw"), errHelloChanged)
+	require.ErrorIs(t, handshake("allowed.test", "raw", "h3"), errHelloChanged)
+
+	d.flows[flowKeyOf(client)].conns = map[string]*quicConn{}
+	require.ErrorIs(t, handshake("allowed.test", "raw"), errNotPlaced)
+}
+
+// firstSendConn sends what extra returns for the first datagram ahead of it.
+type firstSendConn struct {
+	net.PacketConn
+	extra func(datagram []byte) [][]byte
+	once  sync.Once
+}
+
+func (c *firstSendConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	c.once.Do(func() {
+		for _, e := range c.extra(b) {
+			_, _ = c.PacketConn.WriteTo(e, addr)
+		}
+	})
+	return c.PacketConn.WriteTo(b, addr)
+}
+
+// forgedInitial is a QUIC v1 Initial of dcid with the fixed bit cleared and the ClientHello
+// of RFC 9001 Appendix A.2 for name, which has eleven bytes.
+func forgedInitial(t *testing.T, dcid []byte, name string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join("internal", "quicsniff", "testdata", "rfc9001-client-crypto.hex"))
+	require.NoError(t, err)
+	frame, err := hex.DecodeString(strings.Join(strings.Fields(string(b)), ""))
+	require.NoError(t, err)
+	i := bytes.Index(frame, []byte("example.com"))
+	require.Positive(t, i)
+	require.Len(t, name, 11)
+	copy(frame[i:], name)
+	frames := append(frame, make([]byte, 1162-len(frame))...)
+
+	expand := func(secret []byte, label string, n int) []byte {
+		full := "tls13 " + label
+		info := binary.BigEndian.AppendUint16(nil, uint16(n))
+		info = append(info, byte(len(full)))
+		info = append(info, full...)
+		info = append(info, 0)
+		out, err := hkdf.Expand(sha256.New, secret, string(info), n)
+		require.NoError(t, err)
+		return out
+	}
+	salt := []byte{0x38, 0x76, 0x2c, 0xf7, 0xf5, 0x59, 0x34, 0xb3, 0x4d, 0x17, 0x9a, 0xe6, 0xa4, 0xc8, 0x0c, 0xad, 0xcc, 0xbb, 0x7f, 0x0a}
+	secret, err := hkdf.Extract(sha256.New, dcid, salt)
+	require.NoError(t, err)
+	client := expand(secret, "client in", 32)
+	key, iv, hp := expand(client, "quic key", 16), expand(client, "quic iv", 12), expand(client, "quic hp", 16)
+
+	hdr := []byte{0x83}
+	hdr = binary.BigEndian.AppendUint32(hdr, quicsniff.Version1)
+	hdr = append(hdr, byte(len(dcid)))
+	hdr = append(hdr, dcid...)
+	hdr = append(hdr, 0, 0)
+	hdr = quicvarint.AppendWithLen(hdr, uint64(4+len(frames)+16), 2)
+	pnOffset := len(hdr)
+	hdr = append(hdr, 0, 0, 0, 0)
+	block, err := aes.NewCipher(key)
+	require.NoError(t, err)
+	aead, err := cipher.NewGCM(block)
+	require.NoError(t, err)
+	out := aead.Seal(bytes.Clone(hdr), iv, frames, hdr)
+	block, err = aes.NewCipher(hp)
+	require.NoError(t, err)
+	var mask [16]byte
+	block.Encrypt(mask[:], out[pnOffset+4:pnOffset+20])
+	out[0] ^= mask[0] & 0x0f
+	for i := range 4 {
+		out[pnOffset+i] ^= mask[1+i]
+	}
+	return out
+}
+
+// A copy of the client's first Initial with a broken authentication tag, sent ahead of it, is
+// discarded, and the connection is placed on the Initial that follows.
+func TestQUIC_ACorruptInitialLeavesTheConnection(t *testing.T) {
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(proxyCA))
+	require.NoError(t, err)
+	p.MustAdd(h3Authority+"/", func(c *HTTPCtx) (*http.Response, error) { return Text(http.StatusOK, "ok"), nil })
+	proxyAddr := startQUIC(t, p)
+
+	pc, err := loopbackUDP()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = pc.Close() })
+	conn := &firstSendConn{PacketConn: pc, extra: func(dg []byte) [][]byte {
+		bad := bytes.Clone(dg)
+		bad[len(bad)-1] ^= 0xff
+		return [][]byte{bad}
+	}}
+	qc, err := quic.Dial(t.Context(), conn, net.UDPAddrFromAddrPort(proxyAddr),
+		&tls.Config{ServerName: h3Authority, RootCAs: poolOf(proxyCA), NextProtos: []string{"h3"}, MinVersion: tls.VersionTLS13},
+		&quic.Config{HandshakeIdleTimeout: 3 * time.Second})
+	require.NoError(t, err)
+	_ = qc.CloseWithError(0, "")
+}
+
+// An Initial the terminating stack discards, sent ahead of the client's own with another
+// server name, does not place the connection on that name.
+func TestQUIC_AForgedInitialCannotChangeTheName(t *testing.T) {
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(proxyCA))
+	require.NoError(t, err)
+	var served atomic.Bool
+	p.MustAdd[QUIC]("allowed.com", func(c *QUICCtx) error {
+		served.Store(true)
+		return nil
+	})
+	proxyAddr := startQUICRedirected(t, p, netip.MustParseAddrPort("127.0.0.1:443"))
+
+	pc, err := loopbackUDP()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = pc.Close() })
+	conn := &firstSendConn{PacketConn: pc, extra: func(dg []byte) [][]byte {
+		_, dcid, _, ok := quicsniff.ParseLongHeader(dg)
+		require.True(t, ok)
+		return [][]byte{forgedInitial(t, dcid, "allowed.com")}
+	}}
+	_, err = quic.Dial(t.Context(), conn, net.UDPAddrFromAddrPort(proxyAddr),
+		&tls.Config{ServerName: "blocked.com", RootCAs: poolOf(proxyCA), NextProtos: []string{"alpn"}, MinVersion: tls.VersionTLS13},
+		&quic.Config{HandshakeIdleTimeout: time.Second})
+	require.Error(t, err, "blocked.com was terminated")
+	assert.False(t, served.Load())
+}
+
 // The read loop holds no lock between reading a datagram and publishing the relay it leads
 // to, so an immediate close can run to completion in between. The publication must be
 // refused, not land in a demux already swept.
@@ -1097,6 +1263,68 @@ func TestQUIC_AcceptInspectsAndRelaysStreams(t *testing.T) {
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.Contains(t, string(body), "path=/inspected", "the inspected bytes were not lost")
 	assert.Greater(t, streams.Load(), int64(0), "the handler saw the streams it carried")
+}
+
+// A stream the client resets reaches the origin reset with the same code, where a FIN would
+// read as a complete stream.
+func TestQUIC_RelayPassesAStreamResetOn(t *testing.T) {
+	originCA, err := GenerateCA(WithCASubject("edge raw QUIC origin CA"))
+	require.NoError(t, err)
+	ln, err := quic.ListenAddr("127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{selfSignedFor(t, originCA, h3Authority)},
+		NextProtos:   []string{"raw"},
+		MinVersion:   tls.VersionTLS13,
+	}, &quic.Config{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	ended := make(chan error, 1)
+	go func() {
+		conn, aerr := ln.Accept(t.Context())
+		if aerr != nil {
+			return
+		}
+		str, aerr := conn.AcceptStream(t.Context())
+		if aerr != nil {
+			return
+		}
+		_, rerr := io.ReadAll(str)
+		ended <- rerr
+	}()
+	origin, err := netip.ParseAddrPort(ln.Addr().String())
+	require.NoError(t, err)
+
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	tr := DefaultTransport()
+	tr.RootCAs = poolOf(originCA)
+	p, err := New(WithCA(proxyCA), WithTransport(tr))
+	require.NoError(t, err)
+	p.MustAdd[QUIC](h3Authority, func(c *QUICCtx) error { return c.Relay() })
+	proxyAddr := startQUICRedirected(t, p, origin)
+
+	pc, err := loopbackUDP()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = pc.Close() })
+	conn, err := quic.Dial(t.Context(), pc, net.UDPAddrFromAddrPort(proxyAddr), &tls.Config{
+		ServerName: h3Authority, RootCAs: poolOf(proxyCA), NextProtos: []string{"raw"}, MinVersion: tls.VersionTLS13,
+	}, &quic.Config{HandshakeIdleTimeout: 3 * time.Second})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.CloseWithError(0, "") })
+
+	str, err := conn.OpenStreamSync(t.Context())
+	require.NoError(t, err)
+	_, err = str.Write([]byte("hello"))
+	require.NoError(t, err)
+	str.CancelWrite(0x42)
+
+	select {
+	case rerr := <-ended:
+		se, ok := errors.AsType[*quic.StreamError](rerr)
+		require.True(t, ok, "the origin read %v", rerr)
+		assert.Equal(t, quic.StreamErrorCode(0x42), se.ErrorCode)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stream never ended at the origin")
+	}
 }
 
 // A QUIC connection keeps the entry it was decided on, and Stale reports when the entries as
@@ -1603,6 +1831,43 @@ func TestTransparentUDP_FlowKeepsOrder(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, fmt.Sprintf("%03d", i), got)
 	}
+}
+
+// A datagram with an empty payload reaches the origin, and the empty one it answers reaches
+// the client.
+func TestTransparentUDP_EmptyPayloadCrossesBothWays(t *testing.T) {
+	origin := udpEchoOrigin(t)
+	p, err := New()
+	require.NoError(t, err)
+	p.MustAdd[UDP](origin.String(), func(c *DatagramCtx) error { return c.Forward() })
+	_, proxyAddr := startTProxyQUIC(t, p, origin)
+	client, _ := udpClient(t)
+
+	sendTo(t, client, proxyAddr, "")
+	got, err := readDatagram(t, client, 3*time.Second)
+	require.NoError(t, err)
+	assert.Empty(t, got)
+}
+
+// The socket of a transparent datagram flow leaves the Don't Fragment bit unset, so a datagram
+// is fragmented as it would be without the proxy.
+func TestTransparentUDP_FlowSocketLeavesDontFragmentUnset(t *testing.T) {
+	origin := udpEchoOrigin(t)
+	p, err := New()
+	require.NoError(t, err)
+	p.MustAdd[UDP](origin.String(), func(c *DatagramCtx) error { return c.Forward() })
+	_, proxyAddr := startTProxyQUIC(t, p, origin)
+	client, _ := udpClient(t)
+
+	sendTo(t, client, proxyAddr, "ping")
+	_, err = readDatagram(t, client, 3*time.Second)
+	require.NoError(t, err)
+	set, err := netutil.DontFragment(flowSocket(t, p))
+	if errors.Is(err, errors.ErrUnsupported) {
+		t.Skip("the Don't Fragment bit is read on Linux and darwin alone")
+	}
+	require.NoError(t, err)
+	assert.False(t, set)
 }
 
 // gatedDialer parks the first UDP dial until released, or fails it with err when set, and

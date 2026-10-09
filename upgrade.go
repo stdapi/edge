@@ -5,6 +5,8 @@
 package edge
 
 import (
+	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -38,6 +40,7 @@ func (p *Proxy) serveWebSocketUpgrade(c *routeCtx, w http.ResponseWriter, r *htt
 		// back as one.
 		if werr := writeResponse(w, r, resp); werr != nil {
 			p.logf(r.Context(), slog.LevelDebug, "write websocket handshake response", sess, werr)
+			abortIfCut(werr)
 		}
 		return
 	}
@@ -98,22 +101,36 @@ func (p *Proxy) spliceWebSocket(c *routeCtx, w http.ResponseWriter, r *http.Requ
 		return fmt.Errorf("flush upgrade response: %w", err)
 	}
 
+	ctx, cancel := p.webSocketContext(r)
+	defer cancel()
 	wc := &WebSocketCtx{
-		ctx:      r.Context(),
+		ctx:      ctx,
+		cancel:   cancel,
 		p:        p,
 		sess:     sess,
 		entry:    c.entry,
 		req:      r,
 		resp:     resp,
-		client:   readWriteCloser{r: brw, w: brw, c: client},
-		backend:  backend,
 		params:   c.capturedParams(),
 		target:   Target{Scheme: c.scheme, Host: c.host, Port: c.port},
 		identity: c.identity,
 		maxFrame: p.cfg.server.maxFrameBytes,
 	}
+	wc.setHops(client, &hijackedReader{br: brw.Reader, conn: client}, backend)
+	defer wc.stop()
 
 	return runKindHandler(p, sess, func() error { return handler(wc) })
+}
+
+// webSocketContext returns the context of a WebSocket handler, with the values of the
+// connection's context and an end of its own. Edge closes the client connection while the
+// closing handshake goes on toward the origin.
+func (p *Proxy) webSocketContext(r *http.Request) (context.Context, context.CancelFunc) {
+	base := r.Context()
+	if s := sessionFromRequest(r); s != nil {
+		base = s.Context()
+	}
+	return p.untilShutdown(context.WithoutCancel(base))
 }
 
 // serveUpgradedStream serves what an upgrade left behind as the byte stream it now is. HTTP
@@ -173,12 +190,14 @@ func (p *Proxy) serveUpgradedStream(c *routeCtx, w http.ResponseWriter, r *http.
 		return fmt.Errorf("flush upgrade response: %w", err)
 	}
 
+	ctx, cancel := p.hijackedContext(r)
+	defer cancel()
 	sc := &TCPCtx{
-		ctx:      r.Context(),
+		ctx:      ctx,
 		p:        p,
 		sess:     upSess,
 		entry:    e,
-		client:   heldConn{Conn: bufferedConn{Conn: client, r: brw}},
+		client:   heldConn{Conn: bufferedConn{Conn: client, r: &hijackedReader{br: brw.Reader, conn: client}}},
 		params:   params,
 		target:   target,
 		identity: c.identity,
@@ -197,26 +216,21 @@ func (p *Proxy) serveUpgradedStream(c *routeCtx, w http.ResponseWriter, r *http.
 	return runKindHandler(p, upSess, func() error { return handler(sc) })
 }
 
-// readWriteCloser joins the buffered reader and writer of a hijacked connection to the
-// connection's own Close. Anything the reader buffered past the handshake is already frame
-// data, so reads must go through it.
-type readWriteCloser struct {
-	r io.Reader
-	w io.Writer
-	c io.Closer
+// hijackedReader reads a hijacked connection through the buffer net/http handed back until it
+// is drained, then through that buffer reset onto the connection. A read through net/http's
+// own reader cancels the request context on any error, a half-close included.
+type hijackedReader struct {
+	br    *bufio.Reader
+	conn  net.Conn
+	reset bool
 }
 
-func (rw readWriteCloser) Read(b []byte) (int, error) { return rw.r.Read(b) }
-func (rw readWriteCloser) Close() error               { return rw.c.Close() }
-func (rw readWriteCloser) Write(b []byte) (int, error) {
-	n, err := rw.w.Write(b)
-	if err != nil {
-		return n, err
+func (r *hijackedReader) Read(b []byte) (int, error) {
+	if !r.reset && r.br.Buffered() == 0 {
+		r.br.Reset(r.conn)
+		r.reset = true
 	}
-	if f, ok := rw.w.(interface{ Flush() error }); ok {
-		return n, f.Flush()
-	}
-	return n, nil
+	return r.br.Read(b)
 }
 
 // bufferedConn reads through a buffer that already holds bytes of the stream, the ones a
@@ -227,6 +241,11 @@ type bufferedConn struct {
 }
 
 func (c bufferedConn) Read(b []byte) (int, error) { return c.r.Read(b) }
+
+// CloseWrite forwards the half-close, which the embedded net.Conn does not promote.
+func (c bufferedConn) CloseWrite() error { return closeWrite(c.Conn) }
+
+func (c bufferedConn) Abort() { abort(c.Conn) }
 
 // pipeConn adapts what an upgrade left behind to a net.Conn. The body of a 101 is a byte pipe
 // with no addresses and no deadlines of its own, and closing it is what ends it.

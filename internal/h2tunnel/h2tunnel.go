@@ -1243,9 +1243,10 @@ func (c *Conn) Open(ctx context.Context, req Request) (*Stream, *Response, error
 		return nil, nil, ctx.Err()
 	}
 	s := &Stream{
-		c:      c,
-		wrote:  make(chan writeResult, 1),
-		closed: make(chan struct{}),
+		c:        c,
+		wrote:    make(chan writeResult, 1),
+		closed:   make(chan struct{}),
+		extended: req.Protocol != "",
 	}
 	s.cond.L = &s.mu
 	o := &openReq{req: req, reply: make(chan openReply, 1)}
@@ -1374,6 +1375,7 @@ type Stream struct {
 	answered    bool
 	connected   bool
 	fromPeer    bool
+	extended    bool
 }
 
 type writeReq struct {
@@ -1541,13 +1543,27 @@ func (s *Stream) submit(m msg) (int, error) {
 
 // Close ends the stream, with a RST_STREAM unless the peer ended it first.
 func (s *Stream) Close() error {
-	if s.c.send(msg{kind: msgCloseStream, s: s, code: http2.ErrCodeCancel}) {
+	s.reset(http2.ErrCodeCancel)
+	return nil
+}
+
+// Abort ends the stream with a RST_STREAM of CONNECT_ERROR, RFC 9113 section 8.5, and of
+// PROTOCOL_ERROR for an extended CONNECT, RFC 9113 section 8.1.1.
+func (s *Stream) Abort() {
+	if s.extended {
+		s.reset(http2.ErrCodeProtocol)
+		return
+	}
+	s.reset(http2.ErrCodeConnect)
+}
+
+func (s *Stream) reset(code http2.ErrCode) {
+	if s.c.send(msg{kind: msgCloseStream, s: s, code: code}) {
 		select {
 		case <-s.closed:
 		case <-s.c.done:
 		}
 	}
-	return nil
 }
 
 func (s *Stream) LocalAddr() net.Addr  { return s.c.nc.LocalAddr() }

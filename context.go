@@ -37,7 +37,8 @@ type RequestContext interface {
 	// RoutingPath returns the canonical form of the path the client sent, which is the form
 	// the tree matched on. Percent-encoded RFC 3986 unreserved characters are decoded, bytes
 	// that must be escaped in a path are encoded in place, and every other escape keeps
-	// uppercase hex and stays distinct from its decoded form, so %2F never matches /.
+	// uppercase hex and stays distinct from its decoded form, so %2F never matches /, and an
+	// empty path is /.
 	RoutingPath() string
 	// QueryParams parses the raw query and caches the result.
 	QueryParams() url.Values
@@ -56,6 +57,8 @@ type RequestContext interface {
 // what the handler reads back. It is pooled per tree, and the HTTP view lives inside it so
 // serving a request allocates nothing.
 type routeCtx struct {
+	// w is the client writer a 1xx from the origin is relayed to, nil where none may be.
+	w    http.ResponseWriter
 	req  *http.Request
 	sess *Session
 
@@ -71,13 +74,18 @@ type routeCtx struct {
 	// allocated to serve a request.
 	http HTTPCtx
 
+	relay *infoRelay
+	// grpc borrows the same state through http, a call being a request underneath, so
+	// serving one allocates nothing either.
+	grpc GRPCCtx
+
 	scheme   string
 	host     string
 	port     string
 	identity string
-	// grpc borrows the same state through http, a call being a request underneath, so
-	// serving one allocates nothing either.
-	grpc GRPCCtx
+	// expectContinue is set when net/http writes a 100 Continue from the first read of the
+	// request body.
+	expectContinue bool
 }
 
 func (c *routeCtx) reset(sess *Session, r *http.Request, scheme, host, port string) {
@@ -89,6 +97,8 @@ func (c *routeCtx) reset(sess *Session, r *http.Request, scheme, host, port stri
 	c.cachedQueries = nil
 	c.entry = nil
 	c.identity = ""
+	c.w = nil
+	c.expectContinue = false
 	c.grpc.reset()
 	*c.params = (*c.params)[:0]
 }
@@ -128,6 +138,11 @@ func routingPath(r *http.Request) string {
 	}
 	u := r.URL
 	if u.RawPath == "" {
+		if u.Path == "" {
+			// An absolute-form target may have an empty path, and a lookup without one
+			// reaches the admission of its authority.
+			return "/"
+		}
 		// The wire path was the default encoding of Path, which is always canonical.
 		return stringsutil.EscapePath(u.Path)
 	}

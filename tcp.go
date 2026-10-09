@@ -267,6 +267,8 @@ type heldConn struct {
 // CloseWrite half-closes the connection under it.
 func (s *heldConn) CloseWrite() error { return closeWrite(s.Conn) }
 
+func (s *heldConn) Abort() { abort(s.Conn) }
+
 // close releases the connections the handler opened, once the handler has returned.
 func (c *TCPCtx) close() {
 	if c.up.Conn != nil {

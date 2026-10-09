@@ -112,6 +112,8 @@ func divertedOrigin(local, listener netip.AddrPort) (netip.AddrPort, bool) {
 // CloseWrite forwards the half-close, which the embedded net.Conn does not promote.
 func (c transparentConn) CloseWrite() error { return closeWrite(c.Conn) }
 
+func (c transparentConn) Abort() { abort(c.Conn) }
+
 // TransparentPacketConn returns pc with the socket options a redirected datagram needs, so
 // [Proxy.ServeTransparentUDP] can place each datagram by the address it was headed to. A Linux
 // redirect does not preserve that address, so there connections are placed by their server

@@ -152,7 +152,7 @@ func TestKindWebSocket_HandlerSeesFrames(t *testing.T) {
 		_ = brw.Flush()
 
 		// Read one frame and answer with one of its own, unmasked as a server must.
-		r2 := &wsReader{r: brw, max: 1 << 20}
+		r2 := &wsReader{r: brw, max: 1 << 20, masked: true}
 		f, rerr := r2.read()
 		if rerr != nil {
 			return
@@ -426,7 +426,7 @@ func TestKindWebSocket_ReplyAnswersThePinger(t *testing.T) {
 
 		// The first frame the origin sees must be the text one, the ping being absorbed by
 		// the proxy.
-		r2 := &wsReader{r: brw, max: 1 << 20}
+		r2 := &wsReader{r: brw, max: 1 << 20, masked: true}
 		f, rerr := r2.read()
 		if rerr != nil {
 			return

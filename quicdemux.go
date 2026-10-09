@@ -30,6 +30,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/fox-toolkit/edge/internal/netutil"
 	"github.com/fox-toolkit/edge/internal/quicsniff"
 	"github.com/fox-toolkit/edge/internal/stringsutil"
 	"github.com/quic-go/quic-go"
@@ -948,9 +949,19 @@ func (d *quicDemux) quicTLSConfig() *tls.Config {
 	return &tls.Config{
 		MinVersion: tls.VersionTLS13,
 		GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
+			sess := d.placedSession(chi.Context())
+			if sess == nil {
+				return nil, errNotPlaced
+			}
+			// The connection was placed on the ClientHello the demultiplexer read, and quic-go
+			// parses its own copy. Two copies that differ would terminate a name nothing admits.
+			if hello := sess.ClientHello(); hello == nil || hello.ServerName != chi.ServerName ||
+				!slices.Equal(hello.ALPN, chi.SupportedProtos) {
+				return nil, errHelloChanged
+			}
 			name := chi.ServerName
 			if name == "" {
-				name = d.routedHost(chi.Context())
+				name = sess.target.Host
 			}
 			leaf, err := d.p.cfg.ca.Leaf(name)
 			if err != nil {
@@ -965,21 +976,26 @@ func (d *quicDemux) quicTLSConfig() *tls.Config {
 	}
 }
 
-// quic-go derives the handshake context from ConnContext, and the connection is recorded
-// before its datagrams reach the stack.
-func (d *quicDemux) routedHost(ctx context.Context) string {
+var (
+	errNotPlaced    = errors.New("edge: QUIC handshake of a connection the proxy did not place")
+	errHelloChanged = errors.New("edge: QUIC ClientHello differs from the one the connection was placed on")
+)
+
+// placedSession returns the session of the connection being handshaken. The connection is
+// recorded before its datagrams reach the stack.
+func (d *quicDemux) placedSession(ctx context.Context) *Session {
 	carrier, _ := ctx.Value(quicCarrierKey{}).(*quicCarrier)
 	if carrier == nil {
-		return ""
+		return nil
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if flow := d.flows[flowKeyOf(carrier.client)]; flow != nil {
-		if conn := flow.conns[carrier.odcid]; conn != nil && conn.sess != nil {
-			return conn.sess.target.Host
+		if conn := flow.conns[carrier.odcid]; conn != nil {
+			return conn.sess
 		}
 	}
-	return ""
+	return nil
 }
 
 func (d *quicDemux) quicConfig() *quic.Config {
@@ -1003,10 +1019,6 @@ func (d *quicDemux) run() error {
 			}
 			return err
 		}
-		if n == 0 {
-			continue
-		}
-
 		// The buffer is reused on the next read, so anything kept must be copied.
 		d.dispatch(addr, buf[:n], false)
 	}
@@ -1016,10 +1028,15 @@ func (d *quicDemux) run() error {
 // datagram of one flow is only ever handled by the goroutine feeding that flow.
 func (d *quicDemux) dispatch(addr net.Addr, datagram []byte, owned bool) {
 	from := flowKeyOf(addr)
-	if !from.addr.IsValid() || len(datagram) == 0 {
+	if !from.addr.IsValid() {
 		return
 	}
 	if from.tunnel != nil && from.tunnel.closed.Load() {
+		return
+	}
+	if len(datagram) == 0 {
+		// An empty UDP payload is no QUIC packet.
+		d.dispatchDatagram(addr, from, datagram, owned)
 		return
 	}
 	if datagram[0]&0x80 != 0 {
@@ -1273,13 +1290,20 @@ func (u *udpFlow) newCtx(inbound bool, origin netip.AddrPort) DatagramCtx {
 	}
 }
 
-// dialUDP opens the socket a datagram flow sends through, with the transport's dialer.
-func (d *quicDemux) dialUDP(ctx context.Context, addr string) (net.Conn, error) {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+// dialUDP opens the socket u sends through toward addr, with the transport's dialer. Behind a
+// CONNECT-UDP tunnel the socket sets the Don't Fragment bit where the platform allows it, RFC
+// 9298 section 3.1, and elsewhere a datagram is fragmented as it would be without the proxy.
+func (d *quicDemux) dialUDP(u *udpFlow, addr string) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(u.sess.Context(), 10*time.Second)
 	defer cancel()
 	sock, err := d.p.srv.fwd.up.dial(ctx, "udp", addr, "https")
 	if err != nil {
 		return nil, err
+	}
+	if ta, isTunnel := u.client.(*tunnelAddr); isTunnel {
+		if _, isConnectUDP := ta.tunnel.framing.(*contextFraming); isConnectUDP {
+			_ = netutil.SetDontFragment(sock)
+		}
 	}
 	return noICMPConn{sock}, nil
 }
@@ -1367,7 +1391,7 @@ func (d *quicDemux) runOutbound(from flowKey, u *udpFlow) {
 			(<-u.outQ).release()
 		}
 	}()
-	upstream, err := d.dialUDP(u.sess.Context(), u.key.String())
+	upstream, err := d.dialUDP(u, u.key.String())
 	if err != nil {
 		d.p.cfg.logger.Debug("edge: cannot reach the origin",
 			slog.String("origin", u.key.String()), slog.String("error", err.Error()))
@@ -1492,7 +1516,7 @@ func (d *quicDemux) alternate(u *udpFlow, addr string) (*udpAlt, error) {
 		return alt, err
 	}
 
-	conn, err := d.dialUDP(u.sess.Context(), addr)
+	conn, err := d.dialUDP(u, addr)
 	if err != nil {
 		return nil, err
 	}
@@ -1539,7 +1563,7 @@ func (d *quicDemux) runUDPAlternate(u *udpFlow, addr string, alt *udpAlt) {
 	for {
 		_ = alt.conn.SetReadDeadline(u.idleDeadline())
 		n, err := alt.conn.Read(buf)
-		if n > 0 {
+		if n > 0 || err == nil {
 			d.serveDatagramOn(u, &alt.in, buf[:n])
 		}
 		if err == nil || isTimeout(err) {
@@ -1565,7 +1589,7 @@ func (d *quicDemux) runUDPFlow(from flowKey, u *udpFlow) {
 		// keeps its flow alive without the origin saying anything back.
 		_ = u.upstream.SetReadDeadline(u.idleDeadline())
 		n, err := u.upstream.Read(buf)
-		if n > 0 {
+		if n > 0 || err == nil {
 			d.serveDatagram(u, buf[:n], true)
 		}
 		if err != nil {

@@ -16,6 +16,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 )
 
 const (
@@ -84,6 +87,8 @@ func (c *peekConn) Peek(n int) ([]byte, error) {
 
 // CloseWrite forwards the half-close, which the embedded net.Conn does not promote.
 func (c *peekConn) CloseWrite() error { return closeWrite(c.Conn) }
+
+func (c *peekConn) Abort() { abort(c.Conn) }
 
 // closeWriter is implemented by connections that can be half-closed, which is how a relay
 // tells the far end that one direction is done without tearing down the other.
@@ -170,11 +175,20 @@ type servedConn struct {
 
 func (c *servedConn) Close() error {
 	err := c.Conn.Close()
+	c.release()
+	return err
+}
+
+func (c *servedConn) Abort() {
+	abort(c.Conn)
+	c.release()
+}
+
+func (c *servedConn) release() {
 	c.once.Do(func() {
 		close(c.l.connDone)
 		_ = c.l.Close()
 	})
-	return err
 }
 
 // cancelConn fires the cancel of the session context from Close. Every close path in
@@ -209,6 +223,11 @@ func (c *cancelConn) Close() error {
 		cancel()
 	}
 	return err
+}
+
+func (c *cancelConn) Abort() {
+	lingerZero(c.Conn)
+	_ = c.Close()
 }
 
 // CloseWrite forwards the half-close, which the embedded net.Conn does not promote.
@@ -315,9 +334,10 @@ type h2Stream struct {
 	local   net.Addr
 	remote  net.Addr
 
-	cmu    sync.Mutex
-	wmu    sync.Mutex
-	closed atomic.Bool
+	cmu     sync.Mutex
+	wmu     sync.Mutex
+	closed  atomic.Bool
+	aborted atomic.Bool
 }
 
 func newH2Stream(w http.ResponseWriter, r *http.Request, local, remote net.Addr) *h2Stream {
@@ -354,8 +374,17 @@ func (s *h2Stream) Write(b []byte) (int, error) {
 func (s *h2Stream) Close() error {
 	s.cmu.Lock()
 	defer s.cmu.Unlock()
-	if s.closed.Swap(true) {
+	if !s.stop() {
 		return nil
+	}
+	return s.body.Close()
+}
+
+// stop refuses every later write and waits out the one in flight, and reports whether the
+// stream was open. The caller holds cmu.
+func (s *h2Stream) stop() bool {
+	if s.closed.Swap(true) {
+		return false
 	}
 	// A write in flight returns once the stream is reset, which a deadline in the past does
 	// at once. The barrier then leaves the response writer idle for the caller.
@@ -364,7 +393,29 @@ func (s *h2Stream) Close() error {
 		s.wmu.Lock()
 	}
 	s.wmu.Unlock()
-	return s.body.Close()
+	return true
+}
+
+// Abort closes the stream and resets it. An HTTP/3 stream is reset at once with
+// H3_CONNECT_ERROR, and an HTTP/2 stream by the handler serving it once it returns.
+func (s *h2Stream) Abort() {
+	hs, ok := s.w.(http3.HTTPStreamer)
+	if !ok {
+		s.aborted.Store(true)
+		_ = s.Close()
+		return
+	}
+	s.cmu.Lock()
+	defer s.cmu.Unlock()
+	// HTTPStream flushes the response writer, so stop first ends any write in flight. Closing
+	// the body cancels the read with a code of its own, so it comes last.
+	open := s.stop()
+	str := hs.HTTPStream()
+	str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeConnectError))
+	str.CancelRead(quic.StreamErrorCode(http3.ErrCodeConnectError))
+	if open {
+		_ = s.body.Close()
+	}
 }
 
 // CloseWrite ends the proxy-to-client direction. An HTTP/2 stream has no way to do that
@@ -501,6 +552,12 @@ func cancelConnOf(c net.Conn) *cancelConn {
 	return nil
 }
 
+// writeError is an error of the destination of a copy, which is how the end of a copy is
+// passed to the side that did not fail.
+type writeError struct{ error }
+
+func (e writeError) Unwrap() error { return e.error }
+
 func copyStream(dst io.Writer, src io.Reader, idle *idleTracker) (int64, error) {
 	buf := getCopyBuf()
 	defer putCopyBuf(buf)
@@ -513,10 +570,10 @@ func copyStream(dst io.Writer, src io.Reader, idle *idleTracker) (int64, error) 
 			w, werr := dst.Write(buf[:n])
 			total += int64(w)
 			if werr != nil {
-				return total, werr
+				return total, writeError{werr}
 			}
 			if w != n {
-				return total, io.ErrShortWrite
+				return total, writeError{io.ErrShortWrite}
 			}
 		}
 		if rerr != nil {
@@ -529,6 +586,47 @@ func copyStream(dst io.Writer, src io.Reader, idle *idleTracker) (int64, error) 
 }
 
 func halfClose(c net.Conn) { _ = closeWrite(c) }
+
+// endCopy passes the end of a copy from src to dst on. A clean end half-closes dst, and a
+// failure of either side resets the other.
+func endCopy(src, dst net.Conn, err error) {
+	switch {
+	case filterCopyErr(err) == nil:
+		halfClose(dst)
+	case errors.As(err, new(writeError)):
+		abort(src)
+	default:
+		abort(dst)
+	}
+}
+
+// aborter is implemented by connections that can end so their peer reads a failure, a reset
+// TCP connection or a reset stream.
+type aborter interface {
+	Abort()
+}
+
+// abort ends c so its peer reads a failure where a close reads a clean end.
+func abort(c net.Conn) {
+	switch c := c.(type) {
+	case aborter:
+		c.Abort()
+	case *tls.Conn:
+		// Closing the TLS layer sends close_notify, which reads as a clean end.
+		abort(c.NetConn())
+	case *net.TCPConn:
+		_ = c.SetLinger(0)
+		_ = c.Close()
+	default:
+		_ = c.Close()
+	}
+}
+
+func lingerZero(c net.Conn) {
+	if tc, ok := c.(*net.TCPConn); ok {
+		_ = tc.SetLinger(0)
+	}
+}
 
 // closeWrite ends the write direction of c, or closes it when it cannot half-close.
 func closeWrite(c net.Conn) error {

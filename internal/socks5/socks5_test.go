@@ -87,8 +87,14 @@ func TestCredentials_RoundTrip(t *testing.T) {
 	if err != nil || user != "alice" || pass != long {
 		t.Fatalf("got %q %q %v", user, pass, err)
 	}
-	if err := WriteCredentials(&buf, strings.Repeat("u", 256), ""); !errors.Is(err, ErrCredentials) {
-		t.Fatalf("got %v, want ErrCredentials", err)
+	buf.Reset()
+	for _, c := range [][2]string{{strings.Repeat("u", 256), "p"}, {"", "p"}, {"u", ""}} {
+		if err := WriteCredentials(&buf, c[0], c[1]); !errors.Is(err, ErrCredentials) {
+			t.Fatalf("username of %d bytes and password of %d bytes: got %v, want ErrCredentials", len(c[0]), len(c[1]), err)
+		}
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("refused credentials wrote %x", buf.Bytes())
 	}
 
 	buf.Reset()

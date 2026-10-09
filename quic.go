@@ -345,7 +345,7 @@ func (s *QUICStream) Relay() error {
 
 	if !s.bidi {
 		_, err = copyStream(dstW, s.src, nil)
-		_ = dstW.Close()
+		endStreamCopy(s.src, dstW, err)
 		return filterCopyErr(err)
 	}
 
@@ -353,14 +353,33 @@ func (s *QUICStream) Relay() error {
 	var upErr, downErr error
 	wg.Go(func() {
 		_, upErr = copyStream(dstW, s.src, nil)
-		_ = dstW.Close()
+		endStreamCopy(s.src, dstW, upErr)
 	})
 	wg.Go(func() {
 		_, downErr = copyStream(s.srcW, dstR, nil)
-		_ = s.srcW.Close()
+		endStreamCopy(dstR, s.srcW, downErr)
 	})
 	wg.Wait()
 	return errors.Join(filterCopyErr(upErr), filterCopyErr(downErr))
+}
+
+// endStreamCopy passes the end of a copy between two QUIC streams on. A reset or a
+// STOP_SENDING crosses with its code, and anything else ends dst with a FIN.
+func endStreamCopy(src io.Reader, dst io.WriteCloser, err error) {
+	se, reset := errors.AsType[*quic.StreamError](err)
+	switch {
+	case reset && errors.As(err, new(writeError)):
+		if r, ok := src.(interface{ CancelRead(quic.StreamErrorCode) }); ok {
+			r.CancelRead(se.ErrorCode)
+			return
+		}
+	case reset:
+		if w, ok := dst.(interface{ CancelWrite(quic.StreamErrorCode) }); ok {
+			w.CancelWrite(se.ErrorCode)
+			return
+		}
+	}
+	_ = dst.Close()
 }
 
 // closePeer closes to with the application error that ended the peer connection, when there

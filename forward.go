@@ -7,6 +7,7 @@ package edge
 import (
 	"cmp"
 	"context"
+	"io"
 	"net"
 	"net/http"
 	"net/textproto"
@@ -53,6 +54,8 @@ type upstreamPool struct {
 	h1 *http.Transport
 	h2 *http.Transport
 	h3 http.RoundTripper
+	// absolute is set when net/http sends the absolute form to a proxy.
+	absolute bool
 }
 
 func newUpstreamPool(up *upstreamDialer, scheme, fixed string, proxy *url.URL) *upstreamPool {
@@ -69,7 +72,7 @@ func newUpstreamPool(up *upstreamDialer, scheme, fixed string, proxy *url.URL) *
 	} else if proxy != nil {
 		via = http.ProxyURL(proxy)
 	}
-	pool := &upstreamPool{h1: t.httpTransport(false, fixed != "", dial, via)}
+	pool := &upstreamPool{h1: t.httpTransport(false, fixed != "", dial, via), absolute: via != nil}
 	if t.AllowHTTP2 {
 		if scheme == "http" && fixed != "" {
 			// The client used h2c with a destination it declared, and no ALPN can ask the
@@ -178,6 +181,11 @@ func (f *forwarder) roundTrip(req *http.Request, proto Protocol, fixed string) (
 	if err != nil {
 		return nil, err
 	}
+	if pool.absolute && req.URL.Path == "*" {
+		// RFC 9112 3.2.4 leaves "*" to the last proxy, and net/http writes an empty path as
+		// "/" unless the target is opaque.
+		req.URL.Opaque = "//" + req.URL.Host
+	}
 	switch {
 	case proto == HTTP3 && pool.h3 != nil:
 		return pool.h3.RoundTrip(req)
@@ -186,8 +194,21 @@ func (f *forwarder) roundTrip(req *http.Request, proto Protocol, fixed string) (
 		// served over HTTP/1.1 by the same transport.
 		return pool.h2.RoundTrip(req)
 	default:
+		if _, ok := req.Header["Te"]; ok {
+			// RFC 9110 10.1.4. Only HTTP/1.1 has connection options, an HTTP/2 or HTTP/3
+			// transport refuses the request when Connection lists one.
+			addConnectionOption(req.Header, "TE")
+		}
 		return pool.h1.RoundTrip(req)
 	}
+}
+
+func addConnectionOption(h http.Header, option string) {
+	if v := h["Connection"]; len(v) > 0 {
+		h["Connection"] = []string{strings.Join(v, ", ") + ", " + option}
+		return
+	}
+	h["Connection"] = []string{option}
 }
 
 // stripPseudoHeaders removes the HTTP/2 and HTTP/3 pseudo headers net/http surfaces as
@@ -202,9 +223,20 @@ func stripPseudoHeaders(h http.Header) {
 }
 
 // stripResponseHopByHop removes the connection-scoped headers from a response, except on a
-// 101 where Connection and Upgrade are the whole point of the answer.
+// 101 where Connection and Upgrade are the answer itself, and removes the trailer fields
+// Connection lists along with their announcement.
 func stripResponseHopByHop(resp *http.Response) {
 	if resp.StatusCode != http.StatusSwitchingProtocols {
+		if conn := resp.Header["Connection"]; len(resp.Trailer) > 0 && listsAny(conn, resp.Trailer) {
+			for _, value := range conn {
+				for field := range strings.SplitSeq(value, ",") {
+					resp.Trailer.Del(textproto.TrimString(field))
+				}
+			}
+			if resp.Body != nil && resp.Body != http.NoBody {
+				resp.Body = &hopTrailers{ReadCloser: resp.Body, resp: resp, conn: conn}
+			}
+		}
 		stripHopByHop(resp.Header)
 		return
 	}
@@ -215,6 +247,39 @@ func stripResponseHopByHop(resp *http.Response) {
 		resp.Header.Set("Connection", "Upgrade")
 		resp.Header.Set("Upgrade", upgrade)
 	}
+}
+
+// listsAny reports whether the Connection values conn list a field of h.
+func listsAny(conn []string, h http.Header) bool {
+	for _, value := range conn {
+		for field := range strings.SplitSeq(value, ",") {
+			if _, ok := h[textproto.CanonicalMIMEHeaderKey(textproto.TrimString(field))]; ok {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hopTrailers removes the trailer fields listed in Connection once the body has ended. The
+// transport merges the received trailer section into the response at the end of the body,
+// after any field was removed from the announcement.
+type hopTrailers struct {
+	io.ReadCloser
+	resp *http.Response
+	conn []string
+}
+
+func (b *hopTrailers) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err == io.EOF {
+		for _, value := range b.conn {
+			for field := range strings.SplitSeq(value, ",") {
+				b.resp.Trailer.Del(textproto.TrimString(field))
+			}
+		}
+	}
+	return n, err
 }
 
 // stripHopByHop removes the connection-scoped headers, including the ones the peer listed in

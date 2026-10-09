@@ -20,8 +20,8 @@ type Relayer struct {
 }
 
 // Relay copies bytes in both directions between a and b and returns once both directions have
-// ended. When one direction ends, the connection it was writing to is half-closed. aToB and
-// bToA count the bytes written to b and to a.
+// ended. When one direction ends, the connection it was writing to is half-closed, and when it
+// fails, the other connection is reset. aToB and bToA count the bytes written to b and to a.
 func (r *Relayer) Relay(a, b net.Conn) (aToB, bToA int64, err error) {
 	var (
 		wg   sync.WaitGroup
@@ -34,12 +34,12 @@ func (r *Relayer) Relay(a, b net.Conn) (aToB, bToA int64, err error) {
 
 	wg.Go(func() {
 		aToB, aErr = copyStream(b, a, idle)
-		halfClose(b)
+		endCopy(a, b, aErr)
 		idle.arm(halfClosedIdleTimeout)
 	})
 	wg.Go(func() {
 		bToA, bErr = copyStream(a, b, idle)
-		halfClose(a)
+		endCopy(b, a, bErr)
 		idle.arm(halfClosedIdleTimeout)
 	})
 	wg.Wait()
@@ -100,6 +100,8 @@ func (s *shapedConn) Write(b []byte) (int, error) {
 
 // CloseWrite half-closes the wrapped connection.
 func (s *shapedConn) CloseWrite() error { return closeWrite(s.Conn) }
+
+func (s *shapedConn) Abort() { abort(s.Conn) }
 
 // sleepCtx sleeps for d and reports false when ctx ended first.
 func sleepCtx(ctx context.Context, d time.Duration) bool {

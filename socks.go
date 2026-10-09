@@ -27,6 +27,9 @@ const (
 	socks5NameCache     = 64
 	socks5NameResolving = 8
 	socks5NameRetry     = 5 * time.Second
+	// socks5RefuseLinger stays well under the ten seconds RFC 1928 section 6 allows between a
+	// failure reply and the close.
+	socks5RefuseLinger = 2 * time.Second
 )
 
 // ListenAndServeSOCKS5 listens on addr and serves as a SOCKS5 proxy, RFC 1928. Clients point
@@ -91,13 +94,19 @@ func (p *Proxy) serveSOCKS5(conn net.Conn) error {
 	if err != nil {
 		return err
 	}
+	bound := socks5Bound(conn.LocalAddr())
 	cmd, addr, err := socks5.ReadRequest(conn)
 	if err != nil {
+		switch {
+		case errors.Is(err, socks5.ErrAddressType):
+			refuseSOCKS5(conn, socks5.AddressTypeNotSupported, bound)
+		case errors.Is(err, socks5.ErrNameLength):
+			refuseSOCKS5(conn, socks5.GeneralFailure, bound)
+		}
 		return err
 	}
 	_ = conn.SetReadDeadline(time.Time{})
 
-	bound := socks5Bound(conn.LocalAddr())
 	switch cmd {
 	case socks5.CmdConnect:
 	case socks5.CmdAssociate:
@@ -129,6 +138,17 @@ func (p *Proxy) serveSOCKS5(conn net.Conn) error {
 		p.logf(ctx, slog.LevelDebug, "connection closed", sess, err)
 	}
 	return nil
+}
+
+// refuseSOCKS5 answers a request it could not read to its end. A close with unread data
+// sends a reset, which can destroy the reply before the client reads it.
+func refuseSOCKS5(conn net.Conn, rep socks5.Reply, bound socks5.Addr) {
+	if socks5.WriteReply(conn, rep, bound) != nil {
+		return
+	}
+	_ = closeWrite(conn)
+	_ = conn.SetReadDeadline(time.Now().Add(socks5RefuseLinger))
+	_, _ = io.Copy(io.Discard, conn)
 }
 
 // One method is offered, username/password when an authenticator is configured and none

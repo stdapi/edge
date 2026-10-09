@@ -22,6 +22,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/net/http2"
 )
 
 func grpcDo(t *testing.T, client *http.Client, target string, payload []byte) *http.Response {
@@ -515,6 +516,189 @@ func TestKindGRPC_ReturnWithInboundPendingEndsOnInternal(t *testing.T) {
 		"the origin was canceled")
 }
 
+// forwardFirst forwards the first request message and returns, and reports its return on
+// returned.
+func forwardFirst(returned chan<- struct{}) GRPC {
+	return func(c *GRPCCtx) error {
+		defer func() { returned <- struct{}{} }()
+		if err := c.Open(); err != nil {
+			return err
+		}
+		m, err := c.Outbound().ReadMessage()
+		if err != nil {
+			return err
+		}
+		return m.Forward()
+	}
+}
+
+// A unary handler that forwards the one request message and returns leaves the end of the
+// request stream to the proxy, and the client reads the response of the origin.
+func TestKindGRPC_ReturnAfterTheOneMessageEndsOnTheOriginStatus(t *testing.T) {
+	origin := httptest.NewUnstartedServer(grpcEchoHandler(nil))
+	origin.EnableHTTP2 = true
+	origin.StartTLS()
+	t.Cleanup(origin.Close)
+	p, host, client := grpcProxy(t, origin)
+	p.MustAdd(host+"/pkg.Svc/Unary", forwardFirst(make(chan struct{}, 1)))
+
+	resp := grpcDo(t, client, origin.URL+"/pkg.Svc/Unary", grpcPayload("hello"))
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	require.NoError(t, err)
+
+	assert.Equal(t, grpcPayload("hello"), body)
+	code, msg := grpcStatus(resp)
+	assert.Equal(t, "0", code, msg)
+}
+
+// The request messages a client sends after the handler returned reach the origin, and the
+// response streams back meanwhile.
+func TestKindGRPC_RequestMessagesAfterTheReturnReachTheOrigin(t *testing.T) {
+	returned := make(chan struct{}, 1)
+	b := newGRPCBench(t, streamOrigin(t), forwardFirst(returned))
+	c := b.client(t)
+	id := c.call("/pkg.Svc/Method")
+	c.data(id, false, lpm(0, "one"))
+	<-returned
+	var r grpcResult
+	c.awaitData(id, &r, len(lpm(0, "one")))
+	c.data(id, false, lpm(0, "two"))
+	c.awaitData(id, &r, len(lpm(0, "one"))+len(lpm(0, "two")))
+	c.data(id, true, nil)
+	for !r.done() {
+		c.step(id, &r)
+	}
+
+	call := b.origin.call(t)
+	require.NoError(t, call.readErr)
+	assert.Equal(t, append(lpm(0, "one"), lpm(0, "two")...), call.body)
+	assert.False(t, r.reset)
+	assert.Equal(t, "0", grpcStatusOf(r))
+}
+
+// A request stream the client cuts after the handler returned is reset toward the origin.
+func TestKindGRPC_RequestCutAfterTheReturnResetsTheOrigin(t *testing.T) {
+	cuts := []struct {
+		cut  func(c *grpcClient, id uint32)
+		name string
+	}{
+		{func(c *grpcClient, id uint32) { c.data(id, true, lpm(0, "two")[:6]) }, "inside a message"},
+		{func(c *grpcClient, id uint32) { require.NoError(t, c.fr.WriteRSTStream(id, http2.ErrCodeCancel)) }, "by a reset"},
+	}
+	for _, tc := range cuts {
+		t.Run(tc.name, func(t *testing.T) {
+			returned := make(chan struct{}, 1)
+			b := newGRPCBench(t, streamOrigin(t), forwardFirst(returned))
+			c := b.client(t)
+			id := c.call("/pkg.Svc/Method")
+			c.data(id, false, lpm(0, "one"))
+			<-returned
+			var r grpcResult
+			c.awaitData(id, &r, len(lpm(0, "one")))
+			tc.cut(c, id)
+			assert.Error(t, b.origin.call(t).readErr, "the origin read a complete call the client cut short")
+		})
+	}
+}
+
+// A request message sent after the handler returned is still decided on the tree and bounded.
+func TestKindGRPC_RequestMessageAfterTheReturnIsRefusedOrBounded(t *testing.T) {
+	t.Run("refused by the tree", func(t *testing.T) {
+		returned := make(chan struct{}, 1)
+		b := newGRPCBench(t, streamOrigin(t), forwardFirst(returned))
+		c := b.client(t)
+		id := c.call("/pkg.Svc/Method")
+		c.data(id, false, lpm(0, "one"))
+		<-returned
+		var r grpcResult
+		c.awaitData(id, &r, len(lpm(0, "one")))
+		_, err := b.p.Delete[GRPC](b.host + "/*{method}")
+		require.NoError(t, err)
+		c.data(id, true, lpm(0, "two"))
+		for !r.done() {
+			c.step(id, &r)
+		}
+
+		call := b.origin.call(t)
+		assert.Equal(t, lpm(0, "one"), call.body)
+		assert.Error(t, call.readErr)
+		assert.Equal(t, "14", r.trailer("grpc-status"))
+	})
+	t.Run("over the bound", func(t *testing.T) {
+		returned := make(chan struct{}, 1)
+		b := newGRPCBench(t, streamOrigin(t), forwardFirst(returned), WithMaxMessageBytes(8))
+		c := b.client(t)
+		id := c.call("/pkg.Svc/Method")
+		c.data(id, false, lpm(0, "one"))
+		<-returned
+		var r grpcResult
+		c.awaitData(id, &r, len(lpm(0, "one")))
+		c.data(id, true, lpm(0, "123456789"))
+		for !r.done() {
+			c.step(id, &r)
+		}
+
+		call := b.origin.call(t)
+		assert.Equal(t, lpm(0, "one"), call.body)
+		assert.Error(t, call.readErr)
+		assert.Equal(t, "8", r.trailer("grpc-status"))
+	})
+}
+
+// An origin that ends the call before the client ends its request stream ends it for the
+// client as well, after the handler returned.
+func TestKindGRPC_OriginEndingFirstEndsTheCallAfterTheReturn(t *testing.T) {
+	o := newGRPCOrigin(t, func(o *grpcOrigin, w http.ResponseWriter, r *http.Request) {
+		src := &msgSource{r: r.Body, max: defaultMaxMessageBytes}
+		payload, flag, err := src.next()
+		o.calls <- originCall{readErr: err}
+		answerOK(w, appendGRPCFrame(nil, flag, payload))
+	})
+	returned := make(chan struct{}, 1)
+	b := newGRPCBench(t, o, forwardFirst(returned))
+	c := b.client(t)
+	id := c.call("/pkg.Svc/Method")
+	c.data(id, false, lpm(0, "one"))
+	r := c.await(id)
+
+	require.NoError(t, o.call(t).readErr)
+	assert.Equal(t, lpm(0, "one"), r.data)
+	assert.Equal(t, "0", grpcStatusOf(r))
+}
+
+// A handler that returns from a merge while a read of Outbound is pending ends the call on
+// Internal, and the request stream is not read twice at once.
+func TestKindGRPC_ReturnFromAMergeWithAReadPendingEndsOnInternal(t *testing.T) {
+	h := func(c *GRPCCtx) error {
+		if err := c.Open(); err != nil {
+			return err
+		}
+		src := MergeMessages(c.Outbound(), c.Inbound())
+		for {
+			m, err := src.ReadMessage()
+			if err != nil {
+				return err
+			}
+			if err := m.Forward(); err != nil {
+				return err
+			}
+			if m.Inbound() {
+				return nil
+			}
+		}
+	}
+	b := newGRPCBench(t, streamOrigin(t), h)
+	c := b.client(t)
+	id := c.call("/pkg.Svc/Method")
+	c.data(id, false, lpm(0, "one"))
+	r := c.await(id)
+
+	assert.Equal(t, lpm(0, "one"), r.data)
+	assert.Equal(t, "13", grpcStatusOf(r))
+	assert.Error(t, b.origin.call(t).readErr, "the origin read a request stream the client never ended")
+}
+
 // An error returned after Open reaches the client as the status it maps to.
 func TestKindGRPC_ErrorAfterOpenReachesTheClient(t *testing.T) {
 	release := make(chan struct{})
@@ -544,8 +728,8 @@ func TestKindGRPC_ErrorAfterOpenReachesTheClient(t *testing.T) {
 
 	assert.Equal(t, grpcPayload("one"), body)
 	code, msg := grpcStatus(resp)
-	assert.Equal(t, "14", code)
-	assert.Equal(t, "Unavailable", msg, "the reason stays in the log")
+	assert.Equal(t, "2", code)
+	assert.Equal(t, "Unknown", msg, "the reason stays in the log")
 }
 
 // Forward refuses a call whose request stream was read, and the origin is not reached.
@@ -568,7 +752,7 @@ func TestKindGRPC_ForwardAfterAReadIsRefused(t *testing.T) {
 
 	assert.EqualError(t, forwardErr, "edge: request stream already read")
 	assert.Equal(t, int64(0), received.Load(), "the origin was never reached")
-	assert.Equal(t, "14", resp.Header.Get("Grpc-Status"))
+	assert.Equal(t, "2", resp.Header.Get("Grpc-Status"))
 }
 
 // Response gives the origin's headers once it answered and its trailers once Inbound ended.

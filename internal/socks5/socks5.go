@@ -51,7 +51,7 @@ var (
 	ErrNameLength  = errors.New("socks5: a name must be 1 to 255 bytes")
 	ErrFragmented  = errors.New("socks5: fragmented datagram")
 	ErrShort       = errors.New("socks5: short message")
-	ErrCredentials = errors.New("socks5: credentials must be at most 255 bytes each")
+	ErrCredentials = errors.New("socks5: a username and a password must be 1 to 255 bytes each")
 	ErrAuthFailed  = errors.New("socks5: authentication failed")
 )
 
@@ -281,9 +281,10 @@ func WriteCredentialsStatus(w io.Writer, ok bool) error {
 	return err
 }
 
-// WriteCredentials sends a username and a password, RFC 1929.
+// WriteCredentials sends a username and a password, RFC 1929, and returns [ErrCredentials]
+// without writing when either is empty or longer than 255 bytes.
 func WriteCredentials(w io.Writer, username, password string) error {
-	if len(username) > 255 || len(password) > 255 {
+	if len(username) == 0 || len(username) > 255 || len(password) == 0 || len(password) > 255 {
 		return ErrCredentials
 	}
 	b := make([]byte, 0, 3+len(username)+len(password))

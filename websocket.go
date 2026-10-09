@@ -9,14 +9,15 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"io"
 	"iter"
+	"net"
 	"net/http"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // Opcode is the frame type of a WebSocket frame (RFC 6455 section 5.2).
@@ -60,9 +61,16 @@ func (o Opcode) String() string {
 // 125 payload bytes and forbids fragmenting.
 func (o Opcode) Control() bool { return o&0x8 != 0 }
 
-// closeTooBig is the RFC 6455 status code 1009, sent for a frame larger than the receiver
-// accepts.
-const closeTooBig = 1009
+// The RFC 6455 status codes edge sends when a frame breaks the protocol.
+const (
+	closeGoingAway     = 1001
+	closeProtocolError = 1002
+	closeTooBig        = 1009
+)
+
+// wsCloseTimeout bounds the wait for the rest of the closing handshake once a peer has sent
+// its Close and ended its stream, or once edge waits for the origin to close.
+const wsCloseTimeout = 5 * time.Second
 
 // Frame is one WebSocket frame, unmasked. The payload is valid until the next read on the
 // reader that returned it.
@@ -123,8 +131,8 @@ func MergeFrames(a, b *FrameReader) *FrameReader {
 // FrameCtx is one frame and the decision about it. A frame reaches the far side only through
 // [FrameCtx.Forward] or [FrameCtx.Send].
 type FrameCtx struct {
-	w    *wsWriter
-	back *wsWriter
+	w    *wsHop
+	back *wsHop
 	Frame
 }
 
@@ -157,22 +165,24 @@ func NewFrame(op Opcode, payload []byte) Frame {
 // did.
 type WebSocketCtx struct {
 	ctx      context.Context
-	client   io.ReadWriteCloser
-	backend  io.ReadWriteCloser
+	cancel   context.CancelFunc
 	p        *Proxy
 	sess     *Session
 	entry    *entry
 	req      *http.Request
 	resp     *http.Response
-	wOrigin  *wsWriter
-	wClient  *wsWriter
 	outR     *FrameReader
 	inR      *FrameReader
+	timer    *time.Timer
 	target   Target
 	identity string
 	params   []Param
+	toClient wsHop
+	toOrigin wsHop
 	maxFrame int
+	mu       sync.Mutex
 	initOnce sync.Once
+	done     bool
 }
 
 // Context returns a context canceled when the connection ends.
@@ -241,29 +251,32 @@ func (c *WebSocketCtx) Inbound() *FrameReader {
 	return c.inR
 }
 
+// setHops sets the two connections of c. The proxy is the server toward the client and the
+// client toward the origin, so the masking rule of RFC 6455 section 5.3 runs one way on each.
+func (c *WebSocketCtx) setHops(client net.Conn, clientR io.Reader, backend io.ReadWriteCloser) {
+	c.toClient.c, c.toClient.peer, c.toClient.server = c, &c.toOrigin, true
+	c.toClient.conn, c.toClient.r, c.toClient.w.w = client, clientR, client
+	c.toOrigin.c, c.toOrigin.peer = c, &c.toClient
+	c.toOrigin.conn, c.toOrigin.r, c.toOrigin.w.w, c.toOrigin.w.mask = pipeConn{ReadWriteCloser: backend}, backend, backend, true
+}
+
 func (c *WebSocketCtx) init() {
 	c.initOnce.Do(func() {
-		// The proxy is the server toward the client and the client toward the origin, so the
-		// masking rule of RFC 6455 section 5.3 runs one way on each side.
-		c.wOrigin = &wsWriter{w: c.backend, mask: true}
-		c.wClient = &wsWriter{w: c.client, mask: false}
-		c.outR = c.newFrameReader(c.client, c.wOrigin, c.wClient, false)
-		c.inR = c.newFrameReader(c.backend, c.wClient, c.wOrigin, true)
+		c.outR = c.newFrameReader(&c.toClient, false)
+		c.inR = c.newFrameReader(&c.toOrigin, true)
 	})
 }
 
-func (c *WebSocketCtx) newFrameReader(src io.Reader, dst, back *wsWriter, inbound bool) *FrameReader {
-	r := &wsReader{r: src, max: c.maxFrame}
-	fc := &FrameCtx{w: dst, back: back}
+func (c *WebSocketCtx) newFrameReader(src *wsHop, inbound bool) *FrameReader {
+	r := &wsReader{r: src.r, max: c.maxFrame, masked: src.server}
+	fc := &FrameCtx{w: src.peer, back: src}
 	return &FrameReader{ctx: c.ctx, read: func() (*FrameCtx, error) {
 		f, err := r.read()
 		if err != nil {
-			if errors.Is(err, errFrameTooBig) {
-				// Under RFC 6455 section 7.4.1 the peer that refuses the frame sends the
-				// close, to the sender of the frame.
-				_ = back.write(closeFrame(closeTooBig, "frame too big"))
-			}
-			return nil, err
+			return nil, src.readEnded(err)
+		}
+		if f.opcode == OpClose {
+			src.closeCrossed(&src.recvClose)
 		}
 		f.inbound = inbound
 		fc.Frame = f
@@ -271,24 +284,219 @@ func (c *WebSocketCtx) newFrameReader(src io.Reader, dst, back *wsWriter, inboun
 	}}
 }
 
-// Relay relays every frame in both directions until either peer closes. A connection is
+// Relay relays every frame in both directions until the connection ends. A connection is
 // driven either by Relay or by its readers.
 func (c *WebSocketCtx) Relay() error {
 	c.init()
 
 	var wg sync.WaitGroup
 	var upErr, downErr error
-	wg.Go(func() {
-		upErr = pumpFrames(c.outR)
-		_ = c.backend.Close()
-	})
-	wg.Go(func() {
-		downErr = pumpFrames(c.inR)
-		_ = c.client.Close()
-	})
+	wg.Go(func() { upErr = pumpFrames(c.outR) })
+	wg.Go(func() { downErr = pumpFrames(c.inR) })
 	wg.Wait()
 
-	return errors.Join(filterCopyErr(upErr), filterCopyErr(downErr))
+	return errors.Join(filterFrameErr(upErr), filterFrameErr(downErr))
+}
+
+// filterFrameErr drops the errors that are the normal end of a relay, a frame the peer sent
+// after a Close included.
+func filterFrameErr(err error) error {
+	if errors.Is(err, errAfterClose) {
+		return nil
+	}
+	return filterCopyErr(err)
+}
+
+func (c *WebSocketCtx) waitLocked() {
+	if c.timer == nil && !c.done {
+		c.timer = time.AfterFunc(wsCloseTimeout, c.expire)
+	}
+}
+
+func (c *WebSocketCtx) expire() {
+	c.mu.Lock()
+	client, origin := c.toClient.endLocked(hopClose), c.toOrigin.endLocked(hopClose)
+	c.cancelIfEndedLocked()
+	c.mu.Unlock()
+	c.toClient.finish(client)
+	c.toOrigin.finish(origin)
+}
+
+// stop keeps the close timer from outliving the handler.
+func (c *WebSocketCtx) stop() {
+	c.mu.Lock()
+	c.done = true
+	if c.timer != nil {
+		c.timer.Stop()
+	}
+	c.mu.Unlock()
+}
+
+// hopEnd is how edge ends the connection of a hop.
+type hopEnd uint8
+
+const (
+	hopOpen hopEnd = iota
+	hopClose
+	hopAbort
+)
+
+// wsHop is one connection of a WebSocket, toward the client with edge as its server or toward
+// the origin with edge as its client, and where the closing handshake stands on it. The state
+// is guarded by the mutex of c.
+type wsHop struct {
+	conn      net.Conn
+	r         io.Reader
+	c         *WebSocketCtx
+	peer      *wsHop
+	w         wsWriter
+	server    bool
+	recvClose bool
+	sentClose bool
+	eof       bool
+	ended     bool
+}
+
+func (h *wsHop) write(f Frame) error {
+	if err := h.w.write(f); err != nil {
+		if !errors.Is(err, errAfterClose) {
+			h.writeFailed()
+		}
+		return err
+	}
+	if f.opcode == OpClose {
+		h.closeCrossed(&h.sentClose)
+		h.c.mu.Lock()
+		h.c.cancelIfEndedLocked()
+		h.c.mu.Unlock()
+	}
+	return nil
+}
+
+// closeCrossed records a Close received from h or sent to h, flag being one of the two.
+func (h *wsHop) closeCrossed(flag *bool) {
+	h.c.mu.Lock()
+	*flag = true
+	end := h.settleLocked()
+	h.c.mu.Unlock()
+	h.finish(end)
+}
+
+// settleLocked ends h once both Close frames crossed it. RFC 6455 section 7.1.1 has the
+// server close the TCP connection first, so toward the origin edge waits for it, bounded.
+func (h *wsHop) settleLocked() hopEnd {
+	if !h.recvClose {
+		return hopOpen
+	}
+	if !h.sentClose {
+		if h.eof {
+			h.c.waitLocked()
+		}
+		return hopOpen
+	}
+	if h.server || h.eof {
+		return h.endLocked(hopClose)
+	}
+	h.c.waitLocked()
+	return hopOpen
+}
+
+// readEnded handles the error that ended a read of h and returns the one the reader returns.
+func (h *wsHop) readEnded(err error) error {
+	c := h.c
+	if fe, ok := errors.AsType[*frameError](err); ok {
+		// Under RFC 6455 section 7.1.7 a Close precedes the end, and the other peer reads 1001
+		// because edge leaves it.
+		c.mu.Lock()
+		toSelf, toPeer := !h.sentClose && !h.ended, !h.peer.sentClose && !h.peer.ended
+		h.sentClose, h.peer.sentClose = true, true
+		self, peer := h.endLocked(hopClose), h.peer.endLocked(hopClose)
+		c.mu.Unlock()
+		if toSelf {
+			h.writeClose(fe.code)
+		}
+		if toPeer {
+			h.peer.writeClose(closeGoingAway)
+		}
+		h.finish(self)
+		h.peer.finish(peer)
+		return err
+	}
+
+	var self, peer hopEnd
+	c.mu.Lock()
+	switch {
+	case h.ended:
+		err = io.EOF
+	case errors.Is(err, io.EOF):
+		h.eof = true
+		if h.recvClose {
+			self = h.settleLocked()
+		} else {
+			self, peer = h.endLocked(hopClose), h.peer.endLocked(hopClose)
+		}
+	case errors.Is(err, net.ErrClosed):
+		// A connection closed on this side, by a Session Close, ends the other one cleanly.
+		self, peer = h.endLocked(hopClose), h.peer.endLocked(hopClose)
+	default:
+		self, peer = h.endLocked(hopClose), h.peer.endLocked(hopAbort)
+	}
+	c.mu.Unlock()
+	h.finish(self)
+	h.peer.finish(peer)
+	return err
+}
+
+// writeClose writes a Close of edge's own, bounded so a peer that stopped reading cannot keep
+// the reader of the other hop waiting. The connection toward the origin has no deadline, so
+// it is closed once the bound passes.
+func (h *wsHop) writeClose(code uint16) {
+	_ = h.conn.SetWriteDeadline(time.Now().Add(wsCloseTimeout))
+	t := time.AfterFunc(wsCloseTimeout, func() { _ = h.conn.Close() })
+	_ = h.w.write(closeFrame(code))
+	t.Stop()
+	_ = h.conn.SetWriteDeadline(time.Time{})
+}
+
+func (h *wsHop) writeFailed() {
+	h.c.mu.Lock()
+	var self, peer hopEnd
+	if !h.ended {
+		how := hopAbort
+		if h.peer.recvClose && h.peer.sentClose {
+			how = hopClose
+		}
+		self, peer = h.endLocked(hopClose), h.peer.endLocked(how)
+	}
+	h.c.cancelIfEndedLocked()
+	h.c.mu.Unlock()
+	h.finish(self)
+	h.peer.finish(peer)
+}
+
+func (h *wsHop) endLocked(how hopEnd) hopEnd {
+	if h.ended {
+		return hopOpen
+	}
+	h.ended = true
+	return how
+}
+
+// cancelIfEndedLocked cancels the context once both hops ended. A read that ends them leaves
+// the cancel to the handler's return, so the end it reports reaches a merged reader first.
+func (c *WebSocketCtx) cancelIfEndedLocked() {
+	if c.toClient.ended && c.toOrigin.ended {
+		c.cancel()
+	}
+}
+
+func (h *wsHop) finish(how hopEnd) {
+	switch how {
+	case hopClose:
+		_ = h.conn.Close()
+	case hopAbort:
+		abort(h.conn)
+	}
 }
 
 func pumpFrames(r *FrameReader) error {
@@ -303,20 +511,35 @@ func pumpFrames(r *FrameReader) error {
 	}
 }
 
-func closeFrame(code uint16, reason string) Frame {
-	payload := make([]byte, 2+len(reason))
-	binary.BigEndian.PutUint16(payload, code)
-	copy(payload[2:], reason)
-	return Frame{opcode: OpClose, payload: payload, fin: true}
+func closeFrame(code uint16) Frame {
+	return Frame{opcode: OpClose, payload: binary.BigEndian.AppendUint16(nil, code), fin: true}
 }
 
-var errFrameTooBig = errors.New("edge: websocket frame larger than the configured limit")
+// frameError is a frame that breaks RFC 6455, and code is the status of the Close edge sends
+// to its sender.
+type frameError struct {
+	msg  string
+	code uint16
+}
 
-// wsReader reads RFC 6455 frames off a stream, unmasking what the client masked.
+func (e *frameError) Error() string { return e.msg }
+
+var errAfterClose = errors.New("edge: websocket frame written after a Close")
+
+var (
+	errFrameTooBig  = &frameError{msg: "edge: websocket frame larger than the configured limit", code: closeTooBig}
+	errFrameMask    = &frameError{msg: "edge: websocket frame masked against its direction", code: closeProtocolError}
+	errFrameLength  = &frameError{msg: "edge: websocket frame length with its most significant bit set", code: closeProtocolError}
+	errFrameControl = &frameError{msg: "edge: malformed websocket control frame", code: closeProtocolError}
+)
+
+// wsReader reads RFC 6455 frames off a stream, unmasking what the client masked. masked is
+// whether the frames must be masked, which RFC 6455 section 5.1 requires from a client only.
 type wsReader struct {
-	r   io.Reader
-	buf []byte
-	max int
+	r      io.Reader
+	buf    []byte
+	max    int
+	masked bool
 }
 
 func (r *wsReader) read() (Frame, error) {
@@ -348,22 +571,27 @@ func (r *wsReader) read() (Frame, error) {
 		length = binary.BigEndian.Uint64(ext[:])
 	}
 
-	if f.opcode.Control() {
-		// RFC 6455 section 5.5 limits a control frame to 125 bytes and forbids fragmenting
-		// it. A peer that breaks that does not implement WebSocket.
-		if length > 125 || !f.fin {
-			return Frame{}, fmt.Errorf("edge: malformed websocket control frame")
-		}
-	}
-	if r.max > 0 && length > uint64(r.max) {
-		return Frame{}, errFrameTooBig
-	}
-
+	// The key is read before the checks, so a refused header leaves nothing unread and the
+	// close reaches the peer as a FIN.
 	var key [4]byte
 	if masked {
 		if _, err := io.ReadFull(r.r, key[:]); err != nil {
 			return Frame{}, err
 		}
+	}
+
+	if masked != r.masked {
+		return Frame{}, errFrameMask
+	}
+	if length>>63 != 0 {
+		return Frame{}, errFrameLength
+	}
+	// RFC 6455 section 5.5 limits a control frame to 125 bytes and forbids fragmenting it.
+	if f.opcode.Control() && (length > 125 || !f.fin) {
+		return Frame{}, errFrameControl
+	}
+	if r.max > 0 && length > uint64(r.max) {
+		return Frame{}, errFrameTooBig
 	}
 
 	if uint64(cap(r.buf)) < length {
@@ -385,15 +613,22 @@ func (r *wsReader) read() (Frame, error) {
 // wsWriter writes RFC 6455 frames, masked when the proxy writes as a client. Writes are
 // serialized, since both directions of a relay may write to the same side.
 type wsWriter struct {
-	w    io.Writer
-	mu   sync.Mutex
-	hdr  [14]byte
-	mask bool
+	w      io.Writer
+	mu     sync.Mutex
+	hdr    [14]byte
+	mask   bool
+	closed bool
 }
 
 func (w *wsWriter) write(f Frame) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+
+	// RFC 6455 section 5.5.1 allows no data frame after a Close, and edge sends nothing at all.
+	if w.closed {
+		return errAfterClose
+	}
+	w.closed = f.opcode == OpClose
 
 	n := 2
 	w.hdr[0] = byte(f.opcode) | (f.rsv << 4)
@@ -450,6 +685,6 @@ func (w *wsWriter) write(f Frame) error {
 // of [KindWebSocket]. Only the HTTP/1.1 handshake is recognized. The RFC 8441 extended
 // CONNECT is refused with 501.
 func isWebSocketUpgrade(r *http.Request) bool {
-	return r != nil && r.ProtoMajor == 1 && r.Method == http.MethodGet &&
+	return r != nil && r.ProtoMajor == 1 && r.ProtoMinor >= 1 && r.Method == http.MethodGet &&
 		strings.EqualFold(upgradeType(r.Header), "websocket")
 }

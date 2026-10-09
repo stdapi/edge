@@ -6,6 +6,7 @@ package edge
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -15,13 +16,16 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/quic-go/qpack"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
+	"github.com/quic-go/quic-go/quicvarint"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -1074,6 +1078,50 @@ func TestLifecycle_CloseCancelsTheResolutionInFlight(t *testing.T) {
 	case <-time.After(15 * time.Second):
 		t.Fatal("the parked handshake never ended")
 	}
+}
+
+// Closing a CONNECT-UDP tunnel whose HTTP/3 client has not sent its SETTINGS answers 200 and
+// ends the stream, as a Close of any other tunnel does.
+func TestLifecycle_CloseEndsATunnelWaitingForSettings(t *testing.T) {
+	p, ca, front, origin := masqueProxy(t)
+	qc := dialQUICFront(t, front, ca)
+
+	// No control stream, so no SETTINGS.
+	var fields bytes.Buffer
+	enc := qpack.NewEncoder(&fields)
+	for _, f := range []qpack.HeaderField{
+		{Name: ":method", Value: http.MethodConnect},
+		{Name: ":protocol", Value: connectUDPUpgrade},
+		{Name: ":scheme", Value: "https"},
+		{Name: ":authority", Value: front.String()},
+		{Name: ":path", Value: connectUDPTargetPath(h3Authority, strconv.Itoa(int(origin.Port())))},
+		{Name: "capsule-protocol", Value: "?1"},
+	} {
+		require.NoError(t, enc.WriteField(f))
+	}
+	frame := quicvarint.Append(quicvarint.Append(nil, 0x01), uint64(fields.Len()))
+	str, err := qc.OpenStreamSync(t.Context())
+	require.NoError(t, err)
+	_, err = str.Write(append(frame, fields.Bytes()...))
+	require.NoError(t, err)
+
+	tunnel := waitForSessions(t, p, 1)[0]
+	require.True(t, tunnel.Tunnel())
+	require.NoError(t, tunnel.Close())
+
+	require.NoError(t, str.SetReadDeadline(time.Now().Add(3*time.Second)))
+	answer, err := io.ReadAll(str)
+	require.NoError(t, err, "the stream did not end after the Close")
+	typ, n, err := quicvarint.Parse(answer)
+	require.NoError(t, err)
+	require.Equal(t, uint64(0x01), typ, "the stream opens with a HEADERS frame")
+	length, m, err := quicvarint.Parse(answer[n:])
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, uint64(len(answer)-n-m), length)
+	status, err := qpack.NewDecoder().Decode(answer[n+m : n+m+int(length)])()
+	require.NoError(t, err)
+	assert.Equal(t, qpack.HeaderField{Name: ":status", Value: "200"}, status)
+	waitForSessions(t, p, 0)
 }
 
 func TestLifecycle_CloseEndsASOCKS5Connection(t *testing.T) {
