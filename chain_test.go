@@ -40,8 +40,6 @@ func fixedProxy(raw string) func(*http.Request) (*url.URL, error) {
 	return func(*http.Request) (*url.URL, error) { return u, err }
 }
 
-// A TCP stream reaches its origin with a CONNECT to the proxy Transport.Proxy selects, which
-// is asked with the destination as a URL, and the proxy is the only address the front dials.
 func TestChain_TCPStreamThroughCONNECT(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -89,8 +87,6 @@ func TestChain_TCPStreamThroughCONNECT(t *testing.T) {
 	assert.Equal(t, KindTCP, sess.Kind())
 }
 
-// Credentials in the proxy URL are sent as a Basic Proxy-Authorization, and a proxy that
-// refuses the CONNECT fails the dial with its status.
 func TestChain_CONNECTCarriesTheCredentials(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -128,8 +124,6 @@ func TestChain_CONNECTCarriesTheCredentials(t *testing.T) {
 	assert.Contains(t, err.Error(), "407")
 }
 
-// A datagram flow reaches its origin through a CONNECT-UDP tunnel to the proxy, and every
-// tunnel to one proxy shares one HTTP/3 connection.
 func TestChain_DatagramFlowThroughCONNECTUDP(t *testing.T) {
 	echo := udpEcho(t)
 	ca, err := GenerateCA()
@@ -176,8 +170,6 @@ func TestChain_DatagramFlowThroughCONNECTUDP(t *testing.T) {
 	front.srv.fwd.up.mu.Unlock()
 }
 
-// A QUIC connection a handler dials runs inside a CONNECT-UDP tunnel to the proxy, which
-// terminates it in turn.
 func TestChain_QUICConnectionThroughCONNECTUDP(t *testing.T) {
 	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
 	require.NoError(t, err)
@@ -229,7 +221,6 @@ func TestChain_QUICConnectionThroughCONNECTUDP(t *testing.T) {
 	assert.Same(t, tunnel, inner.Via())
 }
 
-// An HTTP/3 upstream runs inside a CONNECT-UDP tunnel to the proxy.
 func TestChain_H3UpstreamThroughCONNECTUDP(t *testing.T) {
 	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
 	require.NoError(t, err)
@@ -274,7 +265,6 @@ func TestChain_H3UpstreamThroughCONNECTUDP(t *testing.T) {
 	waitForSessions(t, back, 2)
 }
 
-// What the selected proxy cannot serve fails the dial, and nothing goes around it.
 func TestChain_RefusesWhatTheProxyCannotCarry(t *testing.T) {
 	tr := DefaultTransport()
 	tr.Proxy = fixedProxy("ftp://127.0.0.1:1")
@@ -309,8 +299,6 @@ func fakeProxy(t *testing.T, reply func(w io.Writer)) string {
 	return ln.Addr().String()
 }
 
-// A refused CONNECT fails the dial with the status the proxy answered, without waiting for a
-// body the proxy never finishes.
 func TestChain_RefusedCONNECTReportsTheStatus(t *testing.T) {
 	proxy := fakeProxy(t, func(w io.Writer) {
 		_, _ = io.WriteString(w, "HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 100\r\n\r\nhello")
@@ -327,8 +315,6 @@ func TestChain_RefusedCONNECTReportsTheStatus(t *testing.T) {
 	assert.Less(t, time.Since(start), time.Second)
 }
 
-// The response to a CONNECT is read up to a bound, so a proxy that never ends its headers
-// fails the dial instead of growing them without limit.
 func TestChain_CONNECTResponseIsBounded(t *testing.T) {
 	proxy := fakeProxy(t, func(w io.Writer) {
 		_, _ = io.WriteString(w, "HTTP/1.1 200 OK\r\n")
@@ -371,8 +357,6 @@ func (c *silencedPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	return c.PacketConn.WriteTo(b, addr)
 }
 
-// A flow ends when the connection to its proxy dies in silence, so a client is not left with a
-// dead tunnel until the flow idles out.
 func TestChain_DeadProxyEndsTheFlow(t *testing.T) {
 	echo := udpEcho(t)
 	ca, err := GenerateCA()
@@ -416,8 +400,6 @@ func TestChain_DeadProxyEndsTheFlow(t *testing.T) {
 		10*time.Second, 50*time.Millisecond, "the flow outlived its tunnel")
 }
 
-// An HTTP request with a declared destination, a CONNECT target, reaches it with a CONNECT to
-// the proxy Transport.Proxy selects.
 func TestChain_HTTPWithDeclaredDestinationThroughCONNECT(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -503,8 +485,6 @@ func echoThrough(t *testing.T, frontAddr netip.AddrPort, msgs ...string) {
 	}
 }
 
-// A proxy whose dial over HTTP/3 fails is dialed over TCP, the tunnel a GET the proxy
-// upgrades, and the failure is remembered so the next tunnel does not try HTTP/3 again.
 func TestChain_DatagramFlowThroughCONNECTUDPUpgrade(t *testing.T) {
 	echo := udpEcho(t)
 	ca, err := GenerateCA()
@@ -534,8 +514,6 @@ func TestChain_DatagramFlowThroughCONNECTUDPUpgrade(t *testing.T) {
 	assert.True(t, front.srv.fwd.up.remembers(noH3Dial, &url.URL{Scheme: "https", Host: backFront.String()}))
 }
 
-// A plain http proxy carries CONNECT-UDP the way it carries CONNECT, in the clear, and HTTP/3
-// is never tried on it.
 func TestChain_PlainProxyCarriesCONNECTUDP(t *testing.T) {
 	echo := udpEcho(t)
 	ca, err := GenerateCA()
@@ -553,7 +531,6 @@ func TestChain_PlainProxyCarriesCONNECTUDP(t *testing.T) {
 	assert.EqualValues(t, 1, dialer.tcp.Load())
 }
 
-// An HTTP/3 upstream runs inside a tunnel over TCP.
 func TestChain_H3UpstreamThroughCONNECTUDPUpgrade(t *testing.T) {
 	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
 	require.NoError(t, err)
@@ -598,8 +575,6 @@ func TestChain_H3UpstreamThroughCONNECTUDPUpgrade(t *testing.T) {
 	}
 }
 
-// A refusal the proxy answers on a connection that exists is final, the dial fails with the
-// status and nothing is tried another way.
 func TestChain_RefusedCONNECTUDPIsFinal(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -618,7 +593,6 @@ func TestChain_RefusedCONNECTUDPIsFinal(t *testing.T) {
 	assert.EqualValues(t, 2, dialer.tcp.Load())
 }
 
-// A proxy that goes away ends the flows tunnelled over TCP through it.
 func TestChain_DeadProxyEndsTheFlowOverTCP(t *testing.T) {
 	echo := udpEcho(t)
 	ca, err := GenerateCA()
@@ -638,9 +612,6 @@ func TestChain_DeadProxyEndsTheFlowOverTCP(t *testing.T) {
 		10*time.Second, 50*time.Millisecond, "the flow outlived its tunnel")
 }
 
-// A proxy whose HTTP/2 lacks extended CONNECT, which Go's server does unless it runs with
-// GODEBUG=http2xconnect=1, is reached over HTTP/1.1 on another connection, and remembered.
-// The HTTP/2 connection stays for the CONNECT tunnels, which need no extended CONNECT.
 func TestChain_H2ProxyWithoutExtendedConnectUpgradesOverHTTP11(t *testing.T) {
 	if extendedConnectEnabled() {
 		t.Skip("Go's server accepts extended CONNECT under GODEBUG=http2xconnect=1")
@@ -672,8 +643,6 @@ func TestChain_H2ProxyWithoutExtendedConnectUpgradesOverHTTP11(t *testing.T) {
 	assert.EqualValues(t, 3, dialer.tcp.Load(), "the CONNECT went on the HTTP/2 connection")
 }
 
-// Tunnels share one HTTP/2 connection to a proxy that speaks extended CONNECT, an edge front
-// running with GODEBUG=http2xconnect=1.
 func TestChain_DatagramFlowThroughCONNECTUDPOverHTTP2(t *testing.T) {
 	if !extendedConnectEnabled() {
 		t.Skip("run with GODEBUG=http2xconnect=1, Go's HTTP/2 server refuses extended CONNECT without it")
@@ -707,7 +676,6 @@ func TestChain_DatagramFlowThroughCONNECTUDPOverHTTP2(t *testing.T) {
 	assert.EqualValues(t, 1, dialer.tcp.Load())
 }
 
-// An HTTP/3 upstream runs inside a tunnel on the HTTP/2 connection to the proxy.
 func TestChain_H3UpstreamThroughCONNECTUDPOverHTTP2(t *testing.T) {
 	if !extendedConnectEnabled() {
 		t.Skip("run with GODEBUG=http2xconnect=1, Go's HTTP/2 server refuses extended CONNECT without it")
@@ -749,8 +717,6 @@ func TestChain_H3UpstreamThroughCONNECTUDPOverHTTP2(t *testing.T) {
 	}
 }
 
-// A tunnel refused on the HTTP/2 connection the dial just opened leaves that connection
-// shared for the next tunnel.
 func TestChain_RefusedCONNECTUDPLeavesTheHTTP2ConnectionShared(t *testing.T) {
 	if !extendedConnectEnabled() {
 		t.Skip("run with GODEBUG=http2xconnect=1, Go's HTTP/2 server refuses extended CONNECT without it")
@@ -817,8 +783,6 @@ func h2Peer(t *testing.T, nc net.Conn) chan<- uint32 {
 	return goAway
 }
 
-// An HTTP/2 connection to a proxy replaced after a GOAWAY, with a tunnel still on it, ends
-// with the dialer like the one that replaced it.
 func TestChain_ReplacedHTTP2ConnectionEndsWithTheDialer(t *testing.T) {
 	u := newUpstreamDialer(&Transport{})
 	proxy, err := url.Parse("https://proxy.test:443")
@@ -932,8 +896,6 @@ func (p *h2Proxies) dialer(t *testing.T) *upstreamDialer {
 	return u
 }
 
-// A tunnel opened on a pooled HTTP/2 connection the proxy dropped meanwhile is opened again
-// on a fresh one, the proxy having seen nothing of it.
 func TestChain_StaleH2ConnectionIsRetried(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -953,8 +915,6 @@ func TestChain_StaleH2ConnectionIsRetried(t *testing.T) {
 	assert.EqualValues(t, 2, proxies.dials.Load())
 }
 
-// A pooled HTTP/2 connection at the proxy's stream limit is left to its tunnels and a fresh
-// one opened, and it ends once those tunnels end.
 func TestChain_FullH2ConnectionOpensAnother(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -981,9 +941,6 @@ func TestChain_FullH2ConnectionOpensAnother(t *testing.T) {
 	}
 }
 
-// An HTTP/2 request with no declared destination, sent to a TLS front without a CONNECT, is
-// forwarded through an https proxy that offers h2. net/http would offer the proxy the h2 pool's
-// ALPN list and write its CONNECT on the HTTP/2 connection the proxy selected.
 func TestChain_H2RequestWithNoDeclaredDestinationThroughTLSProxy(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -1064,8 +1021,6 @@ func getThroughTunnel(t *testing.T, addr, port string, ca *CA) {
 	assert.Equal(t, "origin host=inner.test", string(body))
 }
 
-// A TCP stream reaches its origin through a CONNECT stream on the HTTP/2 connection to a
-// proxy that offers h2 alone, and every tunnel to one proxy shares that connection.
 func TestChain_TCPStreamThroughCONNECTOverHTTP2(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -1086,9 +1041,6 @@ func TestChain_TCPStreamThroughCONNECTOverHTTP2(t *testing.T) {
 	waitForSessions(t, back, 2)
 }
 
-// A proxy that answers on UDP alone is reached over HTTP/3 once TCP refused the connection,
-// and every tunnel shares that connection. The refusal is not remembered, so a tunnel opened
-// after the connection ended tries TCP again.
 func TestChain_TCPStreamThroughCONNECTOverHTTP3(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -1148,8 +1100,6 @@ func startDualFront(t *testing.T, p *Proxy, ca *CA) netip.AddrPort {
 	return netip.MustParseAddrPort(ln.Addr().String())
 }
 
-// A tunnel to a proxy that answers on TCP and on UDP goes over TCP, and on the HTTP/3
-// connection to the proxy once a datagram flow has opened one.
 func TestChain_TCPStreamJoinsTheHTTP3ConnectionAFlowOpened(t *testing.T) {
 	echo := udpEcho(t)
 	ca, err := GenerateCA()
@@ -1179,8 +1129,6 @@ func TestChain_TCPStreamJoinsTheHTTP3ConnectionAFlowOpened(t *testing.T) {
 	assert.EqualValues(t, 1, dialer.tcp.Load())
 }
 
-// An HTTP/3 connection the proxy is closing is left to its tunnels, and dropped for the next
-// CONNECT.
 func TestChain_HTTP3ConnectionGoingAwayIsLeft(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -1211,8 +1159,6 @@ func TestChain_HTTP3ConnectionGoingAwayIsLeft(t *testing.T) {
 	assert.Equal(t, "ping", string(buf), "the tunnel on the connection going away lives on")
 }
 
-// A proxy answering neither on TCP nor on UDP fails one dial with both errors, and the next
-// dials try TCP alone.
 func TestChain_ProxyDownOnBothIsDialedOverTCPAlone(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -1267,8 +1213,6 @@ func versionedProxy(t *testing.T, ca *CA) netip.AddrPort {
 	return netip.MustParseAddrPort(ln.Addr().String())
 }
 
-// A proxy that answers a CONNECT with 405 over HTTP/3 and over HTTP/2 gets it over HTTP/1.1,
-// and the next CONNECT goes there at once.
 func TestChain_CONNECTNotServedOverHTTP3AndHTTP2GoesOverHTTP11(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -1303,8 +1247,6 @@ func TestChain_CONNECTNotServedOverHTTP3AndHTTP2GoesOverHTTP11(t *testing.T) {
 	assert.EqualValues(t, 1, dialer.udp.Load())
 }
 
-// A CONNECT the proxy refuses on the HTTP/2 connection fails with the status, and leaves the
-// connection shared.
 func TestChain_RefusedCONNECTLeavesTheHTTP2ConnectionShared(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -1323,8 +1265,6 @@ func TestChain_RefusedCONNECTLeavesTheHTTP2ConnectionShared(t *testing.T) {
 	assert.EqualValues(t, 1, dialer.tcp.Load(), "the refusal did not cost the connection")
 }
 
-// A CONNECT opened on a pooled HTTP/2 connection the proxy dropped meanwhile is opened again
-// on a fresh one, the proxy having seen nothing of it.
 func TestChain_StaleH2ConnectionIsRetriedForCONNECT(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -1344,8 +1284,6 @@ func TestChain_StaleH2ConnectionIsRetriedForCONNECT(t *testing.T) {
 	assert.EqualValues(t, 2, proxies.dials.Load())
 }
 
-// A tunnel over HTTP/3 is a connection. A read deadline cuts a read short without losing what
-// arrives after it, and a half-close reaches the origin.
 func TestChain_TunnelOverHTTP3IsAConnection(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -1394,7 +1332,6 @@ func TestChain_TunnelOverHTTP3IsAConnection(t *testing.T) {
 	assert.Equal(t, "got:\x00hello", string(got))
 }
 
-// A write past its deadline resets its stream, and no other on the connection.
 func TestChain_WriteDeadlineResetsTheStreamAlone(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -1465,8 +1402,6 @@ func h3ConnectEcho(t *testing.T, ca *CA) (netip.AddrPort, *http3.Server) {
 	return netip.MustParseAddrPort(pc.LocalAddr().String()), srv
 }
 
-// An HTTP/3 proxy without CONNECT-UDP leaves no failed dial remembered, and the CONNECT
-// tunnels go on the connection the datagram flow opened to it.
 func TestChain_H3ProxyWithoutCONNECTUDPCarriesCONNECT(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -1492,7 +1427,6 @@ func TestChain_H3ProxyWithoutCONNECTUDPCarriesCONNECT(t *testing.T) {
 	assert.EqualValues(t, 1, dialer.udp.Load(), "the CONNECT went on the HTTP/3 connection")
 }
 
-// Concurrent CONNECTs to a proxy the dialer has no connection to share one dial over HTTP/3.
 func TestChain_ConcurrentCONNECTsShareOneHTTP3Dial(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -1518,8 +1452,6 @@ func TestChain_ConcurrentCONNECTsShareOneHTTP3Dial(t *testing.T) {
 	assert.EqualValues(t, 1, dialer.udp.Load(), "one dial over HTTP/3 for all")
 }
 
-// A caller waiting for the dial of a proxy over HTTP/3 dials itself when that dial ended with
-// the context of the caller that started it.
 func TestChain_WaiterDialsWhenTheHTTP3DialWasCancelled(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -1566,7 +1498,6 @@ func TestChain_WaiterDialsWhenTheHTTP3DialWasCancelled(t *testing.T) {
 	assert.EqualValues(t, 2, udpDials.Load())
 }
 
-// Concurrent CONNECTs to an h2 proxy the dialer has no connection to share one dial over TCP.
 func TestChain_ConcurrentCONNECTsShareOneHTTP2Dial(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -1628,8 +1559,6 @@ func fakeProxyTLS(t *testing.T, ca *CA, protos []string, hello func(), reply fun
 	return ln.Addr().String()
 }
 
-// Concurrent CONNECTs to a proxy that negotiates http/1.1 wait for the first dial to find that
-// out, and each dials its own connection from then on.
 func TestChain_HTTP11ProxyIsDialedOncePerCONNECTOnceKnown(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -1685,8 +1614,6 @@ func TestChain_HTTP11ProxyIsDialedOncePerCONNECTOnceKnown(t *testing.T) {
 	assert.True(t, u.remembers(noH2, proxy))
 }
 
-// Concurrent CONNECTs to a proxy whose TLS handshake fails each get that error, one having
-// waited for the first dial.
 func TestChain_ConcurrentCONNECTsToAFailingProxyEachFail(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -1721,8 +1648,6 @@ func TestChain_ConcurrentCONNECTsToAFailingProxyEachFail(t *testing.T) {
 	assert.EqualValues(t, 8, dialer.tcp.Load())
 }
 
-// Concurrent CONNECTs to an h2 proxy that allows one stream per connection each get a
-// connection, one having waited for the first dial.
 func TestChain_ConcurrentCONNECTsToAOneStreamProxyEachSucceed(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -1745,10 +1670,6 @@ func TestChain_ConcurrentCONNECTsToAOneStreamProxyEachSucceed(t *testing.T) {
 	assert.GreaterOrEqual(t, proxies.dials.Load(), int32(8), "one connection per CONNECT at least")
 }
 
-// A request goes through the proxy Transport.Proxy selects for it, so a change of its answer
-// governs the next request whatever connection the last one left idle, and the connections
-// through each proxy stay pooled apart, the one through the first proxy reused once it is
-// selected again.
 func TestChain_RequestFollowsTheProxySwitch(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -1859,8 +1780,6 @@ func TestChain_RequestFollowsTheProxySwitch(t *testing.T) {
 	})
 }
 
-// A pool is keyed on the proxy Transport.Proxy selects, so two proxies never share a
-// connection and no proxy keeps the shared pool.
 func TestChain_PoolPerProxy(t *testing.T) {
 	tr := DefaultTransport()
 	selected := new(atomic.Pointer[url.URL])
@@ -1916,8 +1835,6 @@ func TestChain_PoolPerProxy(t *testing.T) {
 	assert.Equal(t, 3, f.pools.Len())
 }
 
-// A proxy whose dial over TCP timed out is dialed over HTTP/3 first for proxyRetry, and one
-// that refused the dial is dialed over TCP again, the refusal having cost nothing.
 func TestChain_RefusedTCPDialIsNotRemembered(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -1946,8 +1863,6 @@ func TestChain_RefusedTCPDialIsNotRemembered(t *testing.T) {
 	}
 }
 
-// A TCP stream reaches its origin with a CONNECT to a SOCKS5 proxy, the destination sent as
-// the hostname for the proxy to resolve, and the proxy is the only address the front dials.
 func TestChain_TCPStreamThroughSOCKS5(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -1996,8 +1911,6 @@ func TestChain_TCPStreamThroughSOCKS5(t *testing.T) {
 	}
 }
 
-// An HTTP request with a declared destination reaches its origin through a SOCKS5 proxy as
-// well, the fixed pools dialing through the same dialer.
 func TestChain_HTTPWithDeclaredDestinationThroughSOCKS5(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -2036,8 +1949,6 @@ func TestChain_HTTPWithDeclaredDestinationThroughSOCKS5(t *testing.T) {
 	assert.Equal(t, []string{"tcp " + backAddr}, dialed.all())
 }
 
-// The credentials of a socks5 URL are sent with the username/password method, and a proxy
-// that refuses them, or offers no method the dialer has, fails the dial.
 func TestChain_SOCKS5CarriesTheCredentials(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -2135,7 +2046,6 @@ func fakeSOCKS5(t *testing.T, rep byte) string {
 	return ln.Addr().String()
 }
 
-// A refused CONNECT fails the dial with the reply of the proxy.
 func TestChain_RefusedSOCKS5CONNECTReportsTheReply(t *testing.T) {
 	proxy := fakeSOCKS5(t, 2)
 	tr := DefaultTransport()
@@ -2149,8 +2059,6 @@ func TestChain_RefusedSOCKS5CONNECTReportsTheReply(t *testing.T) {
 	assert.Less(t, time.Since(start), time.Second)
 }
 
-// A datagram flow reaches its origin through a UDP ASSOCIATE with a SOCKS5 proxy, one
-// association per flow, and the proxy is the only address the front dials.
 func TestChain_DatagramFlowThroughSOCKS5(t *testing.T) {
 	echo := udpEcho(t)
 	ca, err := GenerateCA()
@@ -2181,8 +2089,6 @@ func TestChain_DatagramFlowThroughSOCKS5(t *testing.T) {
 	assert.EqualValues(t, 2, dialer.udp.Load(), "one relay socket per association")
 }
 
-// An HTTP/3 upstream runs inside a UDP ASSOCIATE with a SOCKS5 proxy, which terminates the
-// connection on its own stack.
 func TestChain_H3UpstreamThroughSOCKS5(t *testing.T) {
 	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
 	require.NoError(t, err)
@@ -2236,7 +2142,6 @@ func TestChain_H3UpstreamThroughSOCKS5(t *testing.T) {
 	assert.Same(t, assoc, inner.Via())
 }
 
-// A proxy answering a UDP ASSOCIATE with a refusal fails the dial with its reply.
 func TestChain_RefusedSOCKS5AssociateReportsTheReply(t *testing.T) {
 	proxy := fakeSOCKS5(t, 7)
 	tr := DefaultTransport()

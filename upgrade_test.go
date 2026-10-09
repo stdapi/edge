@@ -158,9 +158,6 @@ func dialThroughProxy(t *testing.T, proxyAddr, authority string, ca *CA) (*tls.C
 
 const upgradeRequest = "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\n"
 
-// A redirected plaintext connection is reported under the authority of its first request,
-// and so is the pipe an upgrade leaves on it, because past the 101 nothing on it is routed
-// again.
 func TestUpgrade_TransparentPlaintextPipeIsListedAndClosed(t *testing.T) {
 	origin := plainUpgradeOrigin(t)
 	originURL, _ := url.Parse(origin.URL)
@@ -205,9 +202,6 @@ func TestUpgrade_TransparentPlaintextPipeIsListedAndClosed(t *testing.T) {
 	waitForSessions(t, p, 0)
 }
 
-// A request routes on its Host header, which on an intercepted connection can differ from the
-// CONNECT authority. Without a session of its own the pipe would hide behind a connection the
-// sweep still accepts.
 func TestUpgrade_HostDivergesFromTheConnectAuthority(t *testing.T) {
 	origin := upgradeOrigin(t)
 	originURL, _ := url.Parse(origin.URL)
@@ -262,8 +256,6 @@ func TestUpgrade_HostDivergesFromTheConnectAuthority(t *testing.T) {
 	assert.Equal(t, true, p.Admits(target("a.example.test:443"), KindHTTP))
 }
 
-// The tree can change while the upstream is answering. The pipe is registered before the 101
-// reaches the client, so a refusal is an ordinary status and not a granted upgrade torn down.
 func TestUpgrade_RefusedWhenTheRouteGoesAwayFirst(t *testing.T) {
 	origin := upgradeOrigin(t)
 	originURL, _ := url.Parse(origin.URL)
@@ -308,8 +300,6 @@ func TestUpgrade_RefusedWhenTheRouteGoesAwayFirst(t *testing.T) {
 	assert.Equal(t, KindHTTP, sessions[0].Kind())
 }
 
-// A hijacked connection is one http.Server neither closes nor waits for, so without the pipe
-// being tracked a shutdown would return while it is still relaying.
 func TestUpgrade_CloseEndsAPipeOnAFrontConnection(t *testing.T) {
 	origin := plainUpgradeOrigin(t)
 	originURL, _ := url.Parse(origin.URL)
@@ -403,8 +393,6 @@ func TestUpgrade_StreamOutlivesTheClientHalfClose(t *testing.T) {
 	}
 }
 
-// The context of a merging handler outlives the close of the client hop, and the merged
-// reader ends on the end of the connection, never on the context.
 func TestUpgrade_WebSocketMergedReaderEndsOnTheConnection(t *testing.T) {
 	errs := make(chan error, 2)
 	ws := openWS(t, wsConf{handler: func(c *WebSocketCtx) error {
@@ -489,8 +477,6 @@ func (p *stalledPipe) Close() error {
 	return nil
 }
 
-// The Close edge sends toward an origin that stopped reading ends once the bound passes,
-// although the connection toward the origin has no write deadline.
 func TestUpgrade_WebSocketCloseTowardTheOriginIsBounded(t *testing.T) {
 	t.Parallel()
 	client := &stalledPeer{wake: make(chan struct{})}

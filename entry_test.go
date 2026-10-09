@@ -45,8 +45,6 @@ func TestEntry_Accessors(t *testing.T) {
 	assert.Contains(t, e.String(), "pattern:api.stripe.com:8443/")
 }
 
-// The handler signature is what selects the kind, so an entry knows its own without being
-// told, and the handler comes back typed.
 func TestEntry_KindComesFromTheHandler(t *testing.T) {
 	p := testProxy(t)
 
@@ -61,8 +59,6 @@ func TestEntry_KindComesFromTheHandler(t *testing.T) {
 	assert.NotZero(t, e.Handler(), "the handler comes back with the signature it was given")
 }
 
-// Two entries on one path differing only by their method are two entries: the methods are
-// matchers, and matchers are part of what identifies an entry.
 func TestEntry_MethodsIdentifyAnEntry(t *testing.T) {
 	p := testProxy(t)
 	get := p.MustAdd("api.test/v1", noopHandler, WithMethods[HTTP](http.MethodGet))
@@ -74,8 +70,6 @@ func TestEntry_MethodsIdentifyAnEntry(t *testing.T) {
 	assert.Equal(t, post, lookupHTTP(p, "api.test/v1", mustMethods(http.MethodPost)))
 }
 
-// A middleware wraps the kind of its own signature, and an entry takes no other. The compiler
-// refuses it, and registration refuses what a reassembled method set wrote.
 func TestEntry_MiddlewareOfAnotherKindIsRefused(t *testing.T) {
 	p := testProxy(t)
 
@@ -91,8 +85,6 @@ func TestEntry_MiddlewareOfAnotherKindIsRefused(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// An entry setting overrides the proxy default in both directions, and it is the lookup that
-// obeys it.
 func TestEntry_TrailingSlashOverridesTheProxyDefault(t *testing.T) {
 	zero := Entry[HTTP]{}
 
@@ -132,8 +124,6 @@ func TestEntry_NameLookup(t *testing.T) {
 	assert.False(t, ok)
 }
 
-// Middleware wraps the handler the proxy runs, and [Entry.Handler] returns what was
-// registered, without it.
 func TestEntry_HandlerIsWhatWasRegistered(t *testing.T) {
 	p := testProxy(t)
 

@@ -43,8 +43,8 @@ jobs:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
 
   conformance:
-    # The conformance suite drives the proxy with curl rather than a Go client, so a bug the
-    # proxy and a Go client would share cannot hide.
+    # These tests drive the proxy with curl and grpcurl, so a bug the proxy and a Go
+    # client would share cannot hide.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -59,7 +59,7 @@ jobs:
           curl --version | grep -q HTTP3 || echo "no HTTP/3 in this curl, those tests will be skipped"
 
       - name: Conformance
-        run: go test -count=1 -run 'TestConformance|TestQUIC' -v ./...
+        run: go test -count=1 -run 'TestCurl|TestGRPCurl' -v .
 
   fuzz:
     runs-on: ubuntu-latest

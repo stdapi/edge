@@ -324,7 +324,6 @@ func TestTransparent_OriginalDestinationPlacesTheConnection(t *testing.T) {
 	assert.Contains(t, string(out), "reached by address")
 }
 
-// A transparent listener carries many authorities, so each request is decided on its own.
 func TestTransparent_PlaintextRejectsAnUnnamedAuthority(t *testing.T) {
 	reached := new(atomic.Bool)
 	origin := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
@@ -350,9 +349,6 @@ func TestTransparent_PlaintextRejectsAnUnnamedAuthority(t *testing.T) {
 	assert.False(t, reached.Load(), "a rejected authority must not be forwarded to")
 }
 
-// A redirected plaintext connection the platform reports no destination for has no authority
-// of its own: each request names one, and each is routed on its own. Nothing can serve it as a
-// stream, since by the time an authority is known the bytes have been parsed.
 func TestTransparent_PlaintextWithoutADestinationRoutesPerRequest(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprint(w, "origin reached")
@@ -465,8 +461,6 @@ func TestTransparent_SessionReportsTheRedirect(t *testing.T) {
 	assert.True(t, transparent.Load(), "a redirected TLS connection is a transparent one")
 }
 
-// A lookup on a connection that was not redirected answers with the listener's own address.
-// Taking it at face value would send the proxy back into its own socket.
 func TestTransparent_OriginalDestinationPointingAtTheListenerIsIgnored(t *testing.T) {
 	ca, _ := GenerateCA()
 
@@ -529,9 +523,6 @@ func TestTransparent_PacketConnAnswersOnlyForTheDatagramItRead(t *testing.T) {
 	assert.False(t, dst.IsValid())
 }
 
-// A redirected plaintext connection resolves to the address it was headed to, never to an
-// authority. Deciding it at connection level would refuse it, since no entry matches the
-// origin by its address, so each request is decided on its own Host header instead.
 func TestTransparent_PlaintextWithOriginalDestination(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "origin got host=%s", r.Host)
@@ -639,8 +630,6 @@ func TestTransparent_RawTCPTunnelByDestination(t *testing.T) {
 	require.Error(t, err, "closing the session cuts the connection")
 }
 
-// A connection that is neither TLS nor claimed by a tunnel keeps today's path: parsed as a
-// plaintext request, which these bytes are not, so it is closed.
 func TestTransparent_RawTCPRejectedWithoutTunnel(t *testing.T) {
 	origin := tcpEchoOrigin(t)
 
@@ -670,11 +659,6 @@ func TestTransparent_RawTCPRejectedWithoutTunnel(t *testing.T) {
 	assert.Empty(t, slices.Collect(p.Sessions()))
 }
 
-// A tunnel entry says to leave the connection alone, so bytes that would parse as HTTP go
-// through untouched rather than being intercepted on their Host header.
-// A plaintext request is routed on its authority, so a stream entry takes it when it admits
-// that authority, and an entry on the destination alone takes only a request whose authority
-// is the destination.
 func TestTransparent_StreamEntryOnTheAuthorityWinsOverHTTPParsing(t *testing.T) {
 	origin := tcpEchoOrigin(t)
 
@@ -801,9 +785,6 @@ func TestTransparent_TProxyTCPPlacesByTheSocketAddress(t *testing.T) {
 	assert.Equal(t, origin, sessions[0].Upstream())
 }
 
-// A stream entry naming a destination serves it even when a request entry admits the same
-// destination for HTTP. What the connection is comes from its bytes, and the kinds are tried
-// most refined first against the destination, not one against the other by hand.
 func TestTransparent_StreamAndHTTPOnOneDestination(t *testing.T) {
 	origin := tcpEchoOrigin(t)
 
@@ -849,9 +830,6 @@ func (l *countingListener) Accept() (net.Conn, error) {
 	return c, err
 }
 
-// Under plaintext no certificate ties a pooled connection to its name, so the pool is keyed on
-// the destination. A client headed to one origin never uses the connection another client
-// opened to a different one, and two clients headed to the same origin share it.
 func TestTransparent_PlainPoolIsKeyedOnTheDestination(t *testing.T) {
 	var toA countingListener
 	a, b := twoOriginsOnOnePort(t, func(ln net.Listener, id string) {
@@ -900,10 +878,6 @@ func TestTransparent_PlainPoolIsKeyedOnTheDestination(t *testing.T) {
 	assert.EqualValues(t, 1, toA.accepted.Load(), "two clients headed to A share one upstream connection")
 }
 
-// A redirected plaintext connection is decided on the authority of its first request, as a TLS
-// connection is decided on its server name, so an entry on that host takes it ahead of a stream
-// entry on every address. A connection opening with the HTTP/2 preface has no authority
-// before the server sends its SETTINGS, so its destination decides it.
 func TestTransparent_PlaintextIsDecidedOnItsFirstAuthority(t *testing.T) {
 	type counters struct {
 		served, streamed atomic.Int32
@@ -1000,8 +974,6 @@ func TestTransparent_PlaintextIsDecidedOnItsFirstAuthority(t *testing.T) {
 	})
 }
 
-// A CONNECT reaching a terminated connection is a client that takes the origin for a proxy.
-// Its target has no path, and a lookup without one reaches the admission of its authority.
 func TestTransparent_PlaintextConnectIsRefused(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprint(w, "origin reached")
@@ -1030,8 +1002,6 @@ func TestTransparent_PlaintextConnectIsRefused(t *testing.T) {
 	assert.Equal(t, http.StatusNotImplemented, resp.StatusCode)
 }
 
-// gRPC over plaintext opens with the HTTP/2 preface, so its connection is decided on the
-// destination and its calls on their authority.
 func TestTransparent_PlaintextGRPCIsDecidedOnItsDestination(t *testing.T) {
 	setup := func(t *testing.T, streamEntry bool) (*http.Client, *atomic.Int32, *atomic.Int32, *atomic.Int32) {
 		t.Helper()
@@ -1100,10 +1070,6 @@ func TestTransparent_PlaintextGRPCIsDecidedOnItsDestination(t *testing.T) {
 	})
 }
 
-// Name verification stands between the authority a plaintext connection is decided on and
-// its destination, as it does for a server name. A name confirmed routes, a name refused
-// under VerifyReject is admitted by nothing, whatever admits the destination, and a name
-// dropped under VerifyLoose leaves the destination to decide.
 func TestTransparent_PlaintextAuthorityIsVerified(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprint(w, "origin reached")
@@ -1167,9 +1133,6 @@ func TestTransparent_PlaintextAuthorityIsVerified(t *testing.T) {
 	})
 }
 
-// The peek for the authority is bounded by the header size the server accepts and by the
-// header timeout. Past the size the destination decides and the server answers 431, past the
-// timeout the proxy answers 408.
 func TestTransparent_PlaintextAuthorityPeekIsBounded(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprint(w, "origin reached")
@@ -1223,9 +1186,6 @@ func TestTransparent_PlaintextAuthorityPeekIsBounded(t *testing.T) {
 	})
 }
 
-// The name the first request gives replaces the host of the connection's authority and nothing
-// else. The port stays the destination's, as it does under a server name, so a request with a
-// port is routed on that port alone and a later one without is routed on the connection's.
 func TestTransparent_PlaintextPortStaysTheDestinations(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprint(w, "origin reached")

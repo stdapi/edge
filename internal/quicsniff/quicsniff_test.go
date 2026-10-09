@@ -220,9 +220,6 @@ func TestParseLongHeader(t *testing.T) {
 	assert.False(t, quicsniff.IsInitial(0xc3, 0x12345678))
 }
 
-// FuzzReassembler feeds arbitrary bytes to the QUIC Initial parser. Everything it reads is
-// written by an unauthenticated peer, before any handshake has happened, so it is the part
-// of the proxy most exposed to a hostile input.
 func FuzzReassembler(f *testing.F) {
 	for _, dg := range captureInitials(f, "seed.example.test", &tls.Config{NextProtos: []string{"h3"}}) {
 		f.Add(dg)

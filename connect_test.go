@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -62,8 +63,6 @@ func tunnelClient(t *testing.T, addr, authority, name string, ca *CA) *http.Clie
 	}
 }
 
-// A CONNECT names where the packets go and the server name says what the client expects
-// there. The name is what the tree routes on, the CONNECT target is what the proxy dials.
 func TestConnect_NameRoutesAndTheTargetDials(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -100,8 +99,6 @@ func TestConnect_NameRoutesAndTheTargetDials(t *testing.T) {
 	assert.Equal(t, netip.MustParseAddrPort(origin.Host), sess.Upstream())
 }
 
-// A CONNECT naming a hostname is dialed as that name, whatever server name the client sends
-// inside, and the name inside is still what routes.
 func TestConnect_DeclaredNameIsDialed(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -134,8 +131,6 @@ func TestConnect_DeclaredNameIsDialed(t *testing.T) {
 	assert.False(t, sess.Upstream().IsValid(), "a name is left to the dial to resolve")
 }
 
-// A CONNECT to a literal gives name verification the same two facts a redirect does, the
-// name the client wants and the address it chose, so the check applies to it as well.
 func TestConnect_NameVerificationAppliesToALiteralTarget(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -253,8 +248,6 @@ func assertStreamReset(t *testing.T, resp *http.Response) {
 	}
 }
 
-// Closing the session of a CONNECT carried on an HTTP/2 stream returns while the relay is
-// stalled on a client that stopped reading, and the client sees the stream end.
 func TestConnect_CloseOnAStalledH2StreamReturns(t *testing.T) {
 	_, sess, resp := stalledH2Connect(t)
 
@@ -269,7 +262,6 @@ func TestConnect_CloseOnAStalledH2StreamReturns(t *testing.T) {
 	assertStreamReset(t, resp)
 }
 
-// The Shutdown deadline cuts a stalled CONNECT stream like any other connection.
 func TestConnect_ShutdownDeadlineCutsAStalledH2Stream(t *testing.T) {
 	p, _, resp := stalledH2Connect(t)
 
@@ -279,8 +271,6 @@ func TestConnect_ShutdownDeadlineCutsAStalledH2Stream(t *testing.T) {
 	assertStreamReset(t, resp)
 }
 
-// The same close on the HTTP/3 front. The stream ends for the client, which can no longer
-// write on it.
 func TestConnect_CloseOnAStalledH3StreamReturns(t *testing.T) {
 	origin := floodingOrigin(t)
 	ca, err := GenerateCA()
@@ -334,8 +324,6 @@ func TestConnect_CloseOnAStalledH3StreamReturns(t *testing.T) {
 	}, 5*time.Second, 20*time.Millisecond, "the client's send side is canceled")
 }
 
-// Closing the session of a CONNECT carried on an HTTP/2 stream ends that stream and nothing
-// else. The sibling tunnel keeps echoing and the front connection still opens new ones.
 func TestConnect_CloseOnAnH2StreamEndsOnlyThatTunnel(t *testing.T) {
 	origin, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -436,10 +424,6 @@ func TestConnect_CloseOnAnH2StreamEndsOnlyThatTunnel(t *testing.T) {
 	waitForSessions(t, p, 2)
 }
 
-// Two CONNECTs to two different literals on one port under one server name reach the two
-// origins they declared, and a third to the first literal does too. Upstream connections are
-// pooled per destination, so the requests of one client never go over a connection another
-// client chose.
 func TestConnect_PoolIsKeyedOnTheDeclaredDestination(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -490,8 +474,6 @@ func twoOriginsOnOnePort(t *testing.T, serve func(ln net.Listener, id string)) (
 	return netip.MustParseAddrPort(lnA.Addr().String()), netip.MustParseAddrPort(lnB.Addr().String())
 }
 
-// A CONNECT to a port spelled with a leading zero reaches the entry written without it, and
-// the session reports the decimal form.
 func TestConnect_PortIsCanonical(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -529,9 +511,6 @@ func TestTargetFromConnect_PortIsCanonical(t *testing.T) {
 	require.Error(t, err)
 }
 
-// The plaintext inside a CONNECT is placed on the authority of its first request, as the TLS
-// inside one is placed on its server name. A host nothing admits refuses the connection,
-// so no later request on it is served unreported.
 func TestConnect_PlaintextIsPlacedOnItsFirstAuthority(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "origin got host=%s", r.Host)
@@ -622,4 +601,262 @@ func TestConnect_PlaintextIsPlacedOnItsFirstAuthority(t *testing.T) {
 		assert.Equal(t, http.StatusRequestTimeout, resp.StatusCode)
 		assert.Less(t, time.Since(start), 2*headerTimeout-100*time.Millisecond)
 	})
+}
+
+func TestConnect_InterceptHTTPS(t *testing.T) {
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Origin", "yes")
+		fmt.Fprintf(w, "origin saw %s %s idem=%s", r.Method, r.URL.Path, r.Header.Get("Idempotency-Key"))
+	}))
+	defer origin.Close()
+
+	originURL, err := url.Parse(origin.URL)
+	if err != nil {
+		t.Fatalf("parse origin url: %v", err)
+	}
+
+	ca, err := GenerateCA()
+	if err != nil {
+		t.Fatalf("generate CA: %v", err)
+	}
+
+	tr := DefaultTransport()
+	tr.RootCAs = originPool(t, origin)
+
+	p, err := New(WithCA(ca), WithTransport(tr))
+	if err != nil {
+		t.Fatalf("new proxy: %v", err)
+	}
+
+	var seenPattern string
+	p.MustAdd(originHost(originURL)+"/v1/charges", func(c *HTTPCtx) (*http.Response, error) {
+		seenPattern = c.Pattern()
+		c.Request().Header.Set("Idempotency-Key", "abc-123")
+
+		resp, err := c.Forward()
+		if err != nil {
+			return nil, err
+		}
+		body, err := ReadBody(resp, 0)
+		if err != nil {
+			return nil, err
+		}
+		return Rewrite(resp, []byte(string(body)+" | patched")), nil
+	}, WithMethods[HTTP](http.MethodGet))
+
+	addr := startProxy(t, p)
+	client := proxyClient(addr, ca.CertPool())
+
+	resp, err := client.Get(origin.URL + "/v1/charges")
+	if err != nil {
+		t.Fatalf("get through proxy: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+
+	want := "origin saw GET /v1/charges idem=abc-123 | patched"
+	if string(body) != want {
+		t.Fatalf("body = %q, want %q", body, want)
+	}
+	if got := resp.Header.Get("X-Origin"); got != "yes" {
+		t.Fatalf("X-Origin = %q, want yes", got)
+	}
+	if seenPattern != originHost(originURL)+"/v1/charges" {
+		t.Fatalf("pattern = %q", seenPattern)
+	}
+	if resp.ContentLength != int64(len(want)) {
+		t.Fatalf("ContentLength = %d, want %d", resp.ContentLength, len(want))
+	}
+}
+
+// tunnelConn adapts the two halves of an HTTP/2 CONNECT stream to a net.Conn, so a TLS
+// client can run inside a tunnel opened over h2c.
+type tunnelConn struct {
+	r io.ReadCloser
+	w io.WriteCloser
+}
+
+func (c *tunnelConn) Read(b []byte) (int, error) { return c.r.Read(b) }
+
+func (c *tunnelConn) Write(b []byte) (int, error) { return c.w.Write(b) }
+
+func (c *tunnelConn) Close() error {
+	_ = c.w.Close()
+	return c.r.Close()
+}
+
+func (c *tunnelConn) LocalAddr() net.Addr { return dummyTunnelAddr{} }
+
+func (c *tunnelConn) RemoteAddr() net.Addr { return dummyTunnelAddr{} }
+
+func (c *tunnelConn) SetDeadline(time.Time) error { return nil }
+
+func (c *tunnelConn) SetReadDeadline(time.Time) error { return nil }
+
+func (c *tunnelConn) SetWriteDeadline(time.Time) error { return nil }
+
+type dummyTunnelAddr struct{}
+
+func (dummyTunnelAddr) Network() string { return "tunnel" }
+
+func (dummyTunnelAddr) String() string { return "tunnel" }
+
+func TestConnect_H2C(t *testing.T) {
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "origin")
+	}))
+	defer origin.Close()
+	originURL, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	tr := DefaultTransport()
+	tr.RootCAs = originPool(t, origin)
+	p, err := New(WithCA(ca), WithTransport(tr))
+	require.NoError(t, err)
+
+	var seenProto Protocol
+	var seenAuthority string
+	p.MustAdd(originHost(originURL)+"/*{any}", func(c *HTTPCtx) (*http.Response, error) {
+		seenProto, seenAuthority = c.Protocol(), c.Authority()
+		return c.Forward()
+	})
+	addr := startProxy(t, p)
+
+	// h2c to the proxy, opened by hand since http2.Transport has no proxy support.
+	raw, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer func() { _ = raw.Close() }()
+
+	cc, err := (&http2.Transport{AllowHTTP: true}).NewClientConn(raw)
+	require.NoError(t, err)
+
+	pr, pw := io.Pipe()
+	req, err := http.NewRequest(http.MethodConnect, "https://"+originURL.Host, pr)
+	require.NoError(t, err)
+
+	resp, err := cc.RoundTrip(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode, "the proxy must accept the CONNECT stream")
+
+	// The tunnel now carries the client's own TLS, which the proxy terminates with its CA.
+	tunnel := tls.Client(&tunnelConn{r: resp.Body, w: pw}, &tls.Config{
+		RootCAs:    ca.CertPool(),
+		ServerName: originURL.Hostname(),
+		MinVersion: tls.VersionTLS12,
+	})
+	defer func() { _ = tunnel.Close() }()
+
+	// The tunnel is already handshaken, so it is handed over as the TLS connection itself.
+	inner := http.Client{Transport: &http.Transport{
+		DialTLSContext: func(context.Context, string, string) (net.Conn, error) { return tunnel, nil },
+	}}
+	got, err := inner.Get(origin.URL + "/foo")
+	require.NoError(t, err)
+	body, _ := io.ReadAll(got.Body)
+	_ = got.Body.Close()
+
+	assert.Equal(t, "origin", string(body))
+	assert.Equal(t, originURL.Host, seenAuthority)
+	// The tunnel carries HTTP/1.1 inside, whatever the stream that opened it was.
+	assert.Equal(t, HTTP11, seenProto)
+}
+
+func TestConnect_HostHeaderCannotReachAnUnnamedAuthority(t *testing.T) {
+	reached := new(atomic.Bool)
+	other := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		reached.Store(true)
+	}))
+	defer other.Close()
+
+	otherURL, err := url.Parse(other.URL)
+	require.NoError(t, err)
+
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+	p.MustAdd("allowed.example.test/+{rest}", func(c *HTTPCtx) (*http.Response, error) {
+		return c.Forward()
+	})
+	require.Equal(t, false, p.Admits(Target{Scheme: "http", Host: "127.0.0.1", Port: otherURL.Port()}, KindHTTP))
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	go func() { _ = p.Serve(ln) }()
+	t.Cleanup(func() { _ = p.Close() })
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+	require.NoError(t, conn.SetDeadline(time.Now().Add(10*time.Second)))
+
+	_, err = fmt.Fprint(conn, "CONNECT allowed.example.test:80 HTTP/1.1\r\nHost: allowed.example.test:80\r\n\r\n")
+	require.NoError(t, err)
+
+	br := bufio.NewReader(conn)
+	established, err := http.ReadResponse(br, nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, established.StatusCode)
+
+	_, err = fmt.Fprintf(conn, "GET /probe HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", otherURL.Host)
+	require.NoError(t, err)
+
+	resp, err := http.ReadResponse(br, nil)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+	assert.False(t, reached.Load())
+}
+
+func TestConnect_OriginResetEndsAnHTTP3ConnectWithConnectError(t *testing.T) {
+	b := newProxyBench(t, func(o *rawOrigin, w *wire) {
+		buf := make([]byte, 5)
+		if _, err := io.ReadFull(w.br, buf); err != nil {
+			return
+		}
+		o.note(string(buf))
+		_ = w.Conn.(*net.TCPConn).SetLinger(0)
+	})
+	b.p.MustAdd("origin.test", relayStream)
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	front, _ := startQUICFront(t, b.p, ca)
+	tr := &http3.Transport{}
+	defer func() { _ = tr.Close() }()
+	cc := tr.NewClientConn(dialQUICFront(t, front, ca))
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	str, err := cc.OpenRequestStream(ctx)
+	require.NoError(t, err)
+	req, err := http.NewRequest(http.MethodConnect, "https://origin.test:80", nil)
+	require.NoError(t, err)
+	require.NoError(t, str.SendRequestHeader(req))
+	resp, err := str.ReadResponse()
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	_, err = str.Write([]byte("\x01ping"))
+	require.NoError(t, err)
+	assert.Equal(t, "\x01ping", b.origin.nextNote(t))
+
+	require.NoError(t, str.SetReadDeadline(time.Now().Add(5*time.Second)))
+	_, err = io.Copy(io.Discard, str)
+	h3err, ok := errors.AsType[*http3.Error](err)
+	require.True(t, ok, "the stream ended with %v", err)
+	assert.Equal(t, http3.ErrCodeConnectError, h3err.ErrorCode)
+
+	require.Eventually(t, func() bool {
+		_, err = str.Write([]byte("x"))
+		return err != nil
+	}, 5*time.Second, 10*time.Millisecond)
+	stopped, ok := errors.AsType[*quic.StreamError](err)
+	require.True(t, ok, "the write ended with %v", err)
+	assert.Equal(t, quic.StreamErrorCode(http3.ErrCodeConnectError), stopped.ErrorCode)
 }

@@ -23,8 +23,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// A datagram is its own unit, so a handler sees each one, in both directions, and dropping one
-// is something it may do.
 func TestKindUDP_HandlerSeesEveryDatagramBothWays(t *testing.T) {
 	origin := udpEchoOrigin(t)
 
@@ -69,8 +67,6 @@ func TestKindUDP_HandlerSeesEveryDatagramBothWays(t *testing.T) {
 	assert.Equal(t, int64(1), in.Load(), "the answer to the one forwarded did too")
 }
 
-// The kernel hands an ICMP message for the origin to the flow's connected socket as a read or
-// write error. The flow lives on, as it would on an unconnected socket, until it falls idle.
 func TestKindUDP_FlowSurvivesAnICMPPortUnreachable(t *testing.T) {
 	// A datagram to a loopback port nobody listens on draws an ICMP port unreachable.
 	dead, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
@@ -104,8 +100,6 @@ func TestKindUDP_FlowSurvivesAnICMPPortUnreachable(t *testing.T) {
 	assert.Equal(t, 1, open, "the flow is still open")
 }
 
-// A datagram flow is admitted per datagram, so removing the entry stops it at the next one
-// rather than at the next flow.
 func TestKindUDP_DeleteStopsTheFlowAtTheNextDatagram(t *testing.T) {
 	origin := udpEchoOrigin(t)
 
@@ -139,7 +133,6 @@ func TestKindUDP_DeleteStopsTheFlowAtTheNextDatagram(t *testing.T) {
 	require.Error(t, err, "the entry is gone, so the next datagram is not carried")
 }
 
-// Past the 101 the unit is the frame, and a handler sees each one in both directions.
 func TestKindWebSocket_HandlerSeesFrames(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, brw, err := http.NewResponseController(w).Hijack()
@@ -215,8 +208,6 @@ func TestKindWebSocket_HandlerSeesFrames(t *testing.T) {
 	assert.GreaterOrEqual(t, seen.Load(), int64(2), "the text frame and the answer went through")
 }
 
-// A gRPC entry and an HTTP entry can name the same path, and the content type is what tells
-// them apart.
 func TestKindGRPC_ContentTypeSelectsTheEntry(t *testing.T) {
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -282,8 +273,6 @@ func TestKindGRPC_ContentTypeSelectsTheEntry(t *testing.T) {
 	assert.GreaterOrEqual(t, messages.Load(), int64(1))
 }
 
-// A failed call never reaches the server and comes back as a status, which is how a gRPC
-// client reads an error at all.
 func TestKindGRPC_FailAnswersWithoutTheServer(t *testing.T) {
 	var reached atomic.Int64
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -313,8 +302,6 @@ func TestKindGRPC_FailAnswersWithoutTheServer(t *testing.T) {
 	assert.Equal(t, int64(0), reached.Load(), "the server was never reached")
 }
 
-// A stream entry sees the bytes in the clear and can rewrite them, TLS having been terminated
-// on both sides.
 func TestKindTCP_HandlerRewritesTheStream(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -371,7 +358,6 @@ func TestKindTCP_HandlerRewritesTheStream(t *testing.T) {
 	assert.Equal(t, "origin saw HELLO", string(buf[:n]))
 }
 
-// A handler can answer the sender of a datagram directly, the origin never seeing it.
 func TestKindUDP_ReplyAnswersWithoutTheOrigin(t *testing.T) {
 	origin := udpEchoOrigin(t)
 
@@ -412,7 +398,6 @@ func TestKindUDP_ReplyAnswersWithoutTheOrigin(t *testing.T) {
 	assert.Equal(t, "hello", string(buf[:n]))
 }
 
-// A frame handler can answer the peer that sent a frame, the other peer never seeing it.
 func TestKindWebSocket_ReplyAnswersThePinger(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, brw, err := http.NewResponseController(w).Hijack()
@@ -489,8 +474,6 @@ func TestKindWebSocket_ReplyAnswersThePinger(t *testing.T) {
 	assert.Equal(t, "origin:text", string(echoed.Payload()), "the origin never saw the ping")
 }
 
-// The request messages are readable before the call is opened, so a handler can decide on the
-// first one and fail without the origin ever being touched.
 func TestKindGRPC_DecideOnTheFirstMessage(t *testing.T) {
 	var reached atomic.Int64
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -559,8 +542,6 @@ func TestKindGRPC_DecideOnTheFirstMessage(t *testing.T) {
 	assert.Equal(t, int64(1), reached.Load())
 }
 
-// DialTo opens the stream's far side somewhere else than the client asked, with the same
-// transport the proxy dials with.
 func TestKindTCP_DialToReroutesTheStream(t *testing.T) {
 	lineEcho := func(prefix string) string {
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -640,8 +621,6 @@ func grpcPayload(msgs ...string) []byte {
 	return payload
 }
 
-// A handler that opens the call, pumps the request stream and returns leaves the response to
-// the proxy: a direction it never took a reader for is relayed unchanged, trailers included.
 func TestKindGRPC_UntakenInboundIsRelayed(t *testing.T) {
 	origin, received := grpcEchoOrigin(t)
 	p, host, client := interceptingProxy(t, origin)
@@ -682,8 +661,6 @@ func TestKindGRPC_UntakenInboundIsRelayed(t *testing.T) {
 	assert.Equal(t, "0", resp.Trailer.Get("Grpc-Status"), "the trailers followed the body")
 }
 
-// CloseSend ends the request stream before the client is done with it, and the origin sees
-// only what went through before.
 func TestKindGRPC_CloseSendStopsTheRequestStream(t *testing.T) {
 	origin, received := grpcEchoOrigin(t)
 	p, host, client := interceptingProxy(t, origin)
@@ -731,8 +708,6 @@ func TestKindGRPC_CloseSendStopsTheRequestStream(t *testing.T) {
 	assert.Equal(t, "0", resp.Trailer.Get("Grpc-Status"))
 }
 
-// There is no response to carry a message into before the origin answered, so a reply toward
-// the client is refused rather than parked on a pipe nobody reads yet.
 func TestKindGRPC_ReplyBeforeTheOriginAnsweredIsRefused(t *testing.T) {
 	origin, _ := grpcEchoOrigin(t)
 	p, host, client := interceptingProxy(t, origin)
@@ -765,8 +740,6 @@ func TestKindGRPC_ReplyBeforeTheOriginAnsweredIsRefused(t *testing.T) {
 	assert.Equal(t, grpcPayload("hello"), body, "the call itself completed as forwarded")
 }
 
-// A handler that reads the response stream and returns before the origin answered cancels the
-// call, and the client reads it as canceled.
 func TestKindGRPC_ReturnBeforeTheAnswerEndsTheCallOnInternal(t *testing.T) {
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.ReadAll(r.Body)
@@ -829,9 +802,6 @@ func grpcStreamingOrigin(t *testing.T, release <-chan struct{}) *httptest.Server
 	return origin
 }
 
-// A call keeps its handler, but every message is checked against the tree as it arrives.
-// Deleting the entry mid-stream refuses the next message and ends the call on a status the
-// client can read, however the handler chose to serve it.
 func TestKindGRPC_DeleteReachesTheCallAtItsNextMessage(t *testing.T) {
 	handlers := map[string]GRPC{
 		"forward": func(c *GRPCCtx) error { return c.Forward() },
@@ -889,9 +859,6 @@ func TestKindGRPC_DeleteReachesTheCallAtItsNextMessage(t *testing.T) {
 	}
 }
 
-// The gate is an io.Reader like any other, so a reader that asks for fewer bytes than a
-// header at a time still sees the stream in order, and a header cut short by an error is
-// handed out whole before the error.
 func TestKindGRPC_MessageGateIsTransparentForAnyReadSize(t *testing.T) {
 	var in []byte
 	in = appendGRPCMessage(in, false, []byte("0123456789"))
@@ -929,8 +896,6 @@ func TestKindGRPC_MessageGateIsTransparentForAnyReadSize(t *testing.T) {
 	})
 }
 
-// A datagram sent to another origin gets its reply on the same flow, served with the address
-// it came from, and the client reads it from the origin it addressed.
 func TestKindUDP_SendToRepliesOnTheSameFlow(t *testing.T) {
 	origin := udpEchoOrigin(t)
 	other := udpEchoOrigin(t)
@@ -1027,8 +992,6 @@ func flowWithAlternate(t *testing.T) (*Proxy, *quicDemux, net.Conn) {
 	return p, d, alt
 }
 
-// The sweep closes the alternates of an idle flow with its upstream socket. Left open, an
-// alternate keeps its reader spinning on an expired deadline.
 func TestKindUDP_SweepClosesTheAlternates(t *testing.T) {
 	_, d, alt := flowWithAlternate(t)
 
@@ -1045,7 +1008,6 @@ func TestKindUDP_SweepClosesTheAlternates(t *testing.T) {
 	assert.ErrorIs(t, err, net.ErrClosed, "the sweep closes the alternate")
 }
 
-// Closing the session of a datagram flow closes its alternates too.
 func TestKindUDP_SessionCloseClosesTheAlternates(t *testing.T) {
 	p, _, alt := flowWithAlternate(t)
 
@@ -1061,8 +1023,6 @@ func TestKindUDP_SessionCloseClosesTheAlternates(t *testing.T) {
 	assert.ErrorIs(t, err, net.ErrClosed, "closing the session closes the alternate")
 }
 
-// A session listed before its flow ended does not end the flow the same client opened
-// since, under the same key.
 func TestKindUDP_StaleSessionCloseLeavesTheNewFlow(t *testing.T) {
 	origin := udpEchoOrigin(t)
 	p, err := New()
@@ -1117,7 +1077,6 @@ func TestKindUDP_StaleSessionCloseLeavesTheNewFlow(t *testing.T) {
 	assert.Equal(t, 1, flows, "closing the ended session leaves the new flow")
 }
 
-// A flow reaches a bounded number of origins through SendTo, and the next one is refused.
 func TestKindUDP_SendToIsBounded(t *testing.T) {
 	origin := udpEchoOrigin(t)
 	others := make([]netip.AddrPort, 0, maxUDPAlternates+1)
@@ -1160,8 +1119,6 @@ func TestKindUDP_SendToIsBounded(t *testing.T) {
 	assert.Equal(t, 1, failed, "exactly the origin past the bound was refused")
 }
 
-// A datagram flow routes each datagram on the entries as they stand, so a more specific entry
-// serves its next datagram and leaves it in place. It is stale once nothing admits it.
 func TestKindUDP_StaleOnTheKindAlone(t *testing.T) {
 	origin := udpEchoOrigin(t)
 	port := fmt.Sprint(origin.Port())

@@ -5,9 +5,12 @@
 package edge
 
 import (
+	"bufio"
 	"bytes"
+	"crypto/tls"
 	"io"
 	"net"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -16,9 +19,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// The sniff decides on what the client wrote, however short, and only waits when what it has
-// could still become a request line. A short first write that is not HTTP is answered at once,
-// not at the timeout.
 func TestSniff_ShortFirstWriteDecidesWithoutWaiting(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -150,4 +150,60 @@ func BenchmarkPeekAuthority(b *testing.B) {
 			}
 		})
 	}
+}
+
+func TestSniff_NonHTTPALPNIsNotHTTP(t *testing.T) {
+	ca, _ := GenerateCA()
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+	p.MustAdd("example.test/", noopHandler)
+	addr := startProxy(t, p)
+
+	dial := func() (*tls.Conn, error) {
+		raw, derr := net.Dial("tcp", addr)
+		if derr != nil {
+			return nil, derr
+		}
+		if _, werr := raw.Write([]byte("CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\n")); werr != nil {
+			return nil, werr
+		}
+		br := bufio.NewReader(raw)
+		if _, rerr := http.ReadResponse(br, nil); rerr != nil {
+			return nil, rerr
+		}
+		tc := tls.Client(raw, &tls.Config{
+			RootCAs:    ca.CertPool(),
+			ServerName: "example.test",
+			MinVersion: tls.VersionTLS12,
+			NextProtos: []string{"spdy/3"},
+		})
+		return tc, tc.Handshake()
+	}
+
+	// ALPN is settled inside the handshake, so a connection refused for what it turned out to
+	// be is refused just after it, not before: the handshake completes and nothing follows.
+	refused, err := dial()
+	require.NoError(t, err)
+	require.NoError(t, refused.SetReadDeadline(time.Now().Add(5*time.Second)))
+	_, err = refused.Read(make([]byte, 1))
+	assert.Error(t, err, "nothing admits a spdy stream on this authority")
+	_ = refused.Close()
+
+	// With a stream entry the same connection is served, and the protocol the client asked
+	// for is the one it gets.
+	p.MustAdd[TCP]("example.test:443", func(c *TCPCtx) error {
+		assert.Equal(t, "spdy/3", c.ALPN())
+		_, _ = c.Client().Write([]byte("hello"))
+		return nil
+	})
+
+	tc, err := dial()
+	require.NoError(t, err)
+	defer func() { _ = tc.Close() }()
+	assert.Equal(t, "spdy/3", tc.ConnectionState().NegotiatedProtocol)
+
+	buf := make([]byte, 5)
+	_, err = io.ReadFull(tc, buf)
+	require.NoError(t, err)
+	assert.Equal(t, "hello", string(buf))
 }

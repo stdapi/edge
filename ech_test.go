@@ -333,8 +333,6 @@ func TestConnect_RejectECHClosesTheTunnel(t *testing.T) {
 	}
 }
 
-// A ClientHello that offers no ECH is let through, and so is traffic that is not TLS at all.
-// The check refuses what it cannot read, not everything it inspects.
 func TestConnect_RejectECHLeavesOtherTrafficAlone(t *testing.T) {
 	t.Run("plaintext", func(t *testing.T) {
 		origin, err := net.Listen("tcp", "127.0.0.1:0")
@@ -419,8 +417,6 @@ func TestConnect_RejectECHRefusesAnInterceptedHandshake(t *testing.T) {
 	assert.ErrorIs(t, err, io.EOF, "no ServerHello should come back")
 }
 
-// A CONNECT on an h2c stream, the path connectStream serves, refused on the ClientHello
-// the client sends into the tunnel.
 func TestConnect_RejectECHClosesAnH2Stream(t *testing.T) {
 	origin, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)

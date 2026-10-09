@@ -35,8 +35,6 @@ func TestIter_All(t *testing.T) {
 	}, patternsOf(p.Iter().All()))
 }
 
-// Every kind is a registration, and an entry keyed on an authority alone is one like any
-// other. What a registration implied is not, so only Admissions reports it.
 func TestIter_AllReportsEveryKindAndNoImpliedAdmission(t *testing.T) {
 	p := testProxy(t)
 	p.MustAdd("api.stripe.com/v1/charges/{id}", noopHandler)

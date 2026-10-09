@@ -15,6 +15,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -234,4 +236,71 @@ type tlsCertStub struct {
 
 func (s *tlsCertStub) cert() *tls.Certificate {
 	return &tls.Certificate{Leaf: &x509.Certificate{NotBefore: s.notBefore, NotAfter: s.notAfter}}
+}
+
+func TestCA_LeafCacheIsMintedOnce(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+
+	const goroutines = 64
+	var (
+		wg      sync.WaitGroup
+		start   = make(chan struct{})
+		mu      sync.Mutex
+		serials = make(map[string]int)
+	)
+
+	for range goroutines {
+		wg.Go(func() {
+			<-start
+			cert, err := ca.Leaf("burst.example.test")
+			if err != nil {
+				t.Errorf("leaf: %v", err)
+				return
+			}
+			mu.Lock()
+			serials[cert.Leaf.SerialNumber.String()]++
+			mu.Unlock()
+		})
+	}
+
+	close(start)
+	wg.Wait()
+
+	assert.Len(t, serials, 1, "the authority must have been signed once, got %d distinct certificates", len(serials))
+}
+
+func BenchmarkLeafCached(b *testing.B) {
+	ca, err := GenerateCA()
+	if err != nil {
+		b.Fatal(err)
+	}
+	if _, err := ca.Leaf("api.stripe.com"); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ReportAllocs()
+	for b.Loop() {
+		if _, err := ca.Leaf("api.stripe.com"); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkLeafMint(b *testing.B) {
+	ca, err := GenerateCA()
+	if err != nil {
+		b.Fatal(err)
+	}
+
+	b.ReportAllocs()
+	i := 0
+	for b.Loop() {
+		i++
+		// An authority never seen before, so every iteration signs a certificate rather
+		// than reading one back out of the cache.
+		if _, err := ca.Leaf("host-" + strconv.Itoa(i) + ".example.test"); err != nil {
+			b.Fatal(err)
+		}
+	}
 }

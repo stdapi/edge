@@ -12,7 +12,10 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/netip"
+	"net/url"
 	"slices"
 	"sync/atomic"
 	"testing"
@@ -243,7 +246,6 @@ func TestTransparent_StartTLS_TerminatesAnInBandUpgrade(t *testing.T) {
 	assert.Equal(t, "db.test", sess.ClientHello().ServerName)
 }
 
-// A DialTo past StartTLS speaks TLS like a dial on a stream that arrived under it.
 func TestTCP_StartTLS_DialToSpeaksTLSAfterwards(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -297,8 +299,6 @@ func TestTCP_StartTLS_DialToSpeaksTLSAfterwards(t *testing.T) {
 	require.NoError(t, <-dialed)
 }
 
-// A dial placed after StartTLS verifies the origin against the name the client sent, like
-// one placed before.
 func TestTCP_StartTLS_DialAfterwardsUsesTheClientServerName(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -404,8 +404,6 @@ func TestTCP_StartTLS_NeedsACertificateAuthority(t *testing.T) {
 	assert.ErrorIs(t, <-errs, ErrNoCertificateAuthority)
 }
 
-// A client that does not send a ClientHello after the agreement fails the handshake, and the
-// stream ends rather than carrying on in the clear.
 func TestTCP_StartTLS_FailsWithoutAHandshake(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -428,7 +426,6 @@ func TestTCP_StartTLS_FailsWithoutAHandshake(t *testing.T) {
 	assert.ErrorIs(t, err, io.EOF)
 }
 
-// A client that goes silent after the agreement is cut when the handshake timeout elapses.
 func TestTCP_StartTLS_BoundsTheHandshake(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -452,9 +449,6 @@ func TestTCP_StartTLS_BoundsTheHandshake(t *testing.T) {
 	}
 }
 
-// The upstream handshake fails on a certificate the transport does not trust, after the
-// client's own handshake completed, so the client sees its stream end rather than plaintext
-// reaching an origin it asked to speak TLS to.
 func TestTCP_StartTLS_FailsOnAnUntrustedOrigin(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -513,8 +507,6 @@ func TestTCP_StartTLS_RejectsECH(t *testing.T) {
 	assert.ErrorIs(t, err, ErrConnectionRejected)
 }
 
-// Under VerifyReject the server name is checked against the destination the client chose,
-// as it is for a handshake at the first byte. It never reroutes: the entry is decided.
 func TestTCP_StartTLS_NameVerification(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -575,8 +567,6 @@ func TestTCP_StartTLS_NameVerification(t *testing.T) {
 	}
 }
 
-// Sessions() reads the hello while the handler is still writing it, which is why it is
-// atomic. The race detector is what checks this test.
 func TestTCP_StartTLS_ClientHelloIsReadConcurrently(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -620,4 +610,125 @@ func TestTCP_StartTLS_ClientHelloIsReadConcurrently(t *testing.T) {
 
 	sess := tcpSession(t, p)
 	assert.True(t, slices.Equal([]Kind{KindTCP}, sess.ServableAs()))
+}
+
+func TestTCP_StreamEntryTerminatesAndReoriginates(t *testing.T) {
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "streamed")
+	}))
+	defer origin.Close()
+
+	originURL, _ := url.Parse(origin.URL)
+	ca, _ := GenerateCA()
+
+	tr := DefaultTransport()
+	tr.RootCAs = originPool(t, origin)
+	p, err := New(WithCA(ca), WithTransport(tr))
+	if err != nil {
+		t.Fatalf("new proxy: %v", err)
+	}
+	if _, err := p.Add[TCP](originHost(originURL), relayStream); err != nil {
+		t.Fatalf("stream entry %s: %v", originHost(originURL), err)
+	}
+
+	// A request-level catch-all on every other authority. The stream entry names a static
+	// host, so on that host the HTTP kind has nothing registered and the connection is
+	// served as the byte stream the entry asked for.
+	var handlerRan bool
+	p.MustAdd("+{any}/", func(c *HTTPCtx) (*http.Response, error) {
+		handlerRan = true
+		return c.Forward()
+	}, WithMethods[HTTP](http.MethodGet))
+
+	addr := startProxy(t, p)
+
+	// Everything admitted is terminated, so the certificate the client checks is the proxy's
+	// and the proxy is the one that has to trust the origin.
+	client := proxyClient(addr, ca.CertPool())
+
+	resp, err := client.Get(origin.URL + "/")
+	if err != nil {
+		t.Fatalf("get through the stream entry: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "streamed" {
+		t.Fatalf("body = %q, want streamed", body)
+	}
+	if handlerRan {
+		t.Fatal("a request handler ran on a connection served as a stream")
+	}
+}
+
+// A wrapper a tunnel is handed must keep the half-close reachable.
+var (
+	_ closeWriter = (*peekConn)(nil)
+	_ closeWriter = transparentConn{}
+)
+
+func TestTCP_TunnelRelaysTheHalfClose(t *testing.T) {
+	const head, rest = "head", "the rest of the upload"
+
+	originLn, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer func() { _ = originLn.Close() }()
+
+	received := make(chan string, 1)
+	go func() {
+		conn, aerr := originLn.Accept()
+		if aerr != nil {
+			received <- "accept: " + aerr.Error()
+			return
+		}
+		defer func() { _ = conn.Close() }()
+
+		first := make([]byte, len(head))
+		if _, rerr := io.ReadFull(conn, first); rerr != nil {
+			received <- "read: " + rerr.Error()
+			return
+		}
+		// Done sending while the client is still uploading.
+		_ = conn.(*net.TCPConn).CloseWrite()
+
+		tail, _ := io.ReadAll(conn)
+		received <- string(first) + string(tail)
+	}()
+
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+	p.MustAdd[TCP](originLn.Addr().String(), relayStream)
+
+	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	go func() { _ = p.Serve(proxyLn) }()
+	t.Cleanup(func() { _ = p.Close() })
+
+	client, err := net.Dial("tcp", proxyLn.Addr().String())
+	require.NoError(t, err)
+	defer func() { _ = client.Close() }()
+	require.NoError(t, client.SetDeadline(time.Now().Add(10*time.Second)))
+
+	_, err = fmt.Fprintf(client, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", originLn.Addr(), originLn.Addr())
+	require.NoError(t, err)
+
+	br := bufio.NewReader(client)
+	established, err := http.ReadResponse(br, nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, established.StatusCode)
+
+	_, err = client.Write([]byte(head))
+	require.NoError(t, err)
+
+	// Reading to EOF is what says the origin's half-close reached the client.
+	_, err = io.ReadAll(br)
+	require.NoError(t, err)
+
+	_, err = client.Write([]byte(rest))
+	require.NoError(t, err)
+	require.NoError(t, client.(*net.TCPConn).CloseWrite())
+
+	assert.Equal(t, head+rest, <-received)
 }

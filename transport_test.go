@@ -6,8 +6,11 @@ package edge
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"syscall"
 	"testing"
 	"time"
@@ -17,9 +20,6 @@ import (
 	"golang.org/x/net/ipv4"
 )
 
-// A destination pool serves one authority, so it keeps at most MaxIdleConnsPerHost idle
-// connections. A shared pool serves every authority the proxy resolves itself and keeps
-// MaxIdleConns.
 func TestTransport_DestinationPoolIdleLimit(t *testing.T) {
 	tr := DefaultTransport()
 	for _, scheme := range []string{"http", "https"} {
@@ -40,9 +40,6 @@ func TestTransport_DestinationPoolIdleLimit(t *testing.T) {
 	assert.Equal(t, http.DefaultMaxIdleConnsPerHost, pool.h1.MaxIdleConns)
 }
 
-// The kernel hands an ICMP message received for a connected UDP socket to its next read or
-// write as an error, on which quic-go ends the transport. The socket the proxy dials an h3
-// upstream on skips it, as the unconnected socket every QUIC server reads from never sees one.
 func TestTransport_ConnectedSocketSkipsICMPErrors(t *testing.T) {
 	// A datagram to a loopback port nobody listens on draws an ICMP port unreachable.
 	closed, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
@@ -132,4 +129,23 @@ func TestTransport_ConnectedSocketSkipsICMPErrors(t *testing.T) {
 	require.NoError(t, other.SetReadDeadline(time.Now().Add(200*time.Millisecond)))
 	_, _, err = cc.ReadFrom(make([]byte, 1))
 	timesOut(err)
+}
+
+func TestTransport_H2CToAnHTTP11OriginIsRefused(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		fmt.Fprint(w, "origin")
+	}))
+	defer origin.Close()
+	originURL, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+
+	p := testProxy(t)
+	p.MustAdd(originHost(originURL)+"/*{any}", forwardHandler)
+	client := h2cTunnelClient(t, startProxy(t, p), originURL.Host)
+
+	resp, err := client.Get(origin.URL + "/foo")
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+	assert.Equal(t, http.StatusBadGateway, resp.StatusCode)
+	assert.Equal(t, "HTTP/2.0", resp.Proto)
 }

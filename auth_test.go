@@ -143,8 +143,6 @@ func TestProxyAuth_IdentityReachesTheHandler(t *testing.T) {
 	assert.Equal(t, "alice", string(body))
 }
 
-// Every request on the plain path authenticates itself, so the identity a handler reads is
-// the one its own request carried and never the one before it.
 func TestProxyAuth_IdentityIsPerRequest(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprint(w, "origin")
@@ -266,8 +264,6 @@ func TestParseBasicCredentials(t *testing.T) {
 	}
 }
 
-// Proxy-Authorization is hop-by-hop and holds a credential, so it must never reach an origin.
-// The client sends it on every request, and the outbound request is built from it.
 func TestProxyAuth_CredentialsNeverReachTheOrigin(t *testing.T) {
 	seen := make(chan string, 1)
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -294,8 +290,6 @@ func TestProxyAuth_CredentialsNeverReachTheOrigin(t *testing.T) {
 	assert.Empty(t, <-seen, "the origin was handed the client's proxy credentials")
 }
 
-// The same on a stream entry, which re-originates the TLS the client asked for rather than
-// carrying its bytes: the credential belongs to the hop and stops at the proxy either way.
 func TestProxyAuth_CredentialsNeverReachAStreamOrigin(t *testing.T) {
 	seen := make(chan string, 1)
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -356,9 +350,6 @@ func TestProxyAuth_SessionsReportTheIdentity(t *testing.T) {
 	assert.Equal(t, "alice", string(body))
 }
 
-// The identity of a CONNECT carried on an HTTP/2 stream reaches the session serving it. A
-// stream session exists once the traffic has said what it is, so the client writes before the
-// sweep looks.
 func TestProxyAuth_IdentityOnAnHTTP2Connect(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)

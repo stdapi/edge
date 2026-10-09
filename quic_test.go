@@ -125,84 +125,10 @@ func (c fixedOriginPacketConn) OriginalDestination(net.Addr) (netip.AddrPort, er
 	return c.origin, nil
 }
 
-func caFileOf(t *testing.T, ca *CA, name string) string {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), name)
-	require.NoError(t, os.WriteFile(path, ca.CertificatePEM(), 0o600))
-	return path
-}
-
 func poolOf(ca *CA) *x509.CertPool {
 	pool := x509.NewCertPool()
 	pool.AddCert(ca.Certificate())
 	return pool
-}
-
-func TestQUIC_InterceptWithCurl(t *testing.T) {
-	requireCurl(t)
-
-	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
-	require.NoError(t, err)
-	origin := h3Origin(t, originCA)
-
-	proxyCA, err := GenerateCA()
-	require.NoError(t, err)
-
-	tr := DefaultTransport()
-	tr.AllowHTTP3 = true
-	tr.RootCAs = poolOf(originCA)
-
-	p, err := New(WithCA(proxyCA), WithTransport(tr))
-	require.NoError(t, err)
-
-	seen := new(recorder)
-	p.MustAdd(h3Authority+"/+{any}", func(c *HTTPCtx) (*http.Response, error) {
-		seen.add(c.Protocol().String() + " " + c.Request().URL.Path)
-		return c.Forward()
-	})
-
-	proxyAddr := startQUICRedirected(t, p, origin)
-	port := fmt.Sprint(proxyAddr.Port())
-
-	res := runCurl(t,
-		"--http3-only",
-		"--resolve", h3Authority+":"+port+":127.0.0.1",
-		"--cacert", caFileOf(t, proxyCA, "proxy.pem"),
-		fmt.Sprintf("https://%s:%s/echo", h3Authority, port),
-	)
-
-	require.Equal(t, "200", res.status, "body %q", res.body)
-	assert.Equal(t, "3", res.version, "curl must have used HTTP/3")
-	assert.Contains(t, res.body, "proto=HTTP/3.0", "the origin must have been reached over HTTP/3 too")
-	assert.Contains(t, res.body, "path=/echo")
-	require.Equal(t, []string{"HTTP/3.0 /echo"}, seen.all())
-}
-func TestQUIC_HandlerCanShortCircuit(t *testing.T) {
-	requireCurl(t)
-
-	proxyCA, err := GenerateCA()
-	require.NoError(t, err)
-
-	p, err := New(WithCA(proxyCA))
-	require.NoError(t, err)
-
-	p.MustAdd(h3Authority+"/blocked", func(c *HTTPCtx) (*http.Response, error) {
-		return Text(http.StatusForbidden, "blocked by edge over "+c.Protocol().String()), nil
-	}, WithMethods[HTTP](http.MethodGet))
-
-	proxyAddr := startQUIC(t, p)
-	port := fmt.Sprint(proxyAddr.Port())
-
-	res := runCurl(t,
-		"--http3-only",
-		"--resolve", h3Authority+":"+port+":127.0.0.1",
-		"--cacert", caFileOf(t, proxyCA, "proxy.pem"),
-		fmt.Sprintf("https://%s:%s/blocked", h3Authority, port),
-	)
-
-	assert.Equal(t, "403", res.status)
-	assert.Equal(t, "3", res.version)
-	assert.Contains(t, res.body, "blocked by edge over HTTP/3.0")
 }
 
 func TestQUIC_RejectDropsTheConnection(t *testing.T) {
@@ -228,9 +154,6 @@ func TestQUIC_RejectDropsTheConnection(t *testing.T) {
 	require.Error(t, err, "a rejected authority must never complete a handshake")
 }
 
-// The application error space belongs to the protocol a connection negotiated, so a close
-// with nothing to report says H3_NO_ERROR where h3 was negotiated and 0 everywhere else,
-// KindQUIC either way.
 func TestQUIC_CloseCarriesTheProtocolsNoErrorCode(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
@@ -279,8 +202,6 @@ func TestQUIC_CloseCarriesTheProtocolsNoErrorCode(t *testing.T) {
 	}
 }
 
-// A QUIC session is listed while its handshake still runs, so a handshake fact written to a
-// plain field after publication races this loop under the race detector.
 func TestQUIC_SessionALPNDuringHandshake(t *testing.T) {
 	proxyCA, err := GenerateCA()
 	require.NoError(t, err)
@@ -391,8 +312,6 @@ func TestQUIC_InterceptedSessionIsListedAndClosed(t *testing.T) {
 	assert.Empty(t, slices.Collect(p.Sessions()))
 }
 
-// A handler waiting on the session context has to be released when the session ends. A QUIC
-// connection owns its own, since nothing upstream of it cancels one.
 func TestQUIC_SessionContextEndsWithTheSession(t *testing.T) {
 	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
 	require.NoError(t, err)
@@ -468,8 +387,6 @@ func h3Get(t *testing.T, cc *http3.ClientConn, authority string, port uint16) st
 	return string(body)
 }
 
-// Two intercepted connections multiplexed on one client socket each get a session of their
-// own.
 func TestQUIC_TwoInterceptedConnectionsOnOneSocket(t *testing.T) {
 	proxyCA, err := GenerateCA()
 	require.NoError(t, err)
@@ -569,8 +486,6 @@ func TestQUIC_CloseBeforeAdoptionEndsTheConnection(t *testing.T) {
 	}
 }
 
-// The tag routes a connection with no flow state, a client whose address changed included,
-// so it must recognize exactly the IDs its own generator minted.
 func TestQUIC_CIDTagRecognizesOnlyItsOwnIDs(t *testing.T) {
 	tag, err := newQUICCIDTag([16]byte{1: 0xa5, 7: 0x5a})
 	require.NoError(t, err)
@@ -593,8 +508,6 @@ func TestQUIC_CIDTagRecognizesOnlyItsOwnIDs(t *testing.T) {
 	assert.False(t, tag.matches(make([]byte, 20)))
 }
 
-// The session context of an intercepted QUIC connection follows the connection. A client
-// that closes it and leaves ends the context right away rather than through a sweep.
 func TestQUIC_SessionContextEndsWhenTheClientLeaves(t *testing.T) {
 	proxyCA, err := GenerateCA()
 	require.NoError(t, err)
@@ -773,10 +686,6 @@ func TestQUIC_TProxyInterceptRepliesFromTheOrigin(t *testing.T) {
 	assert.Zero(t, wrapper.direct.Load(), "every handshake byte must leave from the origin's socket")
 }
 
-// Two intercepted origins reached from one client socket each get a terminating stack of
-// their own, each replying from its origin's address. The wrapper reports one origin per
-// client at a time, so the two run in sequence here, the concurrent case needing the per
-// datagram attribution only a real TPROXY deployment gives.
 func TestQUIC_TProxyTwoInterceptedOriginsOnOneSocket(t *testing.T) {
 	first := netip.MustParseAddrPort("127.0.0.1:4431")
 	second := netip.MustParseAddrPort("127.0.0.1:4432")
@@ -814,9 +723,6 @@ func TestQUIC_TProxyTwoInterceptedOriginsOnOneSocket(t *testing.T) {
 	assert.NotEqual(t, replyA.String(), replyB.String(), "each origin replies from its own socket")
 }
 
-// A tagged short header with no stack left behind it is answered with a stateless reset
-// holding the token the stack advertised, from the reply socket of the origin the client
-// targeted.
 func TestQUIC_StatelessResetForOrphanedTag(t *testing.T) {
 	first := netip.MustParseAddrPort("127.0.0.1:4431")
 	orphanOrigin := udpEchoOrigin(t)
@@ -876,7 +782,6 @@ func TestQUIC_StatelessResetForOrphanedTag(t *testing.T) {
 	assert.Equal(t, mac.Sum(nil)[:16], buf[n-16:n], "the reset must end with the advertised token")
 }
 
-// One shutdown drains every terminating stack, its single HTTP/3 server sending the GOAWAYs.
 func TestQUIC_ShutdownDrainsEveryInterceptStack(t *testing.T) {
 	first := netip.MustParseAddrPort("127.0.0.1:4431")
 	second := netip.MustParseAddrPort("127.0.0.1:4432")
@@ -961,8 +866,6 @@ func TestQUIC_ShutdownDrainsEveryInterceptStack(t *testing.T) {
 	assert.Equal(t, []string{"first.test", "second.test"}, bodies)
 }
 
-// The eviction candidate at the stack cap is the least recently used idle stack and never
-// one with live connections.
 func TestQUICDemux_EvictInterceptPrefersIdleLRU(t *testing.T) {
 	d := &quicDemux{intercepts: map[interceptKey]*quicIntercept{}}
 	at := func(s string) interceptKey { return interceptKey{origin: netip.MustParseAddrPort(s)} }
@@ -980,8 +883,6 @@ func TestQUICDemux_EvictInterceptPrefersIdleLRU(t *testing.T) {
 	assert.Contains(t, d.intercepts, busy.key)
 }
 
-// The terminating stack refuses a handshake whose ClientHello differs from the one the
-// connection was placed on, which would terminate a name no entry admits.
 func TestQUICDemux_HandshakeRefusesAChangedClientHello(t *testing.T) {
 	proxyCA, err := GenerateCA()
 	require.NoError(t, err)
@@ -1083,8 +984,6 @@ func forgedInitial(t *testing.T, dcid []byte, name string) []byte {
 	return out
 }
 
-// A copy of the client's first Initial with a broken authentication tag, sent ahead of it, is
-// discarded, and the connection is placed on the Initial that follows.
 func TestQUIC_ACorruptInitialLeavesTheConnection(t *testing.T) {
 	proxyCA, err := GenerateCA()
 	require.NoError(t, err)
@@ -1108,8 +1007,6 @@ func TestQUIC_ACorruptInitialLeavesTheConnection(t *testing.T) {
 	_ = qc.CloseWithError(0, "")
 }
 
-// An Initial the terminating stack discards, sent ahead of the client's own with another
-// server name, does not place the connection on that name.
 func TestQUIC_AForgedInitialCannotChangeTheName(t *testing.T) {
 	proxyCA, err := GenerateCA()
 	require.NoError(t, err)
@@ -1137,9 +1034,6 @@ func TestQUIC_AForgedInitialCannotChangeTheName(t *testing.T) {
 	assert.False(t, served.Load())
 }
 
-// The read loop holds no lock between reading a datagram and publishing the relay it leads
-// to, so an immediate close can run to completion in between. The publication must be
-// refused, not land in a demux already swept.
 func TestQUICDemux_CloseRefusesLatePublish(t *testing.T) {
 	p, err := New()
 	require.NoError(t, err)
@@ -1171,8 +1065,6 @@ func TestQUICDemux_CloseRefusesLatePublish(t *testing.T) {
 	require.Zerof(t, udps, "%d datagram flow(s) published into a closed demux, %d flow(s) recreated", udps, flows)
 }
 
-// Shutdown can win the race against a ServeTransparentUDP that is tracked but has not reached run yet,
-// and the demux WaitGroup has to survive that ordering.
 func TestQUICDemux_ShutdownRacesServeQUICStartup(t *testing.T) {
 	for range 200 {
 		p := testProxy(t)
@@ -1205,8 +1097,6 @@ func TestQUICDemux_ShutdownRacesServeQUICStartup(t *testing.T) {
 	}
 }
 
-// The accept loop replaces relaying blind: a handler sees each stream, reads its first bytes,
-// and Relay carries the rest after what was consumed went over by hand.
 func TestQUIC_AcceptInspectsAndRelaysStreams(t *testing.T) {
 	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
 	require.NoError(t, err)
@@ -1265,8 +1155,6 @@ func TestQUIC_AcceptInspectsAndRelaysStreams(t *testing.T) {
 	assert.Greater(t, streams.Load(), int64(0), "the handler saw the streams it carried")
 }
 
-// A stream the client resets reaches the origin reset with the same code, where a FIN would
-// read as a complete stream.
 func TestQUIC_RelayPassesAStreamResetOn(t *testing.T) {
 	originCA, err := GenerateCA(WithCASubject("edge raw QUIC origin CA"))
 	require.NoError(t, err)
@@ -1327,8 +1215,6 @@ func TestQUIC_RelayPassesAStreamResetOn(t *testing.T) {
 	}
 }
 
-// A QUIC connection keeps the entry it was decided on, and Stale reports when the entries as
-// they stand would pick another one.
 func TestQUIC_StaleFollowsTheEntry(t *testing.T) {
 	proxyCA, err := GenerateCA()
 	require.NoError(t, err)
@@ -1378,8 +1264,6 @@ func TestQUIC_StaleFollowsTheEntry(t *testing.T) {
 	assert.True(t, sess.Stale(), "nothing admits it any more")
 }
 
-// An h3 connection served stream by stream, for want of an HTTP entry, goes stale once one
-// admits its authority, since the traffic allowed HTTP from the start.
 func TestQUIC_StaleWhenHTTPAdmitsAnH3Connection(t *testing.T) {
 	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
 	require.NoError(t, err)
@@ -1413,8 +1297,6 @@ func TestQUIC_StaleWhenHTTPAdmitsAnH3Connection(t *testing.T) {
 	assert.True(t, sess.Stale(), "HTTP admits the traffic of this connection")
 }
 
-// An h3 connection served as HTTP stays HTTP when its last HTTP entry goes, and Stale reports
-// that a new connection would be served stream by stream.
 func TestQUIC_StaleWhenTheLastHTTPEntryGoes(t *testing.T) {
 	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
 	require.NoError(t, err)
@@ -1454,8 +1336,6 @@ func TestQUIC_StaleWhenTheLastHTTPEntryGoes(t *testing.T) {
 	assert.False(t, sess.Stale(), "HTTP admits it again, and each request is routed on its own")
 }
 
-// A QUIC handler dials the origin through the transport's dialer, on the socket it returns,
-// and the socket is closed once the handler has returned.
 func TestQUIC_DialUsesTheTransportDialer(t *testing.T) {
 	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
 	require.NoError(t, err)
@@ -1517,8 +1397,6 @@ func (c *closeTrackedConn) Close() error {
 	return c.Conn.Close()
 }
 
-// An h3 upstream is reached through the transport's dialer, whatever connection it returns,
-// and the connection is closed with the QUIC connection it carried.
 func TestQUIC_H3UpstreamUsesTheTransportDialer(t *testing.T) {
 	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
 	require.NoError(t, err)
@@ -1570,8 +1448,6 @@ func TestQUIC_H3UpstreamUsesTheTransportDialer(t *testing.T) {
 		5*time.Second, 20*time.Millisecond, "the socket the h3 upstream ran on is still open")
 }
 
-// A dialer that returns a socket with no peer fails the dial, since a QUIC connection needs
-// one address to write to.
 func TestQUIC_DialRefusesASocketWithNoPeer(t *testing.T) {
 	tr := DefaultTransport()
 	tr.DialContext = func(context.Context, string, string) (net.Conn, error) {
@@ -1590,8 +1466,6 @@ type noDeadlineConn struct{ net.Conn }
 func (c noDeadlineConn) SetReadDeadline(time.Time) error { return nil }
 func (c noDeadlineConn) SetDeadline(time.Time) error     { return nil }
 
-// The socket a QUIC connection ran on is released when the connection ends, even when a read
-// deadline cannot end its read loop.
 func TestQUIC_DialReleasesASocketWithoutDeadlines(t *testing.T) {
 	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
 	require.NoError(t, err)
@@ -1713,7 +1587,6 @@ func sendTo(t *testing.T, conn *net.UDPConn, to netip.AddrPort, payload string) 
 	require.NoError(t, err)
 }
 
-// A handler parked on one client's datagram does not delay another client on the same socket.
 func TestTransparentUDP_ParkedHandlerDoesNotDelayAnotherClient(t *testing.T) {
 	origin := udpEchoOrigin(t)
 	slow, slowAddr := udpClient(t)
@@ -1734,8 +1607,6 @@ func TestTransparentUDP_ParkedHandlerDoesNotDelayAnotherClient(t *testing.T) {
 	assert.Equal(t, "slow", got)
 }
 
-// While the handler is parked, the flow keeps udpQueue datagrams and drops the rest. Another
-// client loses nothing.
 func TestTransparentUDP_FullQueueDropsForThatClientOnly(t *testing.T) {
 	origin, received := udpSinkOrigin(t)
 	slow, slowAddr := udpClient(t)
@@ -1780,7 +1651,6 @@ func TestTransparentUDP_FullQueueDropsForThatClientOnly(t *testing.T) {
 	}
 }
 
-// The queue is bounded in bytes as well, so large datagrams fill it before udpQueue of them.
 func TestTransparentUDP_QueueIsBoundedInBytes(t *testing.T) {
 	origin, received := udpSinkOrigin(t)
 	slow, slowAddr := udpClient(t)
@@ -1812,7 +1682,6 @@ func TestTransparentUDP_QueueIsBoundedInBytes(t *testing.T) {
 	}
 }
 
-// Datagrams of one flow are served in the order they arrived, in both directions.
 func TestTransparentUDP_FlowKeepsOrder(t *testing.T) {
 	origin := udpEchoOrigin(t)
 	p, err := New()
@@ -1833,8 +1702,6 @@ func TestTransparentUDP_FlowKeepsOrder(t *testing.T) {
 	}
 }
 
-// A datagram with an empty payload reaches the origin, and the empty one it answers reaches
-// the client.
 func TestTransparentUDP_EmptyPayloadCrossesBothWays(t *testing.T) {
 	origin := udpEchoOrigin(t)
 	p, err := New()
@@ -1849,8 +1716,6 @@ func TestTransparentUDP_EmptyPayloadCrossesBothWays(t *testing.T) {
 	assert.Empty(t, got)
 }
 
-// The socket of a transparent datagram flow leaves the Don't Fragment bit unset, so a datagram
-// is fragmented as it would be without the proxy.
 func TestTransparentUDP_FlowSocketLeavesDontFragmentUnset(t *testing.T) {
 	origin := udpEchoOrigin(t)
 	p, err := New()
@@ -1914,8 +1779,6 @@ func gatedUDPProxy(t *testing.T, origin netip.AddrPort, dialErr error) (*Proxy, 
 	return p, addr, g, release
 }
 
-// A dial in flight for one client does not delay another client on the same socket, and the
-// datagram that opened the flow is served once the dial returns.
 func TestTransparentUDP_DialInFlightDoesNotDelayAnotherClient(t *testing.T) {
 	origin := udpEchoOrigin(t)
 	_, proxyAddr, g, release := gatedUDPProxy(t, origin, nil)
@@ -1936,7 +1799,6 @@ func TestTransparentUDP_DialInFlightDoesNotDelayAnotherClient(t *testing.T) {
 	assert.Equal(t, "slow", got)
 }
 
-// A flow is a session from its first datagram, and closing it cancels the dial in flight.
 func TestTransparentUDP_CloseCancelsTheDialInFlight(t *testing.T) {
 	origin := udpEchoOrigin(t)
 	p, proxyAddr, g, _ := gatedUDPProxy(t, origin, nil)
@@ -1995,8 +1857,6 @@ func onlyUDPFlow(t *testing.T, p *Proxy) *udpFlow {
 	return found
 }
 
-// A datagram arriving behind a parked handler keeps its flow in use, so the idle sweep does
-// not reap a flow whose client is sending.
 func TestTransparentUDP_ArrivalKeepsTheFlowInUse(t *testing.T) {
 	origin := udpEchoOrigin(t)
 	slow, slowAddr := udpClient(t)
@@ -2010,7 +1870,6 @@ func TestTransparentUDP_ArrivalKeepsTheFlowInUse(t *testing.T) {
 	require.Eventually(t, func() bool { return time.Since(u.lastUse()) < 200*time.Millisecond }, 2*time.Second, 10*time.Millisecond)
 }
 
-// A failed dial drops the datagram that opened the flow, and the next one dials again.
 func TestTransparentUDP_FailedDialIsRetriedByTheNextDatagram(t *testing.T) {
 	origin := udpEchoOrigin(t)
 	p, proxyAddr, g, _ := gatedUDPProxy(t, origin, errors.New("no route"))
@@ -2104,8 +1963,6 @@ func awaitHandshake(t *testing.T, done <-chan error, timeout time.Duration, msg 
 	}
 }
 
-// A name resolution in flight for one QUIC connection delays neither a datagram nor another
-// QUIC connection on the same socket.
 func TestTransparentQUIC_ResolutionInFlightDoesNotDelayOtherClients(t *testing.T) {
 	origin := udpEchoOrigin(t)
 	_, ca, wrapper, proxyAddr, r, release := verifiedQUICProxy(t, origin, "example.test")
@@ -2135,8 +1992,6 @@ func initialDatagram(dcid []byte) []byte {
 	return b[:1200]
 }
 
-// The datagrams of a connection being placed wait for its stack, within the pending bounds,
-// and none of them rejects it.
 func TestQUICDemux_PlacingConnectionKeepsItsDatagrams(t *testing.T) {
 	p := testProxy(t)
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
@@ -2163,4 +2018,76 @@ func TestQUICDemux_PlacingConnectionKeepsItsDatagrams(t *testing.T) {
 	assert.Len(t, conn.pending, maxPendingDatagrams)
 	assert.Equal(t, maxPendingDatagrams*1200, conn.pendingBytes)
 	assert.Equal(t, 1, d.sniffing, "a connection being placed still counts against the sniffing cap")
+}
+
+func BenchmarkDatagramAdmission(b *testing.B) {
+	p, err := New()
+	if err != nil {
+		b.Fatal(err)
+	}
+	if _, err := p.Add("[0.0.0.0/0]:53", func(*DatagramCtx) error { return nil }); err != nil {
+		b.Fatal(err)
+	}
+	target := Target{Scheme: "http", Host: "10.1.2.3", Port: "53"}
+
+	b.ReportAllocs()
+	for b.Loop() {
+		if e, _ := p.admitWith(target, KindUDP); e == nil {
+			b.Fatal("no entry")
+		}
+	}
+}
+
+func BenchmarkDatagramOutbound(b *testing.B) {
+	p, err := New()
+	if err != nil {
+		b.Fatal(err)
+	}
+	served := make(chan struct{}, 1)
+	if _, err := p.Add("[0.0.0.0/0]", func(c *DatagramCtx) error {
+		served <- struct{}{}
+		return c.Drop()
+	}); err != nil {
+		b.Fatal(err)
+	}
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		b.Fatal(err)
+	}
+	d, err := newQUICDemux(p, fixedOriginPacketConn{pc, netip.MustParseAddrPort("127.0.0.1:4433")})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(d.close)
+
+	client := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40000}
+	pkt := make([]byte, 1200)
+	d.dispatch(client, pkt, false)
+	<-served
+
+	b.ReportAllocs()
+	for b.Loop() {
+		d.dispatch(client, pkt, false)
+		<-served
+	}
+}
+
+func BenchmarkDatagramAdmissionCaptured(b *testing.B) {
+	p, err := New()
+	if err != nil {
+		b.Fatal(err)
+	}
+	if _, err := p.Add("{name}.udp.test:53", func(*DatagramCtx) error { return nil }); err != nil {
+		b.Fatal(err)
+	}
+	target := Target{Scheme: "http", Host: "echo.udp.test", Port: "53"}
+
+	var buf []Param
+	b.ReportAllocs()
+	for b.Loop() {
+		var e *entry
+		if e, buf = p.admitInto(target, KindUDP, buf); e == nil || len(buf) != 1 {
+			b.Fatal("no entry or no capture")
+		}
+	}
 }

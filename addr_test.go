@@ -13,9 +13,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// An IPv6 literal starting with a hex letter is an address like any other. The old fast path
-// tested the first byte against digits and ':' only, which silently made half the IPv6 space
-// unregistrable, fc00::/7 and fe80::/10 included.
 func TestAddr_HexFirstLiteralsAreRegistrable(t *testing.T) {
 	p := testProxy(t)
 
@@ -30,8 +27,6 @@ func TestAddr_HexFirstLiteralsAreRegistrable(t *testing.T) {
 	assert.Equal(t, true, p.Admits(target("[cafe::2]:443"), KindHTTP))
 }
 
-// A range has exactly one spelling: bracketed, masked, lowercase, unmapped, and shorter than
-// a full address. Anything the parser could canonicalize is refused with the form to write.
 func TestAddr_RangeSpellingIsCanonical(t *testing.T) {
 	p := testProxy(t)
 
@@ -60,9 +55,6 @@ func TestAddr_RangeSpellingIsCanonical(t *testing.T) {
 	}
 }
 
-// A range written without brackets reads as something else: a path on an authority pattern,
-// an address and a path on an interceptor pattern. Both are refused with the bracketed form
-// rather than silently registered as what they parse as.
 func TestAddr_UnbracketedRangeIsRefused(t *testing.T) {
 	p := testProxy(t)
 
@@ -84,9 +76,6 @@ func TestAddr_UnbracketedRangeIsRefused(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// The refusal covers only spellings whose range reading is valid: unbracketed, masked, and
-// shorter than a full address. Everything else is a path, brackets included, since the
-// brackets already said the host is an address.
 func TestAddr_NumericPathsOnAddressHosts(t *testing.T) {
 	p := testProxy(t)
 
@@ -103,8 +92,6 @@ func TestAddr_NumericPathsOnAddressHosts(t *testing.T) {
 	assert.NotZero(t, match(t, p, http.MethodGet, "https", "10.0.0.1:443", "/32"))
 }
 
-// Every refusal hint names a spelling the parser accepts. A hint pointing at a pattern that
-// is itself refused is a dead end.
 func TestAddr_HintsAreRegistrable(t *testing.T) {
 	p := testProxy(t)
 
@@ -122,8 +109,6 @@ func TestAddr_HintsAreRegistrable(t *testing.T) {
 	}
 }
 
-// A zoned literal is decided as its address, zone dropped. Left to the name patterns it
-// would slip past every address rule while the dial still reaches the address.
 func TestAddr_ZonedLiteralIsDecidedAsItsAddress(t *testing.T) {
 	p := testProxy(t)
 	p.MustAdd[TCP]("+{any}", noopStream)
@@ -139,9 +124,6 @@ func TestAddr_ZonedLiteralIsDecidedAsItsAddress(t *testing.T) {
 	assert.Equal(t, ic, match(t, p2, http.MethodGet, "https", "[fe80::1%25eth0]:443", "/api"))
 }
 
-// A target host parses as an address or it is a name, never both. A host
-// parameter captures name labels only, the name wildcard covers every name and no address,
-// and a parameterized pattern that looks like an address is a name that resembles one.
 func TestAddr_HostKindsRouteSeparately(t *testing.T) {
 	p := testProxy(t)
 	p.MustAdd("{a}/api", noopHandler)
@@ -167,9 +149,6 @@ func TestAddr_HostKindsRouteSeparately(t *testing.T) {
 	assert.Equal(t, true, p2.Admits(target("[::ffff:127.0.0.1]:443"), KindTCP))
 }
 
-// The pattern requires the canonical spelling, and the lookup reduces whatever the client
-// wrote to the same form. No alternative spelling reaches a different entry, which with a
-// permissive fallback registered used to bypass interception.
 func TestAddr_LookupNormalizesTheWireSpelling(t *testing.T) {
 	p := testProxy(t)
 	p.MustAdd[TCP]("[0.0.0.0/0]", noopStream)
@@ -187,9 +166,6 @@ func TestAddr_LookupNormalizesTheWireSpelling(t *testing.T) {
 	assert.Equal(t, true, p.Admits(target("[2001:db8::2]:443"), KindTCP))
 }
 
-// The authority decision cuts a trailing root dot the way the request lookup always has.
-// example.com and example.com. are the same name, and the dotted form used to slip past an
-// interceptor into whatever fallback was registered.
 func TestAddr_AuthorityLookupCutsTheRootDot(t *testing.T) {
 	p := testProxy(t)
 	p.MustAdd("example.com/+{rest}", noopHandler)
@@ -197,8 +173,6 @@ func TestAddr_AuthorityLookupCutsTheRootDot(t *testing.T) {
 	assert.Equal(t, false, p.Admits(Target{Host: "other.com.", Port: "443"}, KindHTTP))
 }
 
-// The longest registered prefix that accepts the port decides, an exact address is a
-// full-length prefix, and overlapping ranges are precision, not a conflict.
 func TestAddr_LongestPrefixDecides(t *testing.T) {
 	p := testProxy(t)
 	p.MustAdd[TCP]("[10.0.0.0/8]", noopStream)
@@ -211,8 +185,6 @@ func TestAddr_LongestPrefixDecides(t *testing.T) {
 	assert.Equal(t, false, p.Admits(target("11.0.0.1:443"), KindHTTP))
 }
 
-// A candidate that refuses the port hands the decision to the next shorter prefix rather
-// than ending the lookup, the same fallback a name walk gets from its skip stack.
 func TestAddr_PortMismatchFallsBackToTheShorterPrefix(t *testing.T) {
 	p := testProxy(t)
 	p.MustAdd[TCP]("[10.0.0.0/8]", noopStream)
@@ -222,8 +194,6 @@ func TestAddr_PortMismatchFallsBackToTheShorterPrefix(t *testing.T) {
 	assert.Equal(t, true, p.Admits(target("10.1.2.3:443"), KindTCP))
 }
 
-// Requests route on the same rule. A path that misses under the longest prefix falls back to
-// a shorter one that serves it, and the exact address outranks every range covering it.
 func TestAddr_RequestRoutingUsesLongestPrefix(t *testing.T) {
 	p := testProxy(t)
 	eight := p.MustAdd("[10.0.0.0/8]/api", noopHandler)
@@ -242,8 +212,6 @@ func TestAddr_RequestRoutingUsesLongestPrefix(t *testing.T) {
 	assert.Equal(t, wide, match(t, p, http.MethodGet, "https", "10.1.9.9:443", "/wide"))
 }
 
-// The path under a range is an ordinary path, parameters and wildcards capture there as
-// under any host. The range itself captures nothing, the real address is on the context.
 func TestAddr_PathParamsUnderARange(t *testing.T) {
 	p := testProxy(t)
 	ic := p.MustAdd("[10.0.0.0/8]/v1/{id}", func(c *HTTPCtx) (*http.Response, error) {
@@ -257,10 +225,6 @@ func TestAddr_PathParamsUnderARange(t *testing.T) {
 	require.Equal(t, ic, got)
 }
 
-// The same prefix declared twice is the same conflict a duplicated authority always was, and
-// a tunneled range refuses interceptors on that exact range in either order. Different
-// precision is not a conflict, which TestAddr_LongestPrefixDecides holds, and neither is
-// another kind on the same prefix.
 func TestAddr_SamePrefixConflicts(t *testing.T) {
 	p := testProxy(t)
 	p.MustAdd[TCP]("[10.0.0.0/8]", noopStream)
@@ -280,8 +244,6 @@ func TestAddr_SamePrefixConflicts(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// A range interceptor implies the interception of its range, reference counted like any
-// authority, and deleting the last one hands the range back to nothing.
 func TestAddr_RangeInterceptorImpliesItsAuthority(t *testing.T) {
 	p := testProxy(t)
 	p.MustAdd("[fd00::/8]/api", noopHandler)
@@ -299,8 +261,6 @@ func TestAddr_RangeInterceptorImpliesItsAuthority(t *testing.T) {
 	assert.Equal(t, false, p.Admits(target("[fd42::1]:443"), KindHTTP))
 }
 
-// The port of a range interceptor scopes the implied interception, so the proxy never
-// terminates TLS on a port no interceptor can serve. Same rule as a name, held on a range.
 func TestAddr_RangeInterceptorPortScopesTheAuthority(t *testing.T) {
 	p := testProxy(t)
 	p.MustAdd("[10.0.0.0/8]:8443/api", noopHandler)
@@ -309,8 +269,6 @@ func TestAddr_RangeInterceptorPortScopesTheAuthority(t *testing.T) {
 	assert.Equal(t, false, p.Admits(target("10.1.2.3:443"), KindHTTP))
 }
 
-// The name index covers both roots. An interceptor on an address host registers,
-// resolves, renames and deletes by name exactly as one on a name host does.
 func TestAddr_NameIndexSpansBothWorlds(t *testing.T) {
 	p := testProxy(t)
 	ic := p.MustAdd("[10.0.0.0/8]/api", noopHandler, WithName[HTTP]("ranged"))
@@ -330,8 +288,6 @@ func TestAddr_NameIndexSpansBothWorlds(t *testing.T) {
 	assert.Zero(t, namedHTTP(p, "renamed"))
 }
 
-// Iteration and the exact-match lookups surface address entries with the spelling they were
-// registered under, encoded keys staying internal to the tree.
 func TestAddr_IterationAndLookupByPattern(t *testing.T) {
 	p := testProxy(t)
 	tn := p.MustAdd[TCP]("[fd00::/8]", noopStream)
@@ -361,8 +317,6 @@ func TestAddr_IterationAndLookupByPattern(t *testing.T) {
 	assert.Equal(t, ic.Pattern(), found[0].Pattern())
 }
 
-// A transaction sees its own pending address entries and an abort leaves the published tree
-// untouched, the address root committing with the others or not at all.
 func TestAddr_TransactionCoversTheAddressRoot(t *testing.T) {
 	p := testProxy(t)
 
@@ -384,8 +338,6 @@ func TestAddr_TransactionCoversTheAddressRoot(t *testing.T) {
 	assert.Equal(t, false, p.Admits(target("10.1.2.3:443"), KindHTTP))
 }
 
-// Deleting a prefix must not fold the surviving nodes across a registered boundary. The
-// prefixes that remain keep answering exactly what they answered before.
 func TestAddr_DeleteKeepsTheSurvivingPrefixes(t *testing.T) {
 	p := testProxy(t)
 	p.MustAdd[TCP]("[10.0.0.0/8]", noopStream)

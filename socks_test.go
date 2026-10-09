@@ -209,8 +209,6 @@ func TestSOCKS5_Auth(t *testing.T) {
 	})
 }
 
-// An authenticator reading HTTP requests alone has nothing to read on a SOCKS5 front, which
-// is refused before it accepts a client.
 func TestSOCKS5_RefusesAnAuthenticatorWithoutPasswords(t *testing.T) {
 	p := testProxy(t, WithProxyAuth(httpOnlyAuth{}))
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -224,8 +222,6 @@ type httpOnlyAuth struct{}
 func (httpOnlyAuth) Authenticate(*http.Request) (string, bool) { return "anyone", true }
 func (httpOnlyAuth) Challenges(*http.Request) []string         { return nil }
 
-// A plaintext connection through a SOCKS5 CONNECT has no absolute target, so it is routed on
-// the Host of its first request, as a redirected connection is.
 func TestSOCKS5_PlaintextIsRoutedOnItsFirstAuthority(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "origin got host=%s", r.Host)
@@ -418,8 +414,6 @@ func echoThroughSOCKS(t *testing.T, c *socksUDPClient, dest net.Addr, msg string
 	return string(buf[:n]), from
 }
 
-// Every datagram in an association is routed on its own destination, an address or a name
-// the proxy resolves, and the flows inside it hang under the association with its identity.
 func TestSOCKS5_AssociateRoutesDatagramsOnTheirDestination(t *testing.T) {
 	echo := udpEcho(t)
 	byHost := udpEcho(t)
@@ -480,8 +474,6 @@ func TestSOCKS5_AssociateRoutesDatagramsOnTheirDestination(t *testing.T) {
 	waitForSessions(t, p, 0)
 }
 
-// An HTTP/3 connection inside an association is terminated on a stack of the association
-// and the origin, and routed request by request.
 func TestSOCKS5_AssociateTerminatesTheInnerHTTP3(t *testing.T) {
 	p, ca, origin := newMasqueProxy(t)
 	addr := startSOCKS5(t, p)
@@ -518,7 +510,6 @@ func TestSOCKS5_AssociateTerminatesTheInnerHTTP3(t *testing.T) {
 	assert.NoError(t, err, "the control connection is closed by the proxy")
 }
 
-// A datagram from a source other than the one the association is bound to is dropped.
 func TestSOCKS5_AssociationDropsOtherSources(t *testing.T) {
 	echo := udpEcho(t)
 	p := testProxy(t)
@@ -561,8 +552,6 @@ func (r *heldResolver) LookupNetIP(ctx context.Context, _ string, host string) (
 	}
 }
 
-// A name is resolved off the goroutine feeding the association, so the datagrams to other
-// destinations keep flowing meanwhile, and the ones waiting on the name follow once it is.
 func TestSOCKS5_AssociationResolvesNamesOffItsLoop(t *testing.T) {
 	echo := udpEcho(t)
 	byHost := udpEcho(t)
@@ -606,8 +595,6 @@ func TestSOCKS5_AssociationResolvesNamesOffItsLoop(t *testing.T) {
 	}
 }
 
-// The datagrams waiting on a name are bounded as the ones waiting on a QUIC connection being
-// placed are, and so are the lookups in flight.
 func TestSOCKS5_AssociationBoundsWhatWaitsOnAName(t *testing.T) {
 	echo := udpEcho(t)
 	byHost := udpEcho(t)
@@ -647,8 +634,6 @@ func TestSOCKS5_AssociationBoundsWhatWaitsOnAName(t *testing.T) {
 	assert.Len(t, got, socks5NameResolving*maxPendingDatagrams, "every name within the bound came back up to its own bound")
 }
 
-// The socket of a datagram flow inside an association leaves the Don't Fragment bit unset. RFC
-// 9298 section 3.1 requires the bit toward the target of a CONNECT-UDP tunnel alone.
 func TestSOCKS5_AssociationFlowSocketLeavesDontFragmentUnset(t *testing.T) {
 	echo := udpEcho(t)
 	p, err := New()
@@ -666,8 +651,6 @@ func TestSOCKS5_AssociationFlowSocketLeavesDontFragmentUnset(t *testing.T) {
 	assert.False(t, set)
 }
 
-// An association nothing has lived in for udpFlowIdle is closed by the sweep, and the client
-// learns it from the end of its control connection.
 func TestSOCKS5_IdleAssociationIsClosed(t *testing.T) {
 	p := testProxy(t)
 	addr := startSOCKS5(t, p)
@@ -690,8 +673,6 @@ func TestSOCKS5_IdleAssociationIsClosed(t *testing.T) {
 	assert.ErrorIs(t, err, io.EOF)
 }
 
-// Past maxUDPPerFlow destinations the least recently used flow of the association makes
-// room, so a client talking to many destinations is never locked out.
 func TestSOCKS5_AssociationEvictsTheLeastRecentlyUsedFlow(t *testing.T) {
 	p := testProxy(t)
 	p.MustAdd[UDP]("[127.0.0.0/8]", forwardDatagram)
@@ -717,8 +698,6 @@ func TestSOCKS5_AssociationEvictsTheLeastRecentlyUsedFlow(t *testing.T) {
 	}
 }
 
-// The source of an association is the address of its control connection, whatever the client
-// declared, so a client cannot bind an association to another address.
 func TestSOCKS5_AssociationBindsToTheControlAddress(t *testing.T) {
 	echo := udpEcho(t)
 	p := testProxy(t)

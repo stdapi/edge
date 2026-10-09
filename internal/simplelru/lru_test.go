@@ -118,7 +118,6 @@ func TestLRU_GetOldest_RemoveOldest(t *testing.T) {
 	}
 }
 
-// Test that Add returns true/false if an eviction occurred
 func TestLRU_Add(t *testing.T) {
 	evictCounter := 0
 	onEvicted := func(k int, v int) {
@@ -138,7 +137,6 @@ func TestLRU_Add(t *testing.T) {
 	}
 }
 
-// Test that Contains doesn't update recent-ness
 func TestLRU_Contains(t *testing.T) {
 	l, err := NewLRU[int, int](2, nil)
 	if err != nil {
@@ -157,7 +155,6 @@ func TestLRU_Contains(t *testing.T) {
 	}
 }
 
-// Test that Peek doesn't update recent-ness
 func TestLRU_Peek(t *testing.T) {
 	l, err := NewLRU[int, int](2, nil)
 	if err != nil {
@@ -176,7 +173,6 @@ func TestLRU_Peek(t *testing.T) {
 	}
 }
 
-// Test that Resize can upsize and downsize
 func TestLRU_Resize(t *testing.T) {
 	onEvictCounter := 0
 	onEvicted := func(k int, v int) {

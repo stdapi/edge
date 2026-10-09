@@ -5,14 +5,7 @@
 package edge
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/tls"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"fmt"
-	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -22,10 +15,11 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
-	"time"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // curlBin is the Homebrew curl, which unlike the one shipped with macOS speaks HTTP/3 and
@@ -100,8 +94,8 @@ func runCurl(t *testing.T, args ...string) curlResult {
 	return res
 }
 
-// conformanceOrigin starts a TLS origin serving both HTTP/1.1 and HTTP/2.
-func conformanceOrigin(t *testing.T) *httptest.Server {
+// curlOrigin starts a TLS origin serving both HTTP/1.1 and HTTP/2.
+func curlOrigin(t *testing.T) *httptest.Server {
 	t.Helper()
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -125,8 +119,8 @@ func conformanceOrigin(t *testing.T) *httptest.Server {
 	return srv
 }
 
-func TestConformance_CurlThroughInterceptingProxy(t *testing.T) {
-	origin := conformanceOrigin(t)
+func TestCurl_ThroughInterceptingProxy(t *testing.T) {
+	origin := curlOrigin(t)
 	originURL, _ := url.Parse(origin.URL)
 
 	ca, err := GenerateCA()
@@ -184,10 +178,7 @@ func TestConformance_CurlThroughInterceptingProxy(t *testing.T) {
 	}
 }
 
-// An h2c client inside a CONNECT tunnel: curl opens the tunnel to a plaintext port and
-// starts HTTP/2 with prior knowledge, no upgrade and no TLS, so the proxy has nothing but
-// the connection preface to detect it by. The origin is reached the same way.
-func TestConformance_CurlH2CThroughInterceptingProxy(t *testing.T) {
+func TestCurl_H2CThroughInterceptingProxy(t *testing.T) {
 	origin := h2cOrigin(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "method=%s path=%s proto=%s", r.Method, r.URL.RequestURI(), r.Proto)
 	}))
@@ -226,8 +217,8 @@ func TestConformance_CurlH2CThroughInterceptingProxy(t *testing.T) {
 	}
 }
 
-func TestConformance_CurlStream(t *testing.T) {
-	origin := conformanceOrigin(t)
+func TestCurl_Stream(t *testing.T) {
+	origin := curlOrigin(t)
 	originURL, _ := url.Parse(origin.URL)
 
 	ca, _ := GenerateCA()
@@ -291,8 +282,8 @@ func TestConformance_CurlStream(t *testing.T) {
 	}
 }
 
-func TestConformance_CurlChunkedResponse(t *testing.T) {
-	origin := conformanceOrigin(t)
+func TestCurl_ChunkedResponse(t *testing.T) {
+	origin := curlOrigin(t)
 	originURL, _ := url.Parse(origin.URL)
 
 	ca, _ := GenerateCA()
@@ -323,8 +314,8 @@ func TestConformance_CurlChunkedResponse(t *testing.T) {
 	}
 }
 
-func TestConformance_CurlOverHTTPSProxy(t *testing.T) {
-	origin := conformanceOrigin(t)
+func TestCurl_OverHTTPSProxy(t *testing.T) {
+	origin := curlOrigin(t)
 	originURL, _ := url.Parse(origin.URL)
 
 	ca, _ := GenerateCA()
@@ -382,61 +373,8 @@ func TestConformance_CurlOverHTTPSProxy(t *testing.T) {
 	}
 }
 
-// selfSignedFor mints a server certificate for host signed by ca, for the proxy's own port.
-func selfSignedFor(t *testing.T, ca *CA, host string) tls.Certificate {
-	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("generate key: %v", err)
-	}
-	tmpl := &x509.Certificate{
-		SerialNumber:          big.NewInt(2),
-		Subject:               pkix.Name{CommonName: host},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(24 * time.Hour),
-		KeyUsage:              x509.KeyUsageDigitalSignature,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-		IPAddresses:           []net.IP{net.ParseIP("127.0.0.1")},
-	}
-	if ip := net.ParseIP(host); ip != nil {
-		tmpl.IPAddresses = append(tmpl.IPAddresses, ip)
-	} else {
-		tmpl.DNSNames = []string{host}
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, ca.Certificate(), key.Public(), ca.key)
-	if err != nil {
-		t.Fatalf("sign proxy certificate: %v", err)
-	}
-	leaf, _ := x509.ParseCertificate(der)
-	return tls.Certificate{Certificate: [][]byte{der, ca.Certificate().Raw}, PrivateKey: key, Leaf: leaf}
-}
-
-// recorder collects what handlers observed. A test driven by curl gets its result through
-// another process, so nothing orders the handler goroutine against the test goroutine and
-// the collection has to carry its own lock.
-type recorder struct {
-	mu      sync.Mutex
-	entries []string
-}
-
-func (r *recorder) add(s string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.entries = append(r.entries, s)
-}
-
-func (r *recorder) all() []string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	return slices.Clone(r.entries)
-}
-
-// TestConformance_CurlProxyAuth drives the proxy authentication with curl rather than a Go
-// client. Go's transport sends Basic preemptively from the proxy URL and never answers a
-// challenge, so it is the one client that would never exercise the 407.
-func TestConformance_CurlProxyAuth(t *testing.T) {
-	origin := conformanceOrigin(t)
+func TestCurl_ProxyAuth(t *testing.T) {
+	origin := curlOrigin(t)
 	originURL, _ := url.Parse(origin.URL)
 
 	ca, _ := GenerateCA()
@@ -508,10 +446,7 @@ func TestConformance_CurlProxyAuth(t *testing.T) {
 	})
 }
 
-// curl reaches the origin through the SOCKS5 front, sending its hostname when asked to let
-// the proxy resolve and the address it resolved itself otherwise. Either way the server name
-// inside routes and the certificate the proxy mints is what curl checks.
-func TestConformance_CurlThroughSOCKS5(t *testing.T) {
+func TestCurl_ThroughSOCKS5(t *testing.T) {
 	ca, err := GenerateCA()
 	if err != nil {
 		t.Fatalf("generate CA: %v", err)
@@ -568,4 +503,72 @@ func TestConformance_CurlThroughSOCKS5(t *testing.T) {
 			t.Fatalf("curl failed for another reason: %s", out)
 		}
 	})
+}
+
+func TestCurl_InterceptHTTP3(t *testing.T) {
+	requireCurl(t)
+
+	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
+	require.NoError(t, err)
+	origin := h3Origin(t, originCA)
+
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+
+	tr := DefaultTransport()
+	tr.AllowHTTP3 = true
+	tr.RootCAs = poolOf(originCA)
+
+	p, err := New(WithCA(proxyCA), WithTransport(tr))
+	require.NoError(t, err)
+
+	seen := new(recorder)
+	p.MustAdd(h3Authority+"/+{any}", func(c *HTTPCtx) (*http.Response, error) {
+		seen.add(c.Protocol().String() + " " + c.Request().URL.Path)
+		return c.Forward()
+	})
+
+	proxyAddr := startQUICRedirected(t, p, origin)
+	port := fmt.Sprint(proxyAddr.Port())
+
+	res := runCurl(t,
+		"--http3-only",
+		"--resolve", h3Authority+":"+port+":127.0.0.1",
+		"--cacert", writeCAFile(t, proxyCA),
+		fmt.Sprintf("https://%s:%s/echo", h3Authority, port),
+	)
+
+	require.Equal(t, "200", res.status, "body %q", res.body)
+	assert.Equal(t, "3", res.version, "curl must have used HTTP/3")
+	assert.Contains(t, res.body, "proto=HTTP/3.0", "the origin must have been reached over HTTP/3 too")
+	assert.Contains(t, res.body, "path=/echo")
+	require.Equal(t, []string{"HTTP/3.0 /echo"}, seen.all())
+}
+
+func TestCurl_HTTP3HandlerCanShortCircuit(t *testing.T) {
+	requireCurl(t)
+
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+
+	p, err := New(WithCA(proxyCA))
+	require.NoError(t, err)
+
+	p.MustAdd(h3Authority+"/blocked", func(c *HTTPCtx) (*http.Response, error) {
+		return Text(http.StatusForbidden, "blocked by edge over "+c.Protocol().String()), nil
+	}, WithMethods[HTTP](http.MethodGet))
+
+	proxyAddr := startQUIC(t, p)
+	port := fmt.Sprint(proxyAddr.Port())
+
+	res := runCurl(t,
+		"--http3-only",
+		"--resolve", h3Authority+":"+port+":127.0.0.1",
+		"--cacert", writeCAFile(t, proxyCA),
+		fmt.Sprintf("https://%s:%s/blocked", h3Authority, port),
+	)
+
+	assert.Equal(t, "403", res.status)
+	assert.Equal(t, "3", res.version)
+	assert.Contains(t, res.body, "blocked by edge over HTTP/3.0")
 }

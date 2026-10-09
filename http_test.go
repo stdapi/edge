@@ -35,33 +35,225 @@ import (
 	"golang.org/x/net/http2/hpack"
 )
 
-// interceptingProxy wires an origin behind a proxy that intercepts it, and returns the
-// proxy, the origin hostname and a client pointed at the proxy.
-func interceptingProxy(t *testing.T, origin *httptest.Server, opts ...ProxyOption) (*Proxy, string, *http.Client) {
-	t.Helper()
-	originURL, err := url.Parse(origin.URL)
-	require.NoError(t, err)
+func TestHTTP_ShortCircuit(t *testing.T) {
+	var originHits int
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		originHits++
+		fmt.Fprint(w, "should not be reached")
+	}))
+	defer origin.Close()
 
-	ca, err := GenerateCA()
-	require.NoError(t, err)
-
+	originURL, _ := url.Parse(origin.URL)
+	ca, _ := GenerateCA()
 	tr := DefaultTransport()
 	tr.RootCAs = originPool(t, origin)
 
-	host := originHost(originURL)
-	all := append([]ProxyOption{WithCA(ca), WithTransport(tr)}, opts...)
-	p, err := New(all...)
-	require.NoError(t, err)
-
-	// Observing an authority without changing anything is a catch-all that forwards. It is
-	// what arms the interception: nothing crosses a proxy that was not asked for it.
-	p.MustAdd(host+"/*{any}", forwardHandler)
+	p, err := New(WithCA(ca), WithTransport(tr))
+	if err != nil {
+		t.Fatalf("new proxy: %v", err)
+	}
+	p.MustAdd(originHost(originURL)+"/v1/charges", func(c *HTTPCtx) (*http.Response, error) {
+		if c.Request().Header.Get("Idempotency-Key") == "" {
+			return Text(http.StatusBadRequest, "missing idempotency key"), nil
+		}
+		return c.Forward()
+	}, WithMethods[HTTP](http.MethodPost))
 
 	addr := startProxy(t, p)
-	return p, host, proxyClient(addr, ca.CertPool())
+	client := proxyClient(addr, ca.CertPool())
+
+	resp, err := client.Post(origin.URL+"/v1/charges", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("post through proxy: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "missing idempotency key" {
+		t.Fatalf("body = %q", body)
+	}
+	if originHits != 0 {
+		t.Fatalf("origin was reached %d times, want 0", originHits)
+	}
 }
 
-func TestSemantics_HeadHasNoBody(t *testing.T) {
+func TestHTTP_PlainHTTPAbsoluteTarget(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "plain %s", r.URL.Path)
+	}))
+	defer origin.Close()
+
+	originURL, _ := url.Parse(origin.URL)
+	ca, _ := GenerateCA()
+
+	p, err := New(WithCA(ca))
+	if err != nil {
+		t.Fatalf("new proxy: %v", err)
+	}
+
+	p.MustAdd(originHost(originURL)+"/hello", func(c *HTTPCtx) (*http.Response, error) {
+		if c.Scheme() != "http" {
+			return nil, fmt.Errorf("scheme = %q, want http", c.Scheme())
+		}
+		resp, err := c.Forward()
+		if err != nil {
+			return nil, err
+		}
+		body, _ := ReadBody(resp, 0)
+		return Rewrite(resp, []byte(strings.ToUpper(string(body)))), nil
+	}, WithMethods[HTTP](http.MethodGet))
+
+	addr := startProxy(t, p)
+	client := proxyClient(addr, nil)
+
+	resp, err := client.Get(origin.URL + "/hello")
+	if err != nil {
+		t.Fatalf("get through proxy: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "PLAIN /HELLO" {
+		t.Fatalf("body = %q, want PLAIN /HELLO", body)
+	}
+}
+
+func TestHTTP_StreamsWithoutBuffering(t *testing.T) {
+	release := make(chan struct{})
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		rc := http.NewResponseController(w)
+		fmt.Fprint(w, "data: first\n\n")
+		_ = rc.Flush()
+		<-release
+		fmt.Fprint(w, "data: second\n\n")
+		_ = rc.Flush()
+	}))
+	defer origin.Close()
+
+	originURL, _ := url.Parse(origin.URL)
+	ca, _ := GenerateCA()
+	tr := DefaultTransport()
+	tr.RootCAs = originPool(t, origin)
+
+	p, err := New(WithCA(ca), WithTransport(tr))
+	if err != nil {
+		t.Fatalf("new proxy: %v", err)
+	}
+	p.MustAdd(originHost(originURL)+"/events", func(c *HTTPCtx) (*http.Response, error) {
+		return c.Forward()
+	}, WithMethods[HTTP](http.MethodGet))
+
+	addr := startProxy(t, p)
+	client := proxyClient(addr, ca.CertPool())
+
+	resp, err := client.Get(origin.URL + "/events")
+	if err != nil {
+		t.Fatalf("get events: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	br := bufio.NewReader(resp.Body)
+	line, err := br.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read first event: %v", err)
+	}
+	// Reaching this before the origin has written the second event proves the proxy is not
+	// waiting for the body to end before relaying it.
+	if strings.TrimSpace(line) != "data: first" {
+		t.Fatalf("first event = %q", line)
+	}
+
+	close(release)
+	rest, _ := io.ReadAll(br)
+	if !strings.Contains(string(rest), "data: second") {
+		t.Fatalf("second event missing from %q", rest)
+	}
+}
+
+func TestHTTP_ForwardsTrailers(t *testing.T) {
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Trailer", "X-Checksum")
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "payload")
+		w.Header().Set("X-Checksum", "deadbeef")
+	}))
+	defer origin.Close()
+
+	originURL, _ := url.Parse(origin.URL)
+	ca, _ := GenerateCA()
+	tr := DefaultTransport()
+	tr.RootCAs = originPool(t, origin)
+
+	p, err := New(WithCA(ca), WithTransport(tr))
+	if err != nil {
+		t.Fatalf("new proxy: %v", err)
+	}
+	p.MustAdd(originHost(originURL)+"/*{any}", forwardHandler)
+
+	addr := startProxy(t, p)
+	client := proxyClient(addr, ca.CertPool())
+
+	resp, err := client.Get(origin.URL + "/")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "payload" {
+		t.Fatalf("body = %q", body)
+	}
+	if got := resp.Trailer.Get("X-Checksum"); got != "deadbeef" {
+		t.Fatalf("trailer X-Checksum = %q, want deadbeef", got)
+	}
+}
+
+func TestHTTP_AnnouncesTETrailersOverHTTP2(t *testing.T) {
+	origin := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "te=%s proto=%s", r.Header.Get("Te"), r.Proto)
+	}))
+	origin.EnableHTTP2 = true
+	origin.StartTLS()
+	defer origin.Close()
+
+	originURL, _ := url.Parse(origin.URL)
+	ca, _ := GenerateCA()
+	tr := DefaultTransport()
+	tr.RootCAs = originPool(t, origin)
+
+	p, err := New(WithCA(ca), WithTransport(tr))
+	if err != nil {
+		t.Fatalf("new proxy: %v", err)
+	}
+	p.MustAdd(originHost(originURL)+"/*{any}", forwardHandler)
+
+	addr := startProxy(t, p)
+	client := h2Client(addr, ca.CertPool())
+
+	req, err := http.NewRequest(http.MethodGet, origin.URL+"/", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("TE", "trailers")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("get through proxy: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, _ := io.ReadAll(resp.Body)
+	if string(body) != "te=trailers proto=HTTP/2.0" {
+		t.Fatalf("origin saw %q, want te=trailers proto=HTTP/2.0", body)
+	}
+}
+
+func TestHTTP_HeadHasNoBody(t *testing.T) {
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", "5")
 		if r.Method != http.MethodHead {
@@ -82,7 +274,7 @@ func TestSemantics_HeadHasNoBody(t *testing.T) {
 	assert.Equal(t, "5", resp.Header.Get("Content-Length"))
 }
 
-func TestSemantics_NoContentAndNotModified(t *testing.T) {
+func TestHTTP_NoContentAndNotModified(t *testing.T) {
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/204":
@@ -105,7 +297,7 @@ func TestSemantics_NoContentAndNotModified(t *testing.T) {
 	}
 }
 
-func TestSemantics_RequestBodyStreams(t *testing.T) {
+func TestHTTP_RequestBodyStreams(t *testing.T) {
 	const size = 4 << 20
 
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -129,7 +321,7 @@ func TestSemantics_RequestBodyStreams(t *testing.T) {
 	assert.Equal(t, fmt.Sprintf("received %d", size), string(got))
 }
 
-func TestSemantics_ContentEncodingIsNotTouched(t *testing.T) {
+func TestHTTP_ContentEncodingIsNotTouched(t *testing.T) {
 	var payload bytes.Buffer
 	zw := gzip.NewWriter(&payload)
 	_, _ = zw.Write([]byte("compressed payload"))
@@ -163,7 +355,7 @@ func TestSemantics_ContentEncodingIsNotTouched(t *testing.T) {
 	assert.Equal(t, payload.Bytes(), raw)
 }
 
-func TestSemantics_HopByHopHeadersAreStripped(t *testing.T) {
+func TestHTTP_HopByHopHeadersAreStripped(t *testing.T) {
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var leaked []string
 		for _, h := range []string{"Proxy-Connection", "Keep-Alive", "X-Hop", "Connection"} {
@@ -192,7 +384,7 @@ func TestSemantics_HopByHopHeadersAreStripped(t *testing.T) {
 	assert.Equal(t, "leaked=", string(body))
 }
 
-func TestSemantics_TETrailersIsAnnouncedForTheProxy(t *testing.T) {
+func TestHTTP_TETrailersIsAnnouncedForTheProxy(t *testing.T) {
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "te=%s", strings.Join(r.Header.Values("Te"), "|"))
 	}))
@@ -237,7 +429,7 @@ func TestSemantics_TETrailersIsAnnouncedForTheProxy(t *testing.T) {
 	}
 }
 
-func TestSemantics_HandlerPanicBecomesAnError(t *testing.T) {
+func TestHTTP_HandlerPanicBecomesAnError(t *testing.T) {
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "origin")
 	}))
@@ -268,9 +460,7 @@ func TestSemantics_HandlerPanicBecomesAnError(t *testing.T) {
 	assert.Equal(t, "still alive", string(body))
 }
 
-// A panic reaches the error handler as a [PanicError] carrying what recover returned and the
-// stack, so a replacement decides both the status and what is logged.
-func TestSemantics_PanicReachesTheErrorHandler(t *testing.T) {
+func TestHTTP_PanicReachesTheErrorHandler(t *testing.T) {
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer origin.Close()
 
@@ -293,11 +483,11 @@ func TestSemantics_PanicReachesTheErrorHandler(t *testing.T) {
 	require.NotZero(t, got)
 	assert.Equal(t, sentinel, got.Value)
 	assert.ErrorIs(t, got, sentinel, "a panic carrying an error stays reachable through Unwrap")
-	assert.Contains(t, got.Stack, "TestSemantics_PanicReachesTheErrorHandler",
+	assert.Contains(t, got.Stack, "TestHTTP_PanicReachesTheErrorHandler",
 		"the first frame captured must be the one that panicked")
 }
 
-func TestSemantics_ErrorHandler(t *testing.T) {
+func TestHTTP_ErrorHandler(t *testing.T) {
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer origin.Close()
 
@@ -322,7 +512,7 @@ func TestSemantics_ErrorHandler(t *testing.T) {
 	assert.Equal(t, "handled: upstream refused", string(body))
 }
 
-func TestSemantics_MiddlewareOrder(t *testing.T) {
+func TestHTTP_MiddlewareOrder(t *testing.T) {
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
 	defer origin.Close()
 
@@ -351,7 +541,7 @@ func TestSemantics_MiddlewareOrder(t *testing.T) {
 	assert.Equal(t, []string{"→outer", "→inner", "→interceptor", "handler", "←interceptor", "←inner", "←outer"}, order)
 }
 
-func TestSemantics_NoInterceptorForwardsUnchanged(t *testing.T) {
+func TestHTTP_NoInterceptorForwardsUnchanged(t *testing.T) {
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "origin got %s", r.URL.Path)
 	}))
@@ -370,10 +560,7 @@ func TestSemantics_NoInterceptorForwardsUnchanged(t *testing.T) {
 	assert.Equal(t, "origin got /unknown", string(body))
 }
 
-// The proxy matches on the canonical form of the path and forwards the one the client sent.
-// The two differ only by the normalizations RFC 3986 declares equivalent, and the target that
-// reaches the origin is the wire target byte for byte.
-func TestSemantics_RawPathIsPreserved(t *testing.T) {
+func TestHTTP_RawPathIsPreserved(t *testing.T) {
 	var seen string
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		seen = r.RequestURI
@@ -421,55 +608,6 @@ func TestSemantics_RawPathIsPreserved(t *testing.T) {
 		assert.Equal(t, tc.wire, seen, "the request target must reach the origin byte for byte")
 		assert.Equal(t, tc.wantRouted, routed, "routing form of %q", tc.wire)
 	}
-}
-
-// A connection admitted for one authority does not admit the ones its Host header can name.
-func TestSemantics_HostHeaderCannotReachAnUnnamedAuthority(t *testing.T) {
-	reached := new(atomic.Bool)
-	other := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-		reached.Store(true)
-	}))
-	defer other.Close()
-
-	otherURL, err := url.Parse(other.URL)
-	require.NoError(t, err)
-
-	ca, err := GenerateCA()
-	require.NoError(t, err)
-	p, err := New(WithCA(ca))
-	require.NoError(t, err)
-	p.MustAdd("allowed.example.test/+{rest}", func(c *HTTPCtx) (*http.Response, error) {
-		return c.Forward()
-	})
-	require.Equal(t, false, p.Admits(Target{Scheme: "http", Host: "127.0.0.1", Port: otherURL.Port()}, KindHTTP))
-
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-	go func() { _ = p.Serve(ln) }()
-	t.Cleanup(func() { _ = p.Close() })
-
-	conn, err := net.Dial("tcp", ln.Addr().String())
-	require.NoError(t, err)
-	defer func() { _ = conn.Close() }()
-	require.NoError(t, conn.SetDeadline(time.Now().Add(10*time.Second)))
-
-	_, err = fmt.Fprint(conn, "CONNECT allowed.example.test:80 HTTP/1.1\r\nHost: allowed.example.test:80\r\n\r\n")
-	require.NoError(t, err)
-
-	br := bufio.NewReader(conn)
-	established, err := http.ReadResponse(br, nil)
-	require.NoError(t, err)
-	require.Equal(t, http.StatusOK, established.StatusCode)
-
-	_, err = fmt.Fprintf(conn, "GET /probe HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", otherURL.Host)
-	require.NoError(t, err)
-
-	resp, err := http.ReadResponse(br, nil)
-	require.NoError(t, err)
-	defer func() { _ = resp.Body.Close() }()
-
-	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
-	assert.False(t, reached.Load())
 }
 
 // A proxy conformance case is one requirement HTTP places on a proxy, checked with a raw
@@ -1793,7 +1931,7 @@ var proxyConformance = []proxyConformanceCase{
 	},
 }
 
-func TestSemantics_NoUserAgentIsAdded(t *testing.T) {
+func TestHTTP_NoUserAgentIsAdded(t *testing.T) {
 	b := newProxyBench(t, always(okReply))
 	got, _ := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\n\r\n")
 	assert.NotContains(t, strings.ToLower(got.head), "user-agent")
@@ -1802,9 +1940,7 @@ func TestSemantics_NoUserAgentIsAdded(t *testing.T) {
 	assert.Contains(t, got.head, "User-Agent: curl/8.0\r\n")
 }
 
-// An origin that fails in the middle of a body leaves the client with a failed read, where a
-// clean end would read as a complete body.
-func TestSemantics_CutBodyIsNotEndedCleanly(t *testing.T) {
+func TestHTTP_CutBodyIsNotEndedCleanly(t *testing.T) {
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, "partial")
 		_ = http.NewResponseController(w).Flush()
@@ -1823,7 +1959,7 @@ func TestSemantics_CutBodyIsNotEndedCleanly(t *testing.T) {
 	assert.Error(t, err, "the body read as complete")
 }
 
-func TestSemantics_EarlyHintsReachAnHTTP3Client(t *testing.T) {
+func TestHTTP_EarlyHintsReachAnHTTP3Client(t *testing.T) {
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Link", "</s.css>; rel=preload")
 		w.WriteHeader(http.StatusEarlyHints)
@@ -1864,56 +2000,7 @@ func TestSemantics_EarlyHintsReachAnHTTP3Client(t *testing.T) {
 	assert.Equal(t, "ok", string(body))
 }
 
-// RFC 9114 4.4, a TCP reset from the origin of a CONNECT ends the stream with H3_CONNECT_ERROR.
-func TestSemantics_OriginResetEndsAnHTTP3ConnectWithConnectError(t *testing.T) {
-	b := newProxyBench(t, func(o *rawOrigin, w *wire) {
-		buf := make([]byte, 5)
-		if _, err := io.ReadFull(w.br, buf); err != nil {
-			return
-		}
-		o.note(string(buf))
-		_ = w.Conn.(*net.TCPConn).SetLinger(0)
-	})
-	b.p.MustAdd("origin.test", relayStream)
-	ca, err := GenerateCA()
-	require.NoError(t, err)
-	front, _ := startQUICFront(t, b.p, ca)
-	tr := &http3.Transport{}
-	defer func() { _ = tr.Close() }()
-	cc := tr.NewClientConn(dialQUICFront(t, front, ca))
-
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel()
-	str, err := cc.OpenRequestStream(ctx)
-	require.NoError(t, err)
-	req, err := http.NewRequest(http.MethodConnect, "https://origin.test:80", nil)
-	require.NoError(t, err)
-	require.NoError(t, str.SendRequestHeader(req))
-	resp, err := str.ReadResponse()
-	require.NoError(t, err)
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-	_, err = str.Write([]byte("\x01ping"))
-	require.NoError(t, err)
-	assert.Equal(t, "\x01ping", b.origin.nextNote(t))
-
-	require.NoError(t, str.SetReadDeadline(time.Now().Add(5*time.Second)))
-	_, err = io.Copy(io.Discard, str)
-	h3err, ok := errors.AsType[*http3.Error](err)
-	require.True(t, ok, "the stream ended with %v", err)
-	assert.Equal(t, http3.ErrCodeConnectError, h3err.ErrorCode)
-
-	require.Eventually(t, func() bool {
-		_, err = str.Write([]byte("x"))
-		return err != nil
-	}, 5*time.Second, 10*time.Millisecond)
-	stopped, ok := errors.AsType[*quic.StreamError](err)
-	require.True(t, ok, "the write ended with %v", err)
-	assert.Equal(t, quic.StreamErrorCode(http3.ErrCodeConnectError), stopped.ErrorCode)
-}
-
-// An asterisk-form OPTIONS is routed on its path, and no entry for a path matches it, over
-// HTTP/3 and through a tunnel.
-func TestSemantics_AsteriskFormNeverReachesAnAdmission(t *testing.T) {
+func TestHTTP_AsteriskFormNeverReachesAnAdmission(t *testing.T) {
 	b := newProxyBench(t, always(okReply))
 	b.p.MustAdd("origin.test", relayStream)
 	ca, err := GenerateCA()
@@ -1942,9 +2029,7 @@ func TestSemantics_AsteriskFormNeverReachesAnAdmission(t *testing.T) {
 	b.origin.none(t)
 }
 
-// An OPTIONS with an empty path is about the server itself, so it reaches the origin as "*"
-// whatever version the proxy uses upstream.
-func TestSemantics_OptionsWithAnEmptyPathOverEveryVersion(t *testing.T) {
+func TestHTTP_OptionsWithAnEmptyPathOverEveryVersion(t *testing.T) {
 	asServer := func(c *HTTPCtx) (*http.Response, error) {
 		r := c.Request().Clone(c.Request().Context())
 		r.Method = http.MethodOptions

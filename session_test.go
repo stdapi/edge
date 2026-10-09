@@ -118,8 +118,6 @@ func TestSession_SweepAfterDeleteStream(t *testing.T) {
 	require.Error(t, err)
 }
 
-// Registering an entry at a more specific kind never moves a connection already open. Stale
-// reports it, since the traffic allowed that kind from the start and the entries admit it now.
 func TestSession_StaleWhenAFinerKindIsAdmitted(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -158,9 +156,6 @@ func TestSession_StaleWhenAFinerKindIsAdmitted(t *testing.T) {
 	assert.Equal(t, KindHTTP, waitForSessions(t, p, 1)[0].Kind())
 }
 
-// A connection keeps the entry it was decided on, and Stale reports when the entries as they
-// stand would pick another one, whether a more specific entry appeared, that entry went away
-// again, or the one serving it was replaced.
 func TestSession_StaleFollowsTheEntry(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -203,8 +198,6 @@ func TestSession_StaleFollowsTheEntry(t *testing.T) {
 	assert.True(t, sess.Stale(), "nothing admits it any more")
 }
 
-// A WebSocket session keeps the entry that served its upgrade. Stale replays the request
-// lookup, so an entry that would now serve the upgrade first makes it stale.
 func TestSession_StaleWebSocket(t *testing.T) {
 	origin, originURL := wsOrigin(t, nil)
 	p := testProxy(t)
@@ -235,7 +228,6 @@ func TestSession_StaleWebSocket(t *testing.T) {
 	assert.True(t, sess.Stale(), "nothing admits it any more")
 }
 
-// A connection served request by request has no decision of its own to go stale.
 func TestSession_FrontIsNeverStale(t *testing.T) {
 	p := testProxy(t)
 	stale := make(chan bool, 1)
@@ -252,8 +244,6 @@ func TestSession_FrontIsNeverStale(t *testing.T) {
 	assert.False(t, <-stale)
 }
 
-// Stale reads a session while the entries change under it, and while the connection it
-// describes is being decided and registered.
 func TestSession_StaleUnderConcurrentChanges(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -291,8 +281,6 @@ func TestSession_StaleUnderConcurrentChanges(t *testing.T) {
 	wg.Wait()
 }
 
-// A tunnel opened over a TLS front carries its own traffic, so a plaintext tunnel reports no
-// TLS state and no ALPN even though the connection to the proxy negotiated both.
 func TestSession_PlaintextTunnelOverTLSFront(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -389,8 +377,6 @@ func TestSession_InterceptedIsListedAndClosed(t *testing.T) {
 	waitForSessions(t, p, 0)
 }
 
-// A connection a client opens to the proxy itself addresses the proxy, not an authority, so it
-// has no decision of its own and is not reported.
 func TestSession_FrontConnectionsAreNotListed(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprint(w, "origin")
@@ -416,7 +402,6 @@ func TestSession_FrontConnectionsAreNotListed(t *testing.T) {
 		"a plain proxy request opens no connection the proxy decides on its own")
 }
 
-// Closing while traffic flows must not race the goroutines serving it.
 func TestSession_CloseUnderTraffic(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -460,8 +445,6 @@ func TestSession_CloseUnderTraffic(t *testing.T) {
 	wg.Wait()
 }
 
-// admitSession is what leaves no window between a commit and a sweep. A connection decided
-// before the commit and registered after it replays its decision and is refused.
 func TestSession_AdmitAfterChange(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -542,15 +525,11 @@ func frontSessionContext(t *testing.T, p *Proxy, client *http.Client) {
 	}
 }
 
-// The proxy-facing session of an explicit connection ends with the connection. A plain
-// proxied request is served under it, so a handler waiting on Session.Context is released
-// when the client goes away.
 func TestSession_FrontContextEndsWithTheConnection(t *testing.T) {
 	p := testProxy(t)
 	frontSessionContext(t, p, proxyClient(startProxy(t, p), nil))
 }
 
-// The same contract when the proxy itself is reached over TLS.
 func TestSession_FrontContextEndsWithTheConnectionOverTLS(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -568,8 +547,6 @@ func TestSession_FrontContextEndsWithTheConnectionOverTLS(t *testing.T) {
 	frontSessionContext(t, p, client)
 }
 
-// FuzzSplitHostPort checks the authority splitter against its inverse. Everything the proxy
-// routes on goes through it, including hostile authorities off the wire.
 func FuzzSplitHostPort(f *testing.F) {
 	seeds := []string{
 		"api.stripe.com:443",
@@ -668,8 +645,6 @@ func wsUpgrade(t *testing.T, proxyAddr string, origin *httptest.Server, extraHea
 	return resp
 }
 
-// A WebSocket handler owns the upgrade request it is handed, so Stale replays a copy while
-// the handler writes to the original.
 func TestSession_StaleReadsACopyOfTheUpgrade(t *testing.T) {
 	origin, originURL := wsOrigin(t, nil)
 	p := testProxy(t)
@@ -699,8 +674,6 @@ func TestSession_StaleReadsACopyOfTheUpgrade(t *testing.T) {
 	close(done)
 }
 
-// An entry committed while the origin answers the upgrade makes the decision stale before the
-// session is registered, so the client is refused and reads the status alone.
 func TestSession_UpgradeRefusedAfterAChangeInTheWindow(t *testing.T) {
 	p := testProxy(t)
 	relayFrames := func(c *WebSocketCtx) error { return c.Relay() }

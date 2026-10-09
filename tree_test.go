@@ -5,49 +5,18 @@
 package edge
 
 import (
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-func testProxy(t *testing.T, opts ...ProxyOption) *Proxy {
-	t.Helper()
-	ca, err := GenerateCA()
-	require.NoError(t, err)
-	p, err := New(append([]ProxyOption{WithCA(ca)}, opts...)...)
-	require.NoError(t, err)
-	return p
-}
-
-func noopHandler(*HTTPCtx) (*http.Response, error) { return Status(http.StatusOK), nil }
-
-// match resolves the interceptor that would serve method and path on authority.
-func match(t *testing.T, p *Proxy, method, scheme, authority, path string) Entry[HTTP] {
-	t.Helper()
-	return matchRequest(t, p, scheme, authority, httptest.NewRequest(method, path, nil))
-}
-
-// matchRequest runs the lookup serve runs, without running a handler. It is the routing
-// oracle the tests assert on: a real request, resolved the way a served one is.
-func matchRequest(t *testing.T, p *Proxy, scheme, authority string, req *http.Request) Entry[HTTP] {
-	t.Helper()
-	host, port := splitHostPort(authority)
-	target := Target{Scheme: scheme, Host: host, Port: port}.normalized()
-
-	tree := p.getTree()
-	c := tree.pool.Get().(*routeCtx)
-	defer tree.pool.Put(c)
-	c.reset(nil, req, target.Scheme, target.Host, target.Port)
-
-	idx, n := tree.lookup(target.Host, routingPath(req), c, false)
-	if n == nil {
-		return Entry[HTTP]{}
-	}
-	return Entry[HTTP]{e: n.entries[idx]}
-}
 
 func TestRouting_SchemeIsOptional(t *testing.T) {
 	p := testProxy(t)
@@ -150,8 +119,6 @@ func TestRouting_WildcardAuthorityMatchesEveryHost(t *testing.T) {
 	assert.Equal(t, true, p.Admits(target("anything.test:443"), KindHTTP))
 }
 
-// An interceptor must name the authority it intercepts. An omitted one used to be accepted and arm
-// nothing, leaving a handler no connection could reach.
 func TestRouting_HostnameIsRequired(t *testing.T) {
 	p := testProxy(t)
 
@@ -194,8 +161,6 @@ func TestRouting_TrailingSlash(t *testing.T) {
 	})
 }
 
-// CONNECT establishes a connection, it is never a request an entry serves, so a method
-// matcher naming it could only ever be dead weight.
 func TestRouting_RejectsConnect(t *testing.T) {
 	p := testProxy(t)
 	_, err := p.Add("api.stripe.com/", noopHandler, WithMethods[HTTP](http.MethodConnect))
@@ -224,8 +189,6 @@ func countAuthorities(p *Proxy) int {
 	return n
 }
 
-// Two interceptors differing only by their port share a tree key and are told apart by the
-// port alone. They are two entries, not a conflict and not one another's update.
 func TestRouting_PortDiscriminatesTwoInterceptors(t *testing.T) {
 	p := testProxy(t)
 
@@ -254,8 +217,6 @@ func TestRouting_PortDiscriminatesTwoInterceptors(t *testing.T) {
 	assert.Equal(t, false, p.Admits(target("localhost:8080"), KindHTTP))
 }
 
-// An interceptor naming a port is more narrowly targeted than one accepting every port, so it
-// is tried first whatever else narrows the other.
 func TestRouting_PortOutranksTheRest(t *testing.T) {
 	p := testProxy(t)
 
@@ -293,6 +254,298 @@ func TestRouting_PortOutranksTheRest(t *testing.T) {
 	assert.Equal(t, any, got, "with nothing left, the fallback")
 }
 
-// noopStream is the connection-level handler the routing tests register when what they check
-// is the pattern, not what the handler does.
-func noopStream(*TCPCtx) error { return nil }
+func TestRouting_InterceptorMutationDuringTraffic(t *testing.T) {
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "origin %s", r.URL.Path)
+	}))
+	defer origin.Close()
+
+	p, authority, client := interceptingProxy(t, origin)
+
+	var served atomic.Int64
+	p.MustAdd(authority+"/stable", func(c *HTTPCtx) (*http.Response, error) {
+		served.Add(1)
+		return Text(http.StatusOK, "stable"), nil
+	}, WithMethods[HTTP](http.MethodGet))
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	// A writer churning the tree: interceptors come and go for the whole run.
+	wg.Go(func() {
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+
+			pattern := fmt.Sprintf("%s/churn/%d", authority, i%16)
+			ic, err := p.Add(pattern, func(c *HTTPCtx) (*http.Response, error) {
+				return Text(http.StatusOK, "churn"), nil
+			}, WithMethods[HTTP](http.MethodGet))
+			if err != nil {
+				continue
+			}
+			// The matchers identify an entry, methods included, so a delete names the same
+			// ones the add did.
+			if _, err := p.Delete[HTTP](ic.Pattern(), WithMethods[HTTP](http.MethodGet)); err != nil {
+				t.Errorf("delete %s: %v", pattern, err)
+				return
+			}
+		}
+	})
+
+	// Readers hammering an interceptor the writer never touches.
+	const readers = 8
+	for range readers {
+		wg.Go(func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+
+				resp, err := client.Get(origin.URL + "/stable")
+				if err != nil {
+					t.Errorf("get: %v", err)
+					return
+				}
+				body, _ := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+				if string(body) != "stable" {
+					t.Errorf("body = %q, want stable", body)
+					return
+				}
+			}
+		})
+	}
+
+	time.Sleep(300 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+
+	assert.Positive(t, served.Load(), "no request was served")
+	assert.Equal(t, true, p.Admits(target(authority), KindHTTP), "the authority the stable interceptor implies must have survived the churn")
+}
+
+func TestRouting_AuthorityMutationDuringTraffic(t *testing.T) {
+	p := testProxy(t)
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+
+	wg.Go(func() {
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			pattern := fmt.Sprintf("churn-%d.example.test", i%32)
+			if _, err := p.Add[TCP](pattern, relayStream); err != nil {
+				continue
+			}
+			if _, err := p.Delete[TCP](pattern); err != nil {
+				t.Errorf("delete tunnel %s: %v", pattern, err)
+				return
+			}
+		}
+	})
+
+	p.MustAdd("stable.example.test/*{any}", noopHandler)
+
+	for range 8 {
+		wg.Go(func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if !p.Admits(target("stable.example.test:443"), KindHTTP) {
+					t.Error("stable authority is not admitted")
+					return
+				}
+				// Named by nothing, so it stays refused however the entry set churns.
+				if p.Admits(target("other.example.test:443"), KindHTTP) {
+					t.Error("unnamed authority is admitted")
+					return
+				}
+			}
+		})
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+}
+
+func benchProxy(b *testing.B, patterns ...string) *Proxy {
+	b.Helper()
+	ca, err := GenerateCA()
+	if err != nil {
+		b.Fatal(err)
+	}
+	p, err := New(WithCA(ca))
+	if err != nil {
+		b.Fatal(err)
+	}
+	for _, pattern := range patterns {
+		if _, err := p.Add(pattern, noopHandler, WithMethods[HTTP](http.MethodGet)); err != nil {
+			b.Fatalf("register %s: %v", pattern, err)
+		}
+	}
+	return p
+}
+
+func BenchmarkLookup(b *testing.B) {
+	cases := []struct {
+		name    string
+		pattern string
+		host    string
+		path    string
+	}{
+		{name: "static", pattern: "api.stripe.com/v1/charges", host: "api.stripe.com", path: "/v1/charges"},
+		{name: "param", pattern: "api.stripe.com/v1/{id}/refunds", host: "api.stripe.com", path: "/v1/ch_1234567890/refunds"},
+		{name: "wildcard path", pattern: "api.stripe.com/files/+{path}", host: "api.stripe.com", path: "/files/a/b/c/d"},
+		{name: "wildcard host", pattern: "+{sub}.stripe.com/v1/charges", host: "eu.west.stripe.com", path: "/v1/charges"},
+		{name: "any authority", pattern: "+{any}/v1/charges", host: "anything.example.test", path: "/v1/charges"},
+		{name: "exact address", pattern: "10.1.2.3/v1/charges", host: "10.1.2.3", path: "/v1/charges"},
+		{name: "range", pattern: "[10.0.0.0/8]/v1/charges", host: "10.1.2.3", path: "/v1/charges"},
+		{name: "range v6", pattern: "[fd00::/8]/v1/charges", host: "fd12:3456::1", path: "/v1/charges"},
+	}
+
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			p := benchProxy(b, tc.pattern)
+			tree := p.getTree()
+			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+
+			c := tree.pool.Get().(*routeCtx)
+			defer tree.pool.Put(c)
+			c.reset(nil, req, "https", tc.host, "443")
+
+			b.ReportAllocs()
+			for b.Loop() {
+				*c.params = (*c.params)[:0]
+				if _, n := tree.lookup(tc.host, tc.path, c, false); n == nil {
+					b.Fatal("no match")
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkLookupDeepTree(b *testing.B) {
+	patterns := []string{
+		"api.stripe.com/v1/charges",
+		"api.stripe.com/v1/charges/{id}",
+		"api.stripe.com/v1/charges/{id}/capture",
+		"api.stripe.com/v1/charges/{id}/refunds",
+		"api.stripe.com/v1/customers",
+		"api.stripe.com/v1/customers/{id}",
+		"api.stripe.com/v1/customers/{id}/sources/{source}",
+		"api.stripe.com/v1/payment_intents",
+		"api.stripe.com/v1/payment_intents/{id}",
+		"api.stripe.com/v1/subscriptions/{id}/items/{item}",
+		"+{sub}.stripe.com/v1/files/+{path}",
+		"files.stripe.com/v1/files/{id}",
+		"connect.stripe.com/oauth/token",
+		"api.internal.corp/health",
+		"+{sub}.internal.corp/metrics",
+	}
+	p := benchProxy(b, patterns...)
+	tree := p.getTree()
+
+	const host = "api.stripe.com"
+	const path = "/v1/subscriptions/sub_123/items/si_456"
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+
+	c := tree.pool.Get().(*routeCtx)
+	defer tree.pool.Put(c)
+	c.reset(nil, req, "https", host, "443")
+
+	b.ReportAllocs()
+	for b.Loop() {
+		*c.params = (*c.params)[:0]
+		if _, n := tree.lookup(host, path, c, false); n == nil {
+			b.Fatal("no match")
+		}
+	}
+}
+
+func BenchmarkLookupUnnarrowed(b *testing.B) {
+	cases := []struct {
+		name    string
+		pattern string
+		host    string
+		path    string
+	}{
+		{name: "static", pattern: "api.stripe.com/v1/charges", host: "api.stripe.com", path: "/v1/charges"},
+		{name: "param", pattern: "api.stripe.com/v1/{id}/refunds", host: "api.stripe.com", path: "/v1/ch_1234567890/refunds"},
+		{name: "any authority", pattern: "+{any}/v1/charges", host: "anything.example.test", path: "/v1/charges"},
+		{name: "range", pattern: "[10.0.0.0/8]/v1/charges", host: "10.1.2.3", path: "/v1/charges"},
+	}
+
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			ca, err := GenerateCA()
+			if err != nil {
+				b.Fatal(err)
+			}
+			p, err := New(WithCA(ca))
+			if err != nil {
+				b.Fatal(err)
+			}
+			if _, err := p.Add(tc.pattern, noopHandler); err != nil {
+				b.Fatalf("register %s: %v", tc.pattern, err)
+			}
+
+			tree := p.getTree()
+			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+
+			c := tree.pool.Get().(*routeCtx)
+			defer tree.pool.Put(c)
+			c.reset(nil, req, "https", tc.host, "443")
+
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, n := tree.lookup(tc.host, tc.path, c, false); n == nil {
+					b.Fatal("no match")
+				}
+			}
+		})
+	}
+}
+
+func BenchmarkAddDelete(b *testing.B) {
+	cases := []struct {
+		name string
+		base string
+	}{
+		{name: "fresh authority"},
+		{name: "admitted authority", base: "api.stripe.com/v1/other"},
+	}
+
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			var patterns []string
+			if tc.base != "" {
+				patterns = append(patterns, tc.base)
+			}
+			p := benchProxy(b, patterns...)
+
+			b.ReportAllocs()
+			for b.Loop() {
+				if _, err := p.Add("api.stripe.com/v1/charges", noopHandler); err != nil {
+					b.Fatal(err)
+				}
+				if _, err := p.Delete[HTTP]("api.stripe.com/v1/charges"); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}

@@ -97,9 +97,6 @@ func TestContext_Accessors(t *testing.T) {
 	assert.Equal(t, KindHTTP, got.kind)
 }
 
-// A request no entry matches is refused. The permissive default is gone: what passes through
-// is a route the caller wrote, so an authority armed by a narrow entry does not quietly open
-// every path under it.
 func TestContext_UnmatchedRequestIsRefused(t *testing.T) {
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "origin")
@@ -185,4 +182,15 @@ func TestContext_RoutingPathCanonicalization(t *testing.T) {
 	}
 
 	assert.Empty(t, routingPath(nil))
+}
+
+func BenchmarkRoutingPath(b *testing.B) {
+	req := httptest.NewRequest(http.MethodGet, "/v1/charges/ch_123/refunds?limit=10", nil)
+
+	b.ReportAllocs()
+	for b.Loop() {
+		if routingPath(req) == "" {
+			b.Fatal("empty routing path")
+		}
+	}
 }

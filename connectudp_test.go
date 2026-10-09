@@ -272,9 +272,6 @@ func newMasqueProxy(t *testing.T, opts ...ProxyOption) (*Proxy, *CA, netip.AddrP
 	return p, proxyCA, origin
 }
 
-// A CONNECT-UDP tunnel carries an HTTP/3 connection the proxy terminates and routes request
-// by request, exactly as it would off a redirected socket. The tunnel and the connection
-// inside it are two sessions, the second hanging under the first.
 func TestConnectUDP_TerminatesTheInnerHTTP3(t *testing.T) {
 	p, ca, front, origin := masqueProxy(t)
 	cc := masqueClient(t, front, ca)
@@ -345,8 +342,6 @@ func TestConnectUDP_TerminatesTheInnerHTTP3(t *testing.T) {
 	assert.Contains(t, body, "path=/third")
 }
 
-// Raw datagrams in a tunnel are routed one by one on the declared target, which may be a
-// hostname, so a UDP entry captures parameters a redirected socket never could.
 func TestConnectUDP_RoutesRawDatagramsOnTheDeclaredTarget(t *testing.T) {
 	echo := udpEcho(t)
 	ca, err := GenerateCA()
@@ -386,8 +381,6 @@ func TestConnectUDP_RoutesRawDatagramsOnTheDeclaredTarget(t *testing.T) {
 	}
 }
 
-// Closing a tunnel closes the alternates its datagram flows opened with their upstream
-// sockets.
 func TestConnectUDP_TunnelCloseClosesTheAlternates(t *testing.T) {
 	echo := udpEcho(t)
 	other := udpEcho(t)
@@ -443,8 +436,6 @@ func TestConnectUDP_TunnelCloseClosesTheAlternates(t *testing.T) {
 	assert.ErrorIs(t, err, net.ErrClosed, "closing the tunnel closes the alternate")
 }
 
-// The declared target is admitted before it is resolved, so a refused target is not resolved,
-// and resolution comes before the proxy answers. Neither failure opens anything.
 func TestConnectUDP_RefusesBeforeTheTunnelExists(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -474,8 +465,6 @@ func TestConnectUDP_RefusesBeforeTheTunnelExists(t *testing.T) {
 	assert.Empty(t, waitForSessions(t, p, 0))
 }
 
-// A datagram that passed the closed check in dispatch while the tunnel was closing finds no
-// flow and must not create one. The guard runs under the lock the close ran under.
 func TestConnectUDP_ClosedTunnelOwnsNoFlow(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -506,8 +495,6 @@ func TestConnectUDP_ClosedTunnelOwnsNoFlow(t *testing.T) {
 	assert.Empty(t, d.flows)
 }
 
-// Deleting the entry that admitted a tunnel makes the documented sweep close it, and the next
-// CONNECT-UDP for the target is refused.
 func TestConnectUDP_SweepAfterDelete(t *testing.T) {
 	p, ca, front, origin := masqueProxy(t)
 	cc := masqueClient(t, front, ca)
@@ -536,8 +523,6 @@ func TestConnectUDP_SweepAfterDelete(t *testing.T) {
 	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
 }
 
-// A tunnel is the authenticated unit. Revoking its identity by closing every session carrying
-// it ends the tunnel and what it carries, and the next CONNECT-UDP is challenged again.
 func TestConnectUDP_IdentityRevocation(t *testing.T) {
 	p, ca, front, origin := masqueProxy(t, WithProxyAuth(testBasic()))
 	cc := masqueClient(t, front, ca)
@@ -569,8 +554,6 @@ func TestConnectUDP_IdentityRevocation(t *testing.T) {
 	require.Error(t, err)
 }
 
-// A tunnel nothing has lived in for a while is closed, the way an idle datagram flow is
-// forgotten, and the client learns it from its stream.
 func TestConnectUDP_IdleTunnelIsClosed(t *testing.T) {
 	p, ca, front, origin := masqueProxy(t)
 	cc := masqueClient(t, front, ca)
@@ -597,8 +580,6 @@ func TestConnectUDP_IdleTunnelIsClosed(t *testing.T) {
 	assert.NotErrorIs(t, err, os.ErrDeadlineExceeded)
 }
 
-// The target parser is fed by the network. Whatever it accepts must be an authority that
-// splits and rejoins to itself, so the target written back is the one that was routed on.
 func FuzzTargetFromConnectUDP(f *testing.F) {
 	for _, seed := range []string{
 		"/.well-known/masque/udp/example.test/443/",
@@ -643,7 +624,6 @@ func TestTargetFromConnectUDP_PortIsCanonical(t *testing.T) {
 	assert.Equal(t, "443", target.Port)
 }
 
-// A client that sends no server name gets a certificate for the target its tunnel declared.
 func TestConnectUDP_NoServerNameGetsTheTargetsCertificate(t *testing.T) {
 	probe, err := net.ListenPacket("udp", "[::1]:0")
 	if err != nil {
@@ -678,8 +658,6 @@ func TestConnectUDP_NoServerNameGetsTheTargetsCertificate(t *testing.T) {
 	assert.True(t, leaf.IPAddresses[0].Equal(net.ParseIP("::1")), "the certificate is for the declared target")
 }
 
-// A tunnel is decided on its kind alone, so it goes stale when its target would now be
-// admitted under another kind, and not when the entries within that kind change.
 func TestConnectUDP_TunnelStaleOnTheKind(t *testing.T) {
 	p, ca, front, origin := masqueProxy(t)
 	cc := masqueClient(t, front, ca)
@@ -703,8 +681,6 @@ func TestConnectUDP_TunnelStaleOnTheKind(t *testing.T) {
 	assert.True(t, tunnel.Stale(), "a new tunnel would be admitted under QUIC")
 }
 
-// The socket a datagram flow behind a CONNECT-UDP tunnel sends through sets the Don't Fragment
-// bit, RFC 9298 section 3.1.
 func TestConnectUDP_FlowSocketSetsDontFragment(t *testing.T) {
 	fx := newUDPFixture(t)
 	origin := newUDPOrigin(t, "127.0.0.1:0", nil)
@@ -749,7 +725,6 @@ func (s *fakeH3Stream) ReceiveDatagram(ctx context.Context) ([]byte, error) {
 	}
 }
 
-// An HTTP/3 stream that ends between two capsules ends the tunnel without a reset.
 func TestConnectUDP_CleanEndOfTheHTTP3StreamResetsNothing(t *testing.T) {
 	str := &fakeH3Stream{Reader: bytes.NewReader(capsuleOf(capsuleDatagram, httpDatagram(0, []byte("last")))), dgrams: make(chan []byte)}
 	pipe := newDatagramPipe(str, quic.StreamErrorCode(http3.ErrCodeNoError), false)
@@ -767,8 +742,6 @@ func TestConnectUDP_CleanEndOfTheHTTP3StreamResetsNothing(t *testing.T) {
 	assert.Nil(t, str.readCode.Load(), "the stream was stopped")
 }
 
-// A DATAGRAM capsule queued right after recv found the queue empty wakes the recv waiting on
-// a QUIC datagram.
 func TestConnectUDP_CapsuleQueuedAsRecvWaitsWakesIt(t *testing.T) {
 	str := &fakeH3Stream{Reader: bytes.NewReader(nil), dgrams: make(chan []byte)}
 	pipe := newDatagramPipe(str, quic.StreamErrorCode(http3.ErrCodeNoError), true)
@@ -794,7 +767,6 @@ func TestConnectUDP_CapsuleQueuedAsRecvWaitsWakesIt(t *testing.T) {
 	assert.Equal(t, want, b)
 }
 
-// A CONNECT-UDP over HTTP/1.1 announcing a body is refused before the body ends.
 func TestConnectUDP_ContentFieldsRefusedBeforeTheBody(t *testing.T) {
 	fx := newUDPFixture(t)
 	origin := newUDPOrigin(t, "127.0.0.1:0", nil)
@@ -804,7 +776,6 @@ func TestConnectUDP_ContentFieldsRefusedBeforeTheBody(t *testing.T) {
 	}
 }
 
-// A read deadline on an HTTP/3 tunnel times the read out and leaves the tunnel readable.
 func TestConnectUDP_HTTP3ReadDeadlineLeavesTheTunnelReadable(t *testing.T) {
 	silent, end := io.Pipe()
 	t.Cleanup(func() { _ = end.Close() })
@@ -822,8 +793,6 @@ func TestConnectUDP_HTTP3ReadDeadlineLeavesTheTunnelReadable(t *testing.T) {
 	assert.Equal(t, httpDatagram(0, []byte("after")), b)
 }
 
-// A datagram of context ID 0 past 65527 bytes of payload aborts an HTTP/3 tunnel with
-// H3_MESSAGE_ERROR, in a QUIC datagram and in a DATAGRAM capsule.
 func TestConnectUDP_OversizedDatagramAbortsTheHTTP3Stream(t *testing.T) {
 	oversized := httpDatagram(0, make([]byte, maxCapsuleDatagram+1))
 	silent, end := io.Pipe()
@@ -1116,8 +1085,6 @@ func openTunnelsH1(t *testing.T, front netip.AddrPort, ca *CA) tunnelOpener {
 	}
 }
 
-// A tunnel over TCP carries an HTTP/3 connection the proxy terminates and routes request by
-// request, the tunnel reporting the front's protocol, and closing it ends the stream.
 func TestConnectUDP_Capsules_TerminatesTheInnerHTTP3(t *testing.T) {
 	for _, f := range capsuleFronts {
 		t.Run(f.name, func(t *testing.T) {
@@ -1176,7 +1143,6 @@ func TestConnectUDP_Capsules_TerminatesTheInnerHTTP3(t *testing.T) {
 	}
 }
 
-// Raw datagrams in a tunnel over TCP are routed one by one on the declared target.
 func TestConnectUDP_Capsules_RoutesRawDatagramsOnTheDeclaredTarget(t *testing.T) {
 	for _, f := range capsuleFronts {
 		t.Run(f.name, func(t *testing.T) {
@@ -1219,8 +1185,6 @@ func TestConnectUDP_Capsules_RoutesRawDatagramsOnTheDeclaredTarget(t *testing.T)
 	}
 }
 
-// A refused or unresolvable target is answered with an ordinary status, before any tunnel
-// exists, on a TCP front as on the HTTP/3 one.
 func TestConnectUDP_Capsules_RefusesBeforeTheTunnelExists(t *testing.T) {
 	for _, f := range capsuleFronts {
 		t.Run(f.name, func(t *testing.T) {
@@ -1249,7 +1213,6 @@ func TestConnectUDP_Capsules_RefusesBeforeTheTunnelExists(t *testing.T) {
 	}
 }
 
-// The client ending its direction ends the tunnel, and so does dropping the stream.
 func TestConnectUDP_Capsules_ClientEndEndsTheTunnel(t *testing.T) {
 	for _, f := range capsuleFronts {
 		t.Run(f.name, func(t *testing.T) {
@@ -1282,8 +1245,6 @@ func TestConnectUDP_Capsules_ClientEndEndsTheTunnel(t *testing.T) {
 	}
 }
 
-// A capsule of another type is skipped, RFC 9297 section 3.2, and a DATAGRAM capsule larger
-// than a UDP payload can be is dropped, neither ending the tunnel.
 func TestConnectUDP_Capsules_SkipsWhatIsNotADatagram(t *testing.T) {
 	for _, f := range capsuleFronts {
 		t.Run(f.name, func(t *testing.T) {
@@ -1342,10 +1303,6 @@ func udpFlood(t *testing.T, bursts, size int) netip.AddrPort {
 	return netip.MustParseAddrPort(pc.LocalAddr().String())
 }
 
-// A client that stops reading its tunnel leaves the proxy's writes stuck. Closing the tunnel
-// still ends it, within the drain timeout, and a shutdown reaches it.
-// Closing a tunnel over TLS toward a client that stopped reading returns at once, although
-// crypto/tls waits up to five seconds on the close_notify of a full connection.
 func TestConnectUDP_Capsules_CloseDoesNotWaitOnTheCloseNotify(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -3664,4 +3621,72 @@ var connectUDPConformance = []connectUDPCase{
 		req:  "On requests that contain the :protocol pseudo-header field, the :scheme and :path pseudo-header fields of the target URI (see Section 5) MUST also be included.",
 		skip: "checked by rfc9298/3.4/5",
 	},
+}
+
+func tunnelBench(b *testing.B) (*quicDemux, *connectUDPTunnel, *demuxPacketConn, []byte) {
+	b.Helper()
+	ca, err := GenerateCA()
+	if err != nil {
+		b.Fatal(err)
+	}
+	p, err := New(WithCA(ca))
+	if err != nil {
+		b.Fatal(err)
+	}
+	d, err := newQUICDemux(p, newTunnelPacketConn())
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = p.Close() })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	b.Cleanup(cancel)
+	target := Target{Scheme: "https", Host: "bench.test", Port: "443"}
+	sess := newSession(p, ctx, nil, target, KindHTTP, HTTP3)
+	sess.remoteAddr = &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 4242}
+	origin := netip.MustParseAddrPort("127.0.0.1:443")
+	tun := newConnectUDPTunnel(d, sess, &contextFraming{target: target, upstream: origin}, cancel)
+	if !d.publishTunnel(tun) {
+		b.Fatal("publish")
+	}
+	dpc := newDemuxPacketConn(nil, 64)
+	it := &quicIntercept{conn: dpc}
+	dcid := "ABCDEFGH"
+	d.mu.Lock()
+	flow := d.flows[tun.key]
+	flow.conns[dcid] = &quicConn{odcid: dcid, state: connTerminated, stack: it}
+	d.mu.Unlock()
+
+	pkt := make([]byte, 1200)
+	pkt[0] = 0xC3
+	pkt[4] = 1
+	pkt[5] = 8
+	copy(pkt[6:], dcid)
+	pkt[14] = 0
+	return d, tun, dpc, pkt
+}
+
+func BenchmarkTunnelInbound(b *testing.B) {
+	d, tun, dpc, pkt := tunnelBench(b)
+	buf := make([]byte, maxUDPPayload)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		d.dispatch(tun.addr, pkt, true)
+		if _, _, err := dpc.ReadFrom(buf); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkTunnelOutbound(b *testing.B) {
+	_, tun, _, pkt := tunnelBench(b)
+	origin := netip.MustParseAddrPort("127.0.0.1:443")
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		tun.send(origin, pkt)
+		out := <-tun.sendCh
+		putTunnelBuf(out)
+	}
 }

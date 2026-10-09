@@ -129,8 +129,6 @@ func TestMatcher_Protocol(t *testing.T) {
 	assert.ErrorIs(t, err, ErrInvalidMatcher)
 }
 
-// A repeated key in the query or the header gives several values, and the matcher reads them
-// all, one match being enough.
 func TestMatcher_ReadsEveryValueOfARepeatedKey(t *testing.T) {
 	q, err := MatchQuery("tenant", "acme")
 	require.NoError(t, err)
@@ -177,8 +175,6 @@ func TestMatcher_NarrowsAnInterceptor(t *testing.T) {
 	assert.Equal(t, fallback, lookupHTTP(p, "api.test/v1/charges", mustMethods(http.MethodGet)))
 }
 
-// The protocol and the client address are read off the request, so a matcher on either
-// narrows an interceptor with nothing but the request in hand.
 func TestMatcher_ProtocolAndRemoteIPComeFromTheRequest(t *testing.T) {
 	p := testProxy(t)
 

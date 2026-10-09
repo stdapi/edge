@@ -18,8 +18,6 @@ func target(authority string) Target {
 	return Target{Scheme: schemeForPort(port), Host: host, Port: port}.normalized()
 }
 
-// Nothing crosses a proxy that was not told about it. An authority no entry names is a hole in
-// the setup, and the caller finds out at once rather than having the traffic pass unobserved.
 func TestAdmission_DefaultIsReject(t *testing.T) {
 	p := testProxy(t)
 	assert.False(t, p.Admits(target("example.com:443"), KindHTTP))
@@ -27,8 +25,6 @@ func TestAdmission_DefaultIsReject(t *testing.T) {
 	assert.False(t, p.Admits(target("10.0.0.1:443"), KindUDP))
 }
 
-// A per-message entry names the authority it serves, so registering one admits it. There is no
-// separate verb for that: naming the authority is what admitting it means.
 func TestAdmission_EntryAdmitsItsAuthority(t *testing.T) {
 	p := testProxy(t)
 	p.MustAdd("api.test/v1/*{rest}", noopHandler)
@@ -38,8 +34,6 @@ func TestAdmission_EntryAdmitsItsAuthority(t *testing.T) {
 	assert.Equal(t, 1, admissionsLen(p))
 }
 
-// The kinds partition the traffic, so two of them share an authority without competing. It is
-// the traffic that picks which one serves a connection, never the tree.
 func TestAdmission_KindsCoexistOnOneAuthority(t *testing.T) {
 	p := testProxy(t)
 	p.MustAdd("api.test/v1", noopHandler)
@@ -50,8 +44,6 @@ func TestAdmission_KindsCoexistOnOneAuthority(t *testing.T) {
 	assert.False(t, p.Admits(target("api.test:443"), KindQUIC))
 }
 
-// An authority admitted for one kind is not admitted for another. A QUIC entry does not admit
-// HTTP/3, whose requests are routed one by one, and an HTTP entry does not admit a raw stream.
 func TestAdmission_IsPerKind(t *testing.T) {
 	p := testProxy(t)
 	p.MustAdd[QUIC]("game.test:443", func(*QUICCtx) error { return nil })
@@ -60,8 +52,6 @@ func TestAdmission_IsPerKind(t *testing.T) {
 	assert.False(t, p.Admits(target("game.test:443"), KindHTTP))
 }
 
-// The flagship shape: watch a whole zone, except the one host served another way. A static
-// authority is more precise than a wildcard, so it decides first.
 func TestAdmission_StaticBeatsWildcard(t *testing.T) {
 	p := testProxy(t)
 	p.MustAdd("+{any}/*{rest}", noopHandler)
@@ -74,8 +64,6 @@ func TestAdmission_StaticBeatsWildcard(t *testing.T) {
 	assert.True(t, p.Admits(target("checkout.stripe.com:443"), KindHTTP))
 }
 
-// Terminating TLS on a port no entry can serve would be visible to the client for nothing, so
-// an entry scoped to a port admits only that port.
 func TestAdmission_PortScoped(t *testing.T) {
 	p := testProxy(t)
 	p.MustAdd("api.test:8443/v1", noopHandler)
@@ -84,8 +72,6 @@ func TestAdmission_PortScoped(t *testing.T) {
 	assert.False(t, p.Admits(target("api.test:443"), KindHTTP))
 }
 
-// A pattern for a kind that routes whole connections carries no path and no scheme: the
-// decision is taken before anything has revealed what the connection carries.
 func TestAdmission_RejectsSchemeAndPath(t *testing.T) {
 	p := testProxy(t)
 
@@ -96,8 +82,6 @@ func TestAdmission_RejectsSchemeAndPath(t *testing.T) {
 	require.Error(t, err)
 }
 
-// The same kind twice on one authority contradicts itself, and is reported rather than
-// silently resolved.
 func TestAdmission_DuplicateKindConflicts(t *testing.T) {
 	p := testProxy(t)
 	p.MustAdd[TCP]("api.test", noopStream)
@@ -107,7 +91,6 @@ func TestAdmission_DuplicateKindConflicts(t *testing.T) {
 	require.ErrorAs(t, err, &ce)
 }
 
-// The admission a per-message entry implies lives exactly as long as the entries needing it.
 func TestAdmission_ImpliedEntryIsReferenceCounted(t *testing.T) {
 	p := testProxy(t)
 	p.MustAdd("api.test/a", noopHandler)
@@ -124,8 +107,6 @@ func TestAdmission_ImpliedEntryIsReferenceCounted(t *testing.T) {
 	assert.Equal(t, 0, admissionsLen(p))
 }
 
-// A gRPC or WebSocket entry rides on HTTP, so it admits the HTTP kind and shares the
-// admission with the plain HTTP entries of the same authority.
 func TestAdmission_RefinedKindsAdmitTheirFamily(t *testing.T) {
 	p := testProxy(t)
 	p.MustAdd("api.test/billing.v1.Billing/Charge", func(*GRPCCtx) error { return nil })
@@ -138,8 +119,6 @@ func TestAdmission_RefinedKindsAdmitTheirFamily(t *testing.T) {
 	assert.Equal(t, 1, admissionsLen(p), "one kind, one admission")
 }
 
-// Everything the proxy admits is terminated, and terminating TLS needs a leaf certificate, so
-// a registration without a certificate authority is refused rather than left unserveable.
 func TestAdmission_TerminationRequiresCA(t *testing.T) {
 	p, err := New()
 	require.NoError(t, err)
@@ -158,7 +137,6 @@ func TestAdmission_TerminationRequiresCA(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// Truncate drops the entries and the admissions they imply together.
 func TestAdmission_TruncateDropsEverything(t *testing.T) {
 	p := testProxy(t)
 	p.MustAdd("api.test/v1", noopHandler)
@@ -171,8 +149,6 @@ func TestAdmission_TruncateDropsEverything(t *testing.T) {
 	assert.False(t, p.Admits(target("api.test:443"), KindHTTP))
 }
 
-// The point of one tree: swapping an authority from one kind to another takes one
-// transaction, so no connection ever observes the half-applied state.
 func TestAdmission_SwapKindsAtomically(t *testing.T) {
 	p := testProxy(t)
 	p.MustAdd("api.test/*{rest}", noopHandler)
@@ -189,7 +165,6 @@ func TestAdmission_SwapKindsAtomically(t *testing.T) {
 	assert.True(t, p.Admits(target("api.test:443"), KindTCP))
 }
 
-// A transaction that fails leaves nothing behind.
 func TestAdmission_FailedTxnAbortsCleanly(t *testing.T) {
 	p := testProxy(t)
 	p.MustAdd("api.test/*{rest}", noopHandler)
@@ -207,7 +182,6 @@ func TestAdmission_FailedTxnAbortsCleanly(t *testing.T) {
 	assert.False(t, p.Admits(target("api.test:443"), KindTCP))
 }
 
-// The admissions are readable, and an implied one says so.
 func TestAdmission_IterationReportsImplied(t *testing.T) {
 	p := testProxy(t)
 	p.MustAdd("api.test/v1", noopHandler)
@@ -225,8 +199,6 @@ func TestAdmission_IterationReportsImplied(t *testing.T) {
 	assert.Equal(t, []string{"smtp.test:465"}, declared)
 }
 
-// A request the tree no longer covers is refused on the connection it arrives on, without
-// waiting for the client to open another one.
 func TestAdmission_DeleteAppliesToTheNextRequest(t *testing.T) {
 	p := testProxy(t)
 	e := p.MustAdd("api.test/v1", noopHandler)
@@ -239,9 +211,6 @@ func TestAdmission_DeleteAppliesToTheNextRequest(t *testing.T) {
 	assert.False(t, p.Admits(target("api.test:443"), KindHTTP))
 }
 
-// An entry that fails to insert must leave no admission behind. One bumped for an entry that
-// never landed outlives it and nothing can withdraw it, since a delete has no entry to release
-// it from.
 func TestAdmission_FailedAddLeavesNoAdmission(t *testing.T) {
 	p := testProxy(t)
 
@@ -264,8 +233,6 @@ func TestAdmission_FailedAddLeavesNoAdmission(t *testing.T) {
 	assert.Equal(t, 0, admissionsLen(p))
 }
 
-// A transaction answers the same admission question the proxy does, or previewing a change is
-// worthless.
 func TestAdmission_TxnAgreesWithTheProxy(t *testing.T) {
 	p := testProxy(t)
 	p.MustAdd("api.test/svc/Method", func(*GRPCCtx) error { return nil })
@@ -290,10 +257,6 @@ func forgedMatcher[H Handler](m RequestMatcher) EntryOption[H] {
 	})
 }
 
-// A matcher on an entry keyed on an authority alone is never evaluated, so accepting one would
-// write a policy narrower than the one enforced. WithRequestMatchers is declared on PathKeyed
-// and the compiler refuses it there, so what registration has to catch is an option that
-// reached the entry another way, which embedding an interface makes possible.
 func TestAdmission_MatchersAreRefusedOnConnectionKinds(t *testing.T) {
 	p := testProxy(t)
 
@@ -314,7 +277,6 @@ func TestAdmission_MatchersAreRefusedOnConnectionKinds(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// Releasing the last admission of a host node retries the merge its presence blocked.
 func TestAdmission_ReleaseRestoresTheMerge(t *testing.T) {
 	p := testProxy(t)
 	p.MustAdd("api.test/x", noopHandler)
@@ -331,8 +293,6 @@ func TestAdmission_ReleaseRestoresTheMerge(t *testing.T) {
 	assert.Equal(t, 2, admissionsLen(p))
 }
 
-// Two ports on one authority are two admissions on one node, and deleting the entries of one
-// must not release the other's.
 func TestAdmission_PortsAreCountedApart(t *testing.T) {
 	p := testProxy(t)
 	p.MustAdd("api.test:8443/x", noopHandler)
@@ -345,7 +305,6 @@ func TestAdmission_PortsAreCountedApart(t *testing.T) {
 	assert.True(t, p.Admits(target("api.test:9443"), KindHTTP))
 }
 
-// The admission of a wildcard host lives on the wildcard node.
 func TestAdmission_WildcardHostIsReferenceCounted(t *testing.T) {
 	p := testProxy(t)
 	p.MustAdd("+{any}/a", noopHandler)
@@ -362,8 +321,6 @@ func TestAdmission_WildcardHostIsReferenceCounted(t *testing.T) {
 	assert.Equal(t, 0, admissionsLen(p))
 }
 
-// Parameter names are no part of identity, here as in the rest of the router. Two hosts of
-// one structure conflict only where their entries do, and share the one admission.
 func TestAdmission_ParamNamesShareOneAdmission(t *testing.T) {
 	p := testProxy(t)
 	p.MustAdd("{sub}.api.test/a", noopHandler)
@@ -385,7 +342,6 @@ func TestAdmission_ParamNamesShareOneAdmission(t *testing.T) {
 	assert.Equal(t, 0, admissionsLen(p))
 }
 
-// The same accounting through the address root, where the host key is encoded prefix bits.
 func TestAdmission_AddressHostIsReferenceCounted(t *testing.T) {
 	p := testProxy(t)
 	p.MustAdd("10.0.0.1/a", noopHandler)
@@ -409,8 +365,6 @@ func TestAdmission_AddressHostIsReferenceCounted(t *testing.T) {
 	assert.Equal(t, 0, admissionsLen(p))
 }
 
-// An entry admitting a whole connection captures what its parameters matched, for the handler
-// that then serves the connection. The plain admission answer skips the captures.
 func TestAdmission_AdmitWithCapturesParameters(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -489,4 +443,43 @@ func TestAdmission_NoEntryGRPCAloneAdmitsHTTPWithoutServingIt(t *testing.T) {
 	require.NoError(t, err)
 	_ = resp.Body.Close()
 	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+}
+
+func BenchmarkAdmits(b *testing.B) {
+	cases := []struct {
+		name        string
+		authorities []string
+		host        string
+	}{
+		{name: "hit static", authorities: []string{"api.stripe.com"}, host: "api.stripe.com"},
+		{name: "hit wildcard", authorities: []string{"+{sub}.stripe.com"}, host: "eu.west.stripe.com"},
+		{name: "miss", authorities: []string{"api.stripe.com"}, host: "example.test"},
+		{name: "hit address", authorities: []string{"10.1.2.3"}, host: "10.1.2.3"},
+		{name: "hit range", authorities: []string{"[10.0.0.0/8]"}, host: "10.9.9.9"},
+		{name: "miss address", authorities: []string{"[10.0.0.0/8]"}, host: "11.0.0.1"},
+	}
+
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			ca, err := GenerateCA()
+			if err != nil {
+				b.Fatal(err)
+			}
+			p, err := New(WithCA(ca))
+			if err != nil {
+				b.Fatal(err)
+			}
+			for _, authority := range tc.authorities {
+				if _, err := p.Add(authority+"/*{any}", noopHandler); err != nil {
+					b.Fatalf("intercept %s: %v", authority, err)
+				}
+			}
+			t := Target{Scheme: "https", Host: tc.host, Port: "443"}
+
+			b.ReportAllocs()
+			for b.Loop() {
+				p.Admits(t, KindHTTP)
+			}
+		})
+	}
 }

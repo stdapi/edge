@@ -38,7 +38,6 @@ func blockedSource(t *testing.T) func() (int, error) {
 	}
 }
 
-// A source ending cleanly leaves the other flowing, and the merge ends once both are done.
 func TestMerge_ServesBothSourcesUntilBothEnd(t *testing.T) {
 	m := &merged[int]{
 		ctx: t.Context(),
@@ -58,8 +57,6 @@ func TestMerge_ServesBothSourcesUntilBothEnd(t *testing.T) {
 	assert.ElementsMatch(t, []int{1, 2, 3}, got)
 }
 
-// A source failing ends the merge with its error, since past it the units of that direction
-// are lost and continuing would look complete.
 func TestMerge_AFailureEndsTheMerge(t *testing.T) {
 	boom := errors.New("boom")
 	m := &merged[int]{
@@ -72,8 +69,6 @@ func TestMerge_AFailureEndsTheMerge(t *testing.T) {
 	require.ErrorIs(t, err, boom)
 }
 
-// A source is not read again until the consumer asks for the next unit, which is what keeps a
-// borrowed buffer valid across the handoff.
 func TestMerge_SourceHeldUntilTheNextRead(t *testing.T) {
 	var reads atomic.Int32
 	m := &merged[int]{

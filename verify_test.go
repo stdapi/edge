@@ -408,8 +408,6 @@ func TestQUIC_NameVerificationLooseFallsBackToTheDestination(t *testing.T) {
 	assert.Equal(t, KindQUIC, sessions[0].Kind())
 }
 
-// The handshake refines an explicit CONNECT target with the handshake's server name.
-// On a session with a dropped name it would put the unproven name back.
 func TestTransparent_NameVerificationInterceptionKeepsTheDroppedTarget(t *testing.T) {
 	origin, dials := countingOrigin(t)
 	ca, err := GenerateCA()
@@ -496,9 +494,6 @@ func plainRequest(t *testing.T, conn net.Conn, br *bufio.Reader, host string) (i
 	return resp.StatusCode, string(body)
 }
 
-// A plaintext connection has no server name, so the host of its first request is checked
-// against the destination as a server name is, and the Host of each later request the same
-// way, one resolution per Host.
 func TestTransparent_NameVerificationAppliesToPlaintext(t *testing.T) {
 	setup := func(t *testing.T, opts ...ProxyOption) (*Proxy, netip.AddrPort, *countingListener, net.Conn, *bufio.Reader) {
 		t.Helper()
@@ -581,8 +576,6 @@ func TestTransparent_NameVerificationAppliesToPlaintext(t *testing.T) {
 	})
 }
 
-// The plaintext inside a CONNECT to a literal is the same case. The literal is the
-// destination and the Host of each request is checked against it.
 func TestConnect_NameVerificationAppliesToPlaintextInsideALiteral(t *testing.T) {
 	origin, accepted := plainOrigin(t, "origin")
 	r := &fakeResolver{addrs: map[string][]netip.Addr{"example.test": addrsOf("9.9.9.9")}}

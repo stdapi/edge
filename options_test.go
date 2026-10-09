@@ -221,8 +221,6 @@ func TestKind_String(t *testing.T) {
 	assert.Equal(t, "unknown", Kind(0).String())
 }
 
-// A middleware's signature is the kind it wraps, so a proxy-wide registration takes any kind
-// and reaches the entries of that kind alone.
 func TestOptions_ProxyMiddlewareTakesEveryKind(t *testing.T) {
 	var seen []string
 	tagHTTP := func(next HTTP) HTTP {
@@ -251,8 +249,6 @@ func TestOptions_ProxyMiddlewareTakesEveryKind(t *testing.T) {
 	assert.Equal(t, []string{"http", "handler"}, seen)
 }
 
-// One option, both placements: the same WithMiddleware works proxy-wide and on a single
-// entry.
 func TestOptions_MiddlewareIsComposable(t *testing.T) {
 	var seen []string
 	tag := func(name string) Middleware[HTTP] {

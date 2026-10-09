@@ -31,8 +31,6 @@ func tcpPair(t *testing.T) (*net.TCPConn, *net.TCPConn) {
 	return a, b
 }
 
-// The counters report what was written to each side, and one direction ending half-closes the
-// other side rather than cutting it.
 func TestRelay_CountersAndHalfClose(t *testing.T) {
 	clientA, a := tcpPair(t)
 	clientB, b := tcpPair(t)
@@ -78,8 +76,6 @@ func TestRelay_CountersAndHalfClose(t *testing.T) {
 	assert.Equal(t, int64(4), bToA)
 }
 
-// A reset on one side reaches the other side as a reset, where a FIN would read as a clean
-// end of the stream.
 func TestRelay_ResetCrossesAsReset(t *testing.T) {
 	clientA, a := tcpPair(t)
 	clientB, b := tcpPair(t)
@@ -100,7 +96,6 @@ func TestRelay_ResetCrossesAsReset(t *testing.T) {
 	assert.NotErrorIs(t, err, io.EOF, "the reset reached the far side as a FIN")
 }
 
-// A relay with an idle bound ends on its own once neither direction moves a byte.
 func TestRelayer_IdleTimeoutEndsASilentRelay(t *testing.T) {
 	_, a := tcpPair(t)
 	_, b := tcpPair(t)
@@ -119,7 +114,6 @@ func TestRelayer_IdleTimeoutEndsASilentRelay(t *testing.T) {
 	}
 }
 
-// Throttled paces the writes toward the wrapped side, so shaping applies to one direction.
 func TestThrottled_PacesWrites(t *testing.T) {
 	a, b := tcpPair(t)
 
@@ -140,7 +134,6 @@ func TestThrottled_PacesWrites(t *testing.T) {
 	assert.Len(t, <-got, 60, "shaping delays the bytes, it does not lose them")
 }
 
-// Delayed holds every write for the configured duration before releasing it.
 func TestDelayed_HoldsEachWrite(t *testing.T) {
 	a, b := tcpPair(t)
 
@@ -163,8 +156,6 @@ func TestDelayed_HoldsEachWrite(t *testing.T) {
 	assert.Equal(t, "onetwo", string(<-got))
 }
 
-// A wrapper stays half-closable, so a relay through it still signals one direction ending
-// without cutting the other.
 func TestShaped_KeepsHalfClose(t *testing.T) {
 	a, b := tcpPair(t)
 	deadline := time.Now().Add(3 * time.Second)

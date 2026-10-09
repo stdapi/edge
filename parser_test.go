@@ -129,9 +129,6 @@ func TestParser_AddressLiteralMustBeCanonical(t *testing.T) {
 	}
 }
 
-// FuzzParsePattern checks that no input makes the pattern parser panic, and that a pattern
-// it accepts is indexed under itself, an address host under its encoded form. The key is
-// what makes a registered interceptor findable again by the string it was registered with.
 func FuzzParsePattern(f *testing.F) {
 	seeds := []string{
 		"api.stripe.com/v1/charges",
@@ -202,8 +199,6 @@ func FuzzParsePattern(f *testing.F) {
 	})
 }
 
-// FuzzParseAuthorityPattern does the same for interception authorities, which carry an authority
-// and no path.
 func FuzzParseAuthorityPattern(f *testing.F) {
 	seeds := []string{
 		"api.stripe.com",

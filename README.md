@@ -306,12 +306,11 @@ BenchmarkLeafMint-16                      63.9 µs/op
 
 ## Testing
 
-The conformance suite drives the proxy with `curl` rather than a Go client, because a Go client shares its HTTP implementation with the proxy and would agree with it on anything both get wrong. It uses `curl3`, the Homebrew build that speaks HTTP/3 and reports the negotiated version, and falls back to whatever `curl` is on `PATH`.
+The curl tests drive the proxy with `curl`. A Go client shares its HTTP implementation with the proxy and would agree with it on anything both get wrong. They use `curl3`, the Homebrew build that supports HTTP/3 and reports the negotiated version, and fall back to whatever `curl` is on `PATH`.
 
 ```bash
 go test -race ./...
-go test -run TestConformance -v .
-go test -run TestQUIC -v .
+go test -run 'TestCurl|TestGRPCurl' -v .
 ```
 
 ## License
