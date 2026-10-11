@@ -45,7 +45,9 @@ type Transport struct {
 	// TCP upstream goes through a CONNECT and a QUIC or UDP upstream through a UDP
 	// ASSOCIATE, RFC 1928, and a hostname is sent for the proxy to resolve under both
 	// schemes. The credentials of the URL are sent with the Basic scheme to an HTTP proxy
-	// and with the username/password method of RFC 1929 to a SOCKS5 one.
+	// and with the username/password method of RFC 1929 to a SOCKS5 one. A request through
+	// an HTTP proxy fails if the Basic scheme cannot encode the credentials of the URL, or if
+	// the proxy answers 407.
 	//
 	// If Proxy is nil or returns a nil *URL, no proxy is used.
 	Proxy func(*http.Request) (*url.URL, error)

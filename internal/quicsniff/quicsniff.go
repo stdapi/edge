@@ -347,6 +347,16 @@ func splitPacket(b []byte) (packet, []byte, error) {
 // QUIC version (RFC 8999), without touching any cryptography. A connection ID past the 20
 // bytes of RFC 9000 is refused.
 func ParseLongHeader(b []byte) (version uint32, dcid, scid []byte, ok bool) {
+	version, dcid, scid, ok = ParseInvariantHeader(b)
+	if !ok || len(dcid) > 20 || len(scid) > 20 {
+		return 0, nil, nil, false
+	}
+	return version, dcid, scid, true
+}
+
+// ParseInvariantHeader is [ParseLongHeader] for any version. It accepts connection IDs of up to
+// 255 bytes, which RFC 8999 section 5.1 allows outside RFC 9000 and RFC 9369.
+func ParseInvariantHeader(b []byte) (version uint32, dcid, scid []byte, ok bool) {
 	if len(b) < 7 || b[0]&0x80 == 0 {
 		return 0, nil, nil, false
 	}
@@ -355,7 +365,7 @@ func ParseLongHeader(b []byte) (version uint32, dcid, scid []byte, ok bool) {
 
 	dcidLen := int(b[pos])
 	pos++
-	if dcidLen > 20 || pos+dcidLen > len(b) {
+	if pos+dcidLen > len(b) {
 		return 0, nil, nil, false
 	}
 	dcid = b[pos : pos+dcidLen]
@@ -366,10 +376,15 @@ func ParseLongHeader(b []byte) (version uint32, dcid, scid []byte, ok bool) {
 	}
 	scidLen := int(b[pos])
 	pos++
-	if scidLen > 20 || pos+scidLen > len(b) {
+	if pos+scidLen > len(b) {
 		return 0, nil, nil, false
 	}
 	return version, dcid, b[pos : pos+scidLen], true
+}
+
+// KnownVersion reports whether version is a QUIC version whose initial keys are known.
+func KnownVersion(version uint32) bool {
+	return version == Version1 || version == Version2
 }
 
 // IsInitial reports whether a long header packet is an Initial of a known QUIC version.
@@ -395,7 +410,7 @@ func isInitialPacket(first byte, version uint32) (bool, error) {
 // decryptInitial removes header protection and authenticated encryption from an Initial
 // packet, returning its frames.
 func decryptInitial(pkt packet) ([]byte, error) {
-	keys, err := initialKeys(pkt.version, pkt.dcid)
+	keys, err := initialKeys(pkt.version, pkt.dcid, "client in")
 	if err != nil {
 		return nil, err
 	}
@@ -456,6 +471,74 @@ func decryptInitial(pkt packet) ([]byte, error) {
 	return plaintext, nil
 }
 
+// CloseInitial returns a server Initial packet of version with a CONNECTION_CLOSE frame of type
+// 0x1c, code and an empty reason, addressed to dcid from scid. It is protected with the
+// server Initial keys of odcid, the destination connection ID of the client's first Initial.
+func CloseInitial(version uint32, odcid, dcid, scid []byte, code uint64) ([]byte, error) {
+	var typ byte
+	switch version {
+	case Version1:
+	case Version2:
+		typ = 0x01
+	default:
+		return nil, fmt.Errorf("%w: 0x%08x", ErrUnsupportedVersion, version)
+	}
+	if len(dcid) > 20 || len(scid) > 20 || code >= 1<<62 {
+		return nil, ErrMalformed
+	}
+	keys, err := initialKeys(version, odcid, "server in")
+	if err != nil {
+		return nil, err
+	}
+
+	// The frame is at least four bytes, so that the header protection sample finds the sixteen
+	// bytes of ciphertext it reads past a one byte packet number.
+	frame := appendVarint([]byte{0x1c}, code)
+	frame = append(frame, 0x00, 0x00)
+
+	const pnLen = 1
+	b := make([]byte, 0, 1+4+1+len(dcid)+1+len(scid)+1+2+pnLen+len(frame)+16)
+	b = append(b, 0xc0|typ<<4|(pnLen-1))
+	b = binary.BigEndian.AppendUint32(b, version)
+	b = append(b, byte(len(dcid))) //nolint:gosec // checked above
+	b = append(b, dcid...)
+	b = append(b, byte(len(scid))) //nolint:gosec // checked above
+	b = append(b, scid...)
+	b = append(b, 0x00)
+	b = binary.BigEndian.AppendUint16(b, 0x4000|uint16(pnLen+len(frame)+16)) //nolint:gosec // at most 28 bytes
+	pnOffset := len(b)
+	b = append(b, 0x00)
+
+	aead, err := cipher.NewGCM(mustCipher(keys.key))
+	if err != nil {
+		return nil, err
+	}
+	// Packet number 0 leaves the IV as it is.
+	sealed := aead.Seal(b[len(b):], keys.iv, frame, b)
+	b = b[:len(b)+len(sealed)]
+
+	var mask [16]byte
+	mustCipher(keys.hp).Encrypt(mask[:], b[pnOffset+4:pnOffset+20])
+	b[0] ^= mask[0] & 0x0f
+	b[pnOffset] ^= mask[1]
+	return b, nil
+}
+
+// appendVarint appends v as a QUIC variable length integer of the shortest encoding. v is below
+// 2^62.
+func appendVarint(b []byte, v uint64) []byte {
+	switch {
+	case v < 1<<6:
+		return append(b, byte(v))
+	case v < 1<<14:
+		return binary.BigEndian.AppendUint16(b, uint16(v)|0x4000)
+	case v < 1<<30:
+		return binary.BigEndian.AppendUint32(b, uint32(v)|0x80000000)
+	default:
+		return binary.BigEndian.AppendUint64(b, v|0xc000000000000000)
+	}
+}
+
 func mustCipher(key []byte) cipher.Block {
 	block, err := aes.NewCipher(key)
 	if err != nil {
@@ -471,9 +554,10 @@ type keys struct {
 	hp  []byte
 }
 
-// initialKeys derives the client's Initial protection keys from the destination connection
-// ID, as specified in RFC 9001 section 5.2.
-func initialKeys(version uint32, dcid []byte) (keys, error) {
+// initialKeys derives the Initial protection keys of one direction, label "client in" or
+// "server in", from the destination connection ID of the client's first Initial, as specified
+// in RFC 9001 section 5.2.
+func initialKeys(version uint32, dcid []byte, label string) (keys, error) {
 	var (
 		salt     []byte
 		keyLabel string
@@ -493,20 +577,20 @@ func initialKeys(version uint32, dcid []byte) (keys, error) {
 	if err != nil {
 		return keys{}, err
 	}
-	clientSecret, err := expandLabel(initialSecret, "client in", 32)
+	secret, err := expandLabel(initialSecret, label, 32)
 	if err != nil {
 		return keys{}, err
 	}
 
-	k, err := expandLabel(clientSecret, keyLabel, 16)
+	k, err := expandLabel(secret, keyLabel, 16)
 	if err != nil {
 		return keys{}, err
 	}
-	iv, err := expandLabel(clientSecret, ivLabel, 12)
+	iv, err := expandLabel(secret, ivLabel, 12)
 	if err != nil {
 		return keys{}, err
 	}
-	hp, err := expandLabel(clientSecret, hpLabel, 16)
+	hp, err := expandLabel(secret, hpLabel, 16)
 	if err != nil {
 		return keys{}, err
 	}

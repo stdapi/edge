@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"slices"
@@ -20,6 +21,54 @@ import (
 // tlsHandshakeRecord is the TLS record type of a handshake message. A connection whose first
 // byte is anything else is not TLS, which is how a CONNECT to a plaintext port is detected.
 const tlsHandshakeRecord = 0x16
+
+// The alert record and the descriptions of RFC 9846 section 6.2 the proxy sends when it
+// refuses a ClientHello.
+const (
+	tlsAlertRecord        = 0x15
+	alertLevelFatal       = 2
+	alertHandshakeFailure = 40
+	alertDecodeError      = 50
+	alertInternalError    = 80
+	alertMissingExtension = 109
+	alertUnrecognizedName = 112
+)
+
+const (
+	// alertWriteTimeout bounds the write of an alert, so a client that stopped reading cannot
+	// keep a refused connection open.
+	alertWriteTimeout = time.Second
+	// alertDrainTimeout and alertDrainLimit bound what is read and discarded after an alert. A
+	// close with bytes left unread sends a reset, which can destroy the alert before the client
+	// reads it.
+	alertDrainTimeout = 500 * time.Millisecond
+	alertDrainLimit   = 64 << 10
+)
+
+func refuseHello(conn net.Conn, alert byte, err error) error {
+	if writeAlert(conn, alert) == nil {
+		lingerClose(conn)
+	}
+	return err
+}
+
+// writeAlert sends a fatal alert on conn. No version is negotiated before the ServerHello, and
+// RFC 9846 section 5.1 sets 0x0303 on every record but an initial ClientHello.
+func writeAlert(conn net.Conn, alert byte) error {
+	_ = conn.SetWriteDeadline(time.Now().Add(alertWriteTimeout))
+	_, err := conn.Write([]byte{tlsAlertRecord, 0x03, 0x03, 0x00, 0x02, alertLevelFatal, alert})
+	_ = conn.SetWriteDeadline(time.Time{})
+	return err
+}
+
+// lingerClose closes the write direction of conn after an alert and drains what the client
+// still sends, so the close that follows leaves nothing unread.
+func lingerClose(conn net.Conn) {
+	_ = closeWrite(conn)
+	_ = conn.SetReadDeadline(time.Now().Add(alertDrainTimeout))
+	_, _ = io.CopyN(io.Discard, conn, alertDrainLimit)
+	_ = conn.SetReadDeadline(time.Time{})
+}
 
 // terminate takes over an admitted connection, terminating TLS when there is TLS, works out
 // what the traffic is, and serves it.
@@ -43,13 +92,13 @@ func (p *Proxy) terminate(ctx context.Context, conn *peekConn, sess *Session) er
 	}
 
 	if p.cfg.ca == nil {
-		return fmt.Errorf("%w: %w", ErrNoCertificateAuthority, errNoCA)
+		return refuseHello(conn, alertInternalError, fmt.Errorf("%w: %w", ErrNoCertificateAuthority, errNoCA))
 	}
 	if err := p.placeTLS(ctx, conn, sess); err != nil {
 		return err
 	}
 
-	tlsConn := tls.Server(conn, p.serverTLSConfig(sess))
+	tlsConn := tls.Server(conn, p.serverTLSConfig(sess, false))
 	if err := tlsConn.HandshakeContext(ctx); err != nil {
 		return fmt.Errorf("tls handshake with client for %s: %w", sess.target.Authority(), err)
 	}
@@ -62,9 +111,20 @@ func (p *Proxy) terminate(ctx context.Context, conn *peekConn, sess *Session) er
 		// The client offered no ALPN, so nothing has said what this is. Past the handshake
 		// the payload is in the clear, which is exactly what the sniff reads.
 		peeked := newPeekConn(tlsConn, nil, defaultPeekSize)
-		return p.serveCandidates(ctx, peeked, sess, sniffStreamCandidates(peeked, p.cfg.server.sniffTimeout), &state)
+		candidates = sniffStreamCandidates(peeked, p.cfg.server.sniffTimeout)
+		served := p.serveCandidates(ctx, peeked, sess, candidates, &state)
+		closeRefused(tlsConn, served)
+		return served
 	}
-	return p.serveCandidates(ctx, tlsConn, sess, candidates, &state)
+	served := p.serveCandidates(ctx, tlsConn, sess, candidates, &state)
+	closeRefused(tlsConn, served)
+	return served
+}
+
+func closeRefused(tlsConn *tls.Conn, err error) {
+	if errors.Is(err, ErrConnectionRejected) {
+		_ = tlsConn.Close()
+	}
 }
 
 // placeTLS decides the authority a TLS connection is routed on, before the handshake commits
@@ -72,9 +132,9 @@ func (p *Proxy) terminate(ctx context.Context, conn *peekConn, sess *Session) er
 // the connection was headed to is what the proxy dials, and name verification stands between
 // the two. Nothing is consumed, the handshake reads the same bytes after.
 func (p *Proxy) placeTLS(ctx context.Context, conn *peekConn, sess *Session) error {
-	hello, err := p.peekClientHello(conn)
+	hello, alert, err := p.peekClientHello(conn)
 	if err != nil {
-		return err
+		return refuseHello(conn, alert, err)
 	}
 
 	target := sess.target
@@ -86,19 +146,28 @@ func (p *Proxy) placeTLS(ctx context.Context, conn *peekConn, sess *Session) err
 	if named {
 		target.Host = stringsutil.ToLowerASCIIString(hello.ServerName)
 	}
+	// A ClientHello the peek could not read may have a server name, and RFC 9846 section 6.2
+	// gives decode_error to a message that does not parse.
+	unnamed := byte(alertMissingExtension)
+	if hello == nil {
+		unnamed = alertDecodeError
+	}
 	if target.Host == "" {
-		return errors.New("edge: TLS connection with no server name and no destination")
+		return refuseHello(conn, unnamed, errors.New("edge: TLS connection with no server name and no destination"))
 	}
 
 	target, admitted, verdict := p.targetForTransparent(ctx, target, sess.upstream, named, KindHTTP, KindTCP)
 	switch verdict {
 	case nameMismatch:
-		return errNameMismatch
+		return refuseHello(conn, alertUnrecognizedName, errNameMismatch)
 	case nameUnresolved:
-		return errNameUnresolved
+		return refuseHello(conn, alertUnrecognizedName, errNameUnresolved)
 	}
 	if !admitted {
-		return ErrConnectionRejected
+		if !named {
+			return refuseHello(conn, unnamed, ErrConnectionRejected)
+		}
+		return refuseHello(conn, alertUnrecognizedName, ErrConnectionRejected)
 	}
 	sess.target = target
 	if hello != nil {
@@ -108,22 +177,25 @@ func (p *Proxy) placeTLS(ctx context.Context, conn *peekConn, sess *Session) err
 }
 
 // peekClientHello reads the ClientHello waiting on conn without consuming it, nil when there
-// is none it can read, and refuses the connection when the hello offers Encrypted Client
-// Hello and the proxy rejects that.
-func (p *Proxy) peekClientHello(conn *peekConn) (*ClientHello, error) {
+// is none it can read, and refuses the connection with the alert to send when the hello offers
+// Encrypted Client Hello and the proxy rejects that.
+func (p *Proxy) peekClientHello(conn *peekConn) (*ClientHello, byte, error) {
 	raw, err := peekHandshakeRecords(conn)
 	if p.cfg.rejectECH {
 		if err != nil {
-			return nil, errECHUnverifiable
+			return nil, alertDecodeError, errECHUnverifiable
 		}
 		if cerr := checkECH(raw); cerr != nil {
-			return nil, cerr
+			if errors.Is(cerr, errECHUnverifiable) {
+				return nil, alertDecodeError, cerr
+			}
+			return nil, alertHandshakeFailure, cerr
 		}
 	}
 	if err != nil {
-		return nil, nil
+		return nil, 0, nil
 	}
-	return clientHelloFromRecords(raw), nil
+	return clientHelloFromRecords(raw), 0, nil
 }
 
 // servePlain serves a connection without TLS, routed on the authority of its first request.
@@ -180,7 +252,7 @@ func (p *Proxy) placePlain(ctx context.Context, conn *peekConn, sess *Session) p
 		return plainNameless
 	}
 	target := sess.target
-	target.Host = stringsutil.ToLowerASCIIString(host)
+	target.Host = canonicalHost(stringsutil.ToLowerASCIIString(host))
 	verified, ok := p.verifyRequestHost(ctx, sess, target, KindHTTP, KindTCP)
 	if !ok {
 		return plainRefused
@@ -216,7 +288,7 @@ func (p *Proxy) serveHTTPConnection(conn net.Conn, sess *Session, state *tls.Con
 	if sess.Protocol() == 0 {
 		sess.setProtocol(HTTP11)
 	}
-	return p.serveTerminatedHTTP(conn, sess)
+	return p.serveTerminatedHTTP(conn, sess, state)
 }
 
 // serveTerminatedStream runs the [TCP] handler admitting this authority. The stream is in the
@@ -254,16 +326,29 @@ func (p *Proxy) serveTerminatedStream(ctx context.Context, conn net.Conn, sess *
 	if handler == nil {
 		return errors.New("edge: TCP entry with no handler")
 	}
-	if err := runKindHandler(p, sess, func() error { return handler(c) }); err != nil {
+	err := runKindHandler(p, sess, func() error { return handler(c) })
+	c.lingerAfterAlert()
+	if err != nil {
+		if c.dialErr != nil {
+			// A CONNECT was answered 2xx before the dial, so a clean end would read as the
+			// destination closing a tunnel that never opened.
+			abort(conn)
+		}
 		return err
 	}
+	// Closing a TLS client is what sends its close_notify, which the caller closing the
+	// connection under it would not.
+	_ = c.client.Close()
 	return nil
 }
 
 // serverTLSConfig builds the configuration the proxy presents to a terminated client. The
 // whole configuration is decided from the ClientHello so the certificate matches the name the
 // client asked for and the negotiated protocol matches what it offered.
-func (p *Proxy) serverTLSConfig(sess *Session) *tls.Config {
+//
+// With decided unset, an offer with no HTTP protocol on an authority admitting no stream ends
+// the handshake on no_application_protocol, RFC 7301 section 3.2.
+func (p *Proxy) serverTLSConfig(sess *Session, decided bool) *tls.Config {
 	return &tls.Config{
 		MinVersion: tls.VersionTLS12,
 		GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
@@ -281,9 +366,16 @@ func (p *Proxy) serverTLSConfig(sess *Session) *tls.Config {
 				name = sess.target.Host
 			}
 
+			next := negotiateALPN(chi.SupportedProtos, KindTCP)
+			if !decided && len(next) == 1 && !slices.Contains(httpOver(KindTCP), next[0]) &&
+				!p.admitsAny(sess.target, KindTCP) {
+				// Offering only what the client did not makes crypto/tls send the alert.
+				next = httpOver(KindTCP)
+			}
+
 			return &tls.Config{
 				MinVersion: tls.VersionTLS12,
-				NextProtos: negotiateALPN(chi.SupportedProtos, KindTCP),
+				NextProtos: next,
 				GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
 					return p.cfg.ca.Leaf(name)
 				},
@@ -292,13 +384,10 @@ func (p *Proxy) serverTLSConfig(sess *Session) *tls.Config {
 	}
 }
 
-// serveTerminatedHTTP runs the HTTP server side of a terminated connection. The requests it
-// reads are ordinary origin-form requests, which is exactly what the routing tree expects.
-//
-// One server serves both protocols. An HTTP/2 client, ALPN or not, opens with the connection
-// preface, which the server detects on the plaintext it is handed and answers natively. That
-// single path ties every terminated connection to the server's graceful shutdown.
-func (p *Proxy) serveTerminatedHTTP(conn net.Conn, sess *Session) error {
+// serveTerminatedHTTP serves a terminated connection on term, whose one HTTP/2 server ties it
+// to the graceful shutdown. ALPN selects the protocol over TLS, the connection preface over
+// plaintext.
+func (p *Proxy) serveTerminatedHTTP(conn net.Conn, sess *Session, state *tls.ConnectionState) error {
 	if sess.remoteAddr == nil {
 		sess.remoteAddr = conn.RemoteAddr()
 	}
@@ -314,7 +403,7 @@ func (p *Proxy) serveTerminatedHTTP(conn net.Conn, sess *Session) error {
 	}
 	defer p.srv.trackSession(sess, false)
 
-	ln := newSingleConnListener(conn, sess)
+	ln := newSingleConnListener(conn, sess, state)
 	err := p.srv.term.Serve(ln)
 	ln.wait()
 	if errors.Is(err, net.ErrClosed) || errors.Is(err, http.ErrServerClosed) {
@@ -325,6 +414,14 @@ func (p *Proxy) serveTerminatedHTTP(conn net.Conn, sess *Session) error {
 
 // serveTerminatedRequest routes one request read off a terminated connection.
 func (p *Proxy) serveTerminatedRequest(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "PRI" && r.ProtoMajor == 2 && r.RequestURI == "*" {
+		// The HTTP/2 preface on a TLS connection where ALPN did not select h2, RFC 7301 section
+		// 3.2, refused with the status of the TLS front. Plaintext never reaches it.
+		w.Header().Set("Connection", "close")
+		p.writeStatus(w, r, http.StatusBadRequest, "HTTP/2 preface on a connection that did not negotiate h2")
+		return
+	}
+
 	sess := sessionFromRequest(r)
 	if sess == nil {
 		sess = newSession(p, r.Context(), nil, Target{}, KindHTTP, protoOfRequest(r))
@@ -337,12 +434,6 @@ func (p *Proxy) serveTerminatedRequest(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Connection", "close")
 		p.writeStatus(w, r, http.StatusForbidden, "no entry admits this authority")
 		return
-	}
-
-	if state := sess.tlsState.Load(); r.TLS == nil && state != nil {
-		// http.Server only recognizes an unwrapped *tls.Conn, and the connection it was
-		// handed is wrapped. Handlers still expect Request.TLS to describe the handshake.
-		r.TLS = state
 	}
 
 	target, ok := terminatedTarget(r, sess)
@@ -393,5 +484,5 @@ func terminatedTarget(r *http.Request, sess *Session) (Target, bool) {
 		port = defaultPort(scheme)
 	}
 
-	return Target{Scheme: scheme, Host: stringsutil.ToLowerASCIIString(host), Port: port}, true
+	return Target{Scheme: scheme, Host: canonicalHost(stringsutil.ToLowerASCIIString(host)), Port: port}, true
 }

@@ -476,14 +476,18 @@ func chain[H Handler](mws []middleware, base H) H {
 	return h
 }
 
-// DefaultErrorHandler answers 502 Bad Gateway, and 500 Internal Server Error for a
-// [PanicError]. The response body is the status text alone. The error is logged, a panic with
-// its stack, and a replacement takes over that logging.
+// DefaultErrorHandler answers 500 Internal Server Error to a [PanicError], 400 Bad Request to
+// a malformed request, and 502 Bad Gateway otherwise. The response body is the status text
+// alone. The error is logged, a panic with its stack, and a replacement takes over
+// that logging.
 func DefaultErrorHandler(c *HTTPCtx, err error) *http.Response {
 	code := http.StatusBadGateway
 	pe, panicked := errors.AsType[*PanicError](err)
-	if panicked {
+	switch {
+	case panicked:
 		code = http.StatusInternalServerError
+	case errors.Is(err, errMalformedRequest):
+		code = http.StatusBadRequest
 	}
 	if c != nil && c.r != nil && c.r.p != nil {
 		logger := c.r.p.cfg.logger

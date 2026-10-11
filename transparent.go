@@ -203,25 +203,11 @@ var errStopHandshake = errors.New("edge: client hello captured")
 func peekHandshakeRecords(conn *peekConn) ([]byte, error) {
 	const recordHeader = 5
 
-	// The first record carries the handshake header, whose 3 byte length says how much of
-	// the message is still to come.
-	head, err := conn.Peek(recordHeader + 4)
-	if err != nil {
-		return nil, fmt.Errorf("peek TLS record header: %w", err)
-	}
-	if head[0] != tlsHandshakeRecord {
-		return nil, errors.New("edge: not a TLS handshake record")
-	}
-	if head[recordHeader] != 0x01 {
-		return nil, errors.New("edge: first handshake message is not a ClientHello")
-	}
-
-	want := int(head[recordHeader+1])<<16 | int(head[recordHeader+2])<<8 | int(head[recordHeader+3])
-	want += 4 // the handshake header itself
-
-	total := 0
-	payload := 0
-	for payload < want {
+	// The 4 byte handshake header may itself be fragmented across records, so its length is
+	// only known once 4 bytes of payload have arrived.
+	var head [4]byte
+	got, want, total := 0, -1, 0
+	for want < 0 || got < want {
 		next, err := conn.Peek(total + recordHeader)
 		if err != nil {
 			return nil, fmt.Errorf("peek TLS record: %w", err)
@@ -232,11 +218,27 @@ func peekHandshakeRecords(conn *peekConn) ([]byte, error) {
 			return nil, errors.New("edge: non-handshake record inside the ClientHello")
 		}
 		length := int(next[total+3])<<8 | int(next[total+4])
-		total += recordHeader + length
-		payload += length
-		if total > clientHelloPeekSize {
+		if length == 0 {
+			return nil, errors.New("edge: empty handshake record")
+		}
+		if total+recordHeader+length > clientHelloPeekSize {
 			return nil, errors.New("edge: ClientHello larger than the peek buffer")
 		}
+		if got < len(head) {
+			rec, err := conn.Peek(total + recordHeader + length)
+			if err != nil {
+				return nil, fmt.Errorf("peek TLS record: %w", err)
+			}
+			n := copy(head[got:], rec[total+recordHeader:])
+			if got == 0 && head[0] != 0x01 {
+				return nil, errors.New("edge: first handshake message is not a ClientHello")
+			}
+			if got+n == len(head) {
+				want = len(head) + (int(head[1])<<16 | int(head[2])<<8 | int(head[3]))
+			}
+		}
+		total += recordHeader + length
+		got += length
 	}
 
 	return conn.Peek(total)

@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"slices"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -511,6 +512,18 @@ func TestTargetFromConnect_PortIsCanonical(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestTargetFromConnect_RootDotIsDropped(t *testing.T) {
+	for authority, host := range map[string]string{"Example.Test.:443": "example.test", "127.0.0.1.:443": "127.0.0.1"} {
+		target, err := targetFromConnect(&http.Request{Method: http.MethodConnect, URL: &url.URL{Host: authority}, Host: authority})
+		require.NoError(t, err)
+		assert.Equal(t, host, target.Host)
+	}
+	for _, authority := range []string{".:443", "example.test..:443"} {
+		_, err := targetFromConnect(&http.Request{Method: http.MethodConnect, URL: &url.URL{Host: authority}, Host: authority})
+		assert.Error(t, err, authority)
+	}
+}
+
 func TestConnect_PlaintextIsPlacedOnItsFirstAuthority(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "origin got host=%s", r.Host)
@@ -859,4 +872,27 @@ func TestConnect_OriginResetEndsAnHTTP3ConnectWithConnectError(t *testing.T) {
 	stopped, ok := errors.AsType[*quic.StreamError](err)
 	require.True(t, ok, "the write ended with %v", err)
 	assert.Equal(t, quic.StreamErrorCode(http3.ErrCodeConnectError), stopped.ErrorCode)
+}
+
+func TestConnect_RefusedDialResetsTheTerminatedClient(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	tr := DefaultTransport()
+	tr.DialContext = func(_ context.Context, network, _ string) (net.Conn, error) {
+		return nil, &net.OpError{Op: "dial", Net: network, Err: syscall.ECONNREFUSED}
+	}
+	p, err := New(WithCA(ca), WithTransport(tr))
+	require.NoError(t, err)
+	p.MustAdd[TCP]("origin.test", relayStream)
+	w := dialWire(t, startProxy(t, p))
+	w.send(t, "CONNECT origin.test:443 HTTP/1.1\r\nHost: origin.test:443\r\n\r\n")
+	require.Equal(t, http.StatusOK, headStatus(t, w.readHead(t)))
+	require.Zero(t, w.br.Buffered())
+
+	tc := tls.Client(w.Conn, &tls.Config{RootCAs: poolOf(ca), ServerName: "origin.test", MinVersion: tls.VersionTLS12})
+	require.NoError(t, tc.Handshake())
+	_, err = tc.Write([]byte("\x01ping"))
+	require.NoError(t, err)
+	_, err = tc.Read(make([]byte, 1))
+	assert.ErrorIs(t, err, syscall.ECONNRESET, "the session ended cleanly where the dial failed")
 }

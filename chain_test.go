@@ -440,24 +440,51 @@ func TestChain_HTTPWithDeclaredDestinationThroughCONNECT(t *testing.T) {
 
 // countingDialer counts the connections the front opens, by network.
 type countingDialer struct {
-	udp, tcp atomic.Int32
+	refusedTCP, refusedUDP string
+	udp, tcp               atomic.Int32
 }
 
 func (d *countingDialer) dial(ctx context.Context, network, addr string) (net.Conn, error) {
+	refused := ""
 	switch network {
 	case "udp":
 		d.udp.Add(1)
+		refused = d.refusedUDP
 	case "tcp":
 		d.tcp.Add(1)
+		refused = d.refusedTCP
+	}
+	if addr == refused {
+		return nil, &net.OpError{Op: "dial", Net: network, Err: syscall.ECONNREFUSED}
 	}
 	return defaultDialer.DialContext(ctx, network, addr)
 }
 
+// backListens is what the proxy a chained front goes through listens on.
+type backListens uint8
+
+const (
+	onBoth backListens = iota
+	onQUIC
+	onTCP
+)
+
 // chainedFront builds a front proxy chained through the proxy at back, admitting UDP to the
-// loopback, with HTTP/3 to the proxy bounded short enough for the fallback to be quick.
-func chainedFront(t *testing.T, ca *CA, back string) (*Proxy, *countingDialer) {
+// loopback, with HTTP/3 to the proxy bounded short enough for the fallback to be quick. A dial
+// to back over the transport it does not listen on is counted and refused, since another test
+// may listen on the port of the same number.
+func chainedFront(t *testing.T, ca *CA, back string, listens backListens) (*Proxy, *countingDialer) {
 	t.Helper()
 	dialer := new(countingDialer)
+	if listens != onBoth {
+		u, err := url.Parse(back)
+		require.NoError(t, err)
+		if listens == onQUIC {
+			dialer.refusedTCP = u.Host
+		} else {
+			dialer.refusedUDP = u.Host
+		}
+	}
 	frontTr := DefaultTransport()
 	frontTr.DialContext = dialer.dial
 	frontTr.RootCAs = poolOf(ca)
@@ -494,7 +521,7 @@ func TestChain_DatagramFlowThroughCONNECTUDPUpgrade(t *testing.T) {
 	back.MustAdd[UDP]("127.0.0.1", forwardDatagram)
 	backFront := startTLSFront(t, back, ca, "http/1.1")
 
-	front, dialer := chainedFront(t, ca, "https://"+backFront.String())
+	front, dialer := chainedFront(t, ca, "https://"+backFront.String(), onBoth)
 	frontAddr := startQUICRedirected(t, front, echo)
 	echoThrough(t, frontAddr, "ping", "pong")
 
@@ -523,7 +550,7 @@ func TestChain_PlainProxyCarriesCONNECTUDP(t *testing.T) {
 	back.MustAdd[UDP]("127.0.0.1", forwardDatagram)
 	backFront := startProxy(t, back)
 
-	front, dialer := chainedFront(t, ca, "http://"+backFront)
+	front, dialer := chainedFront(t, ca, "http://"+backFront, onTCP)
 	frontAddr := startQUICRedirected(t, front, echo)
 	echoThrough(t, frontAddr, "ping")
 	waitForSessions(t, back, 2)
@@ -546,7 +573,7 @@ func TestChain_H3UpstreamThroughCONNECTUDPUpgrade(t *testing.T) {
 	back.MustAdd[QUIC](h3Authority, relayQUIC)
 	backFront := startTLSFront(t, back, ca, "http/1.1")
 
-	front, _ := chainedFront(t, ca, "https://"+backFront.String())
+	front, _ := chainedFront(t, ca, "https://"+backFront.String(), onTCP)
 	front.srv.fwd.up.t.AllowHTTP3 = true
 	seen := new(recorder)
 	front.MustAdd(h3Authority+"/+{any}", func(c *HTTPCtx) (*http.Response, error) {
@@ -582,7 +609,7 @@ func TestChain_RefusedCONNECTUDPIsFinal(t *testing.T) {
 	require.NoError(t, err)
 	backFront := startTLSFront(t, back, ca, "http/1.1")
 
-	front, dialer := chainedFront(t, ca, "https://"+backFront.String())
+	front, dialer := chainedFront(t, ca, "https://"+backFront.String(), onBoth)
 	_, err = front.srv.fwd.up.dial(t.Context(), "udp", "127.0.0.1:53", "https")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "CONNECT-UDP refused with 403")
@@ -602,7 +629,7 @@ func TestChain_DeadProxyEndsTheFlowOverTCP(t *testing.T) {
 	back.MustAdd[UDP]("127.0.0.1", forwardDatagram)
 	backFront := startTLSFront(t, back, ca, "http/1.1")
 
-	front, _ := chainedFront(t, ca, "https://"+backFront.String())
+	front, _ := chainedFront(t, ca, "https://"+backFront.String(), onTCP)
 	frontAddr := startQUICRedirected(t, front, echo)
 	echoThrough(t, frontAddr, "ping")
 	waitForSessions(t, front, 1)
@@ -625,7 +652,7 @@ func TestChain_H2ProxyWithoutExtendedConnectUpgradesOverHTTP11(t *testing.T) {
 	back.MustAdd[TCP]("127.0.0.1", relayStream)
 	backFront := startTLSFront(t, back, ca, "h2", "http/1.1")
 
-	front, dialer := chainedFront(t, ca, "https://"+backFront.String())
+	front, dialer := chainedFront(t, ca, "https://"+backFront.String(), onTCP)
 	frontAddr := startQUICRedirected(t, front, echo)
 	echoThrough(t, frontAddr, "ping", "pong")
 	for _, s := range waitForSessions(t, back, 4) {
@@ -655,7 +682,7 @@ func TestChain_DatagramFlowThroughCONNECTUDPOverHTTP2(t *testing.T) {
 	back.MustAdd[UDP]("127.0.0.1", forwardDatagram)
 	backFront := startTLSFront(t, back, ca, "h2", "http/1.1")
 
-	front, dialer := chainedFront(t, ca, "https://"+backFront.String())
+	front, dialer := chainedFront(t, ca, "https://"+backFront.String(), onTCP)
 	frontAddr := startQUICRedirected(t, front, echo)
 	echoThrough(t, frontAddr, "ping", "pong")
 	var tunnels int
@@ -694,7 +721,7 @@ func TestChain_H3UpstreamThroughCONNECTUDPOverHTTP2(t *testing.T) {
 	back.MustAdd[QUIC](h3Authority, relayQUIC)
 	backFront := startTLSFront(t, back, ca, "h2", "http/1.1")
 
-	front, _ := chainedFront(t, ca, "https://"+backFront.String())
+	front, _ := chainedFront(t, ca, "https://"+backFront.String(), onTCP)
 	front.srv.fwd.up.t.AllowHTTP3 = true
 	front.MustAdd(h3Authority+"/+{any}", forwardHandler)
 	frontAddr := startQUICRedirected(t, front, origin)
@@ -728,7 +755,7 @@ func TestChain_RefusedCONNECTUDPLeavesTheHTTP2ConnectionShared(t *testing.T) {
 	back.MustAdd[UDP]("127.0.0.1", forwardDatagram)
 	backFront := startTLSFront(t, back, ca, "h2", "http/1.1")
 
-	front, dialer := chainedFront(t, ca, "https://"+backFront.String())
+	front, dialer := chainedFront(t, ca, "https://"+backFront.String(), onTCP)
 	up := front.srv.fwd.up
 	_, err = up.dial(t.Context(), "udp", "127.0.0.2:53", "https")
 	require.Error(t, err)
@@ -1030,7 +1057,7 @@ func TestChain_TCPStreamThroughCONNECTOverHTTP2(t *testing.T) {
 	back := streamingBack(t, ca, origin.Host)
 	backFront := startTLSFront(t, back, ca, "h2")
 
-	front, dialer := chainedFront(t, ca, "https://"+backFront.String())
+	front, dialer := chainedFront(t, ca, "https://"+backFront.String(), onTCP)
 	front.MustAdd[TCP]("inner.test", relayStream)
 	frontAddr := startProxy(t, front)
 
@@ -1050,7 +1077,7 @@ func TestChain_TCPStreamThroughCONNECTOverHTTP3(t *testing.T) {
 	back := streamingBack(t, ca, origin.Host)
 	backFront, _ := startQUICFront(t, back, ca)
 
-	front, dialer := chainedFront(t, ca, "https://"+backFront.String())
+	front, dialer := chainedFront(t, ca, "https://"+backFront.String(), onQUIC)
 	front.MustAdd[TCP]("inner.test", relayStream)
 	frontAddr := startProxy(t, front)
 
@@ -1111,7 +1138,7 @@ func TestChain_TCPStreamJoinsTheHTTP3ConnectionAFlowOpened(t *testing.T) {
 	back.MustAdd[UDP]("127.0.0.1", forwardDatagram)
 	backFront := startDualFront(t, back, ca)
 
-	front, dialer := chainedFront(t, ca, "https://"+backFront.String())
+	front, dialer := chainedFront(t, ca, "https://"+backFront.String(), onBoth)
 	front.MustAdd[TCP]("inner.test", relayStream)
 	frontAddr := startProxy(t, front)
 	udpFront := startQUICRedirected(t, front, echo)
@@ -1133,7 +1160,7 @@ func TestChain_HTTP3ConnectionGoingAwayIsLeft(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
 	proxyAddr, srv := h3ConnectEcho(t, ca)
-	front, _ := chainedFront(t, ca, "https://"+proxyAddr.String())
+	front, _ := chainedFront(t, ca, "https://"+proxyAddr.String(), onQUIC)
 	up := front.srv.fwd.up
 	proxy := &url.URL{Scheme: "https", Host: proxyAddr.String()}
 
@@ -1162,7 +1189,7 @@ func TestChain_HTTP3ConnectionGoingAwayIsLeft(t *testing.T) {
 func TestChain_ProxyDownOnBothIsDialedOverTCPAlone(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
-	front, dialer := chainedFront(t, ca, "https://127.0.0.1:1")
+	front, dialer := chainedFront(t, ca, "https://127.0.0.1:1", onBoth)
 	up := front.srv.fwd.up
 
 	_, err = up.dial(t.Context(), "tcp", "192.0.2.1:443", "https")
@@ -1217,7 +1244,7 @@ func TestChain_CONNECTNotServedOverHTTP3AndHTTP2GoesOverHTTP11(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
 	proxyAddr := versionedProxy(t, ca)
-	front, dialer := chainedFront(t, ca, "https://"+proxyAddr.String())
+	front, dialer := chainedFront(t, ca, "https://"+proxyAddr.String(), onBoth)
 	up := front.srv.fwd.up
 	proxy := &url.URL{Scheme: "https", Host: proxyAddr.String()}
 
@@ -1254,7 +1281,7 @@ func TestChain_RefusedCONNECTLeavesTheHTTP2ConnectionShared(t *testing.T) {
 	back := streamingBack(t, ca, origin.Host)
 	backFront := startTLSFront(t, back, ca, "h2")
 
-	front, dialer := chainedFront(t, ca, "https://"+backFront.String())
+	front, dialer := chainedFront(t, ca, "https://"+backFront.String(), onTCP)
 	up := front.srv.fwd.up
 	_, err = up.dial(t.Context(), "tcp", "other.test:443", "https")
 	require.Error(t, err)
@@ -1306,7 +1333,7 @@ func TestChain_TunnelOverHTTP3IsAConnection(t *testing.T) {
 	require.NoError(t, err)
 	back.MustAdd[TCP]("127.0.0.1", relayStream)
 	backFront, _ := startQUICFront(t, back, ca)
-	front, dialer := chainedFront(t, ca, "https://"+backFront.String())
+	front, dialer := chainedFront(t, ca, "https://"+backFront.String(), onQUIC)
 
 	conn, err := front.srv.fwd.up.dial(t.Context(), "tcp", origin.Addr().String(), "http")
 	require.NoError(t, err)
@@ -1336,7 +1363,7 @@ func TestChain_WriteDeadlineResetsTheStreamAlone(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
 	proxyAddr, _ := h3ConnectEcho(t, ca)
-	front, _ := chainedFront(t, ca, "https://"+proxyAddr.String())
+	front, _ := chainedFront(t, ca, "https://"+proxyAddr.String(), onQUIC)
 	up := front.srv.fwd.up
 
 	late, err := up.dial(t.Context(), "tcp", "192.0.2.1:443", "https")
@@ -1406,7 +1433,7 @@ func TestChain_H3ProxyWithoutCONNECTUDPCarriesCONNECT(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
 	proxyAddr, _ := h3ConnectEcho(t, ca)
-	front, dialer := chainedFront(t, ca, "https://"+proxyAddr.String())
+	front, dialer := chainedFront(t, ca, "https://"+proxyAddr.String(), onQUIC)
 	up := front.srv.fwd.up
 
 	_, err = up.dial(t.Context(), "udp", "192.0.2.1:53", "https")
@@ -1431,7 +1458,7 @@ func TestChain_ConcurrentCONNECTsShareOneHTTP3Dial(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
 	proxyAddr, _ := h3ConnectEcho(t, ca)
-	front, dialer := chainedFront(t, ca, "https://"+proxyAddr.String())
+	front, dialer := chainedFront(t, ca, "https://"+proxyAddr.String(), onQUIC)
 	up := front.srv.fwd.up
 
 	var wg sync.WaitGroup
@@ -1462,6 +1489,9 @@ func TestChain_WaiterDialsWhenTheHTTP3DialWasCancelled(t *testing.T) {
 	var udpDials atomic.Int32
 	gate := make(chan struct{})
 	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if network == "tcp" && addr == proxyAddr.String() {
+			return nil, &net.OpError{Op: "dial", Net: network, Err: syscall.ECONNREFUSED}
+		}
 		if network == "udp" && udpDials.Add(1) == 1 {
 			select {
 			case <-gate:
@@ -1629,7 +1659,7 @@ func TestChain_ConcurrentCONNECTsToAFailingProxyEachFail(t *testing.T) {
 			_ = conn.Close()
 		}
 	}()
-	front, dialer := chainedFront(t, ca, "https://"+ln.Addr().String())
+	front, dialer := chainedFront(t, ca, "https://"+ln.Addr().String(), onTCP)
 	up := front.srv.fwd.up
 
 	var wg sync.WaitGroup
@@ -2069,7 +2099,7 @@ func TestChain_DatagramFlowThroughSOCKS5(t *testing.T) {
 	back.MustAdd[UDP]("127.0.0.1", forwardDatagram)
 	backAddr := startSOCKS5(t, back)
 
-	front, dialer := chainedFront(t, ca, "socks5://"+backAddr)
+	front, dialer := chainedFront(t, ca, "socks5://"+backAddr, onBoth)
 	frontAddr := startQUICRedirected(t, front, echo)
 	echoThrough(t, frontAddr, "ping", "pong")
 
@@ -2151,4 +2181,82 @@ func TestChain_RefusedSOCKS5AssociateReportsTheReply(t *testing.T) {
 	_, err := newUpstreamDialer(tr).dial(ctx, "udp", "127.0.0.1:443", "https")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "command not supported")
+}
+
+func TestChain_H3AnswerPastInformational(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	cert, err := ca.Leaf("127.0.0.1")
+	require.NoError(t, err)
+	for _, tc := range []struct {
+		name  string
+		codes []string
+		ok    bool
+	}{
+		{"a 100", []string{"100"}, true},
+		{"five", []string{"100", "103", "103", "103", "103"}, true},
+		{"six", []string{"100", "103", "103", "103", "103", "103"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			up := newRawQUIC(t, *cert, func(_ *rawOrigin, _ *h3Conn, s *h3Stream) {
+				if _, _, err := s.next(); err != nil {
+					return
+				}
+				for _, code := range append(tc.codes, "200") {
+					if _, err := s.Write(h3Headers([]hpack.HeaderField{hf(":status", code)})); err != nil {
+						return
+					}
+				}
+				_, _ = io.Copy(io.Discard, s.br)
+			})
+			cc, _ := dialH3(t, up.addr, ca, true)
+			req := &http.Request{Method: http.MethodConnect, URL: &url.URL{Host: "origin.test:443"}, Host: "origin.test:443", Header: make(http.Header)}
+			str, err := requestOn(t.Context(), cc, req, "CONNECT-UDP", connectUDPAnswer)
+			if !tc.ok {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "too many 1xx answers")
+				return
+			}
+			require.NoError(t, err)
+			str.CancelRead(0)
+			str.CancelWrite(0)
+		})
+	}
+}
+
+func TestChain_NoUserAgentToTheProxy(t *testing.T) {
+	t.Run("CONNECT", func(t *testing.T) {
+		for _, exit := range allExits {
+			t.Run(exit, func(t *testing.T) {
+				b := newExitBench(t, exit, nil, "HTTP/1.1 200 OK\r\n\r\n")
+				b.tunnel(t, "origin.test:80", "")
+				assert.Empty(t, b.origin.next(t).req.Header.Values("User-Agent"))
+			})
+		}
+	})
+	t.Run("CONNECT-UDP", func(t *testing.T) {
+		ca, err := GenerateCA()
+		require.NoError(t, err)
+		eachExit(t, allExits, func(t *testing.T, version string) {
+			u := exitDialer(t, ca)
+			switch version {
+			case viaH3:
+				up := startH3Upstream(t, ca, nil, true, answerH3(http.StatusOK, capsuleProtocolOn))
+				_, err := exitTunnel(t, u, version, up.addr, "192.0.2.1:53")
+				require.NoError(t, err)
+				assert.Empty(t, up.head(t)["user-agent"])
+			case viaH2:
+				up := startH2Upstream(t, ca, h2Status("200"), capsuleProtocolField)
+				_, err := exitTunnel(t, u, version, up.addr, "192.0.2.1:53")
+				require.NoError(t, err)
+				assert.Empty(t, up.head(t)["user-agent"])
+			default:
+				up := startH1Upstream(t, nil, upgraded101)
+				_, err := exitTunnel(t, u, version, up.addr, "192.0.2.1:53")
+				require.NoError(t, err)
+				_, header := up.head(t)
+				assert.Empty(t, header.Values("User-Agent"))
+			}
+		})
+	})
 }

@@ -1425,36 +1425,15 @@ func grpcStatusOf(r grpcResult) string {
 	return r.trailer("grpc-status")
 }
 
-// grpcConformanceCase is one requirement of the gRPC over HTTP/2 protocol or of the status code
-// document, checked by a client and an origin scripted around the proxy. A case that cannot
-// apply states the reason instead of a scenario.
-type grpcConformanceCase struct {
-	run func(t *testing.T)
-	// id is the source and its section, "grpc/requests/1" in PROTOCOL-HTTP2.md.
-	id string
-	// name states what the peers send.
-	name string
-	// req is the requirement in the words of the source.
-	req string
-	// skip gives the reason the case does not apply.
-	skip string
-}
-
 func TestConformanceGRPC(t *testing.T) {
-	for _, tc := range grpcConformance {
-		t.Run(tc.id+" "+tc.name, func(t *testing.T) {
-			if tc.skip != "" {
-				t.Skip(tc.skip)
-			}
-			t.Parallel()
-			tc.run(t)
-		})
-	}
+	runConformance(t, grpcConformance)
 }
 
 const specialStatusMessage = "\t\ntest with whitespace\r\nand Unicode BMP ☺ and non-BMP 😈\t\n"
 
-var grpcConformance = []grpcConformanceCase{
+// grpcConformance lists the requirements of the gRPC over HTTP/2 protocol and of the status
+// code document, checked by a client and an origin scripted around the proxy.
+var grpcConformance = []conformanceCase{
 	{
 		id: "grpc/requests/1", name: "a Call-Definition with every optional field, then one without any",
 		req: "**Call-Definition** → Method Scheme Path [Authority] TE [Timeout] Content-Type [Message-Type] [Message-Encoding] [Message-Accept-Encoding] [User-Agent]",
@@ -2367,4 +2346,19 @@ var grpcConformance = []grpcConformanceCase{
 		req:  "Server shutting down\t| UNAVAILABLE | Server",
 		skip: "a shutdown sends GOAWAY through net/http's HTTP/2 server or closes the connection, and the client maps the latter to UNAVAILABLE",
 	},
+}
+
+func TestKindGRPC_MessagesAreGatedAfterForwardReturns(t *testing.T) {
+	o := newGRPCOrigin(t, func(o *grpcOrigin, w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/grpc")
+		w.Header().Set("Trailer", "Grpc-Status")
+		w.WriteHeader(http.StatusOK)
+		_ = http.NewResponseController(w).Flush()
+		time.Sleep(300 * time.Millisecond)
+		_ = o.record(r)
+		w.Header().Set(http.TrailerPrefix+"Grpc-Status", "0")
+	})
+	b := newGRPCBench(t, o, forwardCall)
+	r := b.client(t).unary("/pkg.Svc/Method", bytes.Repeat(lpm(0, ""), 10000))
+	assert.Equal(t, "0", grpcStatusOf(r))
 }

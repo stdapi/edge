@@ -143,6 +143,7 @@ func (p *Proxy) connectStream(w http.ResponseWriter, r *http.Request, target Tar
 	}
 	defer func() {
 		_ = stream.Close()
+		stream.finish()
 		p.srv.untrack(stream)
 		if stream.aborted.Load() {
 			// A return ends the stream cleanly, where the relay failed, and an HTTP/2 handler
@@ -168,6 +169,7 @@ func targetFromConnect(r *http.Request) (Target, error) {
 		authority = r.URL.Host
 	}
 	host, port := splitHostPort(authority)
+	host = canonicalHost(host)
 	if host == "" {
 		return Target{}, errors.New("CONNECT requires an authority target")
 	}

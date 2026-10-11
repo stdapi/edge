@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -99,6 +100,26 @@ func TestCA_LeafCache(t *testing.T) {
 
 	_, err = ca.Leaf("")
 	assert.ErrorIs(t, err, ErrInvalidConfig)
+}
+
+func TestCA_LeafIsMintedForTheCanonicalName(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+
+	cert, err := ca.Leaf("API.Test.")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"api.test"}, cert.Leaf.DNSNames)
+
+	cert, err = ca.Leaf("127.0.0.1.")
+	require.NoError(t, err)
+	assert.Empty(t, cert.Leaf.DNSNames)
+	require.Len(t, cert.Leaf.IPAddresses, 1)
+	assert.Equal(t, "127.0.0.1", cert.Leaf.IPAddresses[0].String())
+
+	for _, host := range []string{"under_score.test", "-leading.test", "trailing-.test", "exa mple.test", "a..test", strings.Repeat("a", 64) + ".test"} {
+		_, err := ca.Leaf(host)
+		assert.ErrorIs(t, err, ErrInvalidConfig, host)
+	}
 }
 
 func TestCA_LeafTTL(t *testing.T) {

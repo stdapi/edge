@@ -225,6 +225,19 @@ func TestProxyTarget_PortIsCanonical(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestProxyTarget_RootDotIsDropped(t *testing.T) {
+	u, err := url.Parse("http://example.test./x")
+	require.NoError(t, err)
+	target, err := proxyTarget(&http.Request{URL: u, Host: u.Host, ProtoMajor: 1}, "")
+	require.NoError(t, err)
+	assert.Equal(t, "example.test", target.Host)
+	assert.Equal(t, "example.test.", u.Host)
+
+	target, err = proxyTarget(&http.Request{URL: &url.URL{Path: "/x"}, Host: "127.0.0.1.:8443", ProtoMajor: 2}, "https")
+	require.NoError(t, err)
+	assert.Equal(t, "127.0.0.1", target.Host)
+}
+
 func TestLifecycle_ShutdownStopsAccepting(t *testing.T) {
 	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprint(w, "ok")
@@ -544,6 +557,31 @@ func TestLifecycle_ShutdownDrainsInterceptedHTTP2(t *testing.T) {
 		return getBody(client, "https://example.test/")
 	})
 	assert.Equal(t, "drained over HTTP/2.0", body)
+}
+
+func TestLifecycle_ShutdownSendsGoAwayOnAnInterceptedHTTP2Connection(t *testing.T) {
+	p, ca := newTLSProxy(t)
+	conn := connectRaw(t, startProxy(t, p), tlsName+":443")
+	require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+	tc := tls.Client(conn, &tls.Config{ServerName: tlsName, RootCAs: ca.CertPool(), NextProtos: []string{"h2"}, MinVersion: tls.VersionTLS12})
+	require.NoError(t, tc.Handshake())
+	_, err := io.WriteString(tc, http2.ClientPreface)
+	require.NoError(t, err)
+	fr := http2.NewFramer(tc, tc)
+	require.NoError(t, fr.WriteSettings())
+	f, err := fr.ReadFrame()
+	require.NoError(t, err)
+	require.IsType(t, &http2.SettingsFrame{}, f)
+
+	go func() { _ = p.Shutdown(t.Context()) }()
+	for {
+		f, err := fr.ReadFrame()
+		require.NoError(t, err, "the connection ended without a GOAWAY")
+		if g, ok := f.(*http2.GoAwayFrame); ok {
+			assert.Equal(t, http2.ErrCodeNo, g.ErrCode)
+			return
+		}
+	}
 }
 
 func TestLifecycle_ShutdownDrainsInterceptedHTTP3(t *testing.T) {

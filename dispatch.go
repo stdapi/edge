@@ -11,6 +11,9 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 )
 
 // dispatchRequest routes one request and runs whatever serves it. The lookup runs on the tree
@@ -38,6 +41,7 @@ func (p *Proxy) dispatchRequest(w http.ResponseWriter, r *http.Request, sess *Se
 	}
 
 	c.reset(sess, r, target.Scheme, target.Host, target.Port)
+	c.client, c.body = r, r.Body
 	c.identity = identity
 
 	c.entry = tree.route(c, false)
@@ -91,7 +95,7 @@ func (p *Proxy) serveHTTPEntry(c *routeCtx, w http.ResponseWriter, r *http.Reque
 
 	if werr := writeResponse(w, r, resp); werr != nil {
 		p.logf(r.Context(), slog.LevelDebug, "write response", sess, werr)
-		abortIfCut(werr)
+		abortIfCut(w, werr)
 	}
 }
 
@@ -115,7 +119,7 @@ func (p *Proxy) serveGRPC(c *routeCtx, w http.ResponseWriter, r *http.Request, s
 		}
 		if cut != nil {
 			p.logf(r.Context(), slog.LevelDebug, "grpc response", sess, cut)
-			abortIfCut(cut)
+			abortIfCut(w, cut)
 		}
 		return
 	}
@@ -124,7 +128,7 @@ func (p *Proxy) serveGRPC(c *routeCtx, w http.ResponseWriter, r *http.Request, s
 		if resp, err = gc.response(); err == nil {
 			if werr := writeResponse(w, r, resp); werr != nil {
 				p.logf(r.Context(), slog.LevelDebug, "write gRPC response", sess, werr)
-				abortIfCut(werr)
+				abortIfCut(w, werr)
 			}
 			return
 		}
@@ -248,10 +252,18 @@ var errBodyCut = errors.New("response body cut short")
 
 // abortIfCut resets the response when err is errBodyCut. A return would end it cleanly and the
 // client would read a complete body.
-func abortIfCut(err error) {
-	if errors.Is(err, errBodyCut) {
-		panic(http.ErrAbortHandler)
+func abortIfCut(w http.ResponseWriter, err error) {
+	if !errors.Is(err, errBodyCut) {
+		return
 	}
+	if hs, ok := w.(http3.HTTPStreamer); ok {
+		// RFC 9114 4.1.1 resets an abandoned response with H3_REQUEST_CANCELLED, where quic-go
+		// resets an aborted handler with H3_INTERNAL_ERROR.
+		str := hs.HTTPStream()
+		str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+		str.CancelRead(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+	}
+	panic(http.ErrAbortHandler)
 }
 
 // announceTrailers copies the trailer names the upstream declared into the response header, so

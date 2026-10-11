@@ -17,7 +17,10 @@ import (
 	"net/textproto"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync/atomic"
+
+	"golang.org/x/net/http/httpguts"
 )
 
 // HTTPCtx carries one intercepted request through the middleware chain and into the handler.
@@ -212,6 +215,14 @@ func (c *HTTPCtx) ForwardRequest(r *http.Request) (*http.Response, error) {
 	if c.r.sess != nil {
 		fixed = c.r.sess.dialAddr()
 	}
+	var body *clientBody
+	// The HTTP/2 server gives a request without content a body of its own, and a declared
+	// length of zero leaves nothing to check.
+	if cr := c.r.client; cr != nil && cr.ContentLength != 0 && out.Body != nil && out.Body != http.NoBody &&
+		out.Body == c.r.body {
+		body = &clientBody{ReadCloser: out.Body, req: cr, remaining: cr.ContentLength}
+		out.Body = body
+	}
 	var resp *http.Response
 	if relay == nil {
 		resp, err = c.r.p.srv.fwd.roundTrip(out, c.upstreamProtocol(), fixed)
@@ -224,6 +235,9 @@ func (c *HTTPCtx) ForwardRequest(r *http.Request) (*http.Response, error) {
 		resp, err = c.r.relayedRoundTrip(relay, out, c.upstreamProtocol(), fixed, started)
 	}
 	if err != nil {
+		if body != nil && body.malformed.Load() {
+			err = malformedRequest{err}
+		}
 		return nil, fmt.Errorf("forward %s %s: %w", out.Method, out.URL.Redacted(), err)
 	}
 
@@ -454,6 +468,69 @@ func (i *infoRelay) flush(w http.ResponseWriter) {
 	}
 	clear(i.pending)
 	i.pending = i.pending[:0]
+}
+
+// errMalformedRequest marks the failure of a forward on a request the client sent malformed.
+var errMalformedRequest = errors.New("malformed request")
+
+type malformedRequest struct{ error }
+
+func (e malformedRequest) Unwrap() error { return e.error }
+
+func (malformedRequest) Is(target error) bool { return target == errMalformedRequest }
+
+// clientBody marks the request malformed when its content ends short of its Content-Length,
+// which quic-go ends cleanly, or on a trailer field name net/http accepts and that is no token.
+// A cancel is no fault of the request.
+type clientBody struct {
+	io.ReadCloser
+	req *http.Request
+	// remaining is negative when the request declares no Content-Length.
+	remaining int64
+	malformed atomic.Bool
+}
+
+// malformedBodyErrors are the texts of the errors net/http and quic-go return for a body short
+// of its Content-Length or a malformed trailer section, which neither exports.
+var malformedBodyErrors = [...]string{
+	"request declared a Content-Length",
+	"pseudo header in trailer",
+	"frame received after trailers",
+}
+
+func (b *clientBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if b.remaining >= 0 {
+		b.remaining -= int64(n)
+	}
+	switch {
+	case err == nil:
+	case b.remaining > 0 && (err == io.EOF || errors.Is(err, io.ErrUnexpectedEOF)):
+		err = io.ErrUnexpectedEOF
+		b.malformed.Store(true)
+	case err == io.EOF:
+		if !validFieldNames(b.req.Trailer) {
+			err = errors.New("invalid field name in the trailer section")
+			b.malformed.Store(true)
+		}
+	default:
+		for _, text := range malformedBodyErrors {
+			if strings.Contains(err.Error(), text) {
+				b.malformed.Store(true)
+				break
+			}
+		}
+	}
+	return n, err
+}
+
+func validFieldNames(h http.Header) bool {
+	for name := range h {
+		if !httpguts.ValidHeaderFieldName(name) {
+			return false
+		}
+	}
+	return true
 }
 
 // continueBody closes started once the first read of a request body returns. net/http writes

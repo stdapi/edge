@@ -85,6 +85,8 @@ const (
 	// datagram strictly larger gets one, which keeps two proxies from bouncing resets at each
 	// other.
 	quicResetSize = 42
+	// quicMinResetSize is the smallest stateless reset, RFC 9000 section 10.3.
+	quicMinResetSize = 21
 )
 
 // ListenAndServeTransparentUDP listens for UDP on addr and serves the datagrams redirected to
@@ -120,6 +122,9 @@ func (p *Proxy) ListenAndServeTransparentUDP(addr string) error {
 // authority, stream by stream. QUIC requires ALPN, so a connection offering none is refused
 // rather than guessed at.
 //
+// A connection refused before its handshake is closed with the error code of the TLS alert a
+// TLS client gets for the same refusal, or with CONNECTION_REFUSED.
+//
 // A datagram that is not QUIC is placed by the address it was headed to, when the platform
 // reports one, and served by the [UDP] entry admitting it, one datagram at a time. Encrypted
 // datagrams belonging to a QUIC connection are never served that way: a connection the proxy
@@ -129,7 +134,8 @@ func (p *Proxy) ListenAndServeTransparentUDP(addr string) error {
 // While it blocks, up to 64 datagrams or 256 KiB of that flow wait and the rest are dropped.
 //
 // Under Encrypted Client Hello the decision sees the outer server name only, unless
-// [WithRejectECH] refuses such connections. QUIC versions other than v1 and v2 are rejected.
+// [WithRejectECH] refuses such connections. A QUIC version other than v1 and v2 is served by the
+// [UDP] entry admitting its destination.
 // Behind a Linux TPROXY rule every datagram reports its exact destination and replies are sent
 // from the address the client targeted. At most 64 origins are terminated at once there.
 // Beyond that the origin longest without a live connection is reclaimed, and with every origin
@@ -173,11 +179,14 @@ type quicDemux struct {
 
 	p *Proxy
 
+	resetSecret *quicResetSecret
+
 	// h3 serves every terminating stack, so one shutdown sends every GOAWAY.
 	h3 *http3.Server
 
-	// tag recognizes the connection IDs the terminating stacks emit, with no per connection
-	// state. It and resetKey are set once, when the first connection is terminated.
+	// tag recognizes the connection IDs the terminating stacks emit with nothing kept per
+	// connection. It, resetSecret and socketResetKey are set once, when the first connection is
+	// terminated.
 	tag    atomic.Pointer[quicCIDTag]
 	cancel context.CancelFunc
 
@@ -212,7 +221,7 @@ type quicDemux struct {
 	// or visible to the first snapshot the shutdown takes.
 	draining atomic.Bool
 
-	resetKey quic.StatelessResetKey
+	socketResetKey quic.StatelessResetKey
 
 	// exactOrigins is set when pc reads each datagram's destination from the datagram itself,
 	// exact enough to attribute it by.
@@ -299,6 +308,10 @@ type quicConn struct {
 	declared     Target
 	pending      [][]byte
 	pendingBytes int
+	// version and scid are those of the first Initial, to address a refusal.
+	version uint32
+	scid    [20]byte
+	scidLen uint8
 	// kind is the kind the ClientHello named, KindHTTP for a connection offering h3 and
 	// KindQUIC for anything else.
 	kind  Kind
@@ -424,7 +437,8 @@ type quicIntercept struct {
 	key       interceptKey
 	// conns counts the live connections, and a stack holding any is neither swept nor
 	// evicted.
-	conns int
+	conns    int
+	resetKey quic.StatelessResetKey
 }
 
 // deliver hands a datagram to the stack's QUIC transport.
@@ -467,6 +481,20 @@ func closeNoError(qc *quic.Conn) error {
 	}
 	return qc.CloseWithError(code, "")
 }
+
+// alertNoApplicationProtocol is the alert crypto/tls ends a TLS handshake with when no
+// protocol is in common, RFC 7301 section 3.2.
+const alertNoApplicationProtocol = 120
+
+// The QUIC codes of the TLS alerts a refusal sends, 0x100 plus the alert, RFC 9001 section 4.8.
+const (
+	quicHandshakeFailure      = quic.TransportErrorCode(0x100 + alertHandshakeFailure)
+	quicDecodeError           = quic.TransportErrorCode(0x100 + alertDecodeError)
+	quicInternalError         = quic.TransportErrorCode(0x100 + alertInternalError)
+	quicMissingExtension      = quic.TransportErrorCode(0x100 + alertMissingExtension)
+	quicUnrecognizedName      = quic.TransportErrorCode(0x100 + alertUnrecognizedName)
+	quicNoApplicationProtocol = quic.TransportErrorCode(0x100 + alertNoApplicationProtocol)
+)
 
 var (
 	errNoReplyDestination = errors.New("no destination to source the replies from")
@@ -636,10 +664,11 @@ func (d *quicDemux) startTermination() error {
 		return fmt.Errorf("%w: %w", ErrNoCertificateAuthority, errNoCA)
 	}
 
-	tag, resetKey, err := quicInterceptKeys(d.p.cfg.ca)
+	tag, resetSecret, err := quicInterceptKeys(d.p.cfg.ca)
 	if err != nil {
 		return err
 	}
+	socketResetKey := resetSecret.addrKey(addrPort(d.pc.LocalAddr()))
 
 	d.h3 = &http3.Server{
 		Handler:        http.HandlerFunc(d.p.serveTerminatedRequest),
@@ -654,8 +683,9 @@ func (d *quicDemux) startTermination() error {
 			return context.WithValue(ctx, sessionKey{}, carrier.sess)
 		},
 	}
-	d.resetKey = resetKey
-	// Stored last, so a loaded tag guarantees the reset key beside it is readable.
+	d.resetSecret = resetSecret
+	d.socketResetKey = socketResetKey
+	// Stored last, so a loaded tag guarantees the reset keys beside it are readable.
 	d.tag.Store(tag)
 	return nil
 }
@@ -689,6 +719,10 @@ func (d *quicDemux) interceptForLocked(client net.Addr, origin netip.AddrPort) (
 		}
 	}
 
+	resetKey, kerr := d.stackResetKey(key)
+	if kerr != nil {
+		return nil, nil, kerr
+	}
 	queue := interceptQueue
 	if key == (interceptKey{}) {
 		queue = 4 * interceptQueue
@@ -724,10 +758,11 @@ func (d *quicDemux) interceptForLocked(client net.Addr, origin netip.AddrPort) (
 		}
 	}
 
+	it := &quicIntercept{key: key, conn: dpc, resetKey: resetKey}
 	transport := &quic.Transport{
 		Conn:                  dpc,
 		ConnectionIDGenerator: d.tag.Load(),
-		StatelessResetKey:     &d.resetKey,
+		StatelessResetKey:     &it.resetKey,
 		ConnContext: func(ctx context.Context, info *quic.ClientInfo) (context.Context, error) {
 			return context.WithValue(ctx, quicCarrierKey{}, &quicCarrier{client: info.RemoteAddr}), nil
 		},
@@ -751,10 +786,28 @@ func (d *quicDemux) interceptForLocked(client net.Addr, origin netip.AddrPort) (
 	if victim != nil {
 		delete(d.intercepts, victim.key)
 	}
-	it := &quicIntercept{key: key, transport: transport, listener: ln, conn: dpc, lastSeen: time.Now()}
+	it.transport, it.listener, it.lastSeen = transport, ln, time.Now()
 	d.intercepts[key] = it
 	d.wg.Go(func() { d.acceptLoop(it) })
 	return it, victim, nil
+}
+
+// stackResetKey derives the stateless reset key of the stack key identifies, from the address it
+// replies from. A stack behind a tunnel has no such address and gets a random identity, so the
+// connections it terminated are no longer reset once it is gone.
+func (d *quicDemux) stackResetKey(key interceptKey) (quic.StatelessResetKey, error) {
+	switch {
+	case key.tunnel != nil:
+		var id [32]byte
+		if _, err := rand.Read(id[:]); err != nil {
+			return quic.StatelessResetKey{}, err
+		}
+		return d.resetSecret.key(id[:]), nil
+	case key.origin.IsValid():
+		return d.resetSecret.addrKey(key.origin), nil
+	default:
+		return d.socketResetKey, nil
+	}
 }
 
 // acceptLoop takes the connections one stack terminates and serves each in the kind its
@@ -1047,11 +1100,24 @@ func (d *quicDemux) dispatch(addr net.Addr, datagram []byte, owned bool) {
 }
 
 func (d *quicDemux) dispatchLong(addr net.Addr, from flowKey, datagram []byte, owned bool) {
-	version, dcid, _, ok := quicsniff.ParseLongHeader(datagram)
+	version, dcid, scid, ok := quicsniff.ParseInvariantHeader(datagram)
+	if ok && (len(dcid) > 20 || len(scid) > 20) {
+		// Only a version the demux cannot read may have such IDs, and no flow or tag uses them.
+		if !quicsniff.KnownVersion(version) {
+			d.dispatchUnknownVersion(addr, from, datagram, owned, version, dcid, scid)
+			return
+		}
+		ok = false
+	}
 	if !ok {
 		// Arbitrary bytes are free to set the high bit, so failing the parse places the
 		// datagram by its destination rather than dropping it.
 		d.dispatchDatagram(addr, from, datagram, owned)
+		return
+	}
+	initial := quicsniff.IsInitial(datagram[0], version)
+	if initial && len(datagram) < quicsniff.MinClientInitialDatagram {
+		// RFC 9000 section 14.1 applies to every Initial, and quic-go only checks the first.
 		return
 	}
 
@@ -1093,9 +1159,12 @@ func (d *quicDemux) dispatchLong(addr net.Addr, from flowKey, datagram []byte, o
 		}
 		return
 	}
-	if quicsniff.IsInitial(datagram[0], version) &&
-		len(datagram) >= quicsniff.MinClientInitialDatagram && len(dcid) >= 8 {
+	if initial && len(dcid) >= 8 {
 		conn := d.admitConnLocked(from, addr, string(dcid), now)
+		if conn != nil {
+			conn.version = version
+			conn.scidLen = uint8(copy(conn.scid[:], scid)) //nolint:gosec // dispatchLong refuses an ID past 20 bytes
+		}
 		d.mu.Unlock()
 		if conn != nil {
 			d.sniff(from, conn, datagram, owned)
@@ -1103,14 +1172,52 @@ func (d *quicDemux) dispatchLong(addr net.Addr, from flowKey, datagram []byte, o
 		return
 	}
 	d.mu.Unlock()
-	d.dispatchDatagram(addr, from, datagram, owned)
+	if quicsniff.KnownVersion(version) {
+		// A version the demux reads is QUIC and never reaches a datagram handler, where another
+		// version may be another protocol.
+		return
+	}
+	d.dispatchUnknownVersion(addr, from, datagram, owned, version, dcid, scid)
+}
+
+// dispatchUnknownVersion places a long header of a version the demux cannot read by its
+// destination, and answers it with Version Negotiation when nothing admits it.
+func (d *quicDemux) dispatchUnknownVersion(addr net.Addr, from flowKey, datagram []byte, owned bool,
+	version uint32, dcid, scid []byte,
+) {
+	if d.dispatchDatagram(addr, from, datagram, owned) {
+		return
+	}
+	// Version 0 is a Version Negotiation packet, which RFC 9000 section 6.1 bars answering, and
+	// RFC 9000 section 5.2.2 answers only a datagram large enough to open a connection.
+	if version != 0 && len(datagram) >= quicsniff.MinClientInitialDatagram {
+		d.answer(addr, d.originalDst(addr), versionNegotiation(dcid, scid), false)
+	}
+}
+
+// versionNegotiation is the Version Negotiation packet answering a long header of dcid and
+// scid, RFC 9000 section 17.2.1, listing the versions the terminating stacks accept.
+func versionNegotiation(dcid, scid []byte) []byte {
+	b := make([]byte, 0, 7+len(scid)+len(dcid)+8)
+	var unused [1]byte
+	_, _ = rand.Read(unused[:])
+	// The 0x40 bit stays set for the protocols sharing the port, RFC 9000 section 17.2.1.
+	b = append(b, 0xc0|unused[0]&0x3f)
+	b = binary.BigEndian.AppendUint32(b, 0)
+	b = append(b, byte(len(scid))) //nolint:gosec // a length byte of the header it answers
+	b = append(b, scid...)
+	b = append(b, byte(len(dcid))) //nolint:gosec // a length byte of the header it answers
+	b = append(b, dcid...)
+	b = binary.BigEndian.AppendUint32(b, quicsniff.Version1)
+	return binary.BigEndian.AppendUint32(b, quicsniff.Version2)
 }
 
 // dispatchShort places a short header datagram. Only the connection IDs the proxy minted are
 // recognizable here, the ones a peer chose being unreadable without its state.
 func (d *quicDemux) dispatchShort(addr net.Addr, from flowKey, datagram []byte, owned bool) {
 	d.mu.Lock()
-	if flow := d.flows[from]; flow != nil {
+	flow := d.flows[from]
+	if flow != nil {
 		flow.lastSeen = time.Now()
 	}
 	if tag := d.tag.Load(); tag != nil && len(datagram) >= 1+8 && tag.matches(datagram[1:9]) {
@@ -1125,8 +1232,36 @@ func (d *quicDemux) dispatchShort(addr net.Addr, from flowKey, datagram []byte, 
 		}
 		return
 	}
+	if maybeStatelessReset(datagram) && flow != nil && len(flow.conns) > 0 {
+		// A stateless reset from the client has no connection ID the proxy minted, and only the
+		// stack with its tokens can recognize it, RFC 9000 section 10.3.1.
+		if stack := d.terminatedStackLocked(flow, addr); stack != nil {
+			d.mu.Unlock()
+			stack.deliver(addr, datagram, owned)
+			return
+		}
+	}
 	d.mu.Unlock()
 	d.dispatchDatagram(addr, from, datagram, owned)
+}
+
+// maybeStatelessReset reports whether a short header datagram has the form of a stateless reset,
+// RFC 9000 section 10.3. The terminating stacks never advertise grease_quic_bit, RFC 9287, so
+// the QUIC bit of a client's reset is set.
+func maybeStatelessReset(b []byte) bool {
+	return len(b) >= quicMinResetSize && b[0]&0x40 != 0
+}
+
+// terminatedStackLocked returns the stack terminating a connection of flow to the destination
+// of the datagram just read from client, or nil when there is none.
+func (d *quicDemux) terminatedStackLocked(flow *quicFlow, client net.Addr) *quicIntercept {
+	origin := d.originalDst(client)
+	for _, conn := range flow.conns {
+		if conn.state == connTerminated && conn.stack != nil && conn.origin == origin {
+			return conn.stack
+		}
+	}
+	return nil
 }
 
 // replySocketLocked returns the sending socket of one origin, opened on first use. The bind is
@@ -1167,45 +1302,72 @@ func (d *quicDemux) lookupInterceptLocked(client net.Addr) (it *quicIntercept, o
 
 // statelessReset answers a tagged short header packet with no stack left behind it, so the
 // client learns its connection is dead instead of waiting out its idle timeout. The token
-// matches the one the stack advertised, both derived from the same key (RFC 9000 section
-// 10.3). Under TPROXY the reset leaves from a reply socket the demux already holds, since
-// opening one for an unauthenticated datagram would hand an attacker file descriptors.
+// matches the one the stack advertised, both derived from the key of the address the stack
+// replied from (RFC 9000 section 10.3). A tunnel's stack leaves no key behind, so nothing
+// answers there.
 func (d *quicDemux) statelessReset(client net.Addr, origin netip.AddrPort, datagram []byte) {
 	if len(datagram) <= quicResetSize {
 		return
+	}
+	if _, ok := client.(*tunnelAddr); ok {
+		return
+	}
+	key := d.socketResetKey
+	if origin.IsValid() {
+		key = d.resetSecret.addrKey(origin)
 	}
 	pkt := make([]byte, quicResetSize)
 	if _, err := rand.Read(pkt[:quicResetSize-16]); err != nil {
 		return
 	}
 	pkt[0] = pkt[0]&0x3f | 0x40
-	mac := hmac.New(sha256.New, d.resetKey[:])
+	mac := hmac.New(sha256.New, key[:])
 	mac.Write(datagram[1:9])
 	copy(pkt[quicResetSize-16:], mac.Sum(nil)[:16])
+	d.answer(client, origin, pkt, false)
+}
 
+// answer sends a packet of the demux to client from the address the client wrote to, under
+// TPROXY the reply socket of origin. With open, an origin with no reply socket gets one for this
+// packet only, closed at once so an unauthenticated datagram never keeps a file descriptor.
+func (d *quicDemux) answer(client net.Addr, origin netip.AddrPort, pkt []byte, open bool) {
 	if ta, ok := client.(*tunnelAddr); ok {
 		ta.tunnel.send(origin, pkt)
 		return
 	}
-	if origin.IsValid() {
-		d.mu.Lock()
-		sock := d.replySockets[origin]
-		d.mu.Unlock()
-		if sock != nil {
-			_, _ = sock.WriteTo(pkt, client)
-		}
+	if d.replier == nil {
+		_, _ = d.pc.WriteTo(pkt, client)
 		return
 	}
-	_, _ = d.pc.WriteTo(pkt, client)
+	if !origin.IsValid() {
+		return
+	}
+	d.mu.Lock()
+	sock := d.replySockets[origin]
+	d.mu.Unlock()
+	if sock != nil {
+		_, _ = sock.WriteTo(pkt, client)
+		return
+	}
+	if !open {
+		return
+	}
+	sock, err := d.replier.replySocket(origin)
+	if err != nil {
+		return
+	}
+	_, _ = sock.WriteTo(pkt, client)
+	_ = sock.Close()
 }
 
 // dispatchDatagram is the terminal step, for a datagram no QUIC connection could claim. It is
 // its own unit: the flow it belongs to is looked up, the entry serving it is resolved on the
-// tree as it stands, and the handler decides what happens to it.
-func (d *quicDemux) dispatchDatagram(client net.Addr, from flowKey, datagram []byte, owned bool) {
+// tree as it stands, and the handler decides what happens to it. It reports false when nothing
+// admits the datagram, which is then left untouched.
+func (d *quicDemux) dispatchDatagram(client net.Addr, from flowKey, datagram []byte, owned bool) bool {
 	origin := d.originalDst(client)
 	if !origin.IsValid() {
-		return
+		return false
 	}
 
 	id := udpKey{origin: origin, name: d.declaredName(client)}
@@ -1219,14 +1381,14 @@ func (d *quicDemux) dispatchDatagram(client net.Addr, from flowKey, datagram []b
 
 	if u != nil {
 		u.enqueue(datagram, owned)
-		return
+		return true
 	}
-	d.openUDPFlow(client, from, origin, datagram, owned)
+	return d.openUDPFlow(client, from, origin, datagram, owned)
 }
 
 // openUDPFlow admits the first datagram of a flow and publishes the flow, whose goroutine
-// dials the origin.
-func (d *quicDemux) openUDPFlow(client net.Addr, from flowKey, origin netip.AddrPort, datagram []byte, owned bool) {
+// dials the origin. It reports false when no entry admits the destination.
+func (d *quicDemux) openUDPFlow(client net.Addr, from flowKey, origin netip.AddrPort, datagram []byte, owned bool) bool {
 	target := d.declaredTarget(client, origin)
 
 	// Admitted before the socket is opened, so a destination nothing names costs no dial. The
@@ -1236,7 +1398,7 @@ func (d *quicDemux) openUDPFlow(client net.Addr, from flowKey, origin netip.Addr
 			slog.String("client", from.String()),
 			slog.String("origin", origin.String()),
 			slog.String("reason", "no entry admits this destination"))
-		return
+		return false
 	}
 
 	ctx, cancel := context.WithCancel(d.ctx)
@@ -1270,10 +1432,11 @@ func (d *quicDemux) openUDPFlow(client net.Addr, from flowKey, origin netip.Addr
 			slog.String("client", from.String()),
 			slog.String("origin", origin.String()),
 			slog.String("reason", "the proxy is at capacity or shutting down"))
-		return
+		return true
 	}
 
 	u.enqueue(datagram, owned)
+	return true
 }
 
 // newCtx builds the context of one direction of the flow, for datagrams exchanged with origin.
@@ -1766,7 +1929,7 @@ func (d *quicDemux) sniff(from flowKey, conn *quicConn, datagram []byte, owned b
 	// close.
 	if d.draining.Load() {
 		d.mu.Unlock()
-		d.rejectConn(from, conn, "the proxy is shutting down")
+		d.refuseConn(from, conn, quic.ConnectionRefused, "the proxy is shutting down")
 		return
 	}
 	client := flow.client
@@ -1795,26 +1958,30 @@ func (d *quicDemux) place(from flowKey, client net.Addr, conn *quicConn, hello [
 	if d.p.cfg.rejectECH {
 		offered, ok := offersECH(hello)
 		if !ok {
-			d.rejectConn(from, conn, "ClientHello cannot be checked for Encrypted Client Hello")
+			d.refuseConn(from, conn, quicDecodeError, "ClientHello cannot be checked for Encrypted Client Hello")
 			return
 		}
 		if offered {
-			d.rejectConn(from, conn, "ClientHello offers Encrypted Client Hello")
+			d.refuseConn(from, conn, quicHandshakeFailure, "ClientHello offers Encrypted Client Hello")
 			return
 		}
 	}
 
 	ch := clientHelloFromQUIC(hello)
+	if ch == nil {
+		d.refuseConn(from, conn, quicDecodeError, "the ClientHello cannot be parsed")
+		return
+	}
 	target := d.targetFor(ch, conn)
 	if target.Host == "" {
-		d.rejectConn(from, conn, "no server name in the ClientHello")
+		d.refuseConn(from, conn, quicMissingExtension, "no server name in the ClientHello")
 		return
 	}
 
 	// RFC 9001 section 8.1 makes ALPN mandatory on QUIC, so an offer with nothing in it says
 	// nothing about what the connection carries and is refused rather than guessed at.
-	if ch == nil || len(ch.ALPN) == 0 {
-		d.rejectConn(from, conn, "the ClientHello offers no application protocol")
+	if len(ch.ALPN) == 0 {
+		d.refuseConn(from, conn, quicNoApplicationProtocol, "the ClientHello offers no application protocol")
 		return
 	}
 	// What the connection is comes from its own offer; which granularity serves it comes
@@ -1832,16 +1999,27 @@ func (d *quicDemux) place(from flowKey, client net.Addr, conn *quicConn, hello [
 	}
 	switch verdict {
 	case nameMismatch:
-		d.rejectConn(from, conn, "the server name does not resolve to the destination")
+		d.refuseConn(from, conn, quicUnrecognizedName, "the server name does not resolve to the destination")
 		return
 	case nameUnresolved:
-		d.rejectConn(from, conn, "the server name cannot be resolved")
+		d.refuseConn(from, conn, quicUnrecognizedName, "the server name cannot be resolved")
 		return
 	}
 
 	kind := d.p.firstAdmitted(target, candidates...)
 	if kind == 0 {
-		d.rejectConn(from, conn, "no entry admits this authority")
+		// An authority admitted for HTTP only has no protocol in common with an offer without
+		// h3, RFC 9001 section 8.1.
+		if !slices.Contains(candidates, KindHTTP) && d.p.firstAdmitted(target, KindHTTP) != 0 {
+			d.refuseConn(from, conn, quicNoApplicationProtocol, "the ClientHello offers no protocol the authority admits")
+			return
+		}
+		// Without a server name the refusal reports the missing extension, as a TLS front does.
+		code := quicUnrecognizedName
+		if !named {
+			code = quicMissingExtension
+		}
+		d.refuseConn(from, conn, code, "no entry admits this authority")
 		return
 	}
 
@@ -1890,7 +2068,11 @@ func (d *quicDemux) beginTermination(from flowKey, client net.Addr, conn *quicCo
 		if !errors.Is(err, ErrProxyClosed) {
 			d.p.cfg.logger.Error("edge: cannot terminate QUIC", slog.String("error", err.Error()))
 		}
-		d.rejectConn(from, conn, err.Error())
+		code := quic.ConnectionRefused
+		if errors.Is(err, ErrNoCertificateAuthority) {
+			code = quicInternalError
+		}
+		d.refuseConn(from, conn, code, err.Error())
 		return
 	}
 
@@ -1915,14 +2097,14 @@ func (d *quicDemux) beginTermination(from flowKey, client net.Addr, conn *quicCo
 	if d.draining.Load() {
 		d.mu.Unlock()
 		cancel()
-		d.rejectConn(from, conn, "the proxy is shutting down")
+		d.refuseConn(from, conn, quic.ConnectionRefused, "the proxy is shutting down")
 		return
 	}
 	it, evicted, err := d.interceptForLocked(client, conn.origin)
 	if err != nil {
 		d.mu.Unlock()
 		cancel()
-		d.rejectConn(from, conn, err.Error())
+		d.refuseConn(from, conn, quic.ConnectionRefused, err.Error())
 		return
 	}
 	d.setStateLocked(conn, connTerminated)
@@ -1952,7 +2134,8 @@ func (d *quicDemux) beginTermination(from flowKey, client net.Addr, conn *quicCo
 		d.closeIntercept(evicted)
 	}
 	if withdrawn {
-		d.logRejected(from, "the authority was withdrawn while the connection was starting")
+		d.logRefused(from, "the authority was withdrawn while the connection was starting")
+		d.sendRefusal(client, conn, quic.ConnectionRefused)
 	}
 }
 
@@ -1968,6 +2151,34 @@ func (d *quicDemux) rejectConn(from flowKey, conn *quicConn, reason string) {
 	d.logRejected(from, reason)
 }
 
+// refuseConn is rejectConn for a connection whose ClientHello was read, answered once with an
+// Initial with a CONNECTION_CLOSE of code, RFC 9000 section 5.2.2. The tombstone keeps a
+// retransmit from being answered again.
+func (d *quicDemux) refuseConn(from flowKey, conn *quicConn, code quic.TransportErrorCode, reason string) {
+	var client net.Addr
+	d.mu.Lock()
+	if flow := d.flows[from]; flow != nil && flow.conns[conn.odcid] == conn && conn.state != connRejected {
+		client = flow.client
+		d.rejectConnLocked(conn)
+	}
+	d.mu.Unlock()
+	d.logRefused(from, reason)
+	if client != nil {
+		d.sendRefusal(client, conn, code)
+	}
+}
+
+// sendRefusal writes the Initial refusing conn to client, from the address the client wrote to.
+// The fields it reads are set before the connection is published.
+func (d *quicDemux) sendRefusal(client net.Addr, conn *quicConn, code quic.TransportErrorCode) {
+	odcid := []byte(conn.odcid)
+	pkt, err := quicsniff.CloseInitial(conn.version, odcid, conn.scid[:conn.scidLen], odcid, uint64(code))
+	if err != nil {
+		return
+	}
+	d.answer(client, conn.origin, pkt, true)
+}
+
 func (d *quicDemux) rejectConnLocked(conn *quicConn) {
 	d.setStateLocked(conn, connRejected)
 	conn.lastSeen = time.Now()
@@ -1980,6 +2191,11 @@ func (d *quicDemux) rejectConnLocked(conn *quicConn) {
 
 func (d *quicDemux) logRejected(from flowKey, reason string) {
 	d.p.cfg.logger.Debug("edge: QUIC connection dropped",
+		slog.String("client", from.String()), slog.String("reason", reason))
+}
+
+func (d *quicDemux) logRefused(from flowKey, reason string) {
+	d.p.cfg.logger.Debug("edge: QUIC connection refused",
 		slog.String("client", from.String()), slog.String("reason", reason))
 }
 
@@ -2248,17 +2464,16 @@ func (t *quicCIDTag) mac(r []byte) [4]byte {
 	return [4]byte(out[:4])
 }
 
-// quicInterceptKeys derives the tag and stateless reset keys from the CA key so both survive a
-// restart, which lets a connection minted by a previous process be recognized and reset instead
-// of expiring on its idle timeout. A key that cannot be serialized, hardware backed for
-// instance, falls back to per process random keys.
-func quicInterceptKeys(ca *CA) (*quicCIDTag, quic.StatelessResetKey, error) {
+// quicInterceptKeys derives the tag and the stateless reset secret from the CA key, so a proxy
+// restarted with the same CA on the same address resets the connections of the previous process.
+// A key that cannot be serialized, hardware backed for instance, gets per process random keys.
+func quicInterceptKeys(ca *CA) (*quicCIDTag, *quicResetSecret, error) {
 	var tagKey [16]byte
-	var reset quic.StatelessResetKey
+	reset := new(quicResetSecret)
 
 	if der, err := x509.MarshalPKCS8PrivateKey(ca.key); err == nil {
 		t, terr := hkdf.Key(sha256.New, der, nil, "edge quic cid tag", len(tagKey))
-		r, rerr := hkdf.Key(sha256.New, der, nil, "edge quic stateless reset", len(reset))
+		r, rerr := hkdf.Extract(sha256.New, der, nil)
 		if terr == nil && rerr == nil {
 			copy(tagKey[:], t)
 			copy(reset[:], r)
@@ -2268,13 +2483,61 @@ func quicInterceptKeys(ca *CA) (*quicCIDTag, quic.StatelessResetKey, error) {
 	}
 
 	if _, err := rand.Read(tagKey[:]); err != nil {
-		return nil, reset, err
+		return nil, nil, err
 	}
 	if _, err := rand.Read(reset[:]); err != nil {
-		return nil, reset, err
+		return nil, nil, err
 	}
 	tag, err := newQUICCIDTag(tagKey)
 	return tag, reset, err
+}
+
+// quicResetSecret is what the stateless reset key of every terminating stack derives from.
+type quicResetSecret [32]byte
+
+const (
+	quicResetLabel = "edge quic stateless reset "
+	// quicResetIDSize is the largest stack identity, the random one of a stack behind a tunnel.
+	quicResetIDSize = 32
+)
+
+// key derives the stateless reset key of the stack id identifies, HKDF-Expand of RFC 5869 over
+// the label and id. RFC 9000 section 21.11 bars a reset for a connection ID that may be live on
+// any endpoint sharing the key, so every stack has a key of its own.
+func (s *quicResetSecret) key(id []byte) quic.StatelessResetKey {
+	// One HMAC-SHA256 block, written out on arrays so an orphan datagram costs no allocation.
+	var ipad, opad [sha256.BlockSize]byte
+	for i := range ipad {
+		ipad[i], opad[i] = 0x36, 0x5c
+	}
+	for i, b := range s {
+		ipad[i] ^= b
+		opad[i] ^= b
+	}
+	if len(id) > quicResetIDSize {
+		panic("edge: stateless reset identity longer than quicResetIDSize")
+	}
+	var msg [sha256.BlockSize + len(quicResetLabel) + quicResetIDSize + 1]byte
+	n := copy(msg[:], ipad[:])
+	n += copy(msg[n:], quicResetLabel)
+	n += copy(msg[n:], id)
+	msg[n] = 0x01
+	inner := sha256.Sum256(msg[:n+1])
+
+	var outer [sha256.BlockSize + sha256.Size]byte
+	copy(outer[:], opad[:])
+	copy(outer[sha256.BlockSize:], inner[:])
+	return quic.StatelessResetKey(sha256.Sum256(outer[:]))
+}
+
+// addrKey derives the stateless reset key of the stack replying from addr, the same for every
+// process serving that address.
+func (s *quicResetSecret) addrKey(addr netip.AddrPort) quic.StatelessResetKey {
+	var id [18]byte
+	ip := addr.Addr().As16()
+	copy(id[:], ip[:])
+	binary.BigEndian.PutUint16(id[16:], addr.Port())
+	return s.key(id[:])
 }
 
 // clientHelloFromQUIC reads the ClientHello out of a raw handshake message. QUIC carries

@@ -180,14 +180,9 @@ func TestSniff_NonHTTPALPNIsNotHTTP(t *testing.T) {
 		return tc, tc.Handshake()
 	}
 
-	// ALPN is settled inside the handshake, so a connection refused for what it turned out to
-	// be is refused just after it, not before: the handshake completes and nothing follows.
-	refused, err := dial()
-	require.NoError(t, err)
-	require.NoError(t, refused.SetReadDeadline(time.Now().Add(5*time.Second)))
-	_, err = refused.Read(make([]byte, 1))
-	assert.Error(t, err, "nothing admits a spdy stream on this authority")
-	_ = refused.Close()
+	// RFC 7301 section 3.2, an offer the authority admits no kind for ends the handshake.
+	_, err = dial()
+	assert.ErrorContains(t, err, "no application protocol")
 
 	// With a stream entry the same connection is served, and the protocol the client asked
 	// for is the one it gets.

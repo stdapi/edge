@@ -131,7 +131,7 @@ func poolOf(ca *CA) *x509.CertPool {
 	return pool
 }
 
-func TestQUIC_RejectDropsTheConnection(t *testing.T) {
+func TestQUIC_RejectRefusesTheConnection(t *testing.T) {
 	proxyCA, err := GenerateCA()
 	require.NoError(t, err)
 
@@ -151,7 +151,16 @@ func TestQUIC_RejectDropsTheConnection(t *testing.T) {
 		&tls.Config{ServerName: h3Authority, RootCAs: poolOf(proxyCA), NextProtos: []string{"h3"}, MinVersion: tls.VersionTLS13},
 		&quic.Config{HandshakeIdleTimeout: 2 * time.Second},
 	)
-	require.Error(t, err, "a rejected authority must never complete a handshake")
+	wantClosedWith(t, err, quicUnrecognizedName)
+}
+
+// wantClosedWith wants err to be the CONNECTION_CLOSE of code the proxy ended a handshake with.
+func wantClosedWith(t *testing.T, err error, code quic.TransportErrorCode) {
+	t.Helper()
+	te, ok := errors.AsType[*quic.TransportError](err)
+	require.True(t, ok, "the handshake ended without a CONNECTION_CLOSE: %v", err)
+	assert.True(t, te.Remote)
+	assert.Equal(t, code, te.ErrorCode)
 }
 
 func TestQUIC_CloseCarriesTheProtocolsNoErrorCode(t *testing.T) {
@@ -448,9 +457,7 @@ func TestQUIC_CloseBeforeAdoptionEndsTheConnection(t *testing.T) {
 	require.NoError(t, err)
 	p, err := New(WithCA(proxyCA))
 	require.NoError(t, err)
-	p.MustAdd(h3Authority+"/", func(c *HTTPCtx) (*http.Response, error) {
-		return Text(http.StatusOK, "ok"), nil
-	})
+	p.MustAdd(h3Authority+"/", okHandler)
 	proxyAddr := startQUIC(t, p)
 
 	pc, err := loopbackUDP()
@@ -514,9 +521,7 @@ func TestQUIC_SessionContextEndsWhenTheClientLeaves(t *testing.T) {
 	require.NoError(t, err)
 	p, err := New(WithCA(proxyCA))
 	require.NoError(t, err)
-	p.MustAdd(h3Authority+"/", func(c *HTTPCtx) (*http.Response, error) {
-		return Text(http.StatusOK, "ok"), nil
-	})
+	p.MustAdd(h3Authority+"/", okHandler)
 
 	proxyAddr := startQUIC(t, p)
 	tr := dialQUICTo(proxyAddr, poolOf(proxyCA))
@@ -732,9 +737,7 @@ func TestQUIC_StatelessResetForOrphanedTag(t *testing.T) {
 	require.NoError(t, err)
 	p, err := New(WithCA(proxyCA))
 	require.NoError(t, err)
-	p.MustAdd("first.test/", func(c *HTTPCtx) (*http.Response, error) {
-		return Text(http.StatusOK, "ok"), nil
-	})
+	p.MustAdd("first.test/", okHandler)
 	p.MustAdd[UDP](orphanOrigin.String(), forwardDatagram)
 
 	wrapper, proxyAddr := startTProxyQUIC(t, p, first)
@@ -760,9 +763,10 @@ func TestQUIC_StatelessResetForOrphanedTag(t *testing.T) {
 	require.NoError(t, err)
 
 	// The same derivation the demux ran, so the minted ID and the token are the ones a
-	// previous process would have handed a client.
-	tag, resetKey, err := quicInterceptKeys(proxyCA)
+	// previous process serving this origin would have handed a client.
+	tag, secret, err := quicInterceptKeys(proxyCA)
 	require.NoError(t, err)
+	resetKey := secret.addrKey(orphanOrigin)
 	cid, err := tag.GenerateConnectionID()
 	require.NoError(t, err)
 
@@ -990,7 +994,7 @@ func TestQUIC_ACorruptInitialLeavesTheConnection(t *testing.T) {
 	require.NoError(t, err)
 	p, err := New(WithCA(proxyCA))
 	require.NoError(t, err)
-	p.MustAdd(h3Authority+"/", func(c *HTTPCtx) (*http.Response, error) { return Text(http.StatusOK, "ok"), nil })
+	p.MustAdd(h3Authority+"/", okHandler)
 	proxyAddr := startQUIC(t, p)
 
 	pc, err := loopbackUDP()

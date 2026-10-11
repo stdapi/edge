@@ -5,19 +5,34 @@
 package edge
 
 import (
+	"bufio"
+	"context"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/rsa"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
+	"regexp"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
 )
 
 func TestTerminatedTarget_PortIsCanonical(t *testing.T) {
@@ -28,6 +43,40 @@ func TestTerminatedTarget_PortIsCanonical(t *testing.T) {
 
 	_, ok = terminatedTarget(&http.Request{Host: "example.test:x"}, sess)
 	assert.False(t, ok)
+}
+
+func TestTerminatedTarget_RootDotIsDropped(t *testing.T) {
+	sess := newSession(nil, t.Context(), nil, Target{Scheme: "https", Host: "example.test", Port: "443"}, KindHTTP, HTTP11)
+	target, ok := terminatedTarget(&http.Request{Host: "Other.Test.:8443"}, sess)
+	require.True(t, ok)
+	assert.Equal(t, "other.test", target.Host)
+}
+
+func TestTerminate_PlaintextStreamTargetDropsTheRootDot(t *testing.T) {
+	p, err := New()
+	require.NoError(t, err)
+	p.MustAdd[TCP]("origin.test", func(c *TCPCtx) error {
+		_, err := io.WriteString(c.Client(), c.Target().Host)
+		return err
+	})
+	conn := connectRaw(t, startProxy(t, p), "origin.test:80")
+	require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+	_, err = io.WriteString(conn, "GET / HTTP/1.1\r\nHost: origin.test.\r\n\r\n")
+	require.NoError(t, err)
+	got, _ := io.ReadAll(conn)
+	assert.Equal(t, "origin.test", string(got))
+}
+
+func TestTerminate_StreamRefusedPastTheHandshakeSendsCloseNotify(t *testing.T) {
+	p, ca := newTLSProxy(t)
+	rec := &recordingConn{Conn: connectRaw(t, startProxy(t, p), tlsName+":443")}
+	require.NoError(t, rec.SetDeadline(time.Now().Add(5*time.Second)))
+	tc := tls.Client(rec, &tls.Config{ServerName: tlsName, RootCAs: ca.CertPool(), MaxVersion: tls.VersionTLS12, MinVersion: tls.VersionTLS12})
+	require.NoError(t, tc.Handshake())
+	_, err := io.WriteString(tc, "hello\n")
+	require.NoError(t, err)
+	_, _ = io.ReadAll(tc)
+	assert.Equal(t, byte(tlsAlert), rec.lastRecord())
 }
 
 func TestTerminate_InterceptHTTP2(t *testing.T) {
@@ -141,4 +190,1502 @@ func TestTerminate_ALPNMirrorsClientOffer(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTerminate_PrefaceWithoutH2IsRefused(t *testing.T) {
+	for _, alpn := range [][]string{{"http/1.1"}, nil} {
+		t.Run(fmt.Sprint(alpn), func(t *testing.T) {
+			p, ca := newTLSProxy(t)
+			conn := connectRaw(t, startProxy(t, p), tlsName+":443")
+			require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+			tc := tls.Client(conn, &tls.Config{ServerName: tlsName, RootCAs: ca.CertPool(), NextProtos: alpn, MinVersion: tls.VersionTLS12})
+			require.NoError(t, tc.Handshake())
+			_, err := io.WriteString(tc, http2.ClientPreface)
+			require.NoError(t, err)
+			resp, err := http.ReadResponse(bufio.NewReader(tc), nil)
+			require.NoError(t, err)
+			_ = resp.Body.Close()
+			assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+			assert.True(t, resp.Close)
+		})
+	}
+}
+
+func TestTerminate_RefusedClientHelloAlert(t *testing.T) {
+	withSNI := captureClientHello(t, &tls.Config{ServerName: tlsName, InsecureSkipVerify: true, MinVersion: tls.VersionTLS12})
+	withoutSNI := captureClientHello(t, &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12})
+	unknown := captureClientHello(t, &tls.Config{ServerName: "unknown.test", InsecureSkipVerify: true, MinVersion: tls.VersionTLS12})
+	// The extensions block claims one byte more than it has, inside a well framed message.
+	malformed := func() []byte {
+		msg := handshakeFromRecords(withSNI)
+		body := msg[4:]
+		sidEnd := 35 + int(body[34])
+		csEnd := sidEnd + 2 + int(binary.BigEndian.Uint16(body[sidEnd:]))
+		extAt := 4 + csEnd + 1 + int(body[csEnd])
+		out := slices.Clone(msg)
+		binary.BigEndian.PutUint16(out[extAt:], binary.BigEndian.Uint16(out[extAt:])+1)
+		return records(out, tls.VersionTLS10)
+	}()
+	interleaved := func() []byte {
+		raw := records(handshakeFromRecords(withSNI), tls.VersionTLS10, 64)
+		return slices.Concat(raw[:5+64], []byte{0x17, 0x03, 0x03, 0x00, 0x01, 0x00}, raw[5+64:])
+	}()
+	mismatch := &fakeResolver{addrs: map[string][]netip.Addr{tlsName: addrsOf("192.0.2.1"), tlsDB: addrsOf("192.0.2.1")}}
+	redirected := func(net.Conn) (netip.AddrPort, error) { return netip.MustParseAddrPort("127.0.0.1:443"), nil }
+	dial := func(t *testing.T, addr string) net.Conn {
+		c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = c.Close() })
+		return c
+	}
+	starttls := func(t *testing.T, c net.Conn) net.Conn {
+		require.NoError(t, c.SetDeadline(time.Now().Add(5*time.Second)))
+		_, err := io.WriteString(c, "STARTTLS\n")
+		require.NoError(t, err)
+		ok := make([]byte, len("OK\n"))
+		_, err = io.ReadFull(c, ok)
+		require.NoError(t, err)
+		return c
+	}
+
+	cases := []struct {
+		open  func(t *testing.T) net.Conn
+		name  string
+		hello []byte
+		alert byte
+	}{
+		{name: "no certificate authority", hello: withSNI, alert: alertInternalError, open: func(t *testing.T) net.Conn {
+			p, err := New()
+			require.NoError(t, err)
+			p.MustAdd[TCP](tlsName, relayStream)
+			return connectRaw(t, startProxy(t, p), tlsName+":443")
+		}},
+		{name: "an Encrypted Client Hello offer", hello: echClientHello(t, tlsName, "secret.test"), alert: alertHandshakeFailure, open: func(t *testing.T) net.Conn {
+			p, _ := newTLSProxy(t, WithRejectECH(true))
+			return connectRaw(t, startProxy(t, p), tlsName+":443")
+		}},
+		{name: "a ClientHello that does not parse", hello: malformed, alert: alertDecodeError, open: func(t *testing.T) net.Conn {
+			p, _ := newTLSProxy(t, WithRejectECH(true))
+			return connectRaw(t, startProxy(t, p), tlsName+":443")
+		}},
+		{name: "a ClientHello that does not parse, without a destination", hello: malformed, alert: alertDecodeError, open: func(t *testing.T) net.Conn {
+			p, _ := newTLSProxy(t)
+			return dial(t, startTransparent(t, p))
+		}},
+		{name: "a ClientHello split by a record of another type", hello: interleaved, alert: alertDecodeError, open: func(t *testing.T) net.Conn {
+			p, _ := newTLSProxy(t, WithRejectECH(true))
+			return connectRaw(t, startProxy(t, p), tlsName+":443")
+		}},
+		{name: "a server name no entry admits", hello: unknown, alert: alertUnrecognizedName, open: func(t *testing.T) net.Conn {
+			p, _ := newTLSProxy(t)
+			return connectRaw(t, startProxy(t, p), tlsName+":443")
+		}},
+		{name: "a server name no entry admits through a CONNECT over HTTP/2", hello: unknown, alert: alertUnrecognizedName, open: func(t *testing.T) net.Conn {
+			p, ca := newTLSProxy(t)
+			return h2Connect(t, startTLSFront(t, p, ca, "h2"), ca, tlsName+":443")
+		}},
+		{name: "a server name no entry admits through a CONNECT over HTTP/3", hello: unknown, alert: alertUnrecognizedName, open: func(t *testing.T) net.Conn {
+			p, ca := newTLSProxy(t)
+			front, _ := startQUICFront(t, p, ca)
+			return h3Connect(t, front, ca, tlsName+":443")
+		}},
+		{name: "a server name that does not resolve to the destination", hello: withSNI, alert: alertUnrecognizedName, open: func(t *testing.T) net.Conn {
+			p, _ := newTLSProxy(t, WithNameVerification(VerifyReject), WithNameResolver(mismatch))
+			return dial(t, startTransparentRedirected(t, p, redirected))
+		}},
+		{name: "no server name and a destination no entry admits", hello: withoutSNI, alert: alertMissingExtension, open: func(t *testing.T) net.Conn {
+			p, _ := newTLSProxy(t)
+			return dial(t, startTransparentRedirected(t, p, redirected))
+		}},
+		{name: "no server name and no destination", hello: withoutSNI, alert: alertMissingExtension, open: func(t *testing.T) net.Conn {
+			p, _ := newTLSProxy(t)
+			return dial(t, startTransparent(t, p))
+		}},
+		{name: "StartTLS without a certificate authority", hello: withSNI, alert: alertInternalError, open: func(t *testing.T) net.Conn {
+			p, err := New()
+			require.NoError(t, err)
+			p.MustAdd[TCP](tlsDB, startTLSLine)
+			return starttls(t, connectRaw(t, startProxy(t, p), tlsDB+":5432"))
+		}},
+		{name: "StartTLS with a server name that does not resolve to the destination", hello: withSNI, alert: alertUnrecognizedName, open: func(t *testing.T) net.Conn {
+			p, _ := newTLSProxy(t, WithNameVerification(VerifyReject), WithNameResolver(mismatch))
+			p.MustAdd[TCP]("127.0.0.1", startTLSLine)
+			return starttls(t, dial(t, startTransparentRedirected(t, p, redirected)))
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := tc.open(t)
+			require.NoError(t, c.SetDeadline(time.Now().Add(5*time.Second)))
+			_, err := c.Write(tc.hello)
+			require.NoError(t, err)
+			head := make([]byte, 7)
+			_, err = io.ReadFull(c, head)
+			require.NoError(t, err)
+			assert.Equal(t, []byte{tlsAlert, 0x03, 0x03, 0x00, 0x02, 0x02, tc.alert}, head)
+			_, err = c.Read(make([]byte, 1))
+			assert.ErrorIs(t, err, io.EOF)
+		})
+	}
+}
+
+func TestTerminate_RefusedClientHelloAlertBeforeUnreadBytes(t *testing.T) {
+	unknown := captureClientHello(t, &tls.Config{ServerName: "unknown.test", InsecureSkipVerify: true, MinVersion: tls.VersionTLS12})
+	withoutSNI := captureClientHello(t, &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12})
+	// More than the peek reads, so the bytes past it are still unread when the proxy refuses.
+	trailing := make([]byte, 2*clientHelloPeekSize)
+	cases := []struct {
+		open  func(t *testing.T) net.Conn
+		name  string
+		hello []byte
+		alert byte
+	}{
+		{name: "a CONNECT", hello: unknown, alert: alertUnrecognizedName, open: func(t *testing.T) net.Conn {
+			p, _ := newTLSProxy(t)
+			return connectRaw(t, startProxy(t, p), tlsName+":443")
+		}},
+		{name: "a redirected connection", hello: withoutSNI, alert: alertMissingExtension, open: func(t *testing.T) net.Conn {
+			p, _ := newTLSProxy(t)
+			c, err := net.DialTimeout("tcp", startTransparent(t, p), 5*time.Second)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = c.Close() })
+			return c
+		}},
+		{name: "StartTLS", hello: unknown, alert: alertInternalError, open: func(t *testing.T) net.Conn {
+			p, err := New()
+			require.NoError(t, err)
+			p.MustAdd[TCP](tlsDB, startTLSLine)
+			c := connectRaw(t, startProxy(t, p), tlsDB+":5432")
+			require.NoError(t, c.SetDeadline(time.Now().Add(5*time.Second)))
+			_, err = io.WriteString(c, "STARTTLS\n")
+			require.NoError(t, err)
+			_, err = io.ReadFull(c, make([]byte, len("OK\n")))
+			require.NoError(t, err)
+			return c
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := tc.open(t)
+			require.NoError(t, c.SetDeadline(time.Now().Add(5*time.Second)))
+			_, _ = c.Write(append(slices.Clone(tc.hello), trailing...))
+			time.Sleep(200 * time.Millisecond)
+			head := make([]byte, 7)
+			_, err := io.ReadFull(c, head)
+			require.NoError(t, err)
+			assert.Equal(t, []byte{tlsAlert, 0x03, 0x03, 0x00, 0x02, 0x02, tc.alert}, head)
+			_, err = c.Read(make([]byte, 1))
+			assert.ErrorIs(t, err, io.EOF)
+		})
+	}
+}
+
+func TestConformanceTLS(t *testing.T) {
+	runConformance(t, tlsConformance)
+}
+
+const (
+	tlsName     = "origin.test"
+	tlsUpstream = "upstream.test"
+	tlsDB       = "db.test"
+	tlsAlert    = 0x15
+)
+
+// preferredName matches the preferred name syntax of RFC 1123 section 2.1.
+var preferredName = regexp.MustCompile(`^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)*[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$`)
+
+// newTLSProxy returns a proxy and its certificate authority, with an entry on tlsName that
+// the proxy answers itself.
+func newTLSProxy(t *testing.T, opts ...ProxyOption) (*Proxy, *CA) {
+	t.Helper()
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(append([]ProxyOption{WithCA(ca)}, opts...)...)
+	require.NoError(t, err)
+	p.MustAdd(tlsName+"/*{any}", func(*HTTPCtx) (*http.Response, error) {
+		return Text(http.StatusOK, "routed"), nil
+	})
+	return p, ca
+}
+
+// upstreamProxy returns a proxy forwarding requests and relaying streams for tlsUpstream to
+// the origin at addr, and upgrading a stream for tlsDB after an SSLRequest, trusting the
+// certificates roots issued.
+func upstreamProxy(t *testing.T, addr string, roots *x509.CertPool, opts ...ProxyOption) (*Proxy, *CA) {
+	t.Helper()
+	tr := DefaultTransport()
+	tr.DialContext = pinnedDialer(addr)
+	tr.RootCAs = roots
+	p, ca := newTLSProxy(t, append([]ProxyOption{WithTransport(tr)}, opts...)...)
+	p.MustAdd(tlsUpstream+"/*{any}", forwardHandler)
+	p.MustAdd[TCP](tlsUpstream, relayStream)
+	p.MustAdd[TCP](tlsDB, startTLSRelay)
+	return p, ca
+}
+
+// redirectedConn serves one connection with p as a redirected connection whose destination
+// is unknown, so that its server name alone places it. A write on a pipe reaches the proxy
+// as a read of its own.
+func redirectedConn(t *testing.T, p *Proxy) net.Conn {
+	t.Helper()
+	client, server := net.Pipe()
+	go func() { _ = p.ServeConn(server) }()
+	t.Cleanup(func() {
+		_ = client.Close()
+		_ = p.Close()
+	})
+	require.NoError(t, client.SetDeadline(time.Now().Add(5*time.Second)))
+	return client
+}
+
+// helloConn writes the first write of a TLS client, its ClientHello, as the writes frame
+// returns.
+type helloConn struct {
+	net.Conn
+	frame func(records []byte) [][]byte
+	done  bool
+}
+
+func (c *helloConn) Write(b []byte) (int, error) {
+	if c.done {
+		return c.Conn.Write(b)
+	}
+	c.done = true
+	for _, part := range c.frame(b) {
+		if _, err := c.Conn.Write(part); err != nil {
+			return 0, err
+		}
+	}
+	return len(b), nil
+}
+
+// records frames the handshake message msg in records of the given fragment sizes under
+// version, the last record taking what remains.
+func records(msg []byte, version uint16, sizes ...int) []byte {
+	var out []byte
+	for len(msg) > 0 {
+		n := len(msg)
+		if len(sizes) > 0 {
+			n, sizes = min(sizes[0], n), sizes[1:]
+		}
+		out = append(out, tlsHandshakeRecord, byte(version>>8), byte(version))
+		out = binary.BigEndian.AppendUint16(out, uint16(n))
+		out = append(out, msg[:n]...)
+		msg = msg[n:]
+	}
+	return out
+}
+
+func eachRecord(raw []byte) [][]byte {
+	var out [][]byte
+	for len(raw) >= 5 {
+		n := 5 + int(binary.BigEndian.Uint16(raw[3:5]))
+		out = append(out, raw[:n])
+		raw = raw[n:]
+	}
+	return out
+}
+
+// spliceHello returns the ClientHello in raw with suite placed first among its cipher suites
+// and an extension of type ext with data appended, every length rewritten, in records of
+// at most 2^14 bytes.
+func spliceHello(t *testing.T, raw []byte, suite, ext uint16, data []byte) []byte {
+	t.Helper()
+	msg := handshakeFromRecords(raw)
+	require.NotNil(t, msg)
+	body := msg[4:]
+	sidEnd := 35 + int(body[34])
+	csLen := int(binary.BigEndian.Uint16(body[sidEnd:]))
+	compEnd := sidEnd + 2 + csLen + 1 + int(body[sidEnd+2+csLen])
+	extLen := int(binary.BigEndian.Uint16(body[compEnd:]))
+	added := binary.BigEndian.AppendUint16(nil, ext)
+	added = binary.BigEndian.AppendUint16(added, uint16(len(data)))
+	added = append(added, data...)
+
+	b := append([]byte(nil), body[:sidEnd]...)
+	b = binary.BigEndian.AppendUint16(b, uint16(csLen+2))
+	b = binary.BigEndian.AppendUint16(b, suite)
+	b = append(b, body[sidEnd+2:compEnd]...)
+	b = binary.BigEndian.AppendUint16(b, uint16(extLen+len(added)))
+	b = append(b, body[compEnd+2:compEnd+2+extLen]...)
+	b = append(b, added...)
+	msg = append([]byte{0x01, byte(len(b) >> 16), byte(len(b) >> 8), byte(len(b))}, b...)
+	sizes := make([]int, len(msg)/16384+1)
+	for i := range sizes {
+		sizes[i] = 16384
+	}
+	return records(msg, tls.VersionTLS10, sizes...)
+}
+
+// firstRecord reads the first record the proxy writes on c and returns its content type,
+// with the description of an alert. A connection closed before any record returns zero.
+func firstRecord(t *testing.T, c net.Conn) (typ, alert byte) {
+	t.Helper()
+	head := make([]byte, 5)
+	if _, err := io.ReadFull(c, head); err != nil {
+		if ne, ok := errors.AsType[net.Error](err); ok && ne.Timeout() {
+			t.Fatal("the proxy neither answered nor closed the connection")
+		}
+		return 0, 0
+	}
+	if head[0] != tlsAlert {
+		return head[0], 0
+	}
+	body := make([]byte, 2)
+	_, err := io.ReadFull(c, body)
+	require.NoError(t, err)
+	return head[0], body[1]
+}
+
+// recordingConn keeps every byte read through it, so the records a TLS client received can
+// be read back.
+type recordingConn struct {
+	net.Conn
+	got []byte
+}
+
+func (c *recordingConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	c.got = append(c.got, b[:n]...)
+	return n, err
+}
+
+// lastRecord returns the content type of the last record read, zero when none was.
+func (c *recordingConn) lastRecord() byte {
+	raw, last := c.got, byte(0)
+	for len(raw) >= 5 {
+		last = raw[0]
+		raw = raw[min(len(raw), 5+int(binary.BigEndian.Uint16(raw[3:5]))):]
+	}
+	return last
+}
+
+// originHello is the server name a TLS origin received and how its handshake ended.
+type originHello struct {
+	err  error
+	name string
+}
+
+// tlsOrigin serves TLS with cert, the configuration changed by edit, and reports every
+// handshake. Once a handshake completes serve runs, or a request is answered "origin".
+func tlsOrigin(t *testing.T, cert *tls.Certificate, edit func(*tls.Config), serve func(*tls.Conn)) (string, <-chan originHello) {
+	t.Helper()
+	return tlsOriginAfter(t, nil, cert, edit, serve)
+}
+
+// upgradingOrigin is tlsOrigin behind a Postgres SSLRequest it answers with S.
+func upgradingOrigin(t *testing.T, cert *tls.Certificate) (string, <-chan originHello) {
+	t.Helper()
+	return tlsOriginAfter(t, func(c net.Conn) error {
+		var req [8]byte
+		if _, err := io.ReadFull(c, req[:]); err != nil || req != sslRequest {
+			return errors.New("not an SSLRequest")
+		}
+		_, err := c.Write([]byte{'S'})
+		return err
+	}, cert, nil, nil)
+}
+
+func tlsOriginAfter(t *testing.T, prelude func(net.Conn) error, cert *tls.Certificate, edit func(*tls.Config), serve func(*tls.Conn)) (string, <-chan originHello) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	hellos := make(chan originHello, 8)
+	var mu sync.Mutex
+	var conns []net.Conn
+	t.Cleanup(func() {
+		_ = ln.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range conns {
+			_ = c.Close()
+		}
+	})
+	if serve == nil {
+		serve = func(tc *tls.Conn) {
+			if _, err := http.ReadRequest(bufio.NewReader(tc)); err == nil {
+				_, _ = io.WriteString(tc, "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\norigin")
+			}
+		}
+	}
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, c)
+			mu.Unlock()
+			go func() {
+				defer func() { _ = c.Close() }()
+				_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+				if prelude != nil && prelude(c) != nil {
+					return
+				}
+				var name string
+				cfg := &tls.Config{
+					Certificates: []tls.Certificate{*cert},
+					MinVersion:   tls.VersionTLS12,
+					GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
+						name = chi.ServerName
+						return nil, nil
+					},
+				}
+				if edit != nil {
+					edit(cfg)
+				}
+				tc := tls.Server(c, cfg)
+				err := tc.Handshake()
+				hellos <- originHello{name: name, err: err}
+				if err == nil {
+					serve(tc)
+				}
+			}()
+		}
+	}()
+	return ln.Addr().String(), hellos
+}
+
+func nextHello(t *testing.T, hellos <-chan originHello) originHello {
+	t.Helper()
+	select {
+	case h := <-hellos:
+		return h
+	case <-time.After(5 * time.Second):
+		t.Fatal("the origin received no ClientHello")
+		return originHello{}
+	}
+}
+
+// presented terminates authority through a CONNECT on the HTTP/1.1 front at addr, sending
+// the server name sni, and returns the chain the proxy presented.
+func presented(t *testing.T, addr, authority, sni string) []*x509.Certificate {
+	t.Helper()
+	conn := connectRaw(t, addr, authority)
+	require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+	tc := tls.Client(conn, &tls.Config{ServerName: sni, InsecureSkipVerify: true, MinVersion: tls.VersionTLS12})
+	require.NoError(t, tc.Handshake())
+	return tc.ConnectionState().PeerCertificates
+}
+
+// routedOver sends a request for tlsName on the terminated connection c and returns the
+// response body.
+func routedOver(t *testing.T, c net.Conn) string {
+	t.Helper()
+	w := newWire(c)
+	w.send(t, "GET / HTTP/1.1\r\nHost: "+tlsName+"\r\n\r\n")
+	got := w.readResponse(t, http.MethodGet)
+	require.NoError(t, got.err)
+	return string(got.body)
+}
+
+// refusedUpstream sends a request for host on tc and checks that no answer of the origin
+// reaches the client, a 502 over HTTP/1.1 and a closed stream otherwise.
+func refusedUpstream(t *testing.T, tc *tls.Conn, host string) {
+	t.Helper()
+	w := newWire(tc)
+	w.send(t, "GET / HTTP/1.1\r\nHost: "+host+"\r\n\r\n")
+	if tc.ConnectionState().NegotiatedProtocol == "http/1.1" {
+		assert.Equal(t, http.StatusBadGateway, w.readResponse(t, http.MethodGet).resp.StatusCode)
+		return
+	}
+	got, _ := io.ReadAll(w.br)
+	assert.Empty(t, string(got))
+}
+
+// quicHandshake dials addr over QUIC with cfg and returns how the handshake ended.
+func quicHandshake(t *testing.T, addr netip.AddrPort, cfg *tls.Config) error {
+	t.Helper()
+	pc, err := loopbackUDP()
+	require.NoError(t, err)
+	tr := &quic.Transport{Conn: pc}
+	t.Cleanup(func() {
+		_ = tr.Close()
+		_ = pc.Close()
+	})
+	conn, err := tr.Dial(t.Context(), net.UDPAddrFromAddrPort(addr), cfg, &quic.Config{HandshakeIdleTimeout: time.Second})
+	if err == nil {
+		_ = conn.CloseWithError(0, "")
+	}
+	return err
+}
+
+// quicAlert returns the TLS alert a QUIC peer closed the connection with, RFC 9001 section
+// 4.8.
+func quicAlert(err error) (byte, bool) {
+	te, ok := errors.AsType[*quic.TransportError](err)
+	if !ok || !te.Remote || te.ErrorCode < 0x100 || te.ErrorCode > 0x1ff {
+		return 0, false
+	}
+	return byte(te.ErrorCode - 0x100), true
+}
+
+// startTLSLine answers a line with OK, terminates the TLS the client sends next and writes
+// "tls" on it.
+func startTLSLine(c *TCPCtx) error {
+	line := make([]byte, len("STARTTLS\n"))
+	if _, err := io.ReadFull(c.Client(), line); err != nil {
+		return err
+	}
+	if _, err := io.WriteString(c.Client(), "OK\n"); err != nil {
+		return err
+	}
+	if err := c.StartTLS(); err != nil {
+		return err
+	}
+	_, err := io.WriteString(c.Client(), "tls\n")
+	return err
+}
+
+// startTLSRelay dials the origin, relays an SSLRequest and the answer of the origin, then
+// terminates the TLS the client sends next and relays the rest.
+func startTLSRelay(c *TCPCtx) error {
+	up, err := c.Dial()
+	if err != nil {
+		return err
+	}
+	if _, err := relaySSLRequest(c.Client(), up); err != nil {
+		return err
+	}
+	if err := c.StartTLS(); err != nil {
+		return err
+	}
+	return c.Relay()
+}
+
+// upgradedClient opens a stream to tlsDB through a CONNECT on the HTTP/1.1 front at addr and
+// returns the TLS client it starts there after an SSLRequest, its handshake done.
+func upgradedClient(t *testing.T, addr string, ca *CA) *tls.Conn {
+	t.Helper()
+	conn := connectRaw(t, addr, tlsDB+":5432")
+	require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+	return startTLSClient(t, conn, clientTLSConfig(ca, tlsDB))
+}
+
+// h2StreamConn is a stream of an h2Raw connection as a net.Conn. Close stops a blocked
+// read and leaves the stream as it is.
+type h2StreamConn struct {
+	c      *h2Raw
+	events chan h2Event
+	done   chan struct{}
+	rest   []byte
+	once   sync.Once
+	id     uint32
+}
+
+func (s *h2StreamConn) Read(b []byte) (int, error) {
+	for len(s.rest) == 0 {
+		select {
+		case ev := <-s.events:
+			if ev.err != nil {
+				return 0, ev.err
+			}
+			s.rest = ev.data
+		case <-s.done:
+			return 0, net.ErrClosed
+		}
+	}
+	n := copy(b, s.rest)
+	s.rest = s.rest[n:]
+	return n, nil
+}
+
+func (s *h2StreamConn) Write(b []byte) (int, error) {
+	if err := s.c.data(s.id, b, false); err != nil {
+		return 0, err
+	}
+	return len(b), nil
+}
+
+func (s *h2StreamConn) Close() error {
+	s.once.Do(func() { close(s.done) })
+	return nil
+}
+
+func (*h2StreamConn) LocalAddr() net.Addr              { return emptyAddr{} }
+func (*h2StreamConn) RemoteAddr() net.Addr             { return emptyAddr{} }
+func (*h2StreamConn) SetDeadline(time.Time) error      { return nil }
+func (*h2StreamConn) SetReadDeadline(time.Time) error  { return nil }
+func (*h2StreamConn) SetWriteDeadline(time.Time) error { return nil }
+
+// h2Connect sends a CONNECT to authority on an HTTP/2 connection to the front at front and
+// returns its stream once the proxy granted it.
+func h2Connect(t *testing.T, front netip.AddrPort, ca *CA, authority string) net.Conn {
+	t.Helper()
+	c := dialH2Raw(t, front.String(), ca)
+	id, events := c.open(t, []hpack.HeaderField{hf(":method", http.MethodConnect), hf(":authority", authority)})
+	select {
+	case ev := <-events:
+		require.NotNil(t, ev.head, "the answer to CONNECT starts with HEADERS, %v", ev.err)
+		require.Equal(t, "200", ev.head.PseudoValue("status"))
+	case <-time.After(5 * time.Second):
+		t.Fatal("no answer to the CONNECT")
+	}
+	s := &h2StreamConn{c: c, id: id, events: events, done: make(chan struct{})}
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
+// h3Connect sends a CONNECT to authority on an HTTP/3 connection to the front at front and
+// returns its stream once the proxy granted it.
+func h3Connect(t *testing.T, front netip.AddrPort, ca *CA, authority string) net.Conn {
+	t.Helper()
+	h3 := &http3.Transport{}
+	t.Cleanup(func() { _ = h3.Close() })
+	cc := h3.NewClientConn(dialQUICFront(t, front, ca))
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	str, err := cc.OpenRequestStream(ctx)
+	require.NoError(t, err)
+	req, err := http.NewRequest(http.MethodConnect, "https://"+authority, nil)
+	require.NoError(t, err)
+	require.NoError(t, str.SendRequestHeader(req))
+	require.NoError(t, str.SetReadDeadline(time.Now().Add(5*time.Second)))
+	resp, err := str.ReadResponse()
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	return streamConn{str}
+}
+
+// tlsConformance lists the requirements TLS and the certificate profile place on a proxy
+// terminating TLS, checked with a client in front of edge and an origin behind it.
+var tlsConformance = []conformanceCase{
+	// RFC 5280 section 4.1.2.2, serial number.
+	{
+		id: "rfc5280/4.1.2.2/1", name: "a leaf the proxy mints",
+		req: "The serial number MUST be a positive integer assigned by the CA to each certificate.",
+		run: func(t *testing.T) {
+			p, _ := newTLSProxy(t)
+			leaf := presented(t, startProxy(t, p), tlsName+":443", tlsName)[0]
+			assert.Positive(t, leaf.SerialNumber.Sign())
+		},
+	},
+	{
+		id: "rfc5280/4.1.2.2/2", name: "two leaves the proxy mints",
+		req: "It MUST be unique for each certificate issued by a given CA (i.e., the issuer name and serial number identify a unique certificate).",
+		run: func(t *testing.T) {
+			p, ca := newTLSProxy(t)
+			p.MustAdd("other.test/*{any}", noopHandler)
+			addr := startProxy(t, p)
+			first := presented(t, addr, tlsName+":443", tlsName)[0]
+			second := presented(t, addr, "other.test:443", "other.test")[0]
+			assert.NotEqual(t, first.SerialNumber, second.SerialNumber)
+			assert.NotEqual(t, ca.Certificate().SerialNumber, first.SerialNumber)
+		},
+	},
+	{
+		id: "rfc5280/4.1.2.2/3", name: "the serial number of a minted leaf",
+		req: "Conforming CAs MUST NOT use serialNumber values longer than 20 octets.",
+		run: func(t *testing.T) {
+			p, _ := newTLSProxy(t)
+			leaf := presented(t, startProxy(t, p), tlsName+":443", tlsName)[0]
+			// The DER integer has one more octet when the high bit of the first is set.
+			assert.LessOrEqual(t, (leaf.SerialNumber.BitLen()+8)/8, 20)
+		},
+	},
+
+	// RFC 5280 section 4.2.1.2, subject key identifier.
+	{
+		id: "rfc5280/4.2.1.2/1", name: "a leaf the proxy mints",
+		req: "To assist applications in identifying the appropriate end entity certificate, this extension SHOULD be included in all end entity certificates.",
+		run: func(t *testing.T) {
+			p, _ := newTLSProxy(t)
+			leaf := presented(t, startProxy(t, p), tlsName+":443", tlsName)[0]
+			assert.NotEmpty(t, leaf.SubjectKeyId)
+		},
+	},
+
+	// RFC 5280 section 4.2.1.6, subject alternative name.
+	{
+		id: "rfc5280/4.2.1.6/1", name: "a leaf for a name the authority never verified",
+		req:  "Because the subject alternative name is considered to be definitively bound to the public key, all parts of the subject alternative name MUST be verified by the CA.",
+		skip: "edge mints a leaf for any name an entry admits, which is the interception it exists for",
+		run: func(t *testing.T) {
+			p, _ := newTLSProxy(t)
+			conn := connectRaw(t, startProxy(t, p), tlsName+":443")
+			require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+			err := tls.Client(conn, &tls.Config{ServerName: tlsName, InsecureSkipVerify: true, MinVersion: tls.VersionTLS12}).Handshake()
+			assert.Error(t, err, "the proxy presented a leaf for a name it did not verify")
+		},
+	},
+	{
+		id: "rfc5280/4.2.1.6/2", name: "a CONNECT to a host with a trailing dot and no server name",
+		req: "The name MUST be in the \"preferred name syntax\", as specified by Section 3.5 of [RFC1034] and as modified by Section 2.1 of [RFC1123].",
+		run: func(t *testing.T) {
+			p, _ := newTLSProxy(t)
+			p.MustAdd("127.0.0.1/*{any}", noopHandler)
+			addr := startProxy(t, p)
+			for _, tc := range []struct{ name, authority string }{
+				{name: "the trailing dot of a name", authority: tlsName + ".:443"},
+				{name: "the trailing dot of an address", authority: "127.0.0.1.:443"},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					leaf := presented(t, addr, tc.authority, "")[0]
+					for _, name := range leaf.DNSNames {
+						assert.Regexp(t, preferredName, name)
+					}
+				})
+			}
+		},
+	},
+	{
+		id: "rfc5280/4.2.1.6/3", name: "a server name outside the preferred name syntax and an entry on every name",
+		req: "The name MUST be in the \"preferred name syntax\", as specified by Section 3.5 of [RFC1034] and as modified by Section 2.1 of [RFC1123].",
+		run: func(t *testing.T) {
+			p, _ := newTLSProxy(t)
+			p.MustAdd("+{any}/*{any}", noopHandler)
+			addr := startProxy(t, p)
+			for _, sni := range []string{"under_score.test", "-leading.test", "exa mple.test"} {
+				t.Run(sni, func(t *testing.T) {
+					conn := connectRaw(t, addr, tlsName+":443")
+					require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+					tc := tls.Client(conn, &tls.Config{ServerName: sni, InsecureSkipVerify: true, MinVersion: tls.VersionTLS12})
+					if tc.Handshake() != nil {
+						return
+					}
+					for _, name := range tc.ConnectionState().PeerCertificates[0].DNSNames {
+						assert.Regexp(t, preferredName, name)
+					}
+				})
+			}
+		},
+	},
+
+	// RFC 5280 section 4.2.1.12, extended key usage.
+	{
+		id: "rfc5280/4.2.1.12/1", name: "a leaf the proxy presents as a TLS server",
+		req: "If the extension is present, then the certificate MUST only be used for one of the purposes indicated.",
+		run: func(t *testing.T) {
+			p, _ := newTLSProxy(t)
+			leaf := presented(t, startProxy(t, p), tlsName+":443", tlsName)[0]
+			if len(leaf.ExtKeyUsage) > 0 {
+				assert.True(t, slices.Contains(leaf.ExtKeyUsage, x509.ExtKeyUsageServerAuth) || slices.Contains(leaf.ExtKeyUsage, x509.ExtKeyUsageAny),
+					"extended key usage %v", leaf.ExtKeyUsage)
+			}
+		},
+	},
+
+	// RFC 6066 section 3, server name indication.
+	{
+		id: "rfc6066/3/1", name: "a server name no entry admits",
+		req: "If the server understood the ClientHello extension but does not recognize the server name, the server SHOULD take one of two actions: either abort the handshake by sending a fatal-level unrecognized_name(112) alert or continue the handshake.",
+		run: func(t *testing.T) {
+			hello := captureClientHello(t, &tls.Config{ServerName: "unknown.test", InsecureSkipVerify: true, MinVersion: tls.VersionTLS12})
+			check := func(t *testing.T, c net.Conn) {
+				_, err := c.Write(hello)
+				require.NoError(t, err)
+				typ, alert := firstRecord(t, c)
+				if typ != tlsHandshakeRecord {
+					assert.Equal(t, [2]byte{tlsAlert, 112}, [2]byte{typ, alert})
+				}
+			}
+			t.Run("connect", func(t *testing.T) {
+				p, _ := newTLSProxy(t)
+				check(t, connectRaw(t, startProxy(t, p), tlsName+":443"))
+			})
+			t.Run("transparent", func(t *testing.T) {
+				p, _ := newTLSProxy(t)
+				check(t, redirectedConn(t, p))
+			})
+			t.Run("quic", func(t *testing.T) {
+				p, _ := newTLSProxy(t)
+				err := quicHandshake(t, startQUIC(t, p), &tls.Config{ServerName: "unknown.test", InsecureSkipVerify: true, NextProtos: []string{"h3"}, MinVersion: tls.VersionTLS13})
+				if err != nil {
+					alert, ok := quicAlert(err)
+					assert.True(t, ok, "the handshake ended without an alert, %v", err)
+					assert.Equal(t, byte(112), alert)
+				}
+			})
+		},
+	},
+	{
+		id: "rfc6066/3/2", name: "a CONNECT to an address with a trailing dot",
+		req: "Literal IPv4 and IPv6 addresses are not permitted in \"HostName\".",
+		run: func(t *testing.T) {
+			originCA, err := GenerateCA()
+			require.NoError(t, err)
+			cert, err := originCA.Leaf("127.0.0.1")
+			require.NoError(t, err)
+			origin, hellos := tlsOrigin(t, cert, nil, nil)
+			_, port, _ := net.SplitHostPort(origin)
+			authority := "127.0.0.1.:" + port
+
+			tr := DefaultTransport()
+			tr.DialContext = pinnedDialer(origin)
+			tr.RootCAs = originCA.CertPool()
+			p, _ := newTLSProxy(t, WithTransport(tr))
+			p.MustAdd("127.0.0.1/*{any}", forwardHandler)
+			p.MustAdd[TCP]("127.0.0.1", relayStream)
+			addr := startProxy(t, p)
+
+			for _, alpn := range []string{"http/1.1", "x-test"} {
+				t.Run(alpn, func(t *testing.T) {
+					conn := connectRaw(t, addr, authority)
+					require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+					tc := tls.Client(conn, &tls.Config{InsecureSkipVerify: true, NextProtos: []string{alpn}, MinVersion: tls.VersionTLS12})
+					require.NoError(t, tc.Handshake())
+					_, err := io.WriteString(tc, "GET / HTTP/1.1\r\nHost: "+authority+"\r\n\r\n")
+					require.NoError(t, err)
+					h := nextHello(t, hellos)
+					_, perr := netip.ParseAddr(h.name)
+					assert.Error(t, perr, "the origin received the server name %q", h.name)
+				})
+			}
+		},
+	},
+	{
+		id: "rfc6066/3/3", name: "the server name the proxy sends to the origin",
+		req: "It is RECOMMENDED that clients include an extension of type \"server_name\" in the client hello whenever they locate a server by a supported name type.",
+		run: func(t *testing.T) {
+			originCA, err := GenerateCA()
+			require.NoError(t, err)
+			for _, alpn := range []string{"http/1.1", "x-test"} {
+				t.Run(alpn, func(t *testing.T) {
+					cert, err := originCA.Leaf(tlsUpstream)
+					require.NoError(t, err)
+					origin, hellos := tlsOrigin(t, cert, nil, nil)
+					p, ca := upstreamProxy(t, origin, originCA.CertPool())
+					conn := connectRaw(t, startProxy(t, p), tlsUpstream+":443")
+					require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+					tc := tls.Client(conn, &tls.Config{ServerName: tlsUpstream, RootCAs: ca.CertPool(), NextProtos: []string{alpn}, MinVersion: tls.VersionTLS12})
+					require.NoError(t, tc.Handshake())
+					_, err = io.WriteString(tc, "GET / HTTP/1.1\r\nHost: "+tlsUpstream+"\r\n\r\n")
+					require.NoError(t, err)
+					h := nextHello(t, hellos)
+					require.NoError(t, h.err)
+					assert.Equal(t, tlsUpstream, h.name)
+				})
+			}
+			t.Run("STARTTLS", func(t *testing.T) {
+				cert, err := originCA.Leaf(tlsDB)
+				require.NoError(t, err)
+				origin, hellos := upgradingOrigin(t, cert)
+				p, ca := upstreamProxy(t, origin, originCA.CertPool())
+				upgradedClient(t, startProxy(t, p), ca)
+				h := nextHello(t, hellos)
+				require.NoError(t, h.err)
+				assert.Equal(t, tlsDB, h.name)
+			})
+		},
+	},
+
+	// RFC 7301 section 3.2, protocol selection.
+	{
+		id: "rfc7301/3.2/1", name: "two offers of h2 and http/1.1 in opposite orders",
+		req:  "In that case, the server SHOULD select the most highly preferred protocol that it supports and that is also advertised by the client.",
+		skip: "edge selects in the order of the client offer, the mirror of the client that TestTerminate_ALPNMirrorsClientOffer checks",
+		run: func(t *testing.T) {
+			p, ca := newTLSProxy(t)
+			addr := startProxy(t, p)
+			var selected []string
+			for _, offer := range [][]string{{"h2", "http/1.1"}, {"http/1.1", "h2"}} {
+				conn := connectRaw(t, addr, tlsName+":443")
+				require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+				tc := tls.Client(conn, &tls.Config{ServerName: tlsName, RootCAs: ca.CertPool(), NextProtos: offer, MinVersion: tls.VersionTLS12})
+				require.NoError(t, tc.Handshake())
+				selected = append(selected, tc.ConnectionState().NegotiatedProtocol)
+			}
+			assert.Equal(t, selected[0], selected[1], "the selection followed the order of the offer")
+		},
+	},
+	{
+		id: "rfc7301/3.2/2", name: "an offer with no protocol the authority admits",
+		req: "In the event that the server supports no protocols that the client advertises, then the server SHALL respond with a fatal \"no_application_protocol\" alert.",
+		run: func(t *testing.T) {
+			hello := captureClientHello(t, &tls.Config{ServerName: tlsName, InsecureSkipVerify: true, NextProtos: []string{"x-test"}, MinVersion: tls.VersionTLS12})
+			check := func(t *testing.T, c net.Conn) {
+				require.NoError(t, c.SetDeadline(time.Now().Add(5*time.Second)))
+				_, err := c.Write(hello)
+				require.NoError(t, err)
+				typ, alert := firstRecord(t, c)
+				assert.Equal(t, [2]byte{tlsAlert, 120}, [2]byte{typ, alert})
+			}
+			t.Run("connect", func(t *testing.T) {
+				p, _ := newTLSProxy(t)
+				check(t, connectRaw(t, startProxy(t, p), tlsName+":443"))
+			})
+			t.Run("the TLS front", func(t *testing.T) {
+				p, ca := newTLSProxy(t)
+				addr, _ := startProxyTLS(t, p, ca)
+				c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+				require.NoError(t, err)
+				t.Cleanup(func() { _ = c.Close() })
+				check(t, c)
+			})
+			t.Run("the HTTP/3 front", func(t *testing.T) {
+				p, ca := newTLSProxy(t)
+				addr, _ := startQUICFront(t, p, ca)
+				err := quicHandshake(t, addr, &tls.Config{ServerName: tlsName, InsecureSkipVerify: true, NextProtos: []string{"x-test"}, MinVersion: tls.VersionTLS13})
+				alert, ok := quicAlert(err)
+				assert.True(t, ok, "the handshake ended without an alert, %v", err)
+				assert.Equal(t, byte(120), alert)
+			})
+		},
+	},
+	{
+		id: "rfc7301/3.2/3", name: "a QUIC offer with no protocol the authority admits",
+		req: "In the event that the server supports no protocols that the client advertises, then the server SHALL respond with a fatal \"no_application_protocol\" alert.",
+		run: func(t *testing.T) {
+			p, _ := newTLSProxy(t)
+			err := quicHandshake(t, startQUIC(t, p), &tls.Config{ServerName: tlsName, InsecureSkipVerify: true, NextProtos: []string{"x-test"}, MinVersion: tls.VersionTLS13})
+			alert, ok := quicAlert(err)
+			assert.True(t, ok, "the handshake ended without an alert, %v", err)
+			assert.Equal(t, byte(120), alert)
+		},
+	},
+	{
+		id: "rfc7301/3.2/4", name: "a client that negotiated http/1.1 and sends the HTTP/2 preface",
+		req: "The server SHALL NOT respond with a selected protocol and subsequently use a different protocol for application data exchange.",
+		run: func(t *testing.T) {
+			p, ca := newTLSProxy(t)
+			conn := connectRaw(t, startProxy(t, p), tlsName+":443")
+			require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+			tc := tls.Client(conn, &tls.Config{ServerName: tlsName, RootCAs: ca.CertPool(), NextProtos: []string{"http/1.1"}, MinVersion: tls.VersionTLS12})
+			require.NoError(t, tc.Handshake())
+			require.Equal(t, "http/1.1", tc.ConnectionState().NegotiatedProtocol)
+			_, err := io.WriteString(tc, http2.ClientPreface)
+			require.NoError(t, err)
+			require.NoError(t, http2.NewFramer(tc, nil).WriteSettings())
+			head := make([]byte, 9)
+			if _, err := io.ReadFull(tc, head); err == nil {
+				assert.NotEqual(t, byte(http2.FrameSettings), head[3], "the proxy answered in HTTP/2 on a connection that negotiated http/1.1")
+			}
+		},
+	},
+	{
+		id: "rfc7301/3.2/5", name: "a client that negotiated h2 and sends an HTTP/1.1 request",
+		req: "The server SHALL NOT respond with a selected protocol and subsequently use a different protocol for application data exchange.",
+		run: func(t *testing.T) {
+			p, ca := newTLSProxy(t)
+			conn := connectRaw(t, startProxy(t, p), tlsName+":443")
+			require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+			tc := tls.Client(conn, &tls.Config{ServerName: tlsName, RootCAs: ca.CertPool(), NextProtos: []string{"h2"}, MinVersion: tls.VersionTLS12})
+			require.NoError(t, tc.Handshake())
+			require.Equal(t, "h2", tc.ConnectionState().NegotiatedProtocol)
+			_, err := io.WriteString(tc, "GET / HTTP/1.1\r\nHost: "+tlsName+"\r\n\r\n")
+			require.NoError(t, err)
+			head := make([]byte, 8)
+			if _, err := io.ReadFull(tc, head); err == nil {
+				assert.NotEqual(t, "HTTP/1.1", string(head), "the proxy answered in HTTP/1.1 on a connection that negotiated h2")
+			}
+		},
+	},
+
+	// RFC 8813 section 3, the key usage of an elliptic curve key, added to RFC 5480 section 3.
+	{
+		id: "rfc8813/3/1", name: "a leaf the proxy mints for an ECDSA key",
+		req: "If the keyUsage extension is present in a certificate that indicates id-ecPublicKey in SubjectPublicKeyInfo, then the following values MUST NOT be present: keyEncipherment; and dataEncipherment.",
+		run: func(t *testing.T) {
+			p, _ := newTLSProxy(t)
+			leaf := presented(t, startProxy(t, p), tlsName+":443", tlsName)[0]
+			require.Equal(t, x509.ECDSA, leaf.PublicKeyAlgorithm)
+			assert.Zero(t, leaf.KeyUsage&x509.KeyUsageKeyEncipherment, "keyEncipherment")
+			assert.Zero(t, leaf.KeyUsage&x509.KeyUsageDataEncipherment, "dataEncipherment")
+		},
+	},
+
+	// RFC 9525 section 6, verifying the identity of the origin.
+	{
+		id: "rfc9525/6.1.1/1", name: "a redirected connection to an origin with a certificate for its address only",
+		req: "Unless an application defines a process for authenticating intermediate identifiers in a way that then allows them to be used as a reference identifier (for example, see [SMTP-TLS]), any intermediate values are not reference identifiers and MUST NOT be treated as such.",
+		run: func(t *testing.T) {
+			originCA, err := GenerateCA()
+			require.NoError(t, err)
+			cert, err := originCA.Leaf("127.0.0.1")
+			require.NoError(t, err)
+			origin, hellos := tlsOrigin(t, cert, nil, nil)
+			p, ca := upstreamProxy(t, origin, originCA.CertPool())
+			addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) {
+				return netip.ParseAddrPort(origin)
+			})
+			for _, alpn := range []string{"http/1.1", "x-test"} {
+				t.Run(alpn, func(t *testing.T) {
+					c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+					require.NoError(t, err)
+					t.Cleanup(func() { _ = c.Close() })
+					require.NoError(t, c.SetDeadline(time.Now().Add(5*time.Second)))
+					tc := tls.Client(c, &tls.Config{ServerName: tlsUpstream, RootCAs: ca.CertPool(), NextProtos: []string{alpn}, MinVersion: tls.VersionTLS12})
+					require.NoError(t, tc.Handshake())
+					refusedUpstream(t, tc, tlsUpstream)
+					assert.Error(t, nextHello(t, hellos).err, "the origin was verified against its address")
+				})
+			}
+		},
+	},
+	{
+		id: "rfc9525/6.6/1", name: "an origin with a certificate for another name",
+		req: "If the client is an automated application, then it SHOULD terminate the communication attempt with a bad certificate error and log the error appropriately.",
+		run: func(t *testing.T) {
+			originCA, err := GenerateCA()
+			require.NoError(t, err)
+			cert, err := originCA.Leaf("other.test")
+			require.NoError(t, err)
+			origin, hellos := tlsOrigin(t, cert, nil, nil)
+			p, ca := upstreamProxy(t, origin, originCA.CertPool())
+			addr := startProxy(t, p)
+			for _, alpn := range []string{"http/1.1", "x-test"} {
+				t.Run(alpn, func(t *testing.T) {
+					conn := connectRaw(t, addr, tlsUpstream+":443")
+					require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+					tc := tls.Client(conn, &tls.Config{ServerName: tlsUpstream, RootCAs: ca.CertPool(), NextProtos: []string{alpn}, MinVersion: tls.VersionTLS12})
+					require.NoError(t, tc.Handshake())
+					refusedUpstream(t, tc, tlsUpstream)
+					assert.ErrorContains(t, nextHello(t, hellos).err, "bad certificate")
+				})
+			}
+		},
+	},
+	{
+		id: "rfc9525/6.6/2", name: "an origin with a certificate for another name from an authority the proxy does not trust",
+		req: "The application MAY provide a configuration setting to disable this behavior, but it MUST NOT disable this security control by default.",
+		run: func(t *testing.T) {
+			originCA, err := GenerateCA()
+			require.NoError(t, err)
+			cert, err := originCA.Leaf("other.test")
+			require.NoError(t, err)
+			skipping := DefaultTransport()
+			skipping.InsecureSkipVerify = true
+			for _, tc := range []struct {
+				name     string
+				opts     []ProxyOption
+				answered bool
+			}{
+				{name: "the default of New"},
+				{name: "a transport skipping verification", opts: []ProxyOption{WithTransport(skipping)}, answered: true},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					for _, alpn := range []string{"http/1.1", "x-test"} {
+						t.Run(alpn, func(t *testing.T) {
+							origin, hellos := tlsOrigin(t, cert, nil, nil)
+							p, ca := newTLSProxy(t, tc.opts...)
+							p.MustAdd("127.0.0.1/*{any}", forwardHandler)
+							p.MustAdd[TCP]("127.0.0.1", relayStream)
+							conn := connectRaw(t, startProxy(t, p), origin)
+							require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+							c := tls.Client(conn, &tls.Config{ServerName: "127.0.0.1", RootCAs: ca.CertPool(), NextProtos: []string{alpn}, MinVersion: tls.VersionTLS12})
+							require.NoError(t, c.Handshake())
+							if !tc.answered {
+								refusedUpstream(t, c, origin)
+								assert.Error(t, nextHello(t, hellos).err)
+								return
+							}
+							w := newWire(c)
+							w.send(t, "GET / HTTP/1.1\r\nHost: "+origin+"\r\n\r\n")
+							got := w.readResponse(t, http.MethodGet)
+							require.NoError(t, got.err)
+							assert.Equal(t, "origin", string(got.body))
+						})
+					}
+				})
+			}
+		},
+	},
+
+	// RFC 9846 section 4.5.1, the certificate message.
+	{
+		id: "rfc9846/4.5.1/1", name: "the chain the proxy presents",
+		req: "The sender's certificate MUST come in the first CertificateEntry in the list.",
+		run: func(t *testing.T) {
+			p, _ := newTLSProxy(t)
+			chain := presented(t, startProxy(t, p), tlsName+":443", tlsName)
+			require.NotEmpty(t, chain)
+			assert.False(t, chain[0].IsCA)
+			assert.NoError(t, chain[0].VerifyHostname(tlsName))
+		},
+	},
+	{
+		id: "rfc9846/4.5.1/2", name: "the chain the proxy presents",
+		req: "Each following certificate SHOULD directly certify the one immediately preceding it.",
+		run: func(t *testing.T) {
+			p, _ := newTLSProxy(t)
+			chain := presented(t, startProxy(t, p), tlsName+":443", tlsName)
+			for i := 1; i < len(chain); i++ {
+				assert.NoError(t, chain[i-1].CheckSignatureFrom(chain[i]), "certificate %d", i)
+			}
+		},
+	},
+
+	// RFC 9846 section 4.5.1.2, certificate selection.
+	{
+		id: "rfc9846/4.5.1.2/1", name: "a leaf the proxy mints",
+		req: "That is, the digitalSignature bit MUST be set if the Key Usage extension is present, and the public key (with associated restrictions) MUST be compatible with some supported signature scheme.",
+		run: func(t *testing.T) {
+			p, _ := newTLSProxy(t)
+			leaf := presented(t, startProxy(t, p), tlsName+":443", tlsName)[0]
+			if leaf.KeyUsage != 0 {
+				assert.NotZero(t, leaf.KeyUsage&x509.KeyUsageDigitalSignature, "digitalSignature")
+			}
+			// The signature schemes of RFC 9846 section 4.2.3 that crypto/tls implements.
+			switch k := leaf.PublicKey.(type) {
+			case *ecdsa.PublicKey:
+				assert.Contains(t, []string{"P-256", "P-384", "P-521"}, k.Curve.Params().Name)
+			case *rsa.PublicKey, ed25519.PublicKey:
+			default:
+				t.Errorf("a %T key matches no signature scheme", k)
+			}
+		},
+	},
+
+	// RFC 9846 section 5.1, the record layer.
+	{
+		id: "rfc9846/5.1/1", name: "a ClientHello under each record version",
+		req: "This field is deprecated and MUST be ignored for all purposes.",
+		run: func(t *testing.T) {
+			for _, version := range []uint16{0x0300, tls.VersionTLS10, tls.VersionTLS11, tls.VersionTLS12} {
+				t.Run(fmt.Sprintf("%#04x", version), func(t *testing.T) {
+					p, ca := newTLSProxy(t)
+					conn := &helloConn{Conn: redirectedConn(t, p), frame: func(b []byte) [][]byte {
+						return [][]byte{records(handshakeFromRecords(b), version)}
+					}}
+					tc := tls.Client(conn, &tls.Config{ServerName: tlsName, RootCAs: ca.CertPool(), NextProtos: []string{"http/1.1"}, MinVersion: tls.VersionTLS12})
+					require.NoError(t, tc.Handshake())
+					assert.Equal(t, "routed", routedOver(t, tc))
+				})
+			}
+		},
+	},
+
+	// RFC 9846 section 6, the alert protocol.
+	{
+		id: "rfc9846/6.1/1", name: "a terminated connection the proxy closes",
+		req: "Each party MUST send a \"close_notify\" alert before closing its write side of the connection, unless it has already sent some error alert.",
+		run: func(t *testing.T) {
+			p, ca := newTLSProxy(t)
+			p.MustAdd[TCP]("stream.test", func(c *TCPCtx) error {
+				_, err := io.WriteString(c.Client(), "bye")
+				return err
+			})
+			addr := startProxy(t, p)
+			// TLS 1.2 leaves the content type of an alert record readable on the wire.
+			open := func(t *testing.T, name string, alpn ...string) (*tls.Conn, *recordingConn) {
+				rec := &recordingConn{Conn: connectRaw(t, addr, name+":443")}
+				require.NoError(t, rec.SetDeadline(time.Now().Add(5*time.Second)))
+				tc := tls.Client(rec, &tls.Config{ServerName: name, RootCAs: ca.CertPool(), NextProtos: alpn, MaxVersion: tls.VersionTLS12, MinVersion: tls.VersionTLS12})
+				require.NoError(t, tc.Handshake())
+				return tc, rec
+			}
+			t.Run("a response that closes the connection", func(t *testing.T) {
+				tc, rec := open(t, tlsName, "http/1.1")
+				_, err := io.WriteString(tc, "GET / HTTP/1.1\r\nHost: "+tlsName+"\r\nConnection: close\r\n\r\n")
+				require.NoError(t, err)
+				got, _ := io.ReadAll(tc)
+				require.Contains(t, string(got), "routed")
+				assert.Equal(t, byte(tlsAlert), rec.lastRecord())
+			})
+			t.Run("a stream handler that returns", func(t *testing.T) {
+				tc, rec := open(t, "stream.test", "x-test")
+				got, _ := io.ReadAll(tc)
+				require.Equal(t, "bye", string(got))
+				assert.Equal(t, byte(tlsAlert), rec.lastRecord())
+			})
+			t.Run("a connection refused past the handshake", func(t *testing.T) {
+				tc, rec := open(t, tlsName)
+				_, err := tc.Write([]byte{0x00, 0x01, 0x02, 0x03})
+				require.NoError(t, err)
+				_, _ = io.ReadAll(tc)
+				assert.Equal(t, byte(tlsAlert), rec.lastRecord())
+			})
+		},
+	},
+	{
+		id: "rfc9846/6.1/2", name: "the origin closes its write side of a terminated stream",
+		req: "Each party MUST send a \"close_notify\" alert before closing its write side of the connection, unless it has already sent some error alert.  This does not have any effect on its read side of the connection.",
+		run: func(t *testing.T) {
+			originCA, err := GenerateCA()
+			require.NoError(t, err)
+			cert, err := originCA.Leaf(tlsUpstream)
+			require.NoError(t, err)
+			rest := make(chan string, 1)
+			origin, _ := tlsOrigin(t, cert, nil, func(tc *tls.Conn) {
+				_, _ = io.WriteString(tc, "hi")
+				_ = tc.CloseWrite()
+				got, _ := io.ReadAll(tc)
+				rest <- string(got)
+			})
+			p, ca := upstreamProxy(t, origin, originCA.CertPool())
+			rec := &recordingConn{Conn: connectRaw(t, startProxy(t, p), tlsUpstream+":443")}
+			require.NoError(t, rec.SetDeadline(time.Now().Add(5*time.Second)))
+			tc := tls.Client(rec, &tls.Config{ServerName: tlsUpstream, RootCAs: ca.CertPool(), NextProtos: []string{"x-test"}, MaxVersion: tls.VersionTLS12, MinVersion: tls.VersionTLS12})
+			require.NoError(t, tc.Handshake())
+
+			got, err := io.ReadAll(tc)
+			require.NoError(t, err)
+			assert.Equal(t, "hi", string(got))
+			assert.Equal(t, byte(tlsAlert), rec.lastRecord())
+
+			_, err = io.WriteString(tc, "after")
+			require.NoError(t, err)
+			require.NoError(t, tc.CloseWrite())
+			select {
+			case got := <-rest:
+				assert.Equal(t, "after", got)
+			case <-time.After(5 * time.Second):
+				t.Fatal("the origin never read the end of the stream")
+			}
+		},
+	},
+	{
+		id: "rfc9846/6.2/1", name: "a ClientHello the proxy refuses",
+		req: "Whenever an implementation encounters a fatal error condition, it SHOULD send an appropriate fatal alert and MUST close the connection without sending or receiving any additional data.",
+		run: func(t *testing.T) {
+			t.Run("an Encrypted Client Hello offer", func(t *testing.T) {
+				p, _ := newTLSProxy(t, WithRejectECH(true))
+				c := connectRaw(t, startProxy(t, p), tlsName+":443")
+				require.NoError(t, c.SetDeadline(time.Now().Add(5*time.Second)))
+				_, err := c.Write(echClientHello(t, tlsName, "secret.test"))
+				require.NoError(t, err)
+				typ, _ := firstRecord(t, c)
+				assert.Equal(t, byte(tlsAlert), typ)
+			})
+			t.Run("a server name that does not resolve to the destination", func(t *testing.T) {
+				r := &fakeResolver{addrs: map[string][]netip.Addr{tlsName: addrsOf("192.0.2.1")}}
+				p, _ := newTLSProxy(t, WithNameVerification(VerifyReject), WithNameResolver(r))
+				addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) {
+					return netip.MustParseAddrPort("127.0.0.1:443"), nil
+				})
+				c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+				require.NoError(t, err)
+				t.Cleanup(func() { _ = c.Close() })
+				require.NoError(t, c.SetDeadline(time.Now().Add(5*time.Second)))
+				_, err = c.Write(captureClientHello(t, &tls.Config{ServerName: tlsName, InsecureSkipVerify: true, MinVersion: tls.VersionTLS12}))
+				require.NoError(t, err)
+				typ, _ := firstRecord(t, c)
+				assert.Equal(t, byte(tlsAlert), typ)
+			})
+		},
+	},
+
+	// RFC 9846 section 9, compliance requirements.
+	{
+		id: "rfc9846/9.2/1", name: "a ClientHello without a server name and no destination",
+		req: "Servers requiring this extension SHOULD respond to a ClientHello lacking a \"server_name\" extension by terminating the connection with a \"missing_extension\" alert.",
+		run: func(t *testing.T) {
+			p, _ := newTLSProxy(t)
+			c := redirectedConn(t, p)
+			_, err := c.Write(captureClientHello(t, &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12}))
+			require.NoError(t, err)
+			typ, alert := firstRecord(t, c)
+			assert.Equal(t, [2]byte{tlsAlert, 109}, [2]byte{typ, alert})
+		},
+	},
+	{
+		id: "rfc9846/9.3/1", name: "a ClientHello fragmented across records and writes",
+		req: "A middlebox which terminates a TLS connection MUST behave as a compliant TLS server (to the original client), including having a certificate which the client is willing to accept, and also as a compliant TLS client (to the original server), including verifying the original server's certificate.",
+		run: func(t *testing.T) {
+			ones := func(n int) []int {
+				s := make([]int, n)
+				for i := range s {
+					s[i] = 1
+				}
+				return s
+			}
+			frames := []struct {
+				frame func(msg []byte) [][]byte
+				name  string
+			}{
+				{name: "the body across two records", frame: func(m []byte) [][]byte { return [][]byte{records(m, tls.VersionTLS10, 64)} }},
+				{name: "the handshake header across two records", frame: func(m []byte) [][]byte { return [][]byte{records(m, tls.VersionTLS10, 2)} }},
+				{name: "one byte per record", frame: func(m []byte) [][]byte { return [][]byte{records(m, tls.VersionTLS10, ones(len(m))...)} }},
+				{name: "each record in its own write", frame: func(m []byte) [][]byte { return eachRecord(records(m, tls.VersionTLS10, 64, 64)) }},
+				{name: "a record header apart from its body", frame: func(m []byte) [][]byte {
+					raw := records(m, tls.VersionTLS10)
+					return [][]byte{raw[:5], raw[5:]}
+				}},
+			}
+			// A ClientHello the peek cannot read is placed on the CONNECT destination or the
+			// decided entry, and the handshake completes anyway. Rejecting Encrypted Client
+			// Hello refuses it, so the handshake fails when the peek does.
+			entries := []struct {
+				dial   func(t *testing.T, p *Proxy, ca *CA) net.Conn
+				name   string
+				server string
+				reject bool
+			}{
+				{name: "a redirected connection", server: tlsName, dial: func(t *testing.T, p *Proxy, _ *CA) net.Conn {
+					return redirectedConn(t, p)
+				}},
+				{name: "a CONNECT over HTTP/3", server: tlsName, reject: true, dial: func(t *testing.T, p *Proxy, ca *CA) net.Conn {
+					front, _ := startQUICFront(t, p, ca)
+					return h3Connect(t, front, ca, tlsName+":443")
+				}},
+				{name: "a CONNECT over HTTP/2", server: tlsName, reject: true, dial: func(t *testing.T, p *Proxy, ca *CA) net.Conn {
+					return h2Connect(t, startTLSFront(t, p, ca, "h2"), ca, tlsName+":443")
+				}},
+				{name: "a CONNECT over HTTP/1.1", server: tlsName, reject: true, dial: func(t *testing.T, p *Proxy, _ *CA) net.Conn {
+					return connectRaw(t, startProxy(t, p), tlsName+":443")
+				}},
+				{name: "a SOCKS5 CONNECT", server: tlsName, reject: true, dial: func(t *testing.T, p *Proxy, _ *CA) net.Conn {
+					w := socksConnect(t, startSOCKS5(t, p), socksNameBytes(tlsName, 443))
+					require.Equal(t, byte(0), w.readReply()[1])
+					return w.conn
+				}},
+				{name: "STARTTLS", server: tlsDB, reject: true, dial: func(t *testing.T, p *Proxy, _ *CA) net.Conn {
+					p.MustAdd[TCP](tlsDB, startTLSLine)
+					conn := connectRaw(t, startProxy(t, p), tlsDB+":5432")
+					require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+					_, err := io.WriteString(conn, "STARTTLS\n")
+					require.NoError(t, err)
+					ok := make([]byte, len("OK\n"))
+					_, err = io.ReadFull(conn, ok)
+					require.NoError(t, err)
+					require.Equal(t, "OK\n", string(ok))
+					return conn
+				}},
+			}
+			for _, f := range frames {
+				frame := func(b []byte) [][]byte { return f.frame(handshakeFromRecords(b)) }
+				t.Run(f.name, func(t *testing.T) {
+					for _, e := range entries {
+						t.Run(e.name, func(t *testing.T) {
+							t.Parallel()
+							p, ca := newTLSProxy(t, WithRejectECH(e.reject))
+							conn := e.dial(t, p, ca)
+							require.NoError(t, conn.SetDeadline(time.Now().Add(time.Second)))
+							ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+							defer cancel()
+							tc := tls.Client(&helloConn{Conn: conn, frame: frame}, &tls.Config{ServerName: e.server, RootCAs: ca.CertPool(), MinVersion: tls.VersionTLS12})
+							assert.NoError(t, tc.HandshakeContext(ctx))
+						})
+					}
+				})
+			}
+		},
+	},
+	{
+		id: "rfc9846/9.3/2", name: "a ClientHello with an unknown extension and cipher suite",
+		req: "A server receiving a ClientHello MUST correctly ignore all unrecognized cipher suites, extensions, and other parameters.",
+		run: func(t *testing.T) {
+			hello := spliceHello(t, captureClientHello(t, &tls.Config{ServerName: tlsName, InsecureSkipVerify: true, MinVersion: tls.VersionTLS12}), 0x1a1a, 0x1a1a, []byte{0xab, 0xcd})
+			for _, reject := range []bool{false, true} {
+				t.Run(fmt.Sprintf("rejecting ECH %t", reject), func(t *testing.T) {
+					p, _ := newTLSProxy(t, WithRejectECH(reject))
+					c := redirectedConn(t, p)
+					_, err := c.Write(hello)
+					require.NoError(t, err)
+					typ, _ := firstRecord(t, c)
+					assert.Equal(t, byte(tlsHandshakeRecord), typ, "the proxy did not answer the ClientHello")
+				})
+			}
+		},
+	},
+	{
+		id: "rfc9846/9.3/3", name: "a client verifying the leaf the proxy presents",
+		req: "A middlebox which terminates a TLS connection MUST behave as a compliant TLS server (to the original client), including having a certificate which the client is willing to accept, and also as a compliant TLS client (to the original server), including verifying the original server's certificate.",
+		run: func(t *testing.T) {
+			p, ca := newTLSProxy(t)
+			p.MustAdd("127.0.0.1/*{any}", noopHandler)
+			p.MustAdd("[::1]/*{any}", noopHandler)
+			addr := startProxy(t, p)
+			cases := []struct {
+				name, authority string
+				cfg             *tls.Config
+			}{
+				{name: "a name and its server name", authority: tlsName + ":443", cfg: &tls.Config{ServerName: tlsName}},
+				{name: "an IPv4 address", authority: "127.0.0.1:443", cfg: &tls.Config{ServerName: "127.0.0.1"}},
+				{name: "an IPv6 address", authority: "[::1]:443", cfg: &tls.Config{ServerName: "::1"}},
+				{name: "a name without a server name", authority: tlsName + ":443", cfg: &tls.Config{
+					InsecureSkipVerify: true,
+					VerifyConnection: func(cs tls.ConnectionState) error {
+						inter := x509.NewCertPool()
+						for _, c := range cs.PeerCertificates[1:] {
+							inter.AddCert(c)
+						}
+						_, err := cs.PeerCertificates[0].Verify(x509.VerifyOptions{DNSName: tlsName, Roots: ca.CertPool(), Intermediates: inter})
+						return err
+					},
+				}},
+			}
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					tc.cfg.RootCAs = ca.CertPool()
+					tc.cfg.MinVersion = tls.VersionTLS12
+					conn := connectRaw(t, addr, tc.authority)
+					require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+					assert.NoError(t, tls.Client(conn, tc.cfg).Handshake())
+				})
+			}
+			t.Run("a name once a CONNECT reached it with a trailing dot", func(t *testing.T) {
+				p, ca := newTLSProxy(t)
+				addr := startProxy(t, p)
+				presented(t, addr, tlsName+".:443", "")
+				conn := connectRaw(t, addr, tlsName+":443")
+				require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+				assert.NoError(t, tls.Client(conn, &tls.Config{ServerName: tlsName, RootCAs: ca.CertPool(), MinVersion: tls.VersionTLS12}).Handshake())
+			})
+		},
+	},
+	{
+		id: "rfc9846/9.3/4", name: "an origin with a certificate from an authority the proxy does not trust",
+		req: "A middlebox which terminates a TLS connection MUST behave as a compliant TLS server (to the original client), including having a certificate which the client is willing to accept, and also as a compliant TLS client (to the original server), including verifying the original server's certificate.",
+		run: func(t *testing.T) {
+			originCA, err := GenerateCA()
+			require.NoError(t, err)
+			trusted, err := GenerateCA()
+			require.NoError(t, err)
+			cert, err := originCA.Leaf(tlsUpstream)
+			require.NoError(t, err)
+			origin, hellos := tlsOrigin(t, cert, nil, nil)
+			p, ca := upstreamProxy(t, origin, trusted.CertPool())
+			addr := startProxy(t, p)
+			for _, alpn := range []string{"http/1.1", "x-test"} {
+				t.Run(alpn, func(t *testing.T) {
+					conn := connectRaw(t, addr, tlsUpstream+":443")
+					require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+					tc := tls.Client(conn, &tls.Config{ServerName: tlsUpstream, RootCAs: ca.CertPool(), NextProtos: []string{alpn}, MinVersion: tls.VersionTLS12})
+					require.NoError(t, tc.Handshake())
+					refusedUpstream(t, tc, tlsUpstream)
+					assert.Error(t, nextHello(t, hellos).err)
+				})
+			}
+			t.Run("STARTTLS", func(t *testing.T) {
+				cert, err := originCA.Leaf(tlsDB)
+				require.NoError(t, err)
+				origin, hellos := upgradingOrigin(t, cert)
+				p, ca := upstreamProxy(t, origin, trusted.CertPool())
+				refusedUpstream(t, upgradedClient(t, startProxy(t, p), ca), tlsUpstream)
+				assert.Error(t, nextHello(t, hellos).err)
+			})
+		},
+	},
+
+	// RFC 9846 appendix E.5, security restrictions related to backward compatibility.
+	{
+		id: "rfc9846/E.5/1", name: "a peer offering TLS 1.1 at most",
+		req: "The security of SSL 2.0 [SSL2], SSL 3.0 [RFC6101], TLS 1.0 [RFC2246], and TLS 1.1 [RFC4346] are considered insufficient for the reasons enumerated in [RFC6176], [RFC7568], and [RFC8996] and they MUST NOT be negotiated for any reason.",
+		run: func(t *testing.T) {
+			old := &tls.Config{ServerName: tlsName, InsecureSkipVerify: true, MinVersion: tls.VersionTLS10, MaxVersion: tls.VersionTLS11}
+			t.Run("a client through a CONNECT", func(t *testing.T) {
+				p, _ := newTLSProxy(t)
+				conn := connectRaw(t, startProxy(t, p), tlsName+":443")
+				require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+				assert.ErrorContains(t, tls.Client(conn, old.Clone()).Handshake(), "protocol version")
+			})
+			t.Run("a client of the TLS front", func(t *testing.T) {
+				p, ca := newTLSProxy(t)
+				addr, _ := startProxyTLS(t, p, ca)
+				conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+				require.NoError(t, err)
+				t.Cleanup(func() { _ = conn.Close() })
+				require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+				assert.ErrorContains(t, tls.Client(conn, old.Clone()).Handshake(), "protocol version")
+			})
+			t.Run("an origin", func(t *testing.T) {
+				originCA, err := GenerateCA()
+				require.NoError(t, err)
+				cert, err := originCA.Leaf(tlsUpstream)
+				require.NoError(t, err)
+				origin, hellos := tlsOrigin(t, cert, func(c *tls.Config) {
+					c.MinVersion, c.MaxVersion = tls.VersionTLS10, tls.VersionTLS11
+				}, nil)
+				p, ca := upstreamProxy(t, origin, originCA.CertPool())
+				conn := connectRaw(t, startProxy(t, p), tlsUpstream+":443")
+				require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+				tc := tls.Client(conn, &tls.Config{ServerName: tlsUpstream, RootCAs: ca.CertPool(), NextProtos: []string{"http/1.1"}, MinVersion: tls.VersionTLS12})
+				require.NoError(t, tc.Handshake())
+				refusedUpstream(t, tc, tlsUpstream)
+				assert.Error(t, nextHello(t, hellos).err, "the proxy negotiated TLS 1.1 with the origin")
+			})
+		},
+	},
 }

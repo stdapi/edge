@@ -187,6 +187,72 @@ func TestReassembler_RejectsGarbage(t *testing.T) {
 	assert.ErrorIs(t, err, quicsniff.ErrUnsupportedVersion)
 }
 
+func TestCloseInitial(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		version quic.Version
+		code    uint64
+	}{
+		{"v1 CONNECTION_REFUSED", quic.Version1, 0x02},
+		{"v2 CONNECTION_REFUSED", quic.Version2, 0x02},
+		{"v1 no_application_protocol", quic.Version1, 0x178},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = pc.Close() })
+
+			dialed := make(chan error, 1)
+			go func() {
+				conn, err := quic.DialAddr(t.Context(), pc.LocalAddr().String(),
+					&tls.Config{ServerName: "close.test", NextProtos: []string{"h3"}, MinVersion: tls.VersionTLS13},
+					&quic.Config{Versions: []quic.Version{tc.version}, HandshakeIdleTimeout: 2 * time.Second})
+				if err == nil {
+					_ = conn.CloseWithError(0, "")
+				}
+				dialed <- err
+			}()
+
+			buf := make([]byte, 2048)
+			require.NoError(t, pc.SetReadDeadline(time.Now().Add(2*time.Second)))
+			n, client, err := pc.ReadFrom(buf)
+			require.NoError(t, err)
+			version, odcid, scid, ok := quicsniff.ParseLongHeader(buf[:n])
+			require.True(t, ok)
+			require.Equal(t, uint32(tc.version), version)
+
+			pkt, err := quicsniff.CloseInitial(version, odcid, scid, []byte{1, 2, 3, 4, 5, 6, 7, 8}, tc.code)
+			require.NoError(t, err)
+			_, err = pc.WriteTo(pkt, client)
+			require.NoError(t, err)
+
+			err = <-dialed
+			te, ok := errors.AsType[*quic.TransportError](err)
+			require.True(t, ok, "the dial ended without a CONNECTION_CLOSE: %v", err)
+			assert.True(t, te.Remote)
+			assert.Equal(t, quic.TransportErrorCode(tc.code), te.ErrorCode)
+		})
+	}
+}
+
+func TestParseInvariantHeader(t *testing.T) {
+	dcid := bytes.Repeat([]byte{1}, 21)
+	scid := bytes.Repeat([]byte{2}, 255)
+	packet := append([]byte{0xc0, 0x1a, 0x2a, 0x3a, 0x4a, byte(len(dcid))}, dcid...)
+	packet = append(packet, byte(len(scid)))
+	packet = append(packet, scid...)
+
+	_, _, _, ok := quicsniff.ParseLongHeader(packet)
+	assert.False(t, ok, "a connection ID past 20 bytes")
+	version, gotDCID, gotSCID, ok := quicsniff.ParseInvariantHeader(packet)
+	require.True(t, ok)
+	assert.Equal(t, uint32(0x1a2a3a4a), version)
+	assert.Equal(t, dcid, gotDCID)
+	assert.Equal(t, scid, gotSCID)
+	_, _, _, ok = quicsniff.ParseInvariantHeader(packet[:len(packet)-1])
+	assert.False(t, ok, "a truncated source connection ID")
+}
+
 func TestParseLongHeader(t *testing.T) {
 	dcid := []byte{1, 2, 3, 4, 5, 6, 7, 8}
 	scid := []byte{9, 10, 11, 12}

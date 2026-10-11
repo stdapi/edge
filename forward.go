@@ -7,6 +7,7 @@ package edge
 import (
 	"cmp"
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -27,6 +28,7 @@ var hopByHopHeaders = [...]string{
 	"Proxy-Connection",
 	"Keep-Alive",
 	"Proxy-Authenticate",
+	"Proxy-Authentication-Info",
 	"Proxy-Authorization",
 	"Te",
 	"Trailer",
@@ -188,19 +190,50 @@ func (f *forwarder) roundTrip(req *http.Request, proto Protocol, fixed string) (
 	}
 	switch {
 	case proto == HTTP3 && pool.h3 != nil:
-		return pool.h3.RoundTrip(req)
+		resp, err := pool.h3.RoundTrip(req)
+		if err == nil && resp.ContentLength > 0 && resp.Body != nil && resp.Body != http.NoBody &&
+			bodyAllowed(req.Method, resp.StatusCode) {
+			resp.Body = &fullLength{ReadCloser: resp.Body, remaining: resp.ContentLength}
+		}
+		return resp, err
 	case (proto == HTTP2 || proto == HTTP3) && pool.h2 != nil:
 		// Over TLS h2 is reached through ALPN, so an origin that does not offer it is
 		// served over HTTP/1.1 by the same transport.
-		return pool.h2.RoundTrip(req)
+		return pool.refuseProxyAuth(pool.h2.RoundTrip(req))
 	default:
 		if _, ok := req.Header["Te"]; ok {
 			// RFC 9110 10.1.4. Only HTTP/1.1 has connection options, an HTTP/2 or HTTP/3
 			// transport refuses the request when Connection lists one.
 			addConnectionOption(req.Header, "TE")
 		}
-		return pool.h1.RoundTrip(req)
+		return pool.refuseProxyAuth(pool.h1.RoundTrip(req))
 	}
+}
+
+// refuseProxyAuth fails the 407 of a proxy that was sent the request in absolute form. Its
+// challenge is addressed to edge and removed as hop-by-hop, so the client could not answer it.
+func (u *upstreamPool) refuseProxyAuth(resp *http.Response, err error) (*http.Response, error) {
+	if err != nil || !u.absolute || resp.StatusCode != http.StatusProxyAuthRequired {
+		return resp, err
+	}
+	_ = resp.Body.Close()
+	return nil, fmt.Errorf("proxy %w", newRefusal(resp.StatusCode))
+}
+
+// fullLength fails a body that ends before its Content-Length with io.ErrUnexpectedEOF. quic-go
+// ends it cleanly, and Go's HTTP/1.1 and HTTP/2 transports fail it.
+type fullLength struct {
+	io.ReadCloser
+	remaining int64
+}
+
+func (b *fullLength) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	b.remaining -= int64(n)
+	if err == io.EOF && b.remaining > 0 {
+		err = io.ErrUnexpectedEOF
+	}
+	return n, err
 }
 
 func addConnectionOption(h http.Header, option string) {
@@ -297,7 +330,8 @@ func stripHopByHop(h http.Header) {
 		}
 	}
 	for _, name := range hopByHopHeaders {
-		h.Del(name)
+		// Each entry is in canonical form, which Del would compute again.
+		delete(h, name)
 	}
 }
 

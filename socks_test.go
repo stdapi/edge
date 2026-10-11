@@ -725,31 +725,8 @@ func TestSOCKS5_AssociationBindsToTheControlAddress(t *testing.T) {
 	assert.Equal(t, "hello", body, "the declared address is ignored, the control address is what binds")
 }
 
-// A socksConformanceCase is one requirement of RFC 1928 or RFC 1929, checked on the wire
-// against the SOCKS5 front with a scripted client, or against the exit with a scripted
-// upstream proxy. A case that cannot apply states the reason instead of a scenario.
-type socksConformanceCase struct {
-	// id is the section of the source, "rfc1928/6/1".
-	id string
-	// name states what the peer sends.
-	name string
-	// req is the requirement in the words of the RFC.
-	req string
-	// skip gives the reason the case does not apply, or where edge departs from it.
-	skip string
-	run  func(t *testing.T)
-}
-
 func TestConformanceSOCKS5(t *testing.T) {
-	for _, tc := range socksConformance {
-		t.Run(tc.id+" "+tc.name, func(t *testing.T) {
-			if tc.skip != "" {
-				t.Skip(tc.skip)
-			}
-			t.Parallel()
-			tc.run(t)
-		})
-	}
+	runConformance(t, socksConformance)
 }
 
 type socksWire struct {
@@ -1091,7 +1068,9 @@ func readRelay(t *testing.T, relay *net.UDPConn) ([]byte, netip.AddrPort) {
 
 const socksNoEncapsulation = "edge negotiates no authentication and username/password only, and neither defines an encapsulation"
 
-var socksConformance = []socksConformanceCase{
+// socksConformance lists the requirements of RFC 1928 and RFC 1929, checked on the wire against
+// the SOCKS5 front with a scripted client, or against the exit with a scripted upstream proxy.
+var socksConformance = []conformanceCase{
 	{
 		id: "rfc1928/3/1", name: "the client offers GSSAPI, a private method and no authentication",
 		req: "The server selects from one of the methods given in METHODS, and sends a METHOD selection message",

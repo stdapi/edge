@@ -8,6 +8,8 @@ import (
 	"encoding/base64"
 	"net/http"
 	"strings"
+
+	"golang.org/x/net/http/httpguts"
 )
 
 var quoteEscaper = strings.NewReplacer(`\`, `\\`, `"`, `\"`)
@@ -21,9 +23,8 @@ type ProxyAuthenticator interface {
 	// but it is indistinguishable from an unauthenticated request and no revocation can
 	// sweep on it.
 	Authenticate(r *http.Request) (identity string, ok bool)
-	// Challenges returns the Proxy-Authenticate values a 407 carries, one per offered scheme.
-	// Returning none answers 403 instead, which is the honest reply when nothing the client
-	// could present would change the answer.
+	// Challenges returns the Proxy-Authenticate values of a 407 response, one per offered
+	// scheme. If it returns no valid field value, the response is 403 Forbidden.
 	Challenges(r *http.Request) []string
 }
 
@@ -39,10 +40,15 @@ type PasswordAuthenticator interface {
 // username as the identity. The proxy holds no credential of its own: verify looks them up
 // wherever they live, so a password can stay hashed. A nil verify refuses every client.
 //
-// Basic sends the credentials on every request, encoded rather than encrypted, so reach the
-// proxy with [Proxy.ListenAndServeTLS] or they cross the network in the clear. The value
+// Basic sends the credentials unencrypted on every request, so serve the proxy with
+// [Proxy.ListenAndServeTLS] when they cross a network. The value
 // returned is a [PasswordAuthenticator] as well, so the same verify serves a SOCKS5 front.
+//
+// BasicAuth panics if realm contains a control character other than horizontal tab.
 func BasicAuth(realm string, verify func(username, password string) bool) ProxyAuthenticator {
+	if !httpguts.ValidHeaderFieldValue(realm) {
+		panic("edge: BasicAuth realm contains a control character")
+	}
 	return basicAuth{
 		// The realm is a quoted-string, so a quote or a backslash in it would end the header
 		// value early and let the caller write a challenge the proxy never meant to offer.

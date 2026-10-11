@@ -40,7 +40,7 @@ func (p *Proxy) serveWebSocketUpgrade(c *routeCtx, w http.ResponseWriter, r *htt
 		// back as one.
 		if werr := writeResponse(w, r, resp); werr != nil {
 			p.logf(r.Context(), slog.LevelDebug, "write websocket handshake response", sess, werr)
-			abortIfCut(werr)
+			abortIfCut(w, werr)
 		}
 		return
 	}

@@ -217,6 +217,25 @@ func TestTCP_StartTLS_TerminatesAnInBandUpgrade(t *testing.T) {
 	assert.False(t, sess.Stale())
 }
 
+func TestTCP_StartTLS_HandlerReturnSendsCloseNotify(t *testing.T) {
+	p, ca := newTLSProxy(t)
+	p.MustAdd[TCP](tlsDB, startTLSLine)
+	conn := connectRaw(t, startProxy(t, p), tlsDB+":5432")
+	require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+	_, err := io.WriteString(conn, "STARTTLS\n")
+	require.NoError(t, err)
+	ok := make([]byte, len("OK\n"))
+	_, err = io.ReadFull(conn, ok)
+	require.NoError(t, err)
+
+	rec := &recordingConn{Conn: conn}
+	tc := tls.Client(rec, &tls.Config{ServerName: tlsDB, RootCAs: ca.CertPool(), MaxVersion: tls.VersionTLS12, MinVersion: tls.VersionTLS12})
+	got, err := io.ReadAll(tc)
+	require.NoError(t, err)
+	assert.Equal(t, "tls\n", string(got))
+	assert.Equal(t, byte(tlsAlert), rec.lastRecord())
+}
+
 func TestTransparent_StartTLS_TerminatesAnInBandUpgrade(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -402,6 +421,47 @@ func TestTCP_StartTLS_NeedsACertificateAuthority(t *testing.T) {
 	_, err = raw.Write(sslRequest[:])
 	require.NoError(t, err)
 	assert.ErrorIs(t, <-errs, ErrNoCertificateAuthority)
+}
+
+func TestTCP_StartTLS_RefusalLeavesTheConnectionToTheHandler(t *testing.T) {
+	p, err := New()
+	require.NoError(t, err)
+	got := make(chan string, 1)
+	p.MustAdd[TCP](tlsDB, func(c *TCPCtx) error {
+		if _, err := io.ReadFull(c.Client(), make([]byte, len("STARTTLS\n"))); err != nil {
+			return err
+		}
+		if _, err := io.WriteString(c.Client(), "OK\n"); err != nil {
+			return err
+		}
+		serr := c.StartTLS()
+		_, werr := io.WriteString(c.Client(), "454 TLS not available\n")
+		line := make([]byte, len("HELLO AFTER\n"))
+		_, rerr := io.ReadFull(c.Client(), line)
+		got <- fmt.Sprintf("%v %v %v %q", errors.Is(serr, ErrNoCertificateAuthority), werr, rerr, line)
+		return nil
+	})
+	c := connectRaw(t, startProxy(t, p), tlsDB+":5432")
+	require.NoError(t, c.SetDeadline(time.Now().Add(5*time.Second)))
+	_, err = io.WriteString(c, "STARTTLS\n")
+	require.NoError(t, err)
+	_, err = io.ReadFull(c, make([]byte, len("OK\n")))
+	require.NoError(t, err)
+	_, err = io.WriteString(c, "HELLO AFTER\n")
+	require.NoError(t, err)
+
+	want := "\x15\x03\x03\x00\x02\x02\x50454 TLS not available\n"
+	head := make([]byte, len(want))
+	_, err = io.ReadFull(c, head)
+	require.NoError(t, err)
+	assert.Equal(t, want, string(head))
+	assert.Equal(t, `true <nil> <nil> "HELLO AFTER\n"`, <-got)
+
+	// Bytes the handler never reads still leave the alert and the end of the stream intact.
+	_, _ = c.Write(make([]byte, 2*clientHelloPeekSize))
+	time.Sleep(200 * time.Millisecond)
+	_, err = c.Read(make([]byte, 1))
+	assert.ErrorIs(t, err, io.EOF)
 }
 
 func TestTCP_StartTLS_FailsWithoutAHandshake(t *testing.T) {

@@ -626,6 +626,17 @@ func TestTargetFromConnectUDP_PortIsCanonical(t *testing.T) {
 	assert.Equal(t, "443", target.Port)
 }
 
+func TestTargetFromWire_RootDotIsDropped(t *testing.T) {
+	target, err := targetFromWire("Example.Test.", "443")
+	require.NoError(t, err)
+	assert.Equal(t, "example.test", target.Host)
+	target, err = targetFromWire("127.0.0.1.", "443")
+	require.NoError(t, err)
+	assert.Equal(t, "127.0.0.1", target.Host)
+	_, err = targetFromWire(".", "443")
+	assert.Error(t, err)
+}
+
 func TestConnectUDP_NoServerNameGetsTheTargetsCertificate(t *testing.T) {
 	probe, err := net.ListenPacket("udp", "[::1]:0")
 	if err != nil {
@@ -1362,31 +1373,8 @@ func TestConnectUDP_Capsules_CloseEndsAStalledClient(t *testing.T) {
 	}
 }
 
-// A conformance case of CONNECT-UDP is one requirement of RFC 9298, RFC 9297 or RFC 8441,
-// checked by a peer written from the RFC against the front or the exit. A case that cannot
-// apply states the reason instead of a scenario.
-type connectUDPCase struct {
-	// id is the section of the source, "rfc9298/3.1/2".
-	id string
-	// name states what the peer sends.
-	name string
-	// req is the requirement in the words of the RFC.
-	req string
-	// skip gives the reason the case does not apply, or where edge departs from it.
-	skip string
-	run  func(t *testing.T)
-}
-
 func TestConformanceConnectUDP(t *testing.T) {
-	for _, tc := range connectUDPConformance {
-		t.Run(tc.id+" "+tc.name, func(t *testing.T) {
-			if tc.skip != "" {
-				t.Skip(tc.skip)
-			}
-			t.Parallel()
-			tc.run(t)
-		})
-	}
+	runConformance(t, connectUDPConformance)
 }
 
 const (
@@ -1633,22 +1621,32 @@ func (u *udpTunnel) waitEnd(t *testing.T) error {
 	}
 }
 
+// readCapsule reads one capsule, or one HTTP/3 frame, which has the same layout. A stream
+// ending inside one is io.ErrUnexpectedEOF.
+func readCapsule(br *bufio.Reader) (uint64, []byte, error) {
+	typ, err := quicvarint.Read(br)
+	if err != nil {
+		return 0, nil, err
+	}
+	length, err := quicvarint.Read(br)
+	if err == nil && length > 1<<20 {
+		err = fmt.Errorf("a capsule of %d bytes", length)
+	}
+	var value []byte
+	if err == nil {
+		value = make([]byte, length)
+		_, err = io.ReadFull(br, value)
+	}
+	if errors.Is(err, io.EOF) {
+		err = io.ErrUnexpectedEOF
+	}
+	return typ, value, err
+}
+
 func readCapsules(ctx context.Context, r io.Reader, caps chan<- capsuleMsg, end chan<- error) {
 	br := bufio.NewReader(r)
 	for {
-		typ, err := quicvarint.Read(br)
-		var length uint64
-		if err == nil {
-			length, err = quicvarint.Read(br)
-		}
-		if err == nil && length > 1<<20 {
-			err = fmt.Errorf("a capsule of %d bytes", length)
-		}
-		var value []byte
-		if err == nil {
-			value = make([]byte, length)
-			_, err = io.ReadFull(br, value)
-		}
+		typ, value, err := readCapsule(br)
 		if err != nil {
 			end <- err
 			return
@@ -2547,7 +2545,9 @@ func (p h1Peer) capsule(t *testing.T) capsuleMsg {
 	return capsuleMsg{typ: typ, value: value}
 }
 
-var connectUDPConformance = []connectUDPCase{
+// connectUDPConformance lists the requirements of RFC 9298, RFC 9297 and RFC 8441, checked
+// against the front and the exit.
+var connectUDPConformance = []conformanceCase{
 	// RFC 9298, the front as the UDP proxy.
 	{
 		id: "rfc9298/2/1", name: "a tunnel at the default template",
@@ -2901,6 +2901,17 @@ var connectUDPConformance = []connectUDPCase{
 					assert.Error(t, err)
 				})
 			}
+		},
+	},
+	{
+		id: "rfc9110/15.2/1", name: "a 100 and a 103 before the 101 answering the upgrade the exit sends",
+		req: "A client MUST be able to parse one or more 1xx responses received prior to a final response, even if the client does not expect one.",
+		run: func(t *testing.T) {
+			ca, err := GenerateCA()
+			require.NoError(t, err)
+			up := startH1Upstream(t, nil, "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </s.css>; rel=preload\r\n\r\n"+upgraded101)
+			_, err = exitTunnel(t, exitDialer(t, ca), viaH1, up.addr, "192.0.2.1:53")
+			require.NoError(t, err)
 		},
 	},
 	{

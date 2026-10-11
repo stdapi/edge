@@ -26,6 +26,7 @@ import (
 	"github.com/fox-toolkit/edge/internal/stringsutil"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
+	"golang.org/x/net/http/httpguts"
 )
 
 type sessionKey struct{}
@@ -110,12 +111,8 @@ func newServer(p *Proxy) (*server, error) {
 	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 
-	// A client may speak HTTP/2 over plaintext, with the connection preface instead of ALPN.
-	// Without unencrypted HTTP/2 enabled it is answered as if it had sent a request whose
-	// method is "PRI". Both servers can receive one, and for term it is the only HTTP/2
-	// path: an intercepted connection arrives with its TLS already terminated, so even a
-	// client that negotiated h2 through ALPN reaches the server as plaintext carrying the
-	// preface every HTTP/2 connection must start with.
+	// A plaintext HTTP/2 client has no ALPN, so only unencrypted HTTP/2 serves it. A terminated
+	// TLS connection reaches term with its handshake, where ALPN selects the protocol.
 	protocols := new(http.Protocols)
 	protocols.SetHTTP1(true)
 	protocols.SetHTTP2(true)
@@ -181,7 +178,7 @@ func newServer(p *Proxy) (*server, error) {
 		// An OPTIONS * through a tunnel is about the origin, so it is routed like any request.
 		DisableGeneralOptionsHandler: true,
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
-			if sc, ok := c.(*servedConn); ok {
+			if sc := servedConnOf(c); sc != nil {
 				return context.WithValue(ctx, sessionKey{}, sc.sess)
 			}
 			return ctx
@@ -566,17 +563,20 @@ func (p *Proxy) authenticate(w http.ResponseWriter, r *http.Request) (string, bo
 		return identity, true
 	}
 
-	challenges := auth.Challenges(r)
-	if len(challenges) == 0 {
+	header := w.Header()
+	for _, challenge := range auth.Challenges(r) {
+		if !httpguts.ValidHeaderFieldValue(challenge) {
+			p.cfg.logger.LogAttrs(r.Context(), slog.LevelDebug, "edge: challenge dropped, invalid as a field value",
+				slog.String("challenge", challenge))
+			continue
+		}
+		header.Add(HeaderProxyAuthenticate, challenge)
+	}
+	if len(header[HeaderProxyAuthenticate]) == 0 {
 		// Nothing the client could present would change the answer, so asking it to
 		// authenticate would be a lie, and a 407 carrying no challenge is malformed.
 		p.writeStatus(w, r, http.StatusForbidden, "proxy access denied")
 		return "", false
-	}
-
-	header := w.Header()
-	for _, challenge := range challenges {
-		header.Add(HeaderProxyAuthenticate, challenge)
 	}
 	p.writeStatus(w, r, http.StatusProxyAuthRequired, "proxy authentication required")
 	return "", false
@@ -833,7 +833,7 @@ func proxyTarget(r *http.Request, scheme string) (Target, error) {
 		return Target{}, errRequestTargetPort
 	}
 	port = cmp.Or(port, defaultPort(scheme))
-	return Target{Scheme: scheme, Host: stringsutil.ToLowerASCIIString(host), Port: port}, nil
+	return Target{Scheme: scheme, Host: canonicalHost(stringsutil.ToLowerASCIIString(host)), Port: port}, nil
 }
 
 var errRequestTargetPort = errors.New("request target port is not a port")
@@ -846,7 +846,7 @@ func targetFromURL(u *url.URL) (Target, error) {
 		return Target{}, errRequestTargetPort
 	}
 	port = cmp.Or(port, defaultPort(scheme))
-	return Target{Scheme: scheme, Host: stringsutil.ToLowerASCIIString(host), Port: port}, nil
+	return Target{Scheme: scheme, Host: canonicalHost(stringsutil.ToLowerASCIIString(host)), Port: port}, nil
 }
 
 func protoOfRequest(r *http.Request) Protocol {

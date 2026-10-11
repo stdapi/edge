@@ -59,6 +59,8 @@ type originConn struct {
 
 func (c *originConn) OriginalDestination() (netip.AddrPort, error) { return c.origin(c.Conn) }
 
+func (c *originConn) CloseWrite() error { return closeWrite(c.Conn) }
+
 // startTransparentRedirected starts p on a loopback port whose connections report where they
 // were headed.
 func startTransparentRedirected(t *testing.T, p *Proxy, origin func(net.Conn) (netip.AddrPort, error)) string {
@@ -257,7 +259,7 @@ func TestTransparent_RejectClosesTheConnection(t *testing.T) {
 		RootCAs:    ca.CertPool(),
 		MinVersion: tls.VersionTLS12,
 	})
-	require.Error(t, tlsConn.Handshake(), "a rejected authority must not get a handshake")
+	assert.ErrorContains(t, tlsConn.Handshake(), "unrecognized name", "a rejected authority must not get a handshake")
 }
 
 func TestTransparent_TLSWithoutServerNameNeedsTheOriginalDestination(t *testing.T) {
@@ -278,7 +280,7 @@ func TestTransparent_TLSWithoutServerNameNeedsTheOriginalDestination(t *testing.
 		InsecureSkipVerify: true,
 		MinVersion:         tls.VersionTLS12,
 	})
-	require.Error(t, tlsConn.Handshake())
+	assert.ErrorContains(t, tlsConn.Handshake(), "missing extension")
 }
 
 func TestTransparent_OriginalDestinationPlacesTheConnection(t *testing.T) {
@@ -484,7 +486,7 @@ func TestTransparent_OriginalDestinationPointingAtTheListenerIsIgnored(t *testin
 		InsecureSkipVerify: true,
 		MinVersion:         tls.VersionTLS12,
 	})
-	require.Error(t, tlsConn.Handshake())
+	assert.ErrorContains(t, tlsConn.Handshake(), "missing extension")
 	assert.Equal(t, addr, listenerAddr.Load(), "the resolver must have been consulted")
 }
 

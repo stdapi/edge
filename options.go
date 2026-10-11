@@ -107,8 +107,8 @@ func WithProxyAuth(a ProxyAuthenticator) ProxyOption {
 }
 
 // WithErrorHandler sets the handler that turns an [HTTP] handler error into a response. It
-// defaults to [DefaultErrorHandler], which answers 502 Bad Gateway. A handler of another kind
-// has no response to write, so its error is logged instead.
+// defaults to [DefaultErrorHandler]. A handler of another kind has no response to write, so
+// its error is logged instead.
 func WithErrorHandler(handler ErrorHandler) ProxyOption {
 	return proxyOption(func(s sealedOption) error {
 		if handler == nil {

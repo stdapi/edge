@@ -30,6 +30,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/net/http2/hpack"
 )
 
 // upgradeOrigin answers an Upgrade request with 101 and then echoes whatever it is sent,
@@ -528,31 +529,8 @@ func TestUpgrade_WebSocketCloseOnAFailureIsBounded(t *testing.T) {
 	assert.True(t, client.deadlines[len(client.deadlines)-1].IsZero(), "the write deadline is left set")
 }
 
-// A WebSocket conformance case is one requirement of RFC 6455 or RFC 7692 checked between a
-// raw client and a raw origin. A rule an extension could make legal is checked as crossing
-// edge unchanged, and a rule on one hop is checked on edge as the endpoint of that hop.
-type wsConformanceCase struct {
-	// id is the section of the source, "rfc6455/5.2/1".
-	id string
-	// name states what the peer sends.
-	name string
-	// req is the requirement in the words of the RFC.
-	req string
-	// skip gives the reason the case does not apply.
-	skip string
-	run  func(t *testing.T)
-}
-
 func TestConformanceWebSocket(t *testing.T) {
-	for _, tc := range wsConformance {
-		t.Run(tc.id+" "+tc.name, func(t *testing.T) {
-			if tc.skip != "" {
-				t.Skip(tc.skip)
-			}
-			t.Parallel()
-			tc.run(t)
-		})
-	}
+	runConformance(t, wsConformance)
 }
 
 // wsFrame is a frame as it appears on the wire. head is the first byte, FIN, RSV and opcode.
@@ -926,7 +904,10 @@ var badPingHead = []byte{0x89, 0xfe, 0x00, 0x7e, 0x37, 0xfa, 0x21, 0x3d}
 // deflateHello is "Hello" compressed, from RFC 7692 section 7.2.3.1.
 var deflateHello = []byte{0xf2, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00}
 
-var wsConformance = []wsConformanceCase{
+// wsConformance lists the requirements of RFC 6455 and RFC 7692, checked between a raw client
+// and a raw origin. A rule an extension could make legal is checked as crossing edge unchanged,
+// and a rule on one hop is checked on edge as the endpoint of that hop.
+var wsConformance = []conformanceCase{
 	{
 		id: "rfc6455/4.1/1", name: "the key of the client and the accept of the origin",
 		req: "If the response lacks a |Sec-WebSocket-Accept| header field or the |Sec-WebSocket-Accept| contains a value other than the base64-encoded SHA-1 of the concatenation of the |Sec-WebSocket-Key| (as a string, not base64-decoded) with the string \"258EAFA5-E914-47DA-95CA-C5AB0DC85B11\" but ignoring any leading and trailing whitespace, the client MUST _Fail the WebSocket Connection_.",
@@ -1046,8 +1027,22 @@ var wsConformance = []wsConformanceCase{
 	},
 	{
 		id: "rfc9220/3", name: "an extended CONNECT with :protocol websocket over HTTP/3",
-		req:  "If a server advertises support for Extended CONNECT but receives an Extended CONNECT request with a \":protocol\" value that is unknown or is not supported, the server SHOULD respond to the request with a 501 (Not Implemented) status code (Section 15.6.2 of [HTTP]).",
-		skip: "WebSocket is served over HTTP/1.1 only, and edge answers an extended CONNECT for any protocol other than connect-udp with 501, as CLAUDE.md states",
+		req: "If a server advertises support for Extended CONNECT but receives an Extended CONNECT request with a \":protocol\" value that is unknown or is not supported, the server SHOULD respond to the request with a 501 (Not Implemented) status code (Section 15.6.2 of [HTTP]).",
+		run: func(t *testing.T) {
+			b := newProxyBench(t, always(okReply))
+			b.p.MustAdd[WebSocket]("origin.test/chat", func(c *WebSocketCtx) error { return nil })
+			h := b.dialH3Front(t)
+			select {
+			case settings := <-h.settings:
+				require.Equal(t, uint64(1), settings[0x08], "the front advertises Extended CONNECT")
+			case <-time.After(5 * time.Second):
+				t.Fatal("no SETTINGS from the front")
+			}
+			s := h.open(t, h3Headers([]hpack.HeaderField{hf(":method", "CONNECT"), hf(":protocol", "websocket"), hf(":scheme", "https"),
+				hf(":authority", "origin.test"), hf(":path", "/chat"), hf("sec-websocket-version", "13")}))
+			assert.Equal(t, "501", s.message(true).status())
+			assert.Zero(t, b.origin.accepted.Load())
+		},
 	},
 	{
 		id: "rfc6455/5.1/1", name: "an unmasked text frame from the client",

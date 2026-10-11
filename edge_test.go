@@ -323,3 +323,26 @@ func matchRequest(t *testing.T, p *Proxy, scheme, authority string, req *http.Re
 }
 
 func noopStream(*TCPCtx) error { return nil }
+
+// A conformanceCase is a requirement of a specification and the test that checks it.
+type conformanceCase struct {
+	run  func(t *testing.T)
+	id   string // source and section, such as "rfc9110/7.6.1/1"
+	name string // what the peers send
+	req  string // the requirement, quoted from the source
+	skip string // why the case does not apply, or how edge departs from it
+}
+
+func runConformance(t *testing.T, cases []conformanceCase) {
+	for _, tc := range cases {
+		t.Run(tc.id+" "+tc.name, func(t *testing.T) {
+			if tc.skip != "" {
+				t.Skip(tc.skip)
+			}
+			t.Parallel()
+			tc.run(t)
+		})
+	}
+}
+
+func okHandler(*HTTPCtx) (*http.Response, error) { return Text(http.StatusOK, "ok"), nil }

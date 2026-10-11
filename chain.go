@@ -15,6 +15,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"slices"
 	"strconv"
@@ -37,6 +38,8 @@ const (
 	proxyResponseBytes = http.DefaultMaxHeaderBytes
 	// proxyKeepAlive keeps the connection to a proxy open while its tunnels are silent.
 	proxyKeepAlive = 10 * time.Second
+	// maxInformational bounds the 1xx answers a proxy may send ahead of its final answer.
+	maxInformational = 5
 	// proxyRetry is how long the dialer remembers a fact of a proxy, a failed dial or a
 	// version that does not serve a CONNECT.
 	proxyRetry = 5 * time.Minute
@@ -151,12 +154,36 @@ func (u *upstreamDialer) selectProxy(req *http.Request) (*url.URL, error) {
 	}
 	if proxy != nil {
 		switch proxy.Scheme {
-		case "http", "https", "socks5", "socks5h":
+		case "http", "https":
+			if err := checkBasicCredentials(proxy.User); err != nil {
+				return nil, fmt.Errorf("edge: dial %s through %s: %w", req.URL.Host, proxy.Redacted(), err)
+			}
+		case "socks5", "socks5h":
 		default:
 			return nil, fmt.Errorf("edge: dial %s through %s: proxy scheme %q is not supported", req.URL.Host, proxy.Redacted(), proxy.Scheme)
 		}
 	}
 	return proxy, nil
+}
+
+// checkBasicCredentials reports why user cannot be sent as Basic credentials, RFC 7617 section 2.
+func checkBasicCredentials(user *url.Userinfo) error {
+	if user == nil {
+		return nil
+	}
+	name := user.Username()
+	pass, _ := user.Password()
+	if strings.IndexByte(name, ':') >= 0 {
+		return errors.New("a user-id with a colon cannot be sent in Basic credentials")
+	}
+	for _, s := range [...]string{name, pass} {
+		for i := range len(s) {
+			if isASCIIControl(s[i]) {
+				return errors.New("a user-id or password with a control character cannot be sent in Basic credentials")
+			}
+		}
+	}
+	return nil
 }
 
 // proxyFor is selectProxy with a request for the destination alone. scheme is https for TLS
@@ -380,14 +407,29 @@ func (u *upstreamDialer) h3Failed(proxy *url.URL, cc *h3ProxyConn, err error) bo
 	switch {
 	case notServed(err):
 		u.remember(noH3Connect, proxy)
-	case errors.Is(err, errOpenStream) && !isContextErr(err), requestRejected(err), cc.Context().Err() != nil:
+	case errors.Is(err, errOpenStream) && !isContextErr(err), requestRejected(err):
 		// The connection is going away or gone. A connection going away closes itself once
 		// its streams end.
 		u.dropH3Conn(proxy, cc)
+	case cc.Context().Err() != nil:
+		u.dropH3Conn(proxy, cc)
+		return !closedOnError(cc)
 	default:
 		return false
 	}
 	return true
+}
+
+// closedOnError reports whether this end closed the connection on an error, which quic-go does
+// when the proxy breaks the protocol, and the proxy may have processed the request by then.
+func closedOnError(cc *h3ProxyConn) bool {
+	cause := context.Cause(cc.Context())
+	if ae, ok := errors.AsType[*quic.ApplicationError](cause); ok {
+		// H3_NO_ERROR is the close of a connection drained after a GOAWAY.
+		return !ae.Remote && ae.ErrorCode != quic.ApplicationErrorCode(http3.ErrCodeNoError)
+	}
+	te, ok := errors.AsType[*quic.TransportError](cause)
+	return ok && !te.Remote
 }
 
 // requestRejected reports whether the proxy reset the stream with H3_REQUEST_REJECTED, a
@@ -511,9 +553,9 @@ func overTCP[T any](ctx context.Context, u *upstreamDialer, proxy *url.URL, d tc
 }
 
 // connectOn sends a CONNECT to the proxy on conn and returns the connection once the proxy
-// answered 200, with the bytes the proxy sent behind its answer.
+// answered 2xx, with the bytes the proxy sent behind its answer.
 func connectOn(conn net.Conn, proxy *url.URL, addr string) (net.Conn, error) {
-	req := &http.Request{Method: http.MethodConnect, URL: &url.URL{Opaque: addr}, Host: addr, Header: make(http.Header)}
+	req := &http.Request{Method: http.MethodConnect, URL: &url.URL{Opaque: addr}, Host: addr, Header: proxyRequestHeader()}
 	if auth := proxyAuthorization(proxy); auth != "" {
 		req.Header.Set("Proxy-Authorization", auth)
 	}
@@ -521,13 +563,13 @@ func connectOn(conn net.Conn, proxy *url.URL, addr string) (net.Conn, error) {
 		return nil, fmt.Errorf("write CONNECT: %w", err)
 	}
 	br := bufio.NewReader(io.LimitReader(conn, proxyResponseBytes))
-	resp, err := http.ReadResponse(br, req)
+	code, _, err := readAnswer(br)
 	if err != nil {
 		return nil, fmt.Errorf("read CONNECT response: %w", err)
 	}
-	if resp.StatusCode != http.StatusOK {
+	if err := connectAnswer(code, nil); err != nil {
 		// The body is left unread, the caller closes the connection.
-		return nil, fmt.Errorf("CONNECT %w", &refusal{code: resp.StatusCode, status: resp.Status})
+		return nil, fmt.Errorf("CONNECT %w", err)
 	}
 	if br.Buffered() == 0 {
 		return conn, nil
@@ -536,6 +578,61 @@ func connectOn(conn net.Conn, proxy *url.URL, addr string) (net.Conn, error) {
 	// response.
 	early, _ := br.Peek(br.Buffered())
 	return bufferedConn{Conn: conn, r: io.MultiReader(bytes.NewReader(slices.Clone(early)), conn)}, nil
+}
+
+// proxyRequestHeader returns the header of a request to a proxy. Request.Write and quic-go
+// write a User-Agent of their own unless the field is present, and an empty one is omitted.
+func proxyRequestHeader() http.Header {
+	return http.Header{"User-Agent": {""}}
+}
+
+// readAnswer reads the answer of a proxy over HTTP/1.1 up to the end of its header section,
+// past any 1xx other than 101. The framing fields are left unparsed, since a client ignores
+// them in a 2xx to CONNECT, RFC 9110 section 9.3.6.
+func readAnswer(br *bufio.Reader) (int, http.Header, error) {
+	tp := textproto.NewReader(br)
+	for n := 0; ; n++ {
+		line, err := tp.ReadLine()
+		if err != nil {
+			return 0, nil, err
+		}
+		proto, rest, _ := strings.Cut(line, " ")
+		status, _, _ := strings.Cut(rest, " ")
+		code, ok := statusCode(status)
+		if _, _, vok := http.ParseHTTPVersion(proto); !vok || !ok {
+			return 0, nil, fmt.Errorf("malformed status line %q", line)
+		}
+		header, err := tp.ReadMIMEHeader()
+		if err != nil {
+			return 0, nil, err
+		}
+		if finalStatus(code) {
+			return code, http.Header(header), nil
+		}
+		if n == maxInformational {
+			return 0, nil, errors.New("too many 1xx answers")
+		}
+	}
+}
+
+// finalStatus reports whether code ends the answers to a request. A 101 ends them, as in
+// quic-go's client.
+func finalStatus(code int) bool {
+	return code >= 200 || code == http.StatusSwitchingProtocols
+}
+
+func statusCode(s string) (int, bool) {
+	if len(s) != 3 {
+		return 0, false
+	}
+	code := 0
+	for i := range 3 {
+		if s[i] < '0' || s[i] > '9' {
+			return 0, false
+		}
+		code = code*10 + int(s[i]-'0')
+	}
+	return code, code >= 100
 }
 
 // connectOnH2 opens the tunnel as a CONNECT stream on the HTTP/2 connection to the proxy.
@@ -550,16 +647,16 @@ func connectOnH2(ctx context.Context, cc *h2tunnel.Conn, proxy *url.URL, addr st
 	if err != nil {
 		return nil, fmt.Errorf("CONNECT: %w", err)
 	}
-	if resp.StatusCode != http.StatusOK {
+	if err := connectAnswer(resp.StatusCode, resp.Header); err != nil {
 		_ = str.Close()
-		return nil, fmt.Errorf("CONNECT %w", newRefusal(resp.StatusCode))
+		return nil, fmt.Errorf("CONNECT %w", err)
 	}
 	return str, nil
 }
 
 // connectOnH3 opens the tunnel as a CONNECT stream on the HTTP/3 connection to the proxy.
 func connectOnH3(ctx context.Context, cc *h3ProxyConn, proxy *url.URL, addr string) (net.Conn, error) {
-	req := &http.Request{Method: http.MethodConnect, URL: &url.URL{Host: addr}, Host: addr, Header: make(http.Header)}
+	req := &http.Request{Method: http.MethodConnect, URL: &url.URL{Host: addr}, Host: addr, Header: proxyRequestHeader()}
 	if auth := proxyAuthorization(proxy); auth != "" {
 		req.Header.Set("Proxy-Authorization", auth)
 	}
@@ -670,9 +767,9 @@ func connectUDPTargetPath(host, port string) string {
 	return connectUDPPath + strings.ReplaceAll(url.PathEscape(host), ":", "%3A") + "/" + port + "/"
 }
 
-// connectAnswer returns the error of a CONNECT answer other than 200.
+// connectAnswer returns the error of a CONNECT answer other than a 2xx, RFC 9110 section 9.3.6.
 func connectAnswer(code int, _ http.Header) error {
-	if code != http.StatusOK {
+	if code < 200 || code > 299 {
 		return newRefusal(code)
 	}
 	return nil
@@ -697,7 +794,7 @@ func openTunnelOn(ctx context.Context, cc *http3.ClientConn, proxy *url.URL, hos
 	if err != nil {
 		return nil, err
 	}
-	req := &http.Request{Method: http.MethodConnect, Proto: connectUDPUpgrade, URL: target, Host: target.Host, Header: make(http.Header)}
+	req := &http.Request{Method: http.MethodConnect, Proto: connectUDPUpgrade, URL: target, Host: target.Host, Header: proxyRequestHeader()}
 	req.Header.Set(http3.CapsuleProtocolHeader, "?1")
 	if auth := proxyAuthorization(proxy); auth != "" {
 		req.Header.Set("Proxy-Authorization", auth)
@@ -735,6 +832,14 @@ func requestOn(ctx context.Context, cc *http3.ClientConn, req *http.Request, ver
 		return nil, fmt.Errorf("write %s: %w", verb, werr)
 	}
 	resp, err := str.ReadResponse()
+	// Each call reads one header section, and quic-go's own client calls again past a 1xx.
+	for n := 0; err == nil && !finalStatus(resp.StatusCode); n++ {
+		if n == maxInformational {
+			err = errors.New("too many 1xx answers")
+			break
+		}
+		resp, err = str.ReadResponse()
+	}
 	if !stop() {
 		return nil, ctx.Err()
 	}
@@ -888,7 +993,7 @@ func upgradeOn(conn net.Conn, proxy *url.URL, host, port string) (tunnelPipe, er
 	if err != nil {
 		return nil, err
 	}
-	req := &http.Request{Method: http.MethodGet, URL: target, Host: target.Host, Header: make(http.Header)}
+	req := &http.Request{Method: http.MethodGet, URL: target, Host: target.Host, Header: proxyRequestHeader()}
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", connectUDPUpgrade)
 	req.Header.Set(http3.CapsuleProtocolHeader, "?1")
@@ -899,22 +1004,22 @@ func upgradeOn(conn net.Conn, proxy *url.URL, host, port string) (tunnelPipe, er
 		return nil, fmt.Errorf("write CONNECT-UDP: %w", werr)
 	}
 	br := bufio.NewReader(io.LimitReader(conn, proxyResponseBytes))
-	resp, err := http.ReadResponse(br, req)
+	code, header, err := readAnswer(br)
 	if err != nil {
 		return nil, fmt.Errorf("read CONNECT-UDP response: %w", err)
 	}
-	if resp.StatusCode != http.StatusSwitchingProtocols {
+	if code != http.StatusSwitchingProtocols {
 		// The body is left unread, the caller closes the connection.
-		return nil, fmt.Errorf("CONNECT-UDP %w", &refusal{code: resp.StatusCode, status: resp.Status})
+		return nil, fmt.Errorf("CONNECT-UDP %w", newRefusal(code))
 	}
 	// RFC 9298 section 3.3 requires one Upgrade value and the upgrade option in Connection.
-	if upgrade := resp.Header.Values("Upgrade"); len(upgrade) != 1 || !strings.EqualFold(upgrade[0], connectUDPUpgrade) {
+	if upgrade := header.Values("Upgrade"); len(upgrade) != 1 || !strings.EqualFold(upgrade[0], connectUDPUpgrade) {
 		return nil, errors.New("CONNECT-UDP upgraded to " + strings.Join(upgrade, ", "))
 	}
-	if !httpguts.HeaderValuesContainsToken(resp.Header["Connection"], "upgrade") {
+	if !httpguts.HeaderValuesContainsToken(header["Connection"], "upgrade") {
 		return nil, errors.New("CONNECT-UDP upgraded without the upgrade option in Connection")
 	}
-	if hasContentFields(resp.Header, resp.TransferEncoding) {
+	if hasContentFields(header, nil) {
 		return nil, fmt.Errorf("CONNECT-UDP %w with content fields", errMalformedAnswer)
 	}
 	// Capsules the proxy sent right behind the 101 may already be in the buffer.

@@ -369,7 +369,7 @@ func TestQUIC_NameVerificationRejectsALyingServerName(t *testing.T) {
 		NextProtos: []string{"h3"},
 		MinVersion: tls.VersionTLS13,
 	}, &quic.Config{HandshakeIdleTimeout: 1500 * time.Millisecond})
-	require.Error(t, err, "a refused connection gets silence, so the handshake must time out")
+	wantClosedWith(t, err, quicUnrecognizedName)
 	assert.Equal(t, int32(1), r.calls.Load())
 }
 

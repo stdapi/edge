@@ -5,6 +5,7 @@
 package edge
 
 import (
+	"io"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -61,6 +62,11 @@ type routeCtx struct {
 	w    http.ResponseWriter
 	req  *http.Request
 	sess *Session
+	// client is the request as the server read it and body is its body, which a handler may
+	// replace on the request. Only dispatch sets them, since a gRPC call routes each message
+	// again from the transport while its handler swaps the body.
+	client *http.Request
+	body   io.ReadCloser
 
 	params    *[]string
 	skipStack *skipStack
@@ -90,6 +96,8 @@ type routeCtx struct {
 
 func (c *routeCtx) reset(sess *Session, r *http.Request, scheme, host, port string) {
 	c.req = r
+	c.client = nil
+	c.body = nil
 	c.sess = sess
 	c.scheme = scheme
 	c.host = host

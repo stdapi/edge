@@ -112,7 +112,7 @@ type singleConnListener struct {
 	taken    bool
 }
 
-func newSingleConnListener(c net.Conn, sess *Session) *singleConnListener {
+func newSingleConnListener(c net.Conn, sess *Session, state *tls.ConnectionState) *singleConnListener {
 	l := &singleConnListener{
 		addr:     c.LocalAddr(),
 		done:     make(chan struct{}),
@@ -120,7 +120,11 @@ func newSingleConnListener(c net.Conn, sess *Session) *singleConnListener {
 	}
 	// Closing the connection closes the listener, so the accept loop set up for it returns
 	// instead of blocking forever on a second Accept that will never be served.
-	l.conn = &servedConn{Conn: c, sess: sess, l: l}
+	sc := &servedConn{Conn: c, sess: sess, l: l}
+	l.conn = sc
+	if state != nil {
+		l.conn = &tlsServedConn{servedConn: sc, state: state}
+	}
 	return l
 }
 
@@ -189,6 +193,25 @@ func (c *servedConn) release() {
 		close(c.l.connDone)
 		_ = c.l.Close()
 	})
+}
+
+// tlsServedConn gives http.Server the handshake of a terminated TLS connection, so that ALPN
+// selects HTTP/2 or HTTP/1.1, RFC 7301 section 3.2.
+type tlsServedConn struct {
+	*servedConn
+	state *tls.ConnectionState
+}
+
+func (c *tlsServedConn) ConnectionState() tls.ConnectionState { return *c.state }
+
+func servedConnOf(c net.Conn) *servedConn {
+	switch c := c.(type) {
+	case *servedConn:
+		return c
+	case *tlsServedConn:
+		return c.servedConn
+	}
+	return nil
 }
 
 // cancelConn fires the cancel of the session context from Close. Every close path in
@@ -334,10 +357,12 @@ type h2Stream struct {
 	local   net.Addr
 	remote  net.Addr
 
-	cmu     sync.Mutex
-	wmu     sync.Mutex
-	closed  atomic.Bool
-	aborted atomic.Bool
+	cmu      sync.Mutex
+	wmu      sync.Mutex
+	closed   atomic.Bool
+	aborted  atomic.Bool
+	sent     bool // guarded by wmu
+	finished bool // guarded by cmu
 }
 
 func newH2Stream(w http.ResponseWriter, r *http.Request, local, remote net.Addr) *h2Stream {
@@ -352,13 +377,22 @@ func (s *h2Stream) Read(b []byte) (int, error) {
 	if s.closed.Load() {
 		return 0, net.ErrClosed
 	}
-	return s.r.Read(b)
+	n, err := s.r.Read(b)
+	if err != nil {
+		if se, ok := errors.AsType[*quic.StreamError](err); ok && se.Remote {
+			// RFC 9114 4.4, a client resetting its direction has the proxy reset the other.
+			if hs, ok := s.w.(http3.HTTPStreamer); ok {
+				s.reset(hs, http3.ErrCodeRequestCanceled)
+			}
+		}
+	}
+	return n, err
 }
 
 func (s *h2Stream) Write(b []byte) (int, error) {
 	s.wmu.Lock()
 	defer s.wmu.Unlock()
-	if s.closed.Load() {
+	if s.closed.Load() || s.sent {
 		return 0, net.ErrClosed
 	}
 
@@ -405,22 +439,51 @@ func (s *h2Stream) Abort() {
 		_ = s.Close()
 		return
 	}
+	s.reset(hs, http3.ErrCodeConnectError)
+}
+
+func (s *h2Stream) reset(hs http3.HTTPStreamer, code http3.ErrCode) {
 	s.cmu.Lock()
 	defer s.cmu.Unlock()
+	if s.finished {
+		return
+	}
 	// HTTPStream flushes the response writer, so stop first ends any write in flight. Closing
 	// the body cancels the read with a code of its own, so it comes last.
 	open := s.stop()
 	str := hs.HTTPStream()
-	str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeConnectError))
-	str.CancelRead(quic.StreamErrorCode(http3.ErrCodeConnectError))
+	str.CancelWrite(quic.StreamErrorCode(code))
+	str.CancelRead(quic.StreamErrorCode(code))
 	if open {
 		_ = s.body.Close()
 	}
 }
 
-// CloseWrite ends the proxy-to-client direction. An HTTP/2 stream has no way to do that
-// without ending the stream, so it is a no-op and the stream is torn down by Close.
-func (s *h2Stream) CloseWrite() error { return nil }
+// finish keeps reset off the response writer, which is invalid once the handler returns.
+func (s *h2Stream) finish() {
+	s.cmu.Lock()
+	defer s.cmu.Unlock()
+	s.finished = true
+}
+
+// CloseWrite ends the proxy-to-client direction of an HTTP/3 stream, which goes on receiving. An
+// HTTP/2 handler cannot end its half of a stream alone, so on HTTP/2 it is a no-op.
+func (s *h2Stream) CloseWrite() error {
+	hs, ok := s.w.(http3.HTTPStreamer)
+	if !ok {
+		return nil
+	}
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	if s.closed.Load() {
+		return net.ErrClosed
+	}
+	if s.sent {
+		return nil
+	}
+	s.sent = true
+	return hs.HTTPStream().Close()
+}
 
 func (s *h2Stream) LocalAddr() net.Addr  { return s.local }
 func (s *h2Stream) RemoteAddr() net.Addr { return s.remote }

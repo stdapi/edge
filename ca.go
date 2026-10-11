@@ -52,8 +52,8 @@ type CA struct {
 	inflight map[string]*mintCall
 	certDER  []byte
 
-	leafPubDER []byte
-	leafTTL    time.Duration
+	leafKeyID []byte
+	leafTTL   time.Duration
 
 	mu sync.Mutex
 }
@@ -166,9 +166,9 @@ func NewCA(cert *x509.Certificate, key crypto.Signer, opts ...CAOption) (*CA, er
 	if err != nil {
 		return nil, fmt.Errorf("generate leaf key: %w", err)
 	}
-	leafPubDER, err := x509.MarshalPKIXPublicKey(leafKey.Public())
+	leafKeyID, err := subjectKeyID(leafKey.Public())
 	if err != nil {
-		return nil, fmt.Errorf("marshal leaf public key: %w", err)
+		return nil, err
 	}
 
 	cache, err := simplelru.NewLRU[string, *tls.Certificate](cfg.cacheSize, nil)
@@ -177,14 +177,14 @@ func NewCA(cert *x509.Certificate, key crypto.Signer, opts ...CAOption) (*CA, er
 	}
 
 	return &CA{
-		cert:       cert,
-		key:        key,
-		certDER:    cert.Raw,
-		leafKey:    leafKey,
-		leafPubDER: leafPubDER,
-		leafTTL:    cfg.leafTTL,
-		cache:      cache,
-		inflight:   make(map[string]*mintCall),
+		cert:      cert,
+		key:       key,
+		certDER:   cert.Raw,
+		leafKey:   leafKey,
+		leafKeyID: leafKeyID,
+		leafTTL:   cfg.leafTTL,
+		cache:     cache,
+		inflight:  make(map[string]*mintCall),
 	}, nil
 }
 
@@ -303,7 +303,8 @@ func (ca *CA) CertPool() *x509.CertPool {
 }
 
 // Leaf returns a certificate for host, minting and caching one on the first call. host is a
-// hostname or an IP literal, without a port.
+// hostname or an IP literal, without a port. Leaf returns an error for a hostname outside the
+// preferred name syntax of RFC 1123 section 2.1.
 func (ca *CA) Leaf(host string) (*tls.Certificate, error) {
 	key := leafCacheKey(host)
 	if key == "" {
@@ -326,7 +327,7 @@ func (ca *CA) Leaf(host string) (*tls.Certificate, error) {
 	ca.inflight[key] = call
 	ca.mu.Unlock()
 
-	call.cert, call.err = ca.mint(host)
+	call.cert, call.err = ca.mint(key)
 
 	ca.mu.Lock()
 	if call.err == nil {
@@ -340,6 +341,10 @@ func (ca *CA) Leaf(host string) (*tls.Certificate, error) {
 }
 
 func (ca *CA) mint(host string) (*tls.Certificate, error) {
+	ip := net.ParseIP(host)
+	if ip == nil && !isPreferredName(host) {
+		return nil, fmt.Errorf("%w: %q is not a valid DNS name", ErrInvalidConfig, host)
+	}
 	serial, err := randomSerial()
 	if err != nil {
 		return nil, err
@@ -351,12 +356,13 @@ func (ca *CA) mint(host string) (*tls.Certificate, error) {
 		Subject:               pkix.Name{CommonName: host},
 		NotBefore:             now.Add(-clockSkew),
 		NotAfter:              now.Add(ca.leafTTL),
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		KeyUsage:              x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		BasicConstraintsValid: true,
+		SubjectKeyId:          ca.leafKeyID,
 	}
 
-	if ip := net.ParseIP(host); ip != nil {
+	if ip != nil {
 		tmpl.IPAddresses = []net.IP{ip}
 		// A certificate for an IP has no meaningful common name, and some stacks reject a
 		// CN that is not a DNS name.
@@ -403,6 +409,30 @@ func leafCacheKey(host string) string {
 		return ip.String()
 	}
 	return stringsutil.ToLowerASCIIString(host)
+}
+
+// isPreferredName reports whether name follows the preferred name syntax of RFC 1123 section
+// 2.1, which RFC 5280 requires of a dNSName.
+func isPreferredName(name string) bool {
+	if len(name) > 253 {
+		return false
+	}
+	start := 0
+	for i := 0; i <= len(name); i++ {
+		if i < len(name) && name[i] != '.' {
+			switch c := name[i]; {
+			case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == '-':
+				continue
+			}
+			return false
+		}
+		label := name[start:i]
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		start = i + 1
+	}
+	return true
 }
 
 func randomSerial() (*big.Int, error) {

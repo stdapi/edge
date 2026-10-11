@@ -56,8 +56,14 @@ func (t *iTree) route(c *routeCtx, lazy bool) *entry {
 	return t.p.cfg.noEntryFor(c)
 }
 
+// canonicalHost returns host without its root label, or an empty string for a host ending in
+// an empty label, which no entry can admit.
 func canonicalHost(host string) string {
-	return strings.TrimSuffix(host, ".")
+	host = strings.TrimSuffix(host, ".")
+	if strings.HasSuffix(host, ".") {
+		return ""
+	}
+	return host
 }
 
 // lookupTarget is the single entry of both lookups, the request routing and the admission

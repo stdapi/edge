@@ -255,8 +255,8 @@ func targetFromConnectUDP(r *http.Request) (Target, error) {
 // hostname or an address, an IPv6 one unbracketed. The pair must survive a rejoin, or the
 // authority written back would not be the one routed on.
 func targetFromWire(host, port string) (Target, error) {
-	host = stringsutil.ToLowerASCIIString(host)
-	if strings.ContainsAny(host, "/[] ") {
+	host = canonicalHost(stringsutil.ToLowerASCIIString(host))
+	if host == "" || strings.ContainsAny(host, "/[] ") {
 		return Target{}, errors.New("target host is not a hostname or an address")
 	}
 	if strings.Contains(host, ":") {

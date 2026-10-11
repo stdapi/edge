@@ -3,10 +3,13 @@ package edge
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/binary"
 	"net"
 	"net/http"
+	"slices"
+	"strings"
 
 	"golang.org/x/net/http2/hpack"
 )
@@ -18,17 +21,28 @@ const h2HeaderTableSize = 4096
 // h2MaxReadFrameSize is the largest frame the front's HTTP/2 server reads.
 const h2MaxReadFrameSize = 1 << 20
 
-// schemeHeader is the field a schemeConn adds to an HTTP/2 request for its :scheme.
-const schemeHeader = "Edge-Scheme"
+// schemeName is the name of the field a schemeConn adds to an HTTP/2 request for its
+// :scheme. It is random per process, so that no client can send it.
+var schemeName = "edge-scheme-" + strings.ToLower(rand.Text())
+
+var schemeHeader = http.CanonicalHeaderKey(schemeName)
 
 // The field as a never-indexed literal, which leaves the HPACK table of both ends as the
-// client left it. Its value is one byte, so the length of a frame is decided before its
-// :scheme is decoded.
-const (
-	schemeFieldHTTP  = "\x10\x0bedge-scheme\x01h"
-	schemeFieldHTTPS = "\x10\x0bedge-scheme\x01s"
-	schemeFieldNone  = "\x10\x0bedge-scheme\x01-"
+// client left it. Its value is one byte, so a frame grows by one length whatever its
+// :scheme.
+var (
+	schemeFieldHTTP  = schemeField('h')
+	schemeFieldHTTPS = schemeField('s')
+	schemeFieldNone  = schemeField('-')
 )
+
+func schemeField(code byte) string {
+	return string(slices.Concat([]byte{0x10, byte(len(schemeName))}, []byte(schemeName), []byte{1, code})) //nolint:gosec // schemeName is 38 bytes
+}
+
+// schemeOutKeep is the capacity of the output buffer a schemeConn keeps once drained. A
+// frame held in full may grow it to h2MaxReadFrameSize.
+const schemeOutKeep = 64 << 10
 
 const h2Preface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 
@@ -71,11 +85,11 @@ type schemeConn struct {
 	end     bool
 	inBlock bool
 	request bool
+	skip    bool
 	desync  bool
-	// inline adds the field at the end of the fragment of the frame, trail in a CONTINUATION
-	// after it, when the frame would grow past h2MaxReadFrameSize.
-	inline bool
-	trail  bool
+	// held marks the frame ending a request block, kept in out until it is read in full since
+	// the field is added only to a block that decodes.
+	held bool
 }
 
 // tlsSchemeConn is a schemeConn over TLS. Its ConnectionState and HandshakeContext have
@@ -129,11 +143,20 @@ func (c *schemeConn) Read(p []byte) (int, error) {
 		return 0, nil
 	}
 	for {
+		if c.held {
+			if err := c.fill(); err != nil {
+				return 0, err
+			}
+			continue
+		}
 		if c.outPos < len(c.out) {
 			n := copy(p, c.out[c.outPos:])
 			c.outPos += n
 			if c.outPos == len(c.out) {
 				c.out, c.outPos = c.out[:0], 0
+				if cap(c.out) > schemeOutKeep {
+					c.out = nil
+				}
 			}
 			return n, nil
 		}
@@ -204,8 +227,8 @@ func (c *schemeConn) emit(f hpack.HeaderField) {
 	}
 }
 
-// A frame net/http refuses as malformed stops the parsing, and the rest of the connection
-// passes through unread.
+// A frame on which net/http ends the connection stops the parsing, and the rest of the
+// connection passes through unread.
 func (c *schemeConn) nextFrame() error {
 	h, err := c.br.Peek(9)
 	if err != nil {
@@ -214,6 +237,10 @@ func (c *schemeConn) nextFrame() error {
 	length := int(h[0])<<16 | int(h[1])<<8 | int(h[2])
 	typ, flags := h[3], h[4]
 	stream := binary.BigEndian.Uint32(h[5:9]) & 0x7fffffff
+	if length > h2MaxReadFrameSize {
+		c.state = schemeRaw
+		return nil
+	}
 
 	if typ != h2FrameHeaders && typ != h2FrameContinuation {
 		if c.inBlock {
@@ -246,12 +273,15 @@ func (c *schemeConn) nextFrame() error {
 		if flags&h2FlagPriority != 0 {
 			fragStart += 5
 		}
-		if fragStart > fragEnd {
+		if fragStart > length {
 			c.state = schemeRaw
 			return nil
 		}
 		c.inBlock, c.stream = true, stream
-		c.request = stream > c.last
+		// net/http resets the stream of a HEADERS frame padded past its fragment and keeps the
+		// connection, with its HPACK table and its highest stream as they were.
+		c.skip = fragStart > fragEnd
+		c.request = !c.skip && stream > c.last
 		if c.request {
 			c.last, c.scheme = stream, ""
 		}
@@ -260,33 +290,73 @@ func (c *schemeConn) nextFrame() error {
 		c.state = schemeRaw
 		return nil
 	}
+	if c.skip {
+		fragStart, fragEnd = 0, 0
+	}
 
 	c.out = append(c.out, h...)
 	_, _ = c.br.Discard(9)
 	c.end = flags&h2FlagEndHeaders != 0
-	// net/http ends the connection on a CONTINUATION after an invalid or a truncated field
-	// list, where the same list in one frame is a stream error.
-	if c.end && c.request {
-		if grown := length + len(schemeFieldNone); grown <= h2MaxReadFrameSize {
-			hdr := c.out[len(c.out)-9:]
-			hdr[0], hdr[1], hdr[2] = byte(grown>>16), byte(grown>>8), byte(grown) //nolint:gosec // at most h2MaxReadFrameSize
-			c.inline = true
-		} else {
-			c.out[len(c.out)-5] &^= h2FlagEndHeaders
-			c.trail = true
-		}
-	}
 	c.left, c.pos, c.fragStart, c.fragEnd = length, 0, fragStart, fragEnd
-	c.advance()
+	c.held = c.end && c.request
+	if !c.held {
+		c.advance()
+	}
 	return nil
 }
 
-func (c *schemeConn) readPayload(p []byte) (int, error) {
-	want := min(len(p), c.left)
-	if c.inline {
-		want = min(want, c.fragEnd-c.pos)
+func (c *schemeConn) fill() error {
+	for c.left > 0 {
+		// Grown with what arrives, so a length the client does not send costs nothing.
+		c.out = slices.Grow(c.out, min(c.left, 16<<10))
+		n, err := c.br.Read(c.out[len(c.out):min(cap(c.out), len(c.out)+c.left)])
+		c.out = c.out[:len(c.out)+n]
+		c.pos += n
+		c.left -= n
+		// An error returned with the last octets of the frame comes back on the next read.
+		if err != nil && c.left > 0 {
+			return err
+		}
 	}
-	n, err := c.br.Read(p[:want])
+	c.held = false
+	c.seal()
+	return nil
+}
+
+// seal decodes the fragment of the held frame and adds the field if the block decodes. A
+// block that does not decode passes unchanged, so the server fails the connection on it,
+// where a field completing a truncated value would make it a stream error.
+func (c *schemeConn) seal() {
+	frame := c.out[len(c.out)-9-c.pos:]
+	if !c.desync {
+		if _, err := c.dec.Write(frame[9+c.fragStart : 9+c.fragEnd]); err != nil {
+			c.desync = true
+		}
+	}
+	c.inBlock = false
+	c.closeBlock()
+	if c.desync {
+		return
+	}
+	field := c.field()
+	// net/http ends the connection on a CONTINUATION after an invalid or a truncated field
+	// list, where the same list in one frame is a stream error.
+	if grown := c.pos + len(field); grown <= h2MaxReadFrameSize {
+		frame[0], frame[1], frame[2] = byte(grown>>16), byte(grown>>8), byte(grown) //nolint:gosec // at most h2MaxReadFrameSize
+		at := len(c.out) - (c.pos - c.fragEnd)
+		c.out = append(c.out, field...)
+		copy(c.out[at+len(field):], c.out[at:len(c.out)-len(field)])
+		copy(c.out[at:], field)
+		return
+	}
+	frame[4] &^= h2FlagEndHeaders
+	c.out = append(c.out, 0, 0, byte(len(field)), h2FrameContinuation, h2FlagEndHeaders) //nolint:gosec // a field is 42 bytes
+	c.out = binary.BigEndian.AppendUint32(c.out, c.stream)
+	c.out = append(c.out, field...)
+}
+
+func (c *schemeConn) readPayload(p []byte) (int, error) {
+	n, err := c.br.Read(p[:min(len(p), c.left)])
 	if c.inBlock && !c.desync {
 		lo, hi := max(c.pos, c.fragStart), min(c.pos+n, c.fragEnd)
 		if lo < hi {
@@ -301,30 +371,17 @@ func (c *schemeConn) readPayload(p []byte) (int, error) {
 	return n, err
 }
 
-// advance adds the field once the fragment of the frame ending a request block is read, and
-// ends the block with the frame.
+// The frame ending a request block never reaches advance, seal ends that block.
 func (c *schemeConn) advance() {
-	if c.inline && c.pos == c.fragEnd {
-		c.inline = false
-		c.closeBlock()
-		c.out = append(c.out, c.field()...)
-	}
 	if c.left > 0 || !c.inBlock || !c.end {
 		return
 	}
 	c.inBlock = false
-	if !c.request {
-		c.closeBlock()
+	if c.skip {
+		c.skip = false
 		return
 	}
-	if c.trail {
-		c.trail = false
-		c.closeBlock()
-		field := c.field()
-		c.out = append(c.out, 0, 0, byte(len(field)), h2FrameContinuation, h2FlagEndHeaders) //nolint:gosec // a field is 15 bytes
-		c.out = binary.BigEndian.AppendUint32(c.out, c.stream)
-		c.out = append(c.out, field...)
-	}
+	c.closeBlock()
 }
 
 func (c *schemeConn) closeBlock() {
@@ -333,16 +390,12 @@ func (c *schemeConn) closeBlock() {
 	}
 }
 
-// field returns the field for the request block just decoded. After a decoding error the
-// table can no longer be mirrored, so every later request gets schemeFieldNone.
 func (c *schemeConn) field() string {
-	if !c.desync {
-		switch c.scheme {
-		case "http":
-			return schemeFieldHTTP
-		case "https":
-			return schemeFieldHTTPS
-		}
+	switch c.scheme {
+	case "http":
+		return schemeFieldHTTP
+	case "https":
+		return schemeFieldHTTPS
 	}
 	return schemeFieldNone
 }
@@ -364,24 +417,19 @@ func (l schemeListener) Accept() (net.Conn, error) {
 // takeScheme returns the scheme of an HTTP/2 or HTTP/3 request and removes schemeHeader from
 // it. It returns "" for an HTTP/1.1 request, whose absolute target has the scheme.
 //
-// The last schemeHeader is the one the schemeConn added, unless the request opened a stream
-// below the last one, which net/http accepts and the schemeConn takes for trailers.
+// An HTTP/2 request on a stream below the last one, which net/http accepts and the schemeConn
+// takes for trailers, has no schemeHeader and gets "".
 func takeScheme(r *http.Request) string {
 	if r.ProtoMajor < 2 {
 		return ""
 	}
 	if sess := sessionFromRequest(r); sess != nil && sess.hasSchemeField {
 		vs := r.Header[schemeHeader]
-		if len(vs) == 0 {
+		delete(r.Header, schemeHeader)
+		if len(vs) != 1 {
 			return ""
 		}
-		code := vs[len(vs)-1]
-		if len(vs) == 1 {
-			delete(r.Header, schemeHeader)
-		} else {
-			r.Header[schemeHeader] = vs[:len(vs)-1]
-		}
-		switch code {
+		switch vs[0] {
 		case "h":
 			return "http"
 		case "s":

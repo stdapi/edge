@@ -43,6 +43,7 @@ type TCPCtx struct {
 	extra    []net.Conn
 
 	dialOnce sync.Once
+	alerted  bool
 }
 
 // Context returns a context canceled when the connection ends.
@@ -108,7 +109,7 @@ func (c *TCPCtx) Proxy() *Proxy { return c.p }
 // server name and the same application protocol the proxy negotiated with the client, and an
 // origin that rejects that protocol fails the dial. The connection returned stays valid
 // across [TCPCtx.StartTLS], which upgrades it in place, and is closed when the handler
-// returns.
+// returns. If Dial fails and the handler returns an error, the client connection is reset.
 func (c *TCPCtx) Dial() (net.Conn, error) {
 	c.dialOnce.Do(func() { c.up.Conn, c.dialErr = c.dial() })
 	if c.dialErr != nil {
@@ -204,14 +205,17 @@ func (c *TCPCtx) upgradeTLS(ctx context.Context, conn net.Conn, addr, serverName
 // return the state of the client handshake, and [TCPCtx.Target] is not affected.
 //
 // StartTLS returns an error if the stream is already using TLS, if the proxy has no
-// certificate authority, or if either handshake fails.
+// certificate authority, if it refuses the ClientHello under [WithRejectECH] or
+// [WithNameVerification], or if either handshake fails. Without a certificate authority or on a
+// refused ClientHello, the client is sent a fatal TLS alert. The connection returned by
+// [TCPCtx.Client] remains open.
 func (c *TCPCtx) StartTLS() error {
 	if c.sess.TLS() != nil {
 		return errAlreadyTLS
 	}
 	p := c.p
 	if p.cfg.ca == nil {
-		return fmt.Errorf("%w: %w", ErrNoCertificateAuthority, errNoCA)
+		return c.refuseTLS(c.client.Conn, alertInternalError, fmt.Errorf("%w: %w", ErrNoCertificateAuthority, errNoCA))
 	}
 
 	conn, ok := c.client.Conn.(*peekConn)
@@ -224,21 +228,21 @@ func (c *TCPCtx) StartTLS() error {
 		defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
 	}
 
-	hello, err := p.peekClientHello(conn)
+	hello, alert, err := p.peekClientHello(conn)
 	if err != nil {
-		return err
+		return c.refuseTLS(conn, alert, err)
 	}
 	// The entry is decided, so the name picks the certificate and is verified, never routed.
 	if hello != nil && hello.ServerName != "" && p.cfg.verifyNames == VerifyReject && c.sess.upstream.IsValid() {
 		switch p.nameResolvesTo(c.ctx, stringsutil.ToLowerASCIIString(hello.ServerName), c.sess.upstream) {
 		case nameMismatch:
-			return errNameMismatch
+			return c.refuseTLS(conn, alertUnrecognizedName, errNameMismatch)
 		case nameUnresolved:
-			return errNameUnresolved
+			return c.refuseTLS(conn, alertUnrecognizedName, errNameUnresolved)
 		}
 	}
 
-	tlsConn := tls.Server(conn, p.serverTLSConfig(c.sess))
+	tlsConn := tls.Server(conn, p.serverTLSConfig(c.sess, true))
 	if err := tlsConn.HandshakeContext(c.ctx); err != nil {
 		return fmt.Errorf("tls handshake with client for %s: %w", c.target.Authority(), err)
 	}
@@ -258,6 +262,24 @@ func (c *TCPCtx) StartTLS() error {
 	return nil
 }
 
+// refuseTLS sends the client a fatal alert and returns err. The connection stays the
+// handler's, and the close after the handler returns drains it as lingerClose does.
+func (c *TCPCtx) refuseTLS(conn net.Conn, alert byte, err error) error {
+	if writeAlert(conn, alert) == nil {
+		c.alerted = true
+	}
+	return err
+}
+
+// lingerAfterAlert runs lingerClose on the client once the handler returned, when StartTLS
+// sent an alert.
+func (c *TCPCtx) lingerAfterAlert() {
+	if c.alerted {
+		c.alerted = false
+		lingerClose(c.client.Conn)
+	}
+}
+
 // heldConn is a connection as the handler holds it. StartTLS replaces the connection under
 // it, so a handler holding it across the call reads plaintext after.
 type heldConn struct {
@@ -271,6 +293,7 @@ func (s *heldConn) Abort() { abort(s.Conn) }
 
 // close releases the connections the handler opened, once the handler has returned.
 func (c *TCPCtx) close() {
+	c.lingerAfterAlert()
 	if c.up.Conn != nil {
 		_ = c.up.Close()
 	}

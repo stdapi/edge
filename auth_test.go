@@ -117,6 +117,34 @@ func TestProxyAuth_NoChallengeAnswers403(t *testing.T) {
 	assert.Empty(t, resp.Header.Get(HeaderProxyAuthenticate))
 }
 
+// fixedChallenges refuses everyone with the challenges it was given.
+type fixedChallenges []string
+
+func (fixedChallenges) Authenticate(*http.Request) (string, bool) { return "", false }
+func (c fixedChallenges) Challenges(*http.Request) []string       { return c }
+
+func TestProxyAuth_InvalidChallengeIsDropped(t *testing.T) {
+	p := Must(WithProxyAuth(fixedChallenges{"Basic realm=\"a\x01b\"", `Bearer realm="ok"`}))
+	p.MustAdd[TCP]("example.com", relayStream)
+	addr := startProxy(t, p)
+
+	resp := rawConnect(t, addr, "example.com:443", "")
+
+	assert.Equal(t, http.StatusProxyAuthRequired, resp.StatusCode)
+	assert.Equal(t, []string{`Bearer realm="ok"`}, resp.Header.Values(HeaderProxyAuthenticate))
+}
+
+func TestProxyAuth_NoValidChallengeAnswers403(t *testing.T) {
+	p := Must(WithProxyAuth(fixedChallenges{"Basic realm=\"a\x01b\"", "Basic realm=\"a\x7fb\""}))
+	p.MustAdd[TCP]("example.com", relayStream)
+	addr := startProxy(t, p)
+
+	resp := rawConnect(t, addr, "example.com:443", "")
+
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+	assert.Empty(t, resp.Header.Values(HeaderProxyAuthenticate))
+}
+
 func TestProxyAuth_IdentityReachesTheHandler(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		fmt.Fprint(w, "origin")

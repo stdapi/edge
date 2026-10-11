@@ -188,7 +188,9 @@ func TestTransparent_RejectECHRefusesBeforeDialing(t *testing.T) {
 		return nil, fmt.Errorf("no upstream in this test")
 	}
 
-	p, err := New(WithRejectECH(true), WithTransport(tr))
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca), WithRejectECH(true), WithTransport(tr))
 	require.NoError(t, err)
 	p.MustAdd[TCP]("allowed.test", relayStream)
 
@@ -204,8 +206,10 @@ func TestTransparent_RejectECHRefusesBeforeDialing(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+	typ, alert := firstRecord(t, conn)
+	assert.Equal(t, [2]byte{tlsAlert, alertHandshakeFailure}, [2]byte{typ, alert})
 	_, err = conn.Read(make([]byte, 1))
-	assert.ErrorIs(t, err, io.EOF, "the connection should be closed without an answer")
+	assert.ErrorIs(t, err, io.EOF)
 	assert.Equal(t, int32(0), dials.Load(), "a refused connection should never reach the dialer")
 }
 
@@ -310,7 +314,9 @@ func TestConnect_RejectECHClosesTheTunnel(t *testing.T) {
 		}
 	}()
 
-	p, err := New(WithRejectECH(true))
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca), WithRejectECH(true))
 	require.NoError(t, err)
 	p.MustAdd[TCP](origin.Addr().String(), relayStream)
 
@@ -321,8 +327,10 @@ func TestConnect_RejectECHClosesTheTunnel(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+	typ, alert := firstRecord(t, conn)
+	assert.Equal(t, [2]byte{tlsAlert, alertHandshakeFailure}, [2]byte{typ, alert})
 	_, err = conn.Read(make([]byte, 1))
-	assert.ErrorIs(t, err, io.EOF, "the connection should be closed without an answer")
+	assert.ErrorIs(t, err, io.EOF)
 
 	// The refusal lands before anything upstream is opened, so the origin sees no connection
 	// at all rather than one that carried nothing.
@@ -413,8 +421,10 @@ func TestConnect_RejectECHRefusesAnInterceptedHandshake(t *testing.T) {
 	require.NoError(t, err)
 
 	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+	typ, alert := firstRecord(t, conn)
+	assert.Equal(t, [2]byte{tlsAlert, alertHandshakeFailure}, [2]byte{typ, alert}, "no ServerHello should come back")
 	_, err = conn.Read(make([]byte, 1))
-	assert.ErrorIs(t, err, io.EOF, "no ServerHello should come back")
+	assert.ErrorIs(t, err, io.EOF)
 }
 
 func TestConnect_RejectECHClosesAnH2Stream(t *testing.T) {
@@ -434,7 +444,9 @@ func TestConnect_RejectECHClosesAnH2Stream(t *testing.T) {
 		received <- int(n)
 	}()
 
-	p, err := New(WithRejectECH(true))
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca), WithRejectECH(true))
 	require.NoError(t, err)
 	p.MustAdd[TCP](origin.Addr().String(), relayStream)
 
@@ -458,9 +470,8 @@ func TestConnect_RejectECHClosesAnH2Stream(t *testing.T) {
 	_, err = pw.Write(echClientHello(t, "allowed.test", "secret.test"))
 	require.NoError(t, err)
 
-	buf := make([]byte, 1)
-	_, err = resp.Body.Read(buf)
-	assert.Error(t, err, "the stream should end without an answer")
+	got, _ := io.ReadAll(resp.Body)
+	assert.Equal(t, []byte{tlsAlert, 0x03, 0x03, 0x00, 0x02, 0x02, alertHandshakeFailure}, got)
 
 	// Nothing upstream is opened until a handler asks for it, so a refused stream leaves the
 	// origin untouched rather than reached and then dropped.
@@ -489,7 +500,7 @@ func (b *syncBuffer) String() string {
 	return b.buf.String()
 }
 
-func TestQUIC_RejectECHDropsTheConnection(t *testing.T) {
+func TestQUIC_RejectECHRefusesTheConnection(t *testing.T) {
 	logs := &syncBuffer{}
 	p, err := New(
 		WithRejectECH(true),
@@ -506,7 +517,7 @@ func TestQUIC_RejectECHDropsTheConnection(t *testing.T) {
 		NextProtos:                     []string{"h3"},
 		EncryptedClientHelloConfigList: echConfigList(t, "allowed.test"),
 	}, &quic.Config{HandshakeIdleTimeout: 2 * time.Second})
-	require.Error(t, err, "the handshake should never complete")
+	wantClosedWith(t, err, quicHandshakeFailure)
 
 	assert.Contains(t, logs.String(), "offers Encrypted Client Hello",
 		"the demux should have refused the connection on its ClientHello")
