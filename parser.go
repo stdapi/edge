@@ -63,18 +63,18 @@ func (p *Proxy) parsePattern(raw string, kind Kind) (pattern, int, error) {
 		return pattern{}, 0, fmt.Errorf("%w: empty pattern", ErrInvalidEntry)
 	}
 
-	if i := strings.Index(raw, "://"); i >= 0 {
+	endHost := hostPathSplit(raw)
+	if endHost > 0 && raw[endHost-1] == ':' && strings.HasPrefix(raw[endHost:], "//") {
 		return pattern{}, 0, &PatternError{
 			Pattern: raw,
 			Type:    "hostname",
 			Reason:  "syntax",
 			Hint:    "a pattern is a hostname and a path, it carries no scheme",
 			Start:   0,
-			End:     i + 3,
+			End:     endHost + 2,
 		}
 	}
 
-	endHost := hostPathSplit(raw)
 	if endHost == -1 {
 		return pattern{}, 0, &PatternError{
 			Pattern: raw,
