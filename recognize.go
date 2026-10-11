@@ -141,11 +141,11 @@ func scanRequestLine(b []byte) sniffVerdict {
 		}
 		i++
 	}
-	if i == 0 {
-		return sniffNo
-	}
 	if i == len(b) {
 		return sniffMore
+	}
+	if i == 0 {
+		return sniffNo
 	}
 
 	// target, anything without a space or a control byte
@@ -157,11 +157,12 @@ func scanRequestLine(b []byte) sniffVerdict {
 		}
 		i++
 	}
-	if i == start {
-		return sniffNo
-	}
+	// The end of the buffer comes first, a target that has not arrived yet is not empty.
 	if i == len(b) {
 		return sniffMore
+	}
+	if i == start {
+		return sniffNo
 	}
 
 	// version

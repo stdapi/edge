@@ -5,6 +5,7 @@
 package edge
 
 import (
+	"cmp"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -146,11 +147,12 @@ func (p *Proxy) placeTLS(ctx context.Context, conn *peekConn, sess *Session) err
 	if named {
 		target.Host = stringsutil.ToLowerASCIIString(hello.ServerName)
 	}
-	// A ClientHello the peek could not read may have a server name, and RFC 9846 section 6.2
-	// gives decode_error to a message that does not parse.
+	// A ClientHello the peek could not read may have a server name. It gets the alert Go's
+	// TLS server sent on it, or the decode_error RFC 9846 section 6.2 gives a message that
+	// does not parse.
 	unnamed := byte(alertMissingExtension)
 	if hello == nil {
-		unnamed = alertDecodeError
+		unnamed = cmp.Or(alert, alertDecodeError)
 	}
 	if target.Host == "" {
 		return refuseHello(conn, unnamed, errors.New("edge: TLS connection with no server name and no destination"))
@@ -177,8 +179,8 @@ func (p *Proxy) placeTLS(ctx context.Context, conn *peekConn, sess *Session) err
 }
 
 // peekClientHello reads the ClientHello waiting on conn without consuming it, nil when there
-// is none it can read, and refuses the connection with the alert to send when the hello offers
-// Encrypted Client Hello and the proxy rejects that.
+// is none it can read, with the alert of clientHelloFromRecords. It refuses the connection with
+// the alert to send when the hello offers Encrypted Client Hello and the proxy rejects that.
 func (p *Proxy) peekClientHello(conn *peekConn) (*ClientHello, byte, error) {
 	raw, err := peekHandshakeRecords(conn)
 	if p.cfg.rejectECH {
@@ -195,7 +197,8 @@ func (p *Proxy) peekClientHello(conn *peekConn) (*ClientHello, byte, error) {
 	if err != nil {
 		return nil, 0, nil
 	}
-	return clientHelloFromRecords(raw), 0, nil
+	hello, alert := clientHelloFromRecords(raw)
+	return hello, alert, nil
 }
 
 // servePlain serves a connection without TLS, routed on the authority of its first request.
@@ -415,10 +418,10 @@ func (p *Proxy) serveTerminatedHTTP(conn net.Conn, sess *Session, state *tls.Con
 // serveTerminatedRequest routes one request read off a terminated connection.
 func (p *Proxy) serveTerminatedRequest(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "PRI" && r.ProtoMajor == 2 && r.RequestURI == "*" {
-		// The HTTP/2 preface on a TLS connection where ALPN did not select h2, RFC 7301 section
-		// 3.2, refused with the status of the TLS front. Plaintext never reaches it.
+		// The preface's request line read as HTTP/1.1, over TLS where ALPN did not select h2, RFC
+		// 7301 section 3.2, or in plaintext after 24 octets that are not the exact preface.
 		w.Header().Set("Connection", "close")
-		p.writeStatus(w, r, http.StatusBadRequest, "HTTP/2 preface on a connection that did not negotiate h2")
+		p.writeStatus(w, r, http.StatusBadRequest, "HTTP/2 preface read as an HTTP/1.1 request")
 		return
 	}
 

@@ -72,6 +72,64 @@ func startTransparentRedirected(t *testing.T, p *Proxy, origin func(net.Conn) (n
 	return ln.Addr().String()
 }
 
+const (
+	viaRedirected   = "redirected"
+	viaUnredirected = "unredirected"
+	viaServeConn    = "serveconn"
+)
+
+// unroutedDestination is the destination of a redirected connection nothing dials.
+var unroutedDestination = netip.MustParseAddrPort("192.0.2.1:80")
+
+type wrapListener struct {
+	net.Listener
+	wrap func(net.Conn) net.Conn
+}
+
+func (l wrapListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return l.wrap(c), nil
+}
+
+// octetConn returns at most one octet per read, as TCP may deliver them.
+type octetConn struct{ net.Conn }
+
+func (c octetConn) Read(b []byte) (int, error) { return c.Conn.Read(b[:min(len(b), 1)]) }
+
+func asOctets(c net.Conn) net.Conn { return octetConn{c} }
+
+// dialTransparentFront serves p on a redirected, unredirected or ServeConn front and returns a
+// connection to it. The proxy reads and writes through wrap.
+func dialTransparentFront(t *testing.T, front string, p *Proxy, wrap func(net.Conn) net.Conn) net.Conn {
+	t.Helper()
+	if front == viaServeConn {
+		client, server := net.Pipe()
+		go func() { _ = p.ServeConn(wrap(server)) }()
+		return client
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	l := wrapListener{Listener: ln, wrap: wrap}
+	switch front {
+	case viaRedirected:
+		go func() {
+			_ = p.ServeTransparent(originListener{Listener: l, origin: func(net.Conn) (netip.AddrPort, error) {
+				return unroutedDestination, nil
+			}})
+		}()
+	case viaUnredirected:
+		go func() { _ = p.ServeTransparent(l) }()
+	default:
+		t.Fatalf("unknown front %q", front)
+	}
+	c, err := net.DialTimeout("tcp", ln.Addr().String(), 5*time.Second)
+	require.NoError(t, err)
+	return c
+}
+
 // pinnedDialer sends every upstream connection to addr, standing in for the DNS the client
 // would have resolved before its traffic was redirected.
 func pinnedDialer(addr string) func(context.Context, string, string) (net.Conn, error) {
@@ -241,6 +299,25 @@ func TestTransparent_PeekClientHelloDoesNotConsume(t *testing.T) {
 
 	body, _ := io.ReadAll(resp.Body)
 	assert.Equal(t, "sni=peek.example.test", string(body))
+}
+
+func TestTransparent_ClientHelloParseReturnsTheAlert(t *testing.T) {
+	hello, alert := clientHelloFromRecords(plainClientHello(t, "allowed.test"))
+	require.NotNil(t, hello)
+	assert.Equal(t, "allowed.test", hello.ServerName)
+	assert.Zero(t, alert)
+
+	hello, alert = clientHelloFromRecords(helloWithECH(t, []byte{0x02}))
+	assert.Nil(t, hello)
+	assert.Equal(t, byte(47), alert, "an undefined ECHClientHelloType")
+
+	hello, alert = clientHelloFromRecords(helloWithECH(t, []byte{0x00}))
+	assert.Nil(t, hello)
+	assert.Equal(t, byte(50), alert, "an outer encrypted_client_hello cut short")
+
+	hello, alert = clientHelloFromRecords([]byte{0x16, 0x03, 0x01, 0x00})
+	assert.Nil(t, hello)
+	assert.Zero(t, alert, "records cut short")
 }
 
 func TestTransparent_RejectClosesTheConnection(t *testing.T) {

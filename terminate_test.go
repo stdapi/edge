@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fox-toolkit/edge/internal/quicsniff"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/stretchr/testify/assert"
@@ -517,6 +518,44 @@ func spliceHello(t *testing.T, raw []byte, suite, ext uint16, data []byte) []byt
 	return records(msg, tls.VersionTLS10, sizes...)
 }
 
+// withExtension returns the ClientHello message msg with an extension of type ext and data
+// appended, every length rewritten.
+func withExtension(t *testing.T, msg []byte, ext uint16, data []byte) []byte {
+	t.Helper()
+	need := func(n int) {
+		if len(msg) < 4+n {
+			t.Fatalf("a ClientHello of %d bytes is cut short", len(msg))
+		}
+	}
+	need(35)
+	body := msg[4:]
+	sidEnd := 35 + int(body[34])
+	need(sidEnd + 2)
+	csLen := int(binary.BigEndian.Uint16(body[sidEnd:]))
+	need(sidEnd + 3 + csLen)
+	compEnd := sidEnd + 2 + csLen + 1 + int(body[sidEnd+2+csLen])
+	need(compEnd + 2)
+	extLen := int(binary.BigEndian.Uint16(body[compEnd:]))
+	need(compEnd + 2 + extLen)
+
+	b := slices.Clone(body[:compEnd])
+	b = binary.BigEndian.AppendUint16(b, uint16(extLen+4+len(data)))
+	b = append(b, body[compEnd+2:compEnd+2+extLen]...)
+	b = binary.BigEndian.AppendUint16(b, ext)
+	b = binary.BigEndian.AppendUint16(b, uint16(len(data)))
+	b = append(b, data...)
+	return append([]byte{0x01, byte(len(b) >> 16), byte(len(b) >> 8), byte(len(b))}, b...)
+}
+
+// helloWithECH is a ClientHello for tlsName with an encrypted_client_hello extension of data,
+// in one record.
+func helloWithECH(t *testing.T, data []byte) []byte {
+	t.Helper()
+	msg := handshakeFromRecords(captureClientHello(t, &tls.Config{ServerName: tlsName, InsecureSkipVerify: true, MinVersion: tls.VersionTLS13}))
+	require.NotNil(t, msg)
+	return records(withExtension(t, msg, extensionECH, data), tls.VersionTLS10)
+}
+
 // firstRecord reads the first record the proxy writes on c and returns its content type,
 // with the description of an alert. A connection closed before any record returns zero.
 func firstRecord(t *testing.T, c net.Conn) (typ, alert byte) {
@@ -560,10 +599,12 @@ func (c *recordingConn) lastRecord() byte {
 	return last
 }
 
-// originHello is the server name a TLS origin received and how its handshake ended.
+// originHello is the server name and the extension types of the ClientHello a TLS origin
+// received, and how its handshake ended.
 type originHello struct {
 	err  error
 	name string
+	exts []uint16
 }
 
 // tlsOrigin serves TLS with cert, the configuration changed by edit, and reports every
@@ -624,11 +665,12 @@ func tlsOriginAfter(t *testing.T, prelude func(net.Conn) error, cert *tls.Certif
 					return
 				}
 				var name string
+				var exts []uint16
 				cfg := &tls.Config{
 					Certificates: []tls.Certificate{*cert},
 					MinVersion:   tls.VersionTLS12,
 					GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
-						name = chi.ServerName
+						name, exts = chi.ServerName, slices.Clone(chi.Extensions)
 						return nil, nil
 					},
 				}
@@ -637,7 +679,7 @@ func tlsOriginAfter(t *testing.T, prelude func(net.Conn) error, cert *tls.Certif
 				}
 				tc := tls.Server(c, cfg)
 				err := tc.Handshake()
-				hellos <- originHello{name: name, err: err}
+				hellos <- originHello{name: name, exts: exts, err: err}
 				if err == nil {
 					serve(tc)
 				}
@@ -846,6 +888,72 @@ func h3Connect(t *testing.T, front netip.AddrPort, ca *CA, authority string) net
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	return streamConn{str}
+}
+
+// tlsFronts are the ways a TLS client reaches p, each returning the client end of a
+// connection to host on which the proxy terminates TLS.
+var tlsFronts = []struct {
+	dial func(t *testing.T, p *Proxy, host string) net.Conn
+	name string
+}{
+	{name: "a transparent connection", dial: func(t *testing.T, p *Proxy, _ string) net.Conn {
+		c, err := net.DialTimeout("tcp", startTransparent(t, p), 5*time.Second)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = c.Close() })
+		require.NoError(t, c.SetDeadline(time.Now().Add(5*time.Second)))
+		return c
+	}},
+	{name: "a CONNECT", dial: func(t *testing.T, p *Proxy, host string) net.Conn {
+		c := connectRaw(t, startProxy(t, p), host+":443")
+		require.NoError(t, c.SetDeadline(time.Now().Add(5*time.Second)))
+		return c
+	}},
+}
+
+// quicFronts are the ways a QUIC client reaches a proxy terminating HTTP/3 for h3Authority,
+// each returning the socket of the client, the address it writes to and the certificate
+// authority of the proxy.
+var quicFronts = []struct {
+	open func(t *testing.T, opts ...ProxyOption) (net.PacketConn, net.Addr, *CA)
+	name string
+}{
+	{name: "QUIC", open: func(t *testing.T, opts ...ProxyOption) (net.PacketConn, net.Addr, *CA) {
+		p, ca := newTLSProxy(t, opts...)
+		p.MustAdd(h3Authority+"/*{any}", okHandler)
+		addr := startQUIC(t, p)
+		pc, err := loopbackUDP()
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = pc.Close() })
+		return pc, net.UDPAddrFromAddrPort(addr), ca
+	}},
+	{name: "a CONNECT-UDP tunnel", open: func(t *testing.T, opts ...ProxyOption) (net.PacketConn, net.Addr, *CA) {
+		_, ca, front, origin := masqueProxy(t, opts...)
+		pc, _, err := openTunnel(t, masqueClient(t, front, ca), front, fmt.Sprintf("%s:%d", h3Authority, origin.Port()), nil)
+		require.NoError(t, err)
+		return pc, net.UDPAddrFromAddrPort(origin), ca
+	}},
+	{name: "a redirected QUIC connection", open: func(t *testing.T, opts ...ProxyOption) (net.PacketConn, net.Addr, *CA) {
+		p, ca := newTLSProxy(t, opts...)
+		p.MustAdd(h3Authority+"/*{any}", okHandler)
+		addr := startQUICRedirected(t, p, netip.MustParseAddrPort("127.0.0.1:443"))
+		pc, err := loopbackUDP()
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = pc.Close() })
+		return pc, net.UDPAddrFromAddrPort(addr), ca
+	}},
+}
+
+// quicHandshakeOver dials the address to through pc with cfg and returns how the handshake
+// ended. The transport is left open, and the front that opened pc closes it.
+func quicHandshakeOver(t *testing.T, pc net.PacketConn, to net.Addr, cfg *tls.Config) error {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	conn, err := (&quic.Transport{Conn: pc}).Dial(ctx, to, cfg, &quic.Config{DisablePathMTUDiscovery: true, HandshakeIdleTimeout: 2 * time.Second})
+	if err == nil {
+		_ = conn.CloseWithError(0, "")
+	}
+	return err
 }
 
 // tlsConformance lists the requirements TLS and the certificate profile place on a proxy
@@ -1348,6 +1456,11 @@ var tlsConformance = []conformanceCase{
 
 	// RFC 9846 section 6, the alert protocol.
 	{
+		id: "rfc9846/6/1", name: "a client that aborts its handshake with ech_required",
+		req:  "Upon receiving an error alert, the TLS implementation SHOULD indicate an error to the application and MUST NOT allow any further data to be sent or received on the connection.",
+		skip: "crypto/tls decides it and departs, a received alert fails the reads alone and a write after it is still encrypted and sent, as rfc9846/6.2/2 records",
+	},
+	{
 		id: "rfc9846/6.1/1", name: "a terminated connection the proxy closes",
 		req: "Each party MUST send a \"close_notify\" alert before closing its write side of the connection, unless it has already sent some error alert.",
 		run: func(t *testing.T) {
@@ -1454,6 +1567,11 @@ var tlsConformance = []conformanceCase{
 				assert.Equal(t, byte(tlsAlert), typ)
 			})
 		},
+	},
+	{
+		id: "rfc9846/6.2/2", name: "a client offering http/1.1 that aborts its handshake with ech_required",
+		req:  "Upon transmission or receipt of a fatal alert message, both parties MUST immediately close the connection.",
+		skip: "net/http and crypto/tls decide it. The HTTP/1.1 server answers a read that failed on the alert with a 400, which crypto/tls encrypts and sends before its close_notify, through a CONNECT and a transparent connection, and with crypto/tls and net/http alone. With h2 the SETTINGS of the server may be written after the alert, in an order x/net and crypto/tls decide",
 	},
 
 	// RFC 9846 section 9, compliance requirements.
@@ -1648,6 +1766,39 @@ var tlsConformance = []conformanceCase{
 			})
 		},
 	},
+	{
+		id: "rfc9846/9.3/5", name: "an offer of Encrypted Client Hello on a stream the proxy relays to a TLS origin",
+		req: "In particular, it MUST generate its own ClientHello containing only parameters it understands, and it MUST generate a fresh ServerHello random value, rather than forwarding the endpoint's value.",
+		run: func(t *testing.T) {
+			originCA, err := GenerateCA()
+			require.NoError(t, err)
+			cert, err := originCA.Leaf(tlsUpstream)
+			require.NoError(t, err)
+			for _, f := range tlsFronts {
+				t.Run(f.name, func(t *testing.T) {
+					origin, hellos := tlsOrigin(t, cert, nil, nil)
+					p, ca := upstreamProxy(t, origin, originCA.CertPool())
+					err := tls.Client(f.dial(t, p, tlsUpstream), &tls.Config{
+						ServerName:                     "secret.test",
+						RootCAs:                        ca.CertPool(),
+						NextProtos:                     []string{"x-test"},
+						MinVersion:                     tls.VersionTLS13,
+						EncryptedClientHelloConfigList: echConfigList(t, tlsUpstream),
+					}).Handshake()
+					require.ErrorAs(t, err, new(*tls.ECHRejectionError))
+					h := nextHello(t, hellos)
+					require.NoError(t, h.err)
+					assert.Equal(t, tlsUpstream, h.name)
+					assert.NotContains(t, h.exts, uint16(extensionECH))
+				})
+			}
+		},
+	},
+	{
+		id: "rfc9846/9.3/6", name: "an offer of Encrypted Client Hello over QUIC on a connection the proxy relays to an origin",
+		req:  "In particular, it MUST generate its own ClientHello containing only parameters it understands, and it MUST generate a fresh ServerHello random value, rather than forwarding the endpoint's value.",
+		skip: "no ClientHello toward the origin can be observed. The CONNECTION_CLOSE of the client with ech_required arrives with its Finished, and the handler of a QUIC entry ran for none of 20 such clients",
+	},
 
 	// RFC 9846 appendix E.5, security restrictions related to backward compatibility.
 	{
@@ -1686,6 +1837,189 @@ var tlsConformance = []conformanceCase{
 				refusedUpstream(t, tc, tlsUpstream)
 				assert.Error(t, nextHello(t, hellos).err, "the proxy negotiated TLS 1.1 with the origin")
 			})
+		},
+	},
+
+	// RFC 9849 section 7, server behavior.
+	{
+		id: "rfc9849/7/1", name: "an encrypted_client_hello extension of an undefined type, on a TCP connection without a destination an entry admits or on any QUIC connection",
+		req: "If ECHClientHello.type is not a valid ECHClientHelloType, then the server MUST abort with an \"illegal_parameter\" alert.",
+		run: func(t *testing.T) {
+			// A server without ECH may also ignore the extension, RFC 9846 section 4.1.2, and
+			// RFC 9846 section 6.2 permits a close without any alert.
+			for _, f := range tlsFronts {
+				if f.name != "a transparent connection" {
+					continue
+				}
+				t.Run(f.name, func(t *testing.T) {
+					p, _ := newTLSProxy(t)
+					c := f.dial(t, p, tlsName)
+					_, err := c.Write(helloWithECH(t, []byte{0x02}))
+					require.NoError(t, err)
+					typ, alert := firstRecord(t, c)
+					if typ != 0 && typ != tlsHandshakeRecord {
+						assert.Equal(t, [2]byte{tlsAlert, 47}, [2]byte{typ, alert})
+					}
+				})
+			}
+			t.Run("a connection redirected to a destination nothing admits", func(t *testing.T) {
+				p, _ := newTLSProxy(t)
+				addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) {
+					return netip.MustParseAddrPort("192.0.2.1:443"), nil
+				})
+				c, err := net.DialTimeout("tcp", addr, 5*time.Second)
+				require.NoError(t, err)
+				t.Cleanup(func() { _ = c.Close() })
+				require.NoError(t, c.SetDeadline(time.Now().Add(5*time.Second)))
+				_, err = c.Write(helloWithECH(t, []byte{0x02}))
+				require.NoError(t, err)
+				typ, alert := firstRecord(t, c)
+				if typ != 0 {
+					assert.Equal(t, [2]byte{tlsAlert, 47}, [2]byte{typ, alert})
+				}
+			})
+			for _, f := range quicFronts {
+				t.Run(f.name, func(t *testing.T) {
+					pc, to, _ := f.open(t)
+					a := newQUICAttempt(t, quicsniff.Version1, h3Authority)
+					a.hello = withExtension(t, a.hello, extensionECH, []byte{0x02})
+					got := quicAnswer(t, pc, to, a)
+					if slices.Contains(got.types, 0x1c) {
+						assert.Equal(t, uint64(0x100+47), got.closeCode, "RFC 9001 section 4.8")
+					} else {
+						assert.Contains(t, got.types, uint64(0x06), "the Initial has no CRYPTO frame")
+					}
+				})
+			}
+		},
+	},
+	{
+		id: "rfc9849/7/2", name: "an encrypted_client_hello extension of an undefined type, on a CONNECT or a redirected TCP connection whose destination an entry admits",
+		req:  "If ECHClientHello.type is not a valid ECHClientHelloType, then the server MUST abort with an \"illegal_parameter\" alert.",
+		skip: "crypto/tls decides it, parsing the extension before it looks for ECH keys, and aborts with illegal_parameter (47)",
+	},
+	{
+		id: "rfc9849/7/3", name: "an encrypted_client_hello extension of type inner",
+		req:  "A shared mode server which receives a ClientHello with ECHClientHello.type of inner MUST abort with an \"illegal_parameter\" alert, because such a ClientHello should never be received directly from the network.",
+		skip: "the sentence binds a shared mode server, and edge has no ECH keys and plays neither role. Without keys crypto/tls answers as the backend server of section 7.2, through a CONNECT with a ServerHello whose random ends in the accept_confirmation of that section, and on QUIC and in a CONNECT-UDP tunnel with an Initial of the server handshake",
+	},
+
+	// RFC 9849 section 7.1, client-facing server.
+	{
+		id: "rfc9849/7.1/1", name: "an offer of Encrypted Client Hello under a configuration the proxy does not have",
+		req: "Otherwise, if all candidate ECHConfig values fail to decrypt the extension, the client-facing server MUST ignore the extension and proceed with the connection using ClientHelloOuter with the following modifications:",
+		run: func(t *testing.T) {
+			for _, f := range tlsFronts {
+				t.Run(f.name, func(t *testing.T) {
+					p, _ := newTLSProxy(t)
+					c := f.dial(t, p, tlsName)
+					_, err := c.Write(echClientHello(t, tlsName, "secret.test"))
+					require.NoError(t, err)
+					typ, _ := firstRecord(t, c)
+					assert.Equal(t, byte(tlsHandshakeRecord), typ, "the proxy did not answer the ClientHelloOuter")
+				})
+			}
+			for _, f := range quicFronts {
+				t.Run(f.name, func(t *testing.T) {
+					pc, to, _ := f.open(t)
+					a := newQUICAttemptWith(t, quicsniff.Version1, &tls.Config{
+						ServerName:                     "secret.test",
+						NextProtos:                     []string{"h3"},
+						MinVersion:                     tls.VersionTLS13,
+						CurvePreferences:               []tls.CurveID{tls.X25519},
+						EncryptedClientHelloConfigList: echConfigList(t, h3Authority),
+					})
+					got := quicAnswer(t, pc, to, a)
+					assert.NotContains(t, got.types, uint64(0x1c), "the proxy closed the connection with %#x", got.closeCode)
+					assert.Contains(t, got.types, uint64(0x06), "the Initial has no CRYPTO frame")
+				})
+			}
+		},
+	},
+	{
+		id: "rfc9849/7.1/2", name: "a GREASE encrypted_client_hello extension",
+		req: "Otherwise, if all candidate ECHConfig values fail to decrypt the extension, the client-facing server MUST ignore the extension and proceed with the connection using ClientHelloOuter with the following modifications:",
+		run: func(t *testing.T) {
+			for _, f := range tlsFronts {
+				t.Run(f.name, func(t *testing.T) {
+					p, _ := newTLSProxy(t)
+					c := f.dial(t, p, tlsName)
+					_, err := c.Write(helloWithECH(t, greaseECH(t)))
+					require.NoError(t, err)
+					typ, _ := firstRecord(t, c)
+					assert.Equal(t, byte(tlsHandshakeRecord), typ, "the proxy did not answer the ClientHello")
+				})
+			}
+			for _, f := range quicFronts {
+				t.Run(f.name, func(t *testing.T) {
+					pc, to, _ := f.open(t)
+					a := newQUICAttempt(t, quicsniff.Version1, h3Authority)
+					a.hello = withExtension(t, a.hello, extensionECH, greaseECH(t))
+					got := quicAnswer(t, pc, to, a)
+					assert.NotContains(t, got.types, uint64(0x1c), "the proxy closed the connection with %#x", got.closeCode)
+					assert.Contains(t, got.types, uint64(0x06), "the Initial has no CRYPTO frame")
+				})
+			}
+		},
+	},
+	{
+		id: "rfc9849/7.1/3", name: "an encrypted_client_hello extension of type outer cut short",
+		req:  "Otherwise, if all candidate ECHConfig values fail to decrypt the extension, the client-facing server MUST ignore the extension and proceed with the connection using ClientHelloOuter with the following modifications:",
+		skip: "crypto/tls decides it, parsing the extension before it looks for ECH keys, and aborts with decode_error (50), the alert RFC 9846 section 6 gives a message that does not parse. A transparent connection and QUIC get decode_error from edge, whose parse of the ClientHello fails the same way",
+	},
+	{
+		id: "rfc9849/7.1/4", name: "an offer of Encrypted Client Hello on a transparent connection to a proxy rejecting it",
+		req:  "Otherwise, if all candidate ECHConfig values fail to decrypt the extension, the client-facing server MUST ignore the extension and proceed with the connection using ClientHelloOuter with the following modifications:",
+		skip: "edge departs under WithRejectECH, which refuses every ClientHello with the extension, an offer and GREASE alike, with handshake_failure (40) before the handshake (checkECH in ech.go, from peekClientHello in terminate.go)",
+	},
+	{
+		id: "rfc9849/7.1/5", name: "an offer of Encrypted Client Hello through a CONNECT to a proxy rejecting it",
+		req:  "Otherwise, if all candidate ECHConfig values fail to decrypt the extension, the client-facing server MUST ignore the extension and proceed with the connection using ClientHelloOuter with the following modifications:",
+		skip: "edge departs under WithRejectECH, which refuses every ClientHello with the extension, an offer and GREASE alike, with handshake_failure (40) before the handshake (checkECH in ech.go, from peekClientHello in terminate.go)",
+	},
+	{
+		id: "rfc9849/7.1/6", name: "an offer of Encrypted Client Hello over QUIC to a proxy rejecting it",
+		req:  "Otherwise, if all candidate ECHConfig values fail to decrypt the extension, the client-facing server MUST ignore the extension and proceed with the connection using ClientHelloOuter with the following modifications:",
+		skip: "edge departs under WithRejectECH, which refuses every ClientHello with the extension, an offer and GREASE alike, with CONNECTION_CLOSE 0x128, the handshake_failure of RFC 9001 section 4.8 (quicDemux.place in quicdemux.go)",
+	},
+	{
+		id: "rfc9849/7.1/7", name: "an offer of Encrypted Client Hello in a CONNECT-UDP tunnel to a proxy rejecting it",
+		req:  "Otherwise, if all candidate ECHConfig values fail to decrypt the extension, the client-facing server MUST ignore the extension and proceed with the connection using ClientHelloOuter with the following modifications:",
+		skip: "edge departs under WithRejectECH, which refuses every ClientHello with the extension, an offer and GREASE alike, with CONNECTION_CLOSE 0x128, the handshake_failure of RFC 9001 section 4.8 (quicDemux.place in quicdemux.go)",
+	},
+
+	// RFC 9849 section 8.1.1, misconfiguration and deployment concerns.
+	{
+		id: "rfc9849/8.1.1/1", name: "an offer of Encrypted Client Hello whose public name an entry admits",
+		req: "In order to ensure that the retry mechanism works successfully, servers SHOULD ensure that every endpoint which might receive a TLS connection is provisioned with an appropriate certificate for the public name.",
+		run: func(t *testing.T) {
+			// crypto/tls verifies the leaf for the public name before it reports the rejection.
+			for _, f := range tlsFronts {
+				t.Run(f.name, func(t *testing.T) {
+					p, ca := newTLSProxy(t)
+					err := tls.Client(f.dial(t, p, tlsName), &tls.Config{
+						ServerName:                     "secret.test",
+						RootCAs:                        ca.CertPool(),
+						MinVersion:                     tls.VersionTLS13,
+						EncryptedClientHelloConfigList: echConfigList(t, tlsName),
+					}).Handshake()
+					assert.ErrorAs(t, err, new(*tls.ECHRejectionError))
+				})
+			}
+			for _, f := range quicFronts {
+				t.Run(f.name, func(t *testing.T) {
+					pc, to, ca := f.open(t)
+					err := quicHandshakeOver(t, pc, to, &tls.Config{
+						ServerName:                     "secret.test",
+						RootCAs:                        ca.CertPool(),
+						NextProtos:                     []string{"h3"},
+						MinVersion:                     tls.VersionTLS13,
+						EncryptedClientHelloConfigList: echConfigList(t, h3Authority),
+					})
+					var rejected *tls.ECHRejectionError
+					assert.True(t, errors.As(err, &rejected), "%v", err)
+				})
+			}
 		},
 	},
 }

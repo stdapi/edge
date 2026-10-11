@@ -1967,9 +1967,13 @@ func (d *quicDemux) place(from flowKey, client net.Addr, conn *quicConn, hello [
 		}
 	}
 
-	ch := clientHelloFromQUIC(hello)
+	ch, alert := clientHelloFromQUIC(hello)
 	if ch == nil {
-		d.refuseConn(from, conn, quicDecodeError, "the ClientHello cannot be parsed")
+		code := quicDecodeError
+		if alert != 0 {
+			code = quic.TransportErrorCode(0x100 + uint64(alert))
+		}
+		d.refuseConn(from, conn, code, "the ClientHello cannot be parsed")
 		return
 	}
 	target := d.targetFor(ch, conn)
@@ -2542,9 +2546,10 @@ func (s *quicResetSecret) addrKey(addr netip.AddrPort) quic.StatelessResetKey {
 
 // clientHelloFromQUIC reads the ClientHello out of a raw handshake message. QUIC carries
 // handshake messages without a record layer, so one is put back for the sake of the parser.
-func clientHelloFromQUIC(hello []byte) *ClientHello {
+// It returns what clientHelloFromRecords returns.
+func clientHelloFromQUIC(hello []byte) (*ClientHello, byte) {
 	if len(hello) == 0 || len(hello) > math.MaxUint16 {
-		return nil
+		return nil, 0
 	}
 
 	record := make([]byte, 0, 5+len(hello))

@@ -734,6 +734,27 @@ func wantInitialBack(t *testing.T, client *net.UDPConn, a *quicAttempt, wait tim
 	}
 }
 
+// quicAnswer sends the first datagram of a to the proxy through pc and returns the frames of
+// the Initial it answers with.
+func quicAnswer(t *testing.T, pc net.PacketConn, to net.Addr, a *quicAttempt) initialContent {
+	t.Helper()
+	_, err := pc.WriteTo(a.first(t), to)
+	require.NoError(t, err)
+	require.NoError(t, pc.SetReadDeadline(time.Now().Add(5*time.Second)))
+	buf := make([]byte, 2048)
+	for {
+		n, _, err := pc.ReadFrom(buf)
+		require.NoError(t, err, "no Initial came back")
+		frames, ok := openServerInitial(a.version, a.dcid, buf[:n])
+		if !ok {
+			continue
+		}
+		c, ok := initialFrames(frames)
+		require.True(t, ok, "the frames of the Initial do not parse")
+		return c
+	}
+}
+
 // wantCloseBack wants the attempt answered with an Initial with a CONNECTION_CLOSE, and returns
 // its error code.
 func wantCloseBack(t *testing.T, client *net.UDPConn, a *quicAttempt, wait time.Duration) uint64 {
@@ -936,15 +957,21 @@ func newQUICAttempt(t *testing.T, version uint32, name string) *quicAttempt {
 
 func newQUICAttemptOffering(t *testing.T, version uint32, name string, protos []string) *quicAttempt {
 	t.Helper()
-	a := &quicAttempt{version: version, dcid: randomBytes(t, 8), scid: randomBytes(t, 8)}
-
-	qc := tls.QUICClient(&tls.QUICConfig{TLSConfig: &tls.Config{
+	return newQUICAttemptWith(t, version, &tls.Config{
 		ServerName:         name,
 		InsecureSkipVerify: name == "",
 		NextProtos:         protos,
 		MinVersion:         tls.VersionTLS13,
 		CurvePreferences:   []tls.CurveID{tls.X25519},
-	}})
+	})
+}
+
+// newQUICAttemptWith is an attempt whose ClientHello Go's TLS stack writes under cfg.
+func newQUICAttemptWith(t *testing.T, version uint32, cfg *tls.Config) *quicAttempt {
+	t.Helper()
+	a := &quicAttempt{version: version, dcid: randomBytes(t, 8), scid: randomBytes(t, 8)}
+
+	qc := tls.QUICClient(&tls.QUICConfig{TLSConfig: cfg})
 	params := quicvarint.Append(nil, 0x0f)
 	params = quicvarint.Append(params, uint64(len(a.scid)))
 	params = append(params, a.scid...)

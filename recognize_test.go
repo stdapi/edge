@@ -60,6 +60,18 @@ func TestSniff_ShortFirstWriteDecidesWithoutWaiting(t *testing.T) {
 	}
 }
 
+func TestScanRequestLine(t *testing.T) {
+	for _, line := range []string{"GET / HTTP/1.1", "PRI * HTTP/2.0"} {
+		for n := range len(line) {
+			assert.Equal(t, sniffMore, scanRequestLine([]byte(line[:n])), "%q", line[:n])
+		}
+		assert.Equal(t, sniffYes, scanRequestLine([]byte(line)), "%q", line)
+	}
+	for _, b := range []string{" ", " GET", "GET  ", "PRI  ", "GET /\x00", "GET / HTTP/x.1", "GET / FTP/1.1", "G(T / HTTP/1.1"} {
+		assert.Equal(t, sniffNo, scanRequestLine([]byte(b)), "%q", b)
+	}
+}
+
 func TestPeekAuthority(t *testing.T) {
 	cases := []struct {
 		name  string

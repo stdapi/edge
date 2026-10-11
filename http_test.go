@@ -1014,10 +1014,15 @@ func dialH2(t *testing.T, addr string) *h2Wire {
 	require.NoError(t, c.SetDeadline(time.Now().Add(10*time.Second)))
 	_, err = io.WriteString(c, http2.ClientPreface)
 	require.NoError(t, err)
+	h := newH2Wire(c)
+	require.NoError(t, h.fr.WriteSettings())
+	return h
+}
+
+func newH2Wire(c net.Conn) *h2Wire {
 	h := &h2Wire{fr: http2.NewFramer(c, c)}
 	h.fr.ReadMetaHeaders = hpack.NewDecoder(4096, nil)
 	h.enc = hpack.NewEncoder(&h.buf)
-	require.NoError(t, h.fr.WriteSettings())
 	return h
 }
 
@@ -1120,6 +1125,143 @@ func (h *h2Wire) h2Connect(t *testing.T) []hpack.HeaderField {
 	status, _ := h2Field(f.Fields, ":status")
 	require.Equal(t, "200", status)
 	return f.Fields
+}
+
+var plainH2Fronts = []string{viaH2C, viaRedirected, viaUnredirected, viaServeConn}
+
+func eachPlainH2Front(t *testing.T, run func(t *testing.T, front string)) {
+	t.Helper()
+	for _, front := range plainH2Fronts {
+		t.Run(front, func(t *testing.T) { run(t, front) })
+	}
+}
+
+// dialPlainH2Front serves p on front and returns a connection to it on which nothing was
+// written. When wrap is set, the proxy reads and writes through it.
+func dialPlainH2Front(t *testing.T, front string, p *Proxy, wrap func(net.Conn) net.Conn) net.Conn {
+	t.Helper()
+	if wrap == nil {
+		wrap = func(c net.Conn) net.Conn { return c }
+	}
+	t.Cleanup(func() { _ = p.Close() })
+	var c net.Conn
+	if front == viaH2C {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		go func() { _ = p.Serve(wrapListener{Listener: ln, wrap: wrap}) }()
+		c, err = net.DialTimeout("tcp", ln.Addr().String(), 5*time.Second)
+		require.NoError(t, err)
+	} else {
+		c = dialTransparentFront(t, front, p, wrap)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	require.NoError(t, c.SetDeadline(time.Now().Add(10*time.Second)))
+	return c
+}
+
+func prefaceThen(t *testing.T, frames func(fr *http2.Framer) error) []byte {
+	t.Helper()
+	var b bytes.Buffer
+	b.WriteString(http2.ClientPreface)
+	require.NoError(t, frames(http2.NewFramer(&b, nil)))
+	return b.Bytes()
+}
+
+// requestEncoder returns an encoder of GET requests on one HPACK context.
+func requestEncoder() func(authority, path string) []byte {
+	var b bytes.Buffer
+	enc := hpack.NewEncoder(&b)
+	return func(authority, path string) []byte {
+		b.Reset()
+		for _, f := range []hpack.HeaderField{hf(":method", "GET"), hf(":scheme", "http"), hf(":authority", authority), hf(":path", path)} {
+			_ = enc.WriteField(f)
+		}
+		return bytes.Clone(b.Bytes())
+	}
+}
+
+// sendAsync writes b on c without waiting. A write on a pipe returns only once the proxy has
+// read all of it.
+func sendAsync(c net.Conn, b []byte) { go func() { _, _ = c.Write(b) }() }
+
+// endedCleanly reports whether a read error is a close or a reset of the connection.
+func endedCleanly(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrClosedPipe) || errors.Is(err, syscall.ECONNRESET)
+}
+
+type echoCounts struct {
+	served atomic.Int32
+	dialed atomic.Int32
+}
+
+// hostEcho returns a proxy that answers every request on a.test and b.test with the host it
+// was routed on, refuses every upstream dial, and counts both.
+func hostEcho(t *testing.T) (*Proxy, *echoCounts) {
+	t.Helper()
+	n := new(echoCounts)
+	tr := DefaultTransport()
+	tr.DialContext = func(_ context.Context, network, _ string) (net.Conn, error) {
+		n.dialed.Add(1)
+		return nil, &net.OpError{Op: "dial", Net: network, Err: syscall.ECONNREFUSED}
+	}
+	p := testProxy(t, WithTransport(tr))
+	for _, host := range []string{"a.test", "b.test"} {
+		p.MustAdd(host+"/*{any}", func(c *HTTPCtx) (*http.Response, error) {
+			n.served.Add(1)
+			return Text(http.StatusOK, c.Host()), nil
+		})
+	}
+	return p, n
+}
+
+func (h *h2Wire) frame(t *testing.T) http2.Frame {
+	t.Helper()
+	f, err := h.fr.ReadFrame()
+	require.NoError(t, err, "no frame before the end of the connection")
+	return f
+}
+
+// bodies reads until every one of streams has ended and returns their bodies.
+func (h *h2Wire) bodies(t *testing.T, streams ...uint32) map[uint32]string {
+	t.Helper()
+	got := make(map[uint32]string)
+	open := len(streams)
+	for open > 0 {
+		f := h.frame(t)
+		if !slices.Contains(streams, f.Header().StreamID) {
+			switch f := f.(type) {
+			case *http2.SettingsFrame:
+				if !f.IsAck() {
+					require.NoError(t, h.fr.WriteSettingsAck())
+				}
+			case *http2.GoAwayFrame:
+				t.Fatalf("GOAWAY %v", f.ErrCode)
+			}
+			continue
+		}
+		switch f := f.(type) {
+		case *http2.RSTStreamFrame:
+			t.Fatalf("stream %d reset with %v", f.StreamID, f.ErrCode)
+		case *http2.MetaHeadersFrame:
+			if _, ok := got[f.StreamID]; !ok {
+				got[f.StreamID] = ""
+			}
+			if f.StreamEnded() {
+				open--
+			}
+		case *http2.DataFrame:
+			got[f.StreamID] += string(f.Data())
+			if f.StreamEnded() {
+				open--
+			}
+		}
+	}
+	return got
+}
+
+func isSettings(f http2.Frame) bool {
+	sf, ok := f.(*http2.SettingsFrame)
+	return ok && !sf.IsAck()
 }
 
 func drainOrigin(last string) func(*rawOrigin, *wire) {
@@ -3572,6 +3714,164 @@ var proxyConformance = []conformanceCase{
 			assert.Equal(t, "GET /a HTTP/1.1", startLine(b.origin.next(t).head))
 			b.origin.none(t)
 		},
+	},
+
+	// RFC 9113 sections 3.3 and 3.4, HTTP/2 with prior knowledge and the connection preface.
+	{
+		id: "rfc9113/3.3/1", name: "the connection preface and an empty SETTINGS frame, then nothing",
+		req: "Likewise, the server MUST send a connection preface (Section 3.4).",
+		run: func(t *testing.T) {
+			eachPlainH2Front(t, func(t *testing.T, front string) {
+				p, _ := hostEcho(t)
+				c := dialPlainH2Front(t, front, p, nil)
+				sendAsync(c, prefaceThen(t, func(fr *http2.Framer) error { return fr.WriteSettings() }))
+				assert.True(t, isSettings(newH2Wire(c).frame(t)), "the first frame is the server connection preface")
+			})
+		},
+	},
+	{
+		id: "rfc9113/3.3/2", name: "the connection preface, an empty SETTINGS frame and a request, read one octet at a time",
+		req: "Likewise, the server MUST send a connection preface (Section 3.4).",
+		run: func(t *testing.T) {
+			eachPlainH2Front(t, func(t *testing.T, front string) {
+				p, _ := hostEcho(t)
+				c := dialPlainH2Front(t, front, p, asOctets)
+				block := requestEncoder()
+				sendAsync(c, prefaceThen(t, func(fr *http2.Framer) error {
+					return errors.Join(fr.WriteSettings(), fr.WriteHeaders(http2.HeadersFrameParam{
+						StreamID: 1, BlockFragment: block("a.test", "/"), EndHeaders: true, EndStream: true,
+					}))
+				}))
+				h := newH2Wire(c)
+				assert.True(t, isSettings(h.frame(t)), "the first frame is the server connection preface")
+				assert.Equal(t, map[uint32]string{1: "a.test"}, h.bodies(t, 1))
+			})
+		},
+	},
+	{
+		id: "rfc9113/3.3/3", name: "the connection preface over TLS from a client that offered no ALPN",
+		req: "This only affects the establishment of HTTP/2 connections over cleartext TCP; HTTP/2 connections over TLS MUST use protocol negotiation in TLS [TLS-ALPN].",
+		run: func(t *testing.T) {
+			for _, front := range []string{"connect", viaRedirected} {
+				t.Run(front, func(t *testing.T) {
+					p, ca := newTLSProxy(t)
+					var conn net.Conn
+					if front == "connect" {
+						conn = connectRaw(t, startProxy(t, p), tlsName+":443")
+					} else {
+						conn = dialWire(t, startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) {
+							return netip.MustParseAddrPort("192.0.2.1:443"), nil
+						})).Conn
+					}
+					require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+					tc := tls.Client(conn, &tls.Config{ServerName: tlsName, RootCAs: ca.CertPool(), MinVersion: tls.VersionTLS12})
+					require.NoError(t, tc.Handshake())
+					require.Empty(t, tc.ConnectionState().NegotiatedProtocol)
+					_, err := tc.Write(prefaceThen(t, func(fr *http2.Framer) error { return fr.WriteSettings() }))
+					require.NoError(t, err)
+					head := make([]byte, 9)
+					if _, err := io.ReadFull(tc, head); err == nil {
+						assert.NotEqual(t, byte(http2.FrameSettings), head[3], "the proxy answered in HTTP/2 on a connection that negotiated no protocol")
+					}
+				})
+			}
+		},
+	},
+	{
+		id: "rfc9113/3.3/4", name: "a connection preface stalled past the sniff timeout",
+		req:  "Likewise, the server MUST send a connection preface (Section 3.4).",
+		skip: "A redirected plaintext connection whose first line has not arrived within WithSniffTimeout is served as a byte stream, so a stalled preface reaches a stream entry on the destination, and is closed when none admits it.",
+	},
+	{
+		id: "rfc9113/3.4/1", name: "the connection preface, an empty SETTINGS frame and a request in one write",
+		req: "The server connection preface consists of a potentially empty SETTINGS frame (Section 6.5) that MUST be the first frame the server sends in the HTTP/2 connection.",
+		run: func(t *testing.T) {
+			eachPlainH2Front(t, func(t *testing.T, front string) {
+				p, _ := hostEcho(t)
+				c := dialPlainH2Front(t, front, p, nil)
+				block := requestEncoder()
+				sendAsync(c, prefaceThen(t, func(fr *http2.Framer) error {
+					return errors.Join(fr.WriteSettings(), fr.WriteHeaders(http2.HeadersFrameParam{
+						StreamID: 1, BlockFragment: block("a.test", "/"), EndHeaders: true, EndStream: true,
+					}))
+				}))
+				h := newH2Wire(c)
+				assert.True(t, isSettings(h.frame(t)), "the first frame is the server connection preface")
+				assert.Equal(t, map[uint32]string{1: "a.test"}, h.bodies(t, 1))
+			})
+		},
+	},
+	{
+		id: "rfc9113/3.4/2", name: "the connection preface and a SETTINGS frame, then nothing",
+		req: "The SETTINGS frames received from a peer as part of the connection preface MUST be acknowledged (see Section 6.5.3) after sending the connection preface.",
+		run: func(t *testing.T) {
+			eachPlainH2Front(t, func(t *testing.T, front string) {
+				p, _ := hostEcho(t)
+				c := dialPlainH2Front(t, front, p, nil)
+				sendAsync(c, prefaceThen(t, func(fr *http2.Framer) error {
+					return fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1 << 20})
+				}))
+				h := newH2Wire(c)
+				require.True(t, isSettings(h.frame(t)), "the first frame is the server connection preface")
+				for {
+					if f, ok := h.frame(t).(*http2.SettingsFrame); ok && f.IsAck() {
+						return
+					}
+				}
+			})
+		},
+	},
+	{
+		id: "rfc9113/3.4/3", name: "the connection preface, a SETTINGS frame and requests to two authorities in one write",
+		req: "To avoid unnecessary latency, clients are permitted to send additional frames to the server immediately after sending the client connection preface, without waiting to receive the server connection preface.",
+		run: func(t *testing.T) {
+			eachPlainH2Front(t, func(t *testing.T, front string) {
+				p, _ := hostEcho(t)
+				c := dialPlainH2Front(t, front, p, nil)
+				block := requestEncoder()
+				sendAsync(c, prefaceThen(t, func(fr *http2.Framer) error {
+					return errors.Join(fr.WriteSettings(),
+						fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: block("a.test", "/"), EndHeaders: true, EndStream: true}),
+						fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 3, BlockFragment: block("b.test", "/"), EndHeaders: true, EndStream: true}))
+				}))
+				assert.Equal(t, map[uint32]string{1: "a.test", 3: "b.test"}, newH2Wire(c).bodies(t, 1, 3))
+			})
+		},
+	},
+	{
+		id: "rfc9113/3.4/4", name: "the connection preface followed by a request in place of SETTINGS",
+		req: "Clients and servers MUST treat an invalid connection preface as a connection error (Section 5.4.1) of type PROTOCOL_ERROR.  A GOAWAY frame (Section 6.8) MAY be omitted in this case, since an invalid preface indicates that the peer is not using HTTP/2.",
+		run: func(t *testing.T) {
+			eachPlainH2Front(t, func(t *testing.T, front string) {
+				p, n := hostEcho(t)
+				c := dialPlainH2Front(t, front, p, nil)
+				block := requestEncoder()
+				sendAsync(c, prefaceThen(t, func(fr *http2.Framer) error {
+					return fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: block("a.test", "/"), EndHeaders: true, EndStream: true})
+				}))
+				h := newH2Wire(c)
+				for {
+					f, err := h.fr.ReadFrame()
+					if err != nil {
+						require.True(t, endedCleanly(err), "the connection ends after HTTP/2 frames, got %v", err)
+						break
+					}
+					switch f := f.(type) {
+					case *http2.GoAwayFrame:
+						assert.Equal(t, http2.ErrCodeProtocol, f.ErrCode, "GOAWAY %v", f.ErrCode)
+					case *http2.MetaHeadersFrame, *http2.DataFrame:
+						t.Fatalf("a response on stream %d", f.Header().StreamID)
+					}
+				}
+				assert.Zero(t, n.served.Load(), "the request reached its handler")
+				assert.Zero(t, n.dialed.Load(), "an upstream connection was dialed")
+			})
+		},
+	},
+	{
+		id: "rfc9113/3.4/5", name: "the 24 octets of the connection preface with SM altered, then SETTINGS and a request",
+		req:  "Clients and servers MUST treat an invalid connection preface as a connection error (Section 5.4.1) of type PROTOCOL_ERROR.  A GOAWAY frame (Section 6.8) MAY be omitted in this case, since an invalid preface indicates that the peer is not using HTTP/2.",
+		skip: "net/http serves HTTP/2 over plaintext only on the exact 24 octets and reads anything else as HTTP/1.1, here a request PRI * HTTP/2.0 that edge answers 400 before net/http closes the connection, with no frame sent and nothing routed.",
 	},
 
 	// RFC 9113, the HTTP/2 front.

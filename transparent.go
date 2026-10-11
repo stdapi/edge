@@ -175,12 +175,13 @@ func redirectedTo(origin netip.AddrPort, local net.Addr) netip.AddrPort {
 }
 
 // clientHelloFromRecords parses the TLS records in raw and returns what the client offered,
-// or nil when they hold no ClientHello. Go's own TLS server does the parsing, since a
-// hand-rolled parser would have to keep up with every extension a client may add, and would
-// be a parser fed by the network.
-func clientHelloFromRecords(raw []byte) *ClientHello {
+// or nil and the alert Go's TLS server sent on them, zero when it sent none. Go's own TLS
+// server does the parsing, since a hand-rolled parser would have to keep up with every
+// extension a client may add, and would be a parser fed by the network.
+func clientHelloFromRecords(raw []byte) (*ClientHello, byte) {
 	var captured *ClientHello
-	_ = tls.Server(&replayConn{r: raw}, &tls.Config{
+	conn := &replayConn{r: raw}
+	_ = tls.Server(conn, &tls.Config{
 		GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
 			captured = &ClientHello{
 				ServerName:        chi.ServerName,
@@ -193,7 +194,11 @@ func clientHelloFromRecords(raw []byte) *ClientHello {
 			return nil, errStopHandshake
 		},
 	}).Handshake()
-	return captured
+	if captured != nil {
+		// The alert is the one errStopHandshake made it send.
+		return captured, 0
+	}
+	return nil, conn.alert
 }
 
 var errStopHandshake = errors.New("edge: client hello captured")
@@ -245,14 +250,15 @@ func peekHandshakeRecords(conn *peekConn) ([]byte, error) {
 }
 
 // replayConn feeds already-read bytes to a TLS server that is only meant to parse them.
-// Writes are discarded: nothing it produces reaches the client, whose handshake is completed
-// later by the real server.
+// Nothing it writes reaches the client, whose handshake is completed later by the real server,
+// so only the description of its first alert is kept, for the caller to send.
 type replayConn struct {
 	r []byte
 	// off must be advanced across reads, which is why every method takes a pointer
 	// receiver: on a value receiver the offset would reset and the TLS reader would see the
 	// same record header forever.
-	off int
+	off   int
+	alert byte
 }
 
 func (c *replayConn) Read(b []byte) (int, error) {
@@ -264,7 +270,13 @@ func (c *replayConn) Read(b []byte) (int, error) {
 	return n, nil
 }
 
-func (c *replayConn) Write(b []byte) (int, error)      { return len(b), nil }
+func (c *replayConn) Write(b []byte) (int, error) {
+	if c.alert == 0 && len(b) >= 7 && b[0] == tlsAlertRecord {
+		c.alert = b[6]
+	}
+	return len(b), nil
+}
+
 func (c *replayConn) Close() error                     { return nil }
 func (c *replayConn) LocalAddr() net.Addr              { return emptyAddr{} }
 func (c *replayConn) RemoteAddr() net.Addr             { return emptyAddr{} }

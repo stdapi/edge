@@ -72,6 +72,22 @@ func echConfigList(t *testing.T, publicName string) []byte {
 	return append(list, config...)
 }
 
+// greaseECH is the payload of a GREASE encrypted_client_hello extension, RFC 9849 section
+// 6.2.1.
+func greaseECH(t *testing.T) []byte {
+	t.Helper()
+	key, err := ecdh.X25519().GenerateKey(rand.Reader)
+	require.NoError(t, err)
+	enc := key.PublicKey().Bytes()
+
+	ext := []byte{0x00, 0x00, 0x01, 0x00, 0x01} // outer, HKDF-SHA256, AES-128-GCM
+	ext = append(ext, randomBytes(t, 1)...)     // config_id
+	ext = binary.BigEndian.AppendUint16(ext, uint16(len(enc)))
+	ext = append(ext, enc...)
+	ext = binary.BigEndian.AppendUint16(ext, 208)
+	return append(ext, randomBytes(t, 208)...)
+}
+
 // captureClientHello returns the TLS records of the first flight a client configured with
 // cfg would send.
 func captureClientHello(t *testing.T, cfg *tls.Config) []byte {
