@@ -604,7 +604,13 @@ func TestSOCKS5_AssociationBoundsWhatWaitsOnAName(t *testing.T) {
 		release: make(chan struct{}),
 	}
 	p := testProxy(t, WithNameResolver(resolver))
-	p.MustAdd[UDP]("+{any}.udp.test", forwardDatagram)
+	forwarded := make(chan string, (socks5NameResolving+1)*(maxPendingDatagrams+1))
+	p.MustAdd[UDP]("+{any}.udp.test", func(c *DatagramCtx) error {
+		if !c.Inbound() {
+			forwarded <- c.Param("any")
+		}
+		return c.Forward()
+	})
 	p.MustAdd[UDP]("[127.0.0.0/8]", forwardDatagram)
 	addr := startSOCKS5(t, p)
 	client := associate(t, addr, "", "")
@@ -630,8 +636,20 @@ func TestSOCKS5_AssociationBoundsWhatWaitsOnAName(t *testing.T) {
 	body, _ := echoThroughSOCKS(t, client, net.UDPAddrFromAddrPort(echo), "probe")
 	require.Equal(t, "probe", body)
 	close(resolver.release)
-	got := readAllThroughSOCKS(t, client, socks5NameResolving*maxPendingDatagrams+1)
-	assert.Len(t, got, socks5NameResolving*maxPendingDatagrams, "every name within the bound came back up to its own bound")
+	got := make(map[string]int)
+	for range socks5NameResolving * maxPendingDatagrams {
+		select {
+		case name := <-forwarded:
+			got[name]++
+		case <-time.After(5 * time.Second):
+			t.Fatalf("forwarded %v", got)
+		}
+	}
+	want := make(map[string]int)
+	for i := range socks5NameResolving {
+		want[fmt.Sprintf("n%d", i)] = maxPendingDatagrams
+	}
+	assert.Equal(t, want, got, "every name within the bound reached its entry up to its own bound")
 }
 
 func TestSOCKS5_AssociationFlowSocketLeavesDontFragmentUnset(t *testing.T) {
