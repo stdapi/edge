@@ -402,12 +402,13 @@ func (t *tXn) insertTokens(p, n *node, tokens []token, ic *entry) (*node, error)
 			// another, the request itself telling them apart.
 			// Conflicts are matcher-aware: /foo/?x=y and /foo/*{any}?a=b don't conflict because the exact path's matcher
 			// creates a gap, such as request with ?a=b (but not ?x=y) fail the exact match and fall through to the catch-empty.
-			// Since pattern matching precedes matcher evaluation, a conflict occurs when the exact path has no matchers (shadows all requests
-			// to that pattern) or matchers equal to the catch-empty's (both match the same request).
+			// The exact path is tried first, so it shadows the catch-empty when each of its matchers, if it has any, is also a
+			// matcher of the catch-empty. Matchers are compared with Equal, so one accepting more requests than another, such as
+			// GET,POST over GET, is not detected.
 			var conflicts []*entry
 			if ic.pattern.optionalCatchAll && p != nil {
 				for _, r := range p.entries {
-					if r.kind == ic.kind && r.samePort(ic) && (len(r.matchers) == 0 || r.matchersEqual(ic.matchers)) {
+					if r.kind == ic.kind && r.samePort(ic) && r.matchersWithin(ic) {
 						conflicts = append(conflicts, r)
 					}
 				}
@@ -418,7 +419,7 @@ func (t *tXn) insertTokens(p, n *node, tokens []token, ic *entry) (*node, error)
 
 			for _, wildcard := range n.wildcards {
 				for _, r := range wildcard.entries {
-					if r.pattern.optionalCatchAll && r.kind == ic.kind && r.samePort(ic) && (len(ic.matchers) == 0 || ic.matchersEqual(r.matchers)) {
+					if r.pattern.optionalCatchAll && r.kind == ic.kind && r.samePort(ic) && ic.matchersWithin(r) {
 						conflicts = append(conflicts, r)
 					}
 				}

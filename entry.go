@@ -135,6 +135,19 @@ outer:
 	return true
 }
 
+func (e *entry) matchersWithin(other *entry) bool {
+outer:
+	for _, a := range e.matchers {
+		for _, b := range other.matchers {
+			if a.Equal(b) {
+				continue outer
+			}
+		}
+		return false
+	}
+	return true
+}
+
 func (e *entry) String() string {
 	sb := new(strings.Builder)
 	entryf(sb, e, 0, true)
