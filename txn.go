@@ -177,6 +177,20 @@ func (txn *Txn) Len() int {
 	return txn.rootTxn.handlers
 }
 
+// Iter returns a set of range iterators over the registered entries. On a write transaction,
+// Iter captures a point-in-time snapshot of the transaction, so writing while iterating is
+// allowed and the iterators do not observe the writes.
+func (txn *Txn) Iter() Iter {
+	if txn.rootTxn == nil {
+		panic(ErrSettledTxn)
+	}
+	patterns, addrs, names := txn.rootTxn.patterns, txn.rootTxn.addrs, txn.rootTxn.names
+	if txn.write {
+		patterns, addrs, names = txn.rootTxn.snapshot()
+	}
+	return Iter{patterns: patterns, addrs: addrs, names: names, maxDepth: txn.rootTxn.maxDepth}
+}
+
 // Admits reports whether a connection to target carrying kind's traffic is admitted, resolved
 // on the tree this transaction sees rather than on the published one. A write transaction can
 // therefore check the effect of a change before it commits. See [Proxy.Admits].

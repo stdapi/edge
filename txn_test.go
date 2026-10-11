@@ -35,6 +35,7 @@ func TestTxn_Truncate(t *testing.T) {
 	defer txn.Abort()
 	require.NoError(t, txn.Truncate())
 	assert.Zero(t, txn.Len())
+	assert.Zero(t, iterutil.Len(txn.Iter().All()))
 	assert.Equal(t, len(githubAPI)+2, p.Len(), "a truncate is not visible before the commit")
 
 	before := p.Txn(false)
@@ -45,10 +46,39 @@ func TestTxn_Truncate(t *testing.T) {
 	assert.Zero(t, iterutil.Len(p.Iter().Names()))
 	assert.False(t, p.Admits(target("api.github.test:443"), KindHTTP))
 	assert.Equal(t, len(githubAPI)+2, before.Len())
+	assert.Equal(t, len(githubAPI)+2, iterutil.Len(before.Iter().All()))
+	assert.Equal(t, len(githubAPI), iterutil.Len(before.Iter().Names()))
 	assert.True(t, before.Admits(target("api.github.test:443"), KindHTTP))
 }
 
 func TestTxn_Isolation(t *testing.T) {
+	t.Run("iterator does not observe writes made after it", func(t *testing.T) {
+		p := testProxy(t)
+		require.NoError(t, p.Updates(func(txn *Txn) error {
+			for _, pattern := range []string{"a.test/ab", "a.test/ab/cd", "a.test/ab/cd/ef"} {
+				if _, err := txn.Add(pattern, noopHandler); err != nil {
+					return err
+				}
+			}
+			it := txn.Iter()
+
+			var patterns []string
+			for e := range it.All() {
+				patterns = append(patterns, e.Pattern())
+				for _, pattern := range []string{"a.test/ab/cd/ef/gh", "a.test/ab/cd/ef/gh/ij", "a.test/ab/cd/e", "a.test/ax", "b.test/ab"} {
+					_, _ = txn.Add(pattern, noopHandler, WithName[HTTP](pattern))
+				}
+				_, _ = txn.Delete[HTTP]("a.test/ab/cd")
+			}
+			assert.Equal(t, []string{"a.test/ab", "a.test/ab/cd", "a.test/ab/cd/ef"}, patterns)
+			assert.Equal(t, []string{"a.test/ab", "a.test/ab/cd", "a.test/ab/cd/ef"}, patternsOf(it.All()))
+			assert.Equal(t, []string{"a.test"}, patternsOf(it.Admissions()))
+			assert.Empty(t, patternsOf(it.Names()))
+			assert.Equal(t, 7, iterutil.Len(txn.Iter().All()))
+			return nil
+		}))
+	})
+
 	t.Run("snapshot does not observe further writes", func(t *testing.T) {
 		p := testProxy(t)
 		require.NoError(t, p.Updates(func(txn *Txn) error {
@@ -84,6 +114,8 @@ func TestTxn_Isolation(t *testing.T) {
 				return nil
 			}))
 			assert.Equal(t, len(githubAPI), txn.Len())
+			assert.Equal(t, len(githubAPI), iterutil.Len(txn.Iter().All()))
+			assert.Equal(t, len(githubAPI), iterutil.Len(txn.Iter().Names()))
 			assert.False(t, txn.Has[HTTP](pattern, mustMethods(http.MethodGet)))
 			_, ok := txn.Named[HTTP]("GET:" + pattern)
 			assert.False(t, ok)
@@ -181,6 +213,7 @@ func TestTxn_UseAfterAbort(t *testing.T) {
 		"Named":    func() { _, _ = txn.Named[HTTP]("foo") },
 		"Truncate": func() { _ = txn.Truncate() },
 		"Admits":   func() { txn.Admits(target("a.test:443"), KindHTTP) },
+		"Iter":     func() { txn.Iter() },
 	} {
 		assert.PanicsWithValue(t, ErrSettledTxn, fn, name)
 	}

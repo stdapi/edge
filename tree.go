@@ -190,6 +190,13 @@ func (t *tXn) clone() *tXn {
 	return tx
 }
 
+// snapshot returns the roots as they stand. Dropping writable makes the next write copy the
+// nodes it touches, which a snapshot may still reach.
+func (t *tXn) snapshot() (patterns, addrs, names *node) {
+	t.writable = nil
+	return t.patterns, t.addrs, t.names
+}
+
 // rootFor returns the root ic's pattern lives under. The insert, delete and search
 // machinery walks whatever root it is handed, so this is the whole of the dispatch.
 func (t *tXn) rootFor(ic *entry) *node {
