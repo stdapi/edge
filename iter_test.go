@@ -132,3 +132,59 @@ func TestIter_Names(t *testing.T) {
 	}
 	require.Equal(t, []string{"charges"}, named)
 }
+
+func TestIter_Break(t *testing.T) {
+	p := testProxy(t)
+	for _, pattern := range []string{"a.test/x", "a.test/y", "b.test/x", "10.0.0.1/x", "[10.0.0.0/8]/x"} {
+		p.MustAdd(pattern, noopHandler, WithName[HTTP](pattern))
+		p.MustAdd(pattern, noopHandler, WithName[HTTP](pattern+" GET"), WithMethods[HTTP](http.MethodGet))
+	}
+	p.MustAdd[TCP]("smtp.test:25", noopStream)
+	p.MustAdd[TCP]("10.0.0.2:25", noopStream)
+
+	it := p.Iter()
+	for name, seq := range map[string]func(func(EntryView) bool){
+		"All":                         it.All(),
+		"Admissions":                  it.Admissions(),
+		"Names":                       it.Names(),
+		"Entries":                     it.Entries("a.test/x"),
+		"PatternPrefix":               it.PatternPrefix(""),
+		"PatternPrefix of a name":     it.PatternPrefix("a.test/"),
+		"PatternPrefix of an address": it.PatternPrefix("10.0.0.1"),
+		"NamePrefix":                  it.NamePrefix("a.test/"),
+	} {
+		n := 0
+		for range seq {
+			n++
+			break
+		}
+		assert.Equal(t, 1, n, name)
+	}
+}
+
+func TestIter_PatternStrictPrefix(t *testing.T) {
+	p := testProxy(t)
+	p.MustAdd("a.test/{a}/b/x", noopHandler)
+	p.MustAdd("a.test/{a}/b/y", noopHandler)
+	p.MustAdd("a.test/{other}/b/z", noopHandler)
+
+	assert.Equal(t, []string{"a.test/{a}/b/x", "a.test/{a}/b/y"}, patternsOf(p.Iter().PatternPrefix("a.test/{a}/b")))
+	assert.Empty(t, patternsOf(p.Iter().PatternPrefix("a.test/{a:")))
+}
+
+func TestIter_Empty(t *testing.T) {
+	it := testProxy(t).Iter()
+	for name, seq := range map[string]func(func(EntryView) bool){
+		"All":                  it.All(),
+		"Admissions":           it.Admissions(),
+		"Names":                it.Names(),
+		"Entries":              it.Entries("a.test/x"),
+		"Entries of nothing":   it.Entries(""),
+		"PatternPrefix":        it.PatternPrefix("a.test/"),
+		"PatternPrefix of all": it.PatternPrefix(""),
+		"NamePrefix":           it.NamePrefix("a"),
+		"NamePrefix of all":    it.NamePrefix(""),
+	} {
+		assert.Empty(t, patternsOf(seq), name)
+	}
+}

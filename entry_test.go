@@ -195,4 +195,33 @@ func TestEntry_Validation(t *testing.T) {
 	assert.Error(t, err)
 	_, err = p.Add[TCP]("api.test/v1", noopStream)
 	assert.Error(t, err)
+
+	p.MustAdd("api.test/v1", noopHandler)
+	_, err = p.Update("api.test/v1", HTTP(nil))
+	assert.ErrorIs(t, err, ErrInvalidEntry)
+	_, err = p.Update("api.test/v1", noopHandler, WithMatchersPriority[HTTP](5))
+	assert.ErrorIs(t, err, ErrInvalidEntry)
+	_, err = p.Update("api.test/v\x00", noopHandler)
+	assert.ErrorAs(t, err, new(*PatternError))
+	_, err = p.Update("api.test/users/j%6Fhn", noopHandler)
+	assert.ErrorAs(t, err, new(*PatternError))
+	assert.Equal(t, 1, p.Len())
+}
+
+func TestEntry_MaxMatchers(t *testing.T) {
+	p := testProxy(t, WithMaxMatchers(3))
+	a, err := MatchQuery("a", "b")
+	require.NoError(t, err)
+	b, err := MatchQuery("b", "c")
+	require.NoError(t, err)
+	c, err := MatchQuery("d", "e")
+	require.NoError(t, err)
+
+	_, err = p.Add("api.test/v1", noopHandler, WithRequestMatchers[HTTP](a, b, c))
+	require.NoError(t, err)
+	_, err = p.Add("api.test/v1", noopHandler, WithRequestMatchers[HTTP](a, b, c), WithMethods[HTTP](http.MethodGet))
+	assert.ErrorIs(t, err, ErrTooManyMatchers, "a method counts as a matcher")
+	_, err = p.Update("api.test/v1", noopHandler, WithRequestMatchers[HTTP](a, b), WithMethods[HTTP](http.MethodGet), WithScheme[HTTP]("https"))
+	assert.ErrorIs(t, err, ErrTooManyMatchers)
+	assert.Equal(t, 1, p.Len())
 }

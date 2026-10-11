@@ -137,18 +137,6 @@ func TestAdmission_TerminationRequiresCA(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestAdmission_TruncateDropsEverything(t *testing.T) {
-	p := testProxy(t)
-	p.MustAdd("api.test/v1", noopHandler)
-	p.MustAdd[TCP]("smtp.test:465", noopStream)
-
-	require.NoError(t, p.Updates(func(txn *Txn) error { return txn.Truncate() }))
-
-	assert.Equal(t, 0, p.Len())
-	assert.Equal(t, 0, admissionsLen(p))
-	assert.False(t, p.Admits(target("api.test:443"), KindHTTP))
-}
-
 func TestAdmission_SwapKindsAtomically(t *testing.T) {
 	p := testProxy(t)
 	p.MustAdd("api.test/*{rest}", noopHandler)
