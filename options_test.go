@@ -54,6 +54,7 @@ func TestOptions_Rejected(t *testing.T) {
 		{"negative idle timeout", WithIdleTimeout(-time.Second)},
 		{"negative sniff timeout", WithSniffTimeout(-time.Second)},
 		{"zero max header bytes", WithMaxHeaderBytes(0)},
+		{"zero max frame bytes", WithMaxFrameBytes(0)},
 	}
 
 	for _, tc := range cases {

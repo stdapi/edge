@@ -827,6 +827,7 @@ type wsConf struct {
 	originEarly []byte
 	tls         bool
 	proto       string
+	maxFrame    int
 }
 
 type wsConn struct {
@@ -905,6 +906,9 @@ func openWS(t *testing.T, conf wsConf) *wsConn {
 	require.NoError(t, err)
 	host, line := originURL.Host, "GET "+origin.URL+"/ws "
 	var opts []ProxyOption
+	if conf.maxFrame > 0 {
+		opts = append(opts, WithMaxFrameBytes(conf.maxFrame))
+	}
 	if conf.tls {
 		host, line = "ws.example.test", "GET /ws "
 		tr := DefaultTransport()
@@ -1585,10 +1589,10 @@ var wsConformance = []conformanceCase{
 		id: "rfc6455/10.4/1", name: "frames of the frame limit and of one byte more from the client",
 		req: "Implementations that have implementation- and/or platform-specific limitations regarding the frame size or total message size after reassembly from multiple frames MUST protect themselves against exceeding those limits.",
 		run: func(t *testing.T) {
-			ws := openWS(t, wsConf{})
-			cross(ws.client, ws.origin, 0x82, make([]byte, 1<<20))
+			ws := openWS(t, wsConf{maxFrame: 1 << 10})
+			cross(ws.client, ws.origin, 0x82, make([]byte, 1<<10))
 			// The header alone. A payload left unread would turn the close into a reset.
-			b := binary.BigEndian.AppendUint64([]byte{0x82, 0xff}, 1<<20+1)
+			b := binary.BigEndian.AppendUint16([]byte{0x82, 0xfe}, 1<<10+1)
 			ws.client.write(append(b, wsKey[:]...))
 			ws.client.wantFailed(1009)
 			ws.origin.wantNoData()
