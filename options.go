@@ -10,20 +10,6 @@ import (
 	"time"
 )
 
-// TrailingSlashOption controls whether an entry matches a path whose trailing slash differs
-// from the one it was registered with.
-type TrailingSlashOption uint8
-
-const (
-	// ExactSlash matches the path exactly as registered. /foo and /foo/ are distinct entries.
-	ExactSlash TrailingSlashOption = iota
-	// RelaxedSlash matches the path with or without its trailing slash. An exactly registered
-	// variant always wins over a relaxed match.
-	RelaxedSlash
-
-	slashOptionSentinel
-)
-
 // ProxyOption configures a [Proxy].
 type ProxyOption interface {
 	applyProxy(sealedOption) error
@@ -187,26 +173,26 @@ func WithAnnotation[H Handler](key, value any) EntryOption[H] {
 	})
 }
 
-// WithTrailingSlash configures trailing slash handling for one entry, overriding the proxy
-// default. Only a kind carrying a path has a trailing slash to handle.
-func WithTrailingSlash[H PathKeyed](opt TrailingSlashOption) EntryOption[H] {
-	return option[H](func(s sealedOption) error {
-		if opt >= slashOptionSentinel {
-			return fmt.Errorf("%w: unknown trailing slash option", ErrInvalidConfig)
+// WithRelaxedTrailingSlash configures how entries handle a trailing slash in request paths. When
+// enabled, both /foo/bar and /foo/bar/ match the same entry. When disabled, the default, they
+// are different entries.
+//
+// This option can be applied on a per-entry basis or globally:
+//   - If applied globally, it affects all entries of kind H by default.
+//   - If applied to a specific entry, it overrides the global setting for that entry.
+//
+// If both /foo/bar and /foo/bar/ are explicitly registered, the exact match always takes precedence.
+func WithRelaxedTrailingSlash[H PathKeyed](enable bool) interface {
+	ProxyOption
+	EntryOption[H]
+} {
+	kind := kindOf[H]()
+	return proxyEntryOption[H](func(s sealedOption) error {
+		if s.entry != nil {
+			s.entry.relaxedSlash = enable
+			return nil
 		}
-		s.entry.handleSlash = opt
-		return nil
-	})
-}
-
-// WithDefaultTrailingSlash sets the trailing slash handling of every entry that does not
-// override it with [WithTrailingSlash].
-func WithDefaultTrailingSlash(opt TrailingSlashOption) ProxyOption {
-	return proxyOption(func(s sealedOption) error {
-		if opt >= slashOptionSentinel {
-			return fmt.Errorf("%w: unknown trailing slash option", ErrInvalidConfig)
-		}
-		s.proxy.cfg.handleSlash = opt
+		s.proxy.cfg.relaxedSlash[kind] = enable
 		return nil
 	})
 }

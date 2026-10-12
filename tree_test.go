@@ -29,7 +29,7 @@ type lookupCase struct {
 	host     string
 	path     string
 	want     string
-	relaxed  bool // the match exists only under RelaxedSlash
+	relaxed  bool
 	params   []Param
 }
 
@@ -53,9 +53,9 @@ func patternOf(e *entry) string {
 	return e.pattern.str
 }
 
-func routingProxy(t *testing.T, slash TrailingSlashOption, patterns ...string) *Proxy {
+func routingProxy(t *testing.T, relaxed bool, patterns ...string) *Proxy {
 	t.Helper()
-	p := testProxy(t, WithRegexpParam(true), WithDefaultTrailingSlash(slash))
+	p := testProxy(t, WithRegexpParam(true), WithRelaxedTrailingSlash[HTTP](relaxed))
 	for _, pattern := range patterns {
 		_, err := p.Add(pattern, noopHandler)
 		require.NoError(t, err)
@@ -63,13 +63,13 @@ func routingProxy(t *testing.T, slash TrailingSlashOption, patterns ...string) *
 	return p
 }
 
-// runLookup checks every case under slash, and under RelaxedSlash checks that ExactSlash finds
-// the same entry unless the case is relaxed. A lazy walk must find the same entry and capture nothing.
-func runLookup(t *testing.T, slash TrailingSlashOption, cases []lookupCase) {
+// runLookup checks every case, and with a relaxed slash checks that an exact slash finds the
+// same entry unless the case is relaxed. A lazy walk must find the same entry and capture nothing.
+func runLookup(t *testing.T, relaxed bool, cases []lookupCase) {
 	t.Helper()
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			p := routingProxy(t, slash, tc.patterns...)
+			p := routingProxy(t, relaxed, tc.patterns...)
 			e, params := lookupOn(p, tc.host, tc.path, httptest.NewRequest(http.MethodGet, "/", nil), false)
 			assert.Equal(t, tc.want, patternOf(e))
 			assert.Equal(t, tc.params, params)
@@ -78,10 +78,10 @@ func runLookup(t *testing.T, slash TrailingSlashOption, cases []lookupCase) {
 			assert.Equal(t, tc.want, patternOf(e), "lazy")
 			assert.Empty(t, params, "lazy")
 
-			if slash == ExactSlash {
+			if !relaxed {
 				return
 			}
-			p = routingProxy(t, ExactSlash, tc.patterns...)
+			p = routingProxy(t, false, tc.patterns...)
 			e, _ = lookupOn(p, tc.host, tc.path, httptest.NewRequest(http.MethodGet, "/", nil), false)
 			if tc.relaxed {
 				assert.NotEqual(t, tc.want, patternOf(e), "exact slash")
@@ -110,7 +110,7 @@ func onPathHost(cases []lookupCase) []lookupCase {
 }
 
 func TestRouting_Hostname(t *testing.T) {
-	runLookup(t, RelaxedSlash, []lookupCase{
+	runLookup(t, true, []lookupCase{
 		{
 			name:     "static hostname with complex overlapping pattern with static priority",
 			patterns: []string{"example.com/foo/bar/baz/{$1}/jo", "example.com/foo/+{any}/baz/{$1}/jo", "example.com/foo/{ps}/baz/{$1}/jo"},
@@ -711,7 +711,7 @@ func TestRouting_Hostname(t *testing.T) {
 }
 
 func TestRouting_Overlapping(t *testing.T) {
-	runLookup(t, ExactSlash, onPathHost([]lookupCase{
+	runLookup(t, false, onPathHost([]lookupCase{
 		{
 			name:     "basic test most specific",
 			patterns: []string{"/products/{id}", "/products/new"},
@@ -1077,7 +1077,7 @@ func TestRouting_Overlapping(t *testing.T) {
 }
 
 func TestRouting_InfixWildcard(t *testing.T) {
-	runLookup(t, ExactSlash, onPathHost([]lookupCase{
+	runLookup(t, false, onPathHost([]lookupCase{
 		{
 			name:     "simple infix wildcard",
 			patterns: []string{"/foo/+{args}/bar"},
@@ -1626,7 +1626,7 @@ func TestRouting_InfixWildcard(t *testing.T) {
 }
 
 func TestRouting_TrailingSlash(t *testing.T) {
-	runLookup(t, RelaxedSlash, onPathHost([]lookupCase{
+	runLookup(t, true, onPathHost([]lookupCase{
 		{
 			name:     "infix wildcard with trailing slash and added slash",
 			patterns: []string{"/foo/+{any}/"},
@@ -2152,7 +2152,7 @@ func TestRouting_TrailingSlash(t *testing.T) {
 }
 
 func TestRouting_NoMatch(t *testing.T) {
-	runLookup(t, ExactSlash, onPathHost([]lookupCase{
+	runLookup(t, false, onPathHost([]lookupCase{
 		{
 			name:     "infix wildcard",
 			patterns: []string{"/foo/+{args}/bar"},
@@ -2701,8 +2701,8 @@ func TestRouting_Matchers(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			for _, slash := range []TrailingSlashOption{RelaxedSlash, ExactSlash} {
-				p := testProxy(t, WithRegexpParam(true), WithDefaultTrailingSlash(slash))
+			for _, relaxed := range []bool{true, false} {
+				p := testProxy(t, WithRegexpParam(true), WithRelaxedTrailingSlash[HTTP](relaxed))
 				for _, r := range tc.entries {
 					var opts []EntryOption[HTTP]
 					if len(r.matchers) > 0 {
@@ -2716,7 +2716,7 @@ func TestRouting_Matchers(t *testing.T) {
 
 				req := httptest.NewRequest(http.MethodGet, tc.target, nil)
 				e, params := lookupOn(p, tc.host, routingPath(req), req, false)
-				if slash == ExactSlash {
+				if !relaxed {
 					if tc.relaxed {
 						assert.NotEqual(t, tc.want, patternOf(e), "exact slash")
 					} else {
@@ -2858,7 +2858,7 @@ func TestRouting_Encoding(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			p := routingProxy(t, ExactSlash, tc.patterns...)
+			p := routingProxy(t, false, tc.patterns...)
 			req := httptest.NewRequest(http.MethodGet, tc.target, nil)
 			e, params := lookupOn(p, "a.test", routingPath(req), req, false)
 			assert.Equal(t, tc.want, patternOf(e))
@@ -2868,7 +2868,7 @@ func TestRouting_Encoding(t *testing.T) {
 }
 
 func TestRouting_RegexpAlternationIsAnchored(t *testing.T) {
-	p := routingProxy(t, ExactSlash, "a.test/role/{role:admin|user|guest}", "a.test/scope/{scope:read|write}/items")
+	p := routingProxy(t, false, "a.test/role/{role:admin|user|guest}", "a.test/scope/{scope:read|write}/items")
 
 	for _, tc := range []struct {
 		path string
@@ -3642,7 +3642,7 @@ func TestTree_AddConflict(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			p := routingProxy(t, ExactSlash, tc.patterns...)
+			p := routingProxy(t, false, tc.patterns...)
 			_, err := p.Add(tc.insert, noopHandler)
 			if tc.conflicts == nil {
 				require.NoError(t, err)
@@ -3916,7 +3916,7 @@ func TestTree_Update(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			p := routingProxy(t, ExactSlash, tc.patterns...)
+			p := routingProxy(t, false, tc.patterns...)
 			e, err := p.Update(tc.update, noopHandler, WithAnnotation[HTTP]("updated", true))
 			if !tc.found {
 				require.ErrorIs(t, err, ErrEntryNotFound)

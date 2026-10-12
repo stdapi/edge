@@ -29,10 +29,10 @@ type entry struct {
 	params   []string
 	matchers []RequestMatcher
 
-	pattern     pattern
-	priority    uint
-	handleSlash TrailingSlashOption
-	kind        Kind
+	pattern      pattern
+	priority     uint
+	relaxedSlash bool
+	kind         Kind
 	// implied marks the admission entry derived from per-message registrations rather than
 	// declared, and refs counts how many of them still need it.
 	implied bool
@@ -207,8 +207,8 @@ func (r Entry[H]) RequestMatchers() iter.Seq[RequestMatcher] { return slices.Val
 // MatchersPriority returns the matcher priority of this entry.
 func (r Entry[H]) MatchersPriority() uint { return r.e.priority }
 
-// TrailingSlashOption returns the [TrailingSlashOption] configured for this entry.
-func (r Entry[H]) TrailingSlashOption() TrailingSlashOption { return r.e.handleSlash }
+// RelaxedTrailingSlash reports whether relaxed trailing slash handling is enabled for this [Entry].
+func (r Entry[H]) RelaxedTrailingSlash() bool { return r.e.relaxedSlash }
 
 func (r Entry[H]) String() string { return r.e.String() }
 

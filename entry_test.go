@@ -6,6 +6,7 @@ package edge
 
 import (
 	"net/http"
+	"net/http/httptest"
 	"slices"
 	"testing"
 
@@ -19,7 +20,7 @@ func TestEntry_Accessors(t *testing.T) {
 	type annotationKey struct{}
 	e := p.MustAdd("api.stripe.com:8443/v1/{id}/refunds/*{rest}", noopHandler,
 		WithName[HTTP]("refunds"), WithAnnotation[HTTP](annotationKey{}, "recorded"),
-		WithTrailingSlash[HTTP](RelaxedSlash), WithScheme[HTTP]("https"), WithMethods[HTTP](http.MethodGet))
+		WithRelaxedTrailingSlash[HTTP](true), WithScheme[HTTP]("https"), WithMethods[HTTP](http.MethodGet))
 
 	assert.Equal(t, "api.stripe.com:8443/v1/{id}/refunds/*{rest}", e.Pattern())
 	assert.Equal(t, "api.stripe.com", e.Host())
@@ -28,7 +29,7 @@ func TestEntry_Accessors(t *testing.T) {
 	assert.Equal(t, "refunds", e.Name())
 	assert.Equal(t, "recorded", e.Annotation(annotationKey{}))
 	assert.Nil(t, e.Annotation("missing"))
-	assert.Equal(t, RelaxedSlash, e.TrailingSlashOption())
+	assert.True(t, e.RelaxedTrailingSlash())
 	assert.Equal(t, KindHTTP, e.Kind())
 
 	assert.Equal(t, 2, e.ParamsLen())
@@ -85,25 +86,41 @@ func TestEntry_MiddlewareOfAnotherKindIsRefused(t *testing.T) {
 	require.NoError(t, err)
 }
 
-func TestEntry_TrailingSlashOverridesTheProxyDefault(t *testing.T) {
+func TestEntry_RelaxedTrailingSlashOverridesTheProxyDefault(t *testing.T) {
 	zero := Entry[HTTP]{}
 
-	p := testProxy(t, WithDefaultTrailingSlash(RelaxedSlash))
+	p := testProxy(t, WithRelaxedTrailingSlash[HTTP](true))
 	p.MustAdd("api.test/v1/charges", noopHandler)
-	p.MustAdd("api.test/v1/refunds", noopHandler, WithTrailingSlash[HTTP](ExactSlash))
+	p.MustAdd("api.test/v1/refunds", noopHandler, WithRelaxedTrailingSlash[HTTP](false))
 
 	assert.NotEqual(t, zero, match(t, p, http.MethodGet, "https", "api.test:443", "/v1/charges/"))
 	assert.Equal(t, zero, match(t, p, http.MethodGet, "https", "api.test:443", "/v1/refunds/"))
 
 	q := testProxy(t)
 	q.MustAdd("api.test/v1/charges", noopHandler)
-	q.MustAdd("api.test/v1/refunds", noopHandler, WithTrailingSlash[HTTP](RelaxedSlash))
+	q.MustAdd("api.test/v1/refunds", noopHandler, WithRelaxedTrailingSlash[HTTP](true))
 
 	assert.Equal(t, zero, match(t, q, http.MethodGet, "https", "api.test:443", "/v1/charges/"))
 	assert.NotEqual(t, zero, match(t, q, http.MethodGet, "https", "api.test:443", "/v1/refunds/"))
+}
 
-	_, err := p.Add("api.test/v1/disputes", noopHandler, WithTrailingSlash[HTTP](TrailingSlashOption(99)))
-	require.ErrorIs(t, err, ErrInvalidConfig)
+func TestEntry_RelaxedTrailingSlashDefaultIsPerKind(t *testing.T) {
+	ws := func(*WebSocketCtx) error { return nil }
+	p := testProxy(t, WithRelaxedTrailingSlash[WebSocket](true))
+	p.MustAdd("api.test/v1/", noopHandler)
+	p.MustAdd[WebSocket]("api.test/chat/", ws)
+	p.MustAdd[WebSocket]("api.test/feed/", ws, WithRelaxedTrailingSlash[WebSocket](false))
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Connection", "Upgrade")
+	req.Header.Set("Upgrade", "websocket")
+
+	e, _ := lookupOn(p, "api.test", "/v1", req, false)
+	assert.Nil(t, e)
+	e, _ = lookupOn(p, "api.test", "/chat", req, false)
+	assert.Equal(t, "api.test/chat/", patternOf(e))
+	e, _ = lookupOn(p, "api.test", "/feed", req, false)
+	assert.Nil(t, e)
 }
 
 func TestEntry_NameLookup(t *testing.T) {

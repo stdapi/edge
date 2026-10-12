@@ -80,10 +80,10 @@ type config struct {
 	maxParamKeyBytes int
 	maxMatchers      int
 
-	handleSlash TrailingSlashOption
-	allowRegexp bool
-	rejectECH   bool
-	verifyNames NameVerification
+	relaxedSlash [KindUDP + 1]bool
+	allowRegexp  bool
+	rejectECH    bool
+	verifyNames  NameVerification
 }
 
 func newConfig() *config {
@@ -92,7 +92,6 @@ func newConfig() *config {
 		maxParams:        math.MaxUint8,
 		maxParamKeyBytes: math.MaxUint8,
 		maxMatchers:      math.MaxUint8,
-		handleSlash:      ExactSlash,
 		transport:        DefaultTransport(),
 		resolver:         net.DefaultResolver,
 		server:           defaultServerConfig(),
@@ -374,10 +373,10 @@ func newEntry[H Handler](p *Proxy, pattern string, handler H, opts ...EntryOptio
 	}
 
 	e := &entry{
-		handler:     handler,
-		pattern:     pat,
-		kind:        kind,
-		handleSlash: p.cfg.handleSlash,
+		handler:      handler,
+		pattern:      pat,
+		kind:         kind,
+		relaxedSlash: p.cfg.relaxedSlash[kind],
 	}
 
 	e.params = make([]string, 0, paramsCnt)

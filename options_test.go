@@ -29,7 +29,7 @@ func TestOptions_Defaults(t *testing.T) {
 	assert.Equal(t, 255, cfg.maxParams)
 	assert.Equal(t, 255, cfg.maxParamKeyBytes)
 	assert.Equal(t, 255, cfg.maxMatchers)
-	assert.Equal(t, ExactSlash, cfg.handleSlash)
+	assert.Equal(t, [KindUDP + 1]bool{}, cfg.relaxedSlash)
 	assert.False(t, cfg.allowRegexp, "a regexp runs on every candidate segment, so it is opt in")
 	assert.NotNil(t, cfg.logger)
 	assert.NotNil(t, cfg.transport)
@@ -54,7 +54,6 @@ func TestOptions_Rejected(t *testing.T) {
 		{"negative idle timeout", WithIdleTimeout(-time.Second)},
 		{"negative sniff timeout", WithSniffTimeout(-time.Second)},
 		{"zero max header bytes", WithMaxHeaderBytes(0)},
-		{"unknown trailing slash", WithDefaultTrailingSlash(TrailingSlashOption(99))},
 	}
 
 	for _, tc := range cases {
@@ -79,7 +78,7 @@ func TestOptions_Applied(t *testing.T) {
 		WithMaxPatternParams(4),
 		WithMaxPatternParamKeyBytes(8),
 		WithMaxMatchers(2),
-		WithDefaultTrailingSlash(RelaxedSlash),
+		WithRelaxedTrailingSlash[HTTP](true),
 		WithRegexpParam(true),
 		WithLogger(slog.New(slog.DiscardHandler)),
 	)
@@ -90,7 +89,7 @@ func TestOptions_Applied(t *testing.T) {
 	assert.Equal(t, 4, cfg.maxParams)
 	assert.Equal(t, 8, cfg.maxParamKeyBytes)
 	assert.Equal(t, 2, cfg.maxMatchers)
-	assert.Equal(t, RelaxedSlash, cfg.handleSlash)
+	assert.True(t, cfg.relaxedSlash[KindHTTP])
 	assert.True(t, cfg.allowRegexp)
 }
 

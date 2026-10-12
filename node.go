@@ -357,14 +357,14 @@ Backtrack:
 }
 
 // lookupByPath returns the node matching path, or nil when nothing matches. An interceptor
-// registered with RelaxedSlash also matches the path with its trailing slash added or removed;
-// one registered with ExactSlash is never a candidate for that. The request is forwarded as the
-// client sent it either way, so nothing outside this walk needs to know which form matched.
+// with a relaxed slash also matches the path with its trailing slash added or removed, and one
+// with an exact slash is never a candidate for that. The request is forwarded as the client
+// sent it either way, so nothing outside this walk depends on which form matched.
 //
 // A slash candidate counts as a direct match and keeps the priority of the branch where it was
 // found (static > regex param > param > regex wildcard > wildcard). The lookup returns it
 // without exploring lower priority alternatives on the skip stack, even when one of them
-// matches the path exactly. For example with /foo/ registered as RelaxedSlash and /{a}, a
+// matches the path exactly. For example with /foo/ registered with a relaxed slash and /{a}, a
 // request for /foo matches /foo/ because the static branch has priority over the param branch.
 //
 // When both slash variants of the same pattern are registered, each request form is served by
@@ -511,9 +511,9 @@ Walk:
 									break
 								}
 								for j, ic := range child.entries {
-									if ic.handleSlash != ExactSlash && ic.match(c) {
+									if ic.relaxedSlash && ic.match(c) {
 										// This is the only case where we don't return a slash match immediately. Interceptors
-										// like /+{args}/ (with RelaxedSlash) and /+{args} can coexist. For a request like
+										// like /+{args}/ (relaxed slash) and /+{args} can coexist. For a request like
 										// /a/b/c, the infix /+{args}/ would match with a trailing slash added, but we must
 										// first check whether a suffix catch-all directly matches. We capture the node here
 										// but defer parameter recording as a fallback.
@@ -642,7 +642,7 @@ Walk:
 		}
 	} else if matched.key == "/" && parent != nil && parent.isLeaf() && !strings.HasSuffix(path, "//") {
 		for i, ic := range parent.entries {
-			if ic.handleSlash != ExactSlash && !ic.pattern.catchAll && ic.match(c) {
+			if ic.relaxedSlash && !ic.pattern.catchAll && ic.match(c) {
 				return i, parent
 			}
 		}
@@ -651,7 +651,7 @@ Walk:
 Backtrack:
 	if search == "/" && matched.isLeaf() && !strings.HasSuffix(path, "//") {
 		for i, ic := range matched.entries {
-			if ic.handleSlash != ExactSlash && !ic.pattern.catchAll && ic.match(c) {
+			if ic.relaxedSlash && !ic.pattern.catchAll && ic.match(c) {
 				return i, matched
 			}
 		}
@@ -684,7 +684,7 @@ Backtrack:
 func matchTrailingSlash(child *node, c *routeCtx, lazy bool) (int, *node) {
 	if child.isLeaf() {
 		for i, ic := range child.entries {
-			if ic.handleSlash != ExactSlash && ic.match(c) {
+			if ic.relaxedSlash && ic.match(c) {
 				return i, child
 			}
 		}
@@ -693,7 +693,7 @@ func matchTrailingSlash(child *node, c *routeCtx, lazy bool) (int, *node) {
 	// we still need to search for a matching empty catch-all.
 	for _, wildcardNode := range child.wildcards {
 		for i, ic := range wildcardNode.entries {
-			if ic.handleSlash != ExactSlash && ic.pattern.optionalCatchAll && ic.match(c) {
+			if ic.relaxedSlash && ic.pattern.optionalCatchAll && ic.match(c) {
 				if !lazy {
 					// record empty match
 					*c.params = append(*c.params, "")
