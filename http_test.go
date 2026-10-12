@@ -10,6 +10,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -21,6 +22,7 @@ import (
 	"net/netip"
 	"net/textproto"
 	"net/url"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -217,6 +219,156 @@ func TestHTTP_ForwardsTrailers(t *testing.T) {
 	}
 	if got := resp.Trailer.Get("X-Checksum"); got != "deadbeef" {
 		t.Fatalf("trailer X-Checksum = %q, want deadbeef", got)
+	}
+}
+
+func TestHTTP_EmptyRequestAnnouncingTrailersEndsUpstream(t *testing.T) {
+	o := prefaceOrigin(t, func(_ *rawOrigin, _ *wire, fr *http2.Framer) {
+		if _, err := fr.ReadFrame(); err != nil || fr.WriteSettings() != nil || fr.WriteSettingsAck() != nil {
+			return
+		}
+		for {
+			f, err := fr.ReadFrame()
+			if err != nil {
+				return
+			}
+			if end, ok := f.(interface{ StreamEnded() bool }); ok && end.StreamEnded() && writeOK(fr, f.Header().StreamID) != nil {
+				return
+			}
+		}
+	})
+	p := testProxy(t)
+	p.MustAdd("origin.test/*{any}", forwardHandler)
+	c := dialDeclared(t, viaRedirected, p, netip.MustParseAddrPort(o.addr))
+	_, err := io.WriteString(c, http2.ClientPreface)
+	require.NoError(t, err)
+	h := newH2Wire(c)
+	require.NoError(t, h.fr.WriteSettings())
+	h.headers(t, 1, false, hf(":method", "POST"), hf(":scheme", "http"), hf(":authority", "origin.test"), hf(":path", "/"),
+		hf("content-length", "0"), hf("trailer", "x-checksum"))
+	h.headers(t, 1, true, hf("x-checksum", "deadbeef"))
+	assert.Equal(t, "ok", string(h.reply(t, 1).body))
+}
+
+func TestHTTP_ContentPastAZeroLengthIsMalformed(t *testing.T) {
+	for _, version := range []string{viaH2, viaH3} {
+		t.Run(version, func(t *testing.T) {
+			errs := make(chan error, 1)
+			p := testProxy(t)
+			p.MustAdd("origin.test/*{any}", func(c *HTTPCtx) (*http.Response, error) {
+				resp, err := c.Forward()
+				errs <- err
+				return resp, err
+			})
+			if version == viaH3 {
+				(&proxyBench{p: p}).dialH3Front(t).roundTrip(t, h3Request("POST", "origin.test", "/", hf("content-length", "0")), h3Data("abcd"))
+			} else {
+				h := dialH2Wire(t, viaH2C, p, "origin.test")
+				h.headers(t, 1, false, hf(":method", "POST"), hf(":scheme", "http"), hf(":authority", "origin.test"), hf(":path", "/"),
+					hf("content-length", "0"))
+				require.NoError(t, h.fr.WriteData(1, true, []byte("abcd")))
+				h.reply(t, 1)
+			}
+			select {
+			case err := <-errs:
+				require.True(t, errors.Is(err, errMalformedRequest), "forward failed with %v", err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("the handler did not return")
+			}
+		})
+	}
+}
+
+func TestHTTP_RequestWithoutContentEndsWithItsHeadersOverHTTP2(t *testing.T) {
+	eachDeclaredFront(t, func(t *testing.T, front string) {
+		for _, req := range []struct {
+			method string
+			want   string
+			extra  []hpack.HeaderField
+		}{
+			{method: "GET", want: `HEADERS stream=1 end_stream=true content-length=""`},
+			{method: "POST", want: `HEADERS stream=1 end_stream=true content-length="0"`, extra: []hpack.HeaderField{hf("content-length", "0")}},
+		} {
+			t.Run(req.method, func(t *testing.T) {
+				o := prefaceOrigin(t, respondH2)
+				got := h2cRequest(t, front, o, req.method, req.extra...)
+				assert.Equal(t, "ok", string(got.body))
+				require.Equal(t, http2.ClientPreface, o.nextNote(t))
+				require.Equal(t, "SETTINGS stream=0 ack=false", o.nextNote(t))
+				assert.Equal(t, req.want, o.nextNote(t))
+			})
+		}
+	})
+}
+
+func TestHTTP_ZeroLengthEndedByAnEmptyDataFrameEndsWithItsHeadersOverHTTP2(t *testing.T) {
+	eachDeclaredFront(t, func(t *testing.T, front string) {
+		o := prefaceOrigin(t, respondH2)
+		h := h2cStream(t, front, o, false, "POST", hf("content-length", "0"))
+		// The response to stream 3 shows the handler of stream 1 started before its DATA frame.
+		h.headers(t, 3, true, hf(":method", "GET"), hf(":scheme", "http"), hf(":authority", "origin.test"), hf(":path", "/"))
+		require.Equal(t, "ok", string(h.reply(t, 3).body))
+		require.NoError(t, h.fr.WriteData(1, true, nil))
+		assert.Equal(t, "ok", string(h.reply(t, 1).body))
+		require.Equal(t, http2.ClientPreface, o.nextNote(t))
+		require.Equal(t, "SETTINGS stream=0 ack=false", o.nextNote(t))
+		assert.Equal(t, `HEADERS stream=1 end_stream=true content-length=""`, o.nextNote(t))
+		assert.Equal(t, `HEADERS stream=3 end_stream=true content-length="0"`, o.nextNote(t))
+	})
+}
+
+func TestHTTP_ZeroLengthFromHTTP3EndsWithItsHeadersOverHTTP2(t *testing.T) {
+	b := newH2OriginBench(t, respondH2)
+	got := b.dialH3Front(t).roundTrip(t, h3Request("POST", "origin.test", "/", hf("content-length", "0")))
+	require.NoError(t, got.err)
+	assert.Equal(t, "ok", string(got.body))
+	require.Equal(t, "SETTINGS stream=0 ack=false", b.origin.nextNote(t))
+	assert.Equal(t, `HEADERS stream=1 end_stream=true content-length="0"`, b.origin.nextNote(t))
+}
+
+func TestHTTP_ZeroLengthEndsWithItsHeadersOverHTTP3(t *testing.T) {
+	b := newH3OriginBench(t, func(o *rawOrigin, _ *h3Conn, s *h3Stream) {
+		for {
+			typ, payload, err := s.next()
+			if err != nil {
+				o.note(fmt.Sprintf("end %v", err))
+				break
+			}
+			switch typ {
+			case h3FrameHeaders:
+				fields, _ := qpackFields(payload)
+				cl, _ := h2Field(fields, "content-length")
+				o.note(fmt.Sprintf("HEADERS content-length=%q", cl))
+			case h3FrameData:
+				o.note(fmt.Sprintf("DATA len=%d", len(payload)))
+			}
+		}
+		if _, err := s.Write(slices.Concat(h3Headers([]hpack.HeaderField{hf(":status", "200")}), h3Data("ok"))); err == nil {
+			_ = s.Close()
+		}
+	})
+	got := b.dialH3Front(t).roundTrip(t, h3Request("POST", "origin.test", "/", hf("content-length", "0")))
+	require.NoError(t, got.err)
+	assert.Equal(t, "ok", string(got.body))
+	assert.Equal(t, `HEADERS content-length="0"`, b.origin.nextNote(t))
+	assert.Equal(t, "end EOF", b.origin.nextNote(t), "a DATA frame followed the header section")
+}
+
+func TestHTTP_HTTP3TrailerSectionRefusedByQUICGoIsMalformed(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		field hpack.HeaderField
+	}{
+		{name: "name with a space", field: hf("x check", "sum")},
+		{name: "value with a NUL", field: hf("x-check", "s\x00m")},
+		{name: "field not allowed in trailers", field: hf("content-length", "1")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			b := newTLSProxyBench(t, always(okReply))
+			got := b.dialH3Front(t).roundTrip(t, h3Request("POST", "origin.test", "/"), h3Data("a"), h3Headers([]hpack.HeaderField{tc.field}))
+			require.NoError(t, got.err)
+			assert.Equal(t, strconv.Itoa(http.StatusBadRequest), got.status())
+		})
 	}
 }
 
@@ -713,6 +865,8 @@ type wire struct {
 	net.Conn
 	br  *bufio.Reader
 	rec bytes.Buffer
+	// originForm rewrites every absolute-form request line sent to origin-form.
+	originForm bool
 }
 
 func newWire(c net.Conn) *wire {
@@ -740,8 +894,15 @@ func (w *wire) headFrom(start int) string {
 	return string(raw)
 }
 
+// absoluteTarget matches the method, the scheme and the authority of an absolute-form request
+// line.
+var absoluteTarget = regexp.MustCompile(`(?m)^([A-Z]+) https?://[^/?# \r\n]*/?`)
+
 func (w *wire) send(t *testing.T, s string) {
 	t.Helper()
+	if w.originForm {
+		s = absoluteTarget.ReplaceAllString(s, "${1} /")
+	}
 	_, err := io.WriteString(w.Conn, s)
 	require.NoError(t, err)
 }
@@ -951,17 +1112,146 @@ const okReply = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
 type proxyBench struct {
 	p      *Proxy
 	origin *rawOrigin
+	trust  *x509.CertPool
 	addr   string
+	front  proxyFront
+}
+
+// A proxyFront is how a client of a proxyBench reaches origin.test. On every front but
+// frontExplicit the request lines are sent in origin-form.
+type proxyFront string
+
+const (
+	frontExplicit      proxyFront = "explicit"
+	frontConnect       proxyFront = "connect"
+	frontRedirected    proxyFront = viaRedirected
+	frontConnectTLS    proxyFront = "connect-tls"
+	frontRedirectedTLS proxyFront = "redirected-tls"
+)
+
+var proxyFronts = []proxyFront{frontExplicit, frontConnect, frontRedirected, frontConnectTLS, frontRedirectedTLS}
+
+func eachProxyFront(t *testing.T, run func(t *testing.T, front proxyFront)) {
+	t.Helper()
+	for _, front := range proxyFronts {
+		t.Run(string(front), func(t *testing.T) { run(t, front) })
+	}
+}
+
+func (f proxyFront) secure() bool { return f == frontConnectTLS || f == frontRedirectedTLS }
+
+func (f proxyFront) scheme() string {
+	if f.secure() {
+		return "https"
+	}
+	return "http"
 }
 
 func newProxyBench(t *testing.T, serve func(*rawOrigin, *wire)) *proxyBench {
 	t.Helper()
-	o := newRawOrigin(t, serve)
-	tr := DefaultTransport()
+	return newProxyBenchOn(t, frontExplicit, serve)
+}
+
+// newProxyBenchOn is newProxyBench served on front, the origin behind TLS on a secure front.
+func newProxyBenchOn(t *testing.T, front proxyFront, serve func(*rawOrigin, *wire)) *proxyBench {
+	t.Helper()
+	return newProxyBenchWith(t, front, DefaultTransport(), serve, forwardHandler, nil)
+}
+
+// newProxyBenchWith is newProxyBenchOn with tr, whose dialer and roots it sets, with handler for
+// origin.test, and with every connection to the origin passed through wrap when wrap is not nil.
+func newProxyBenchWith(t *testing.T, front proxyFront, tr *Transport, serve func(*rawOrigin, *wire), handler func(*HTTPCtx) (*http.Response, error), wrap func(net.Conn) net.Conn) *proxyBench {
+	t.Helper()
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	var o *rawOrigin
+	if front.secure() {
+		originCA, err := GenerateCA()
+		require.NoError(t, err)
+		cert, err := originCA.Leaf("origin.test")
+		require.NoError(t, err)
+		o = newTLSOrigin(t, *cert, serve)
+		tr.RootCAs = poolOf(originCA)
+	} else {
+		o = newRawOrigin(t, serve)
+	}
 	tr.DialContext = pinnedDialer(o.addr)
-	p := testProxy(t, WithTransport(tr))
-	p.MustAdd("origin.test/*{any}", forwardHandler)
-	return &proxyBench{p: p, origin: o, addr: startProxy(t, p)}
+	if wrap != nil {
+		dial := tr.DialContext
+		tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			c, err := dial(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			return wrap(c), nil
+		}
+	}
+	p := testProxyWithCA(t, ca, WithTransport(tr))
+	p.MustAdd("origin.test/*{any}", handler)
+	b := &proxyBench{p: p, origin: o, trust: ca.CertPool(), front: front}
+	switch front {
+	case frontExplicit, frontConnect, frontConnectTLS:
+		b.addr = startProxy(t, p)
+	case frontRedirected, frontRedirectedTLS:
+		dst := netip.MustParseAddrPort(o.addr)
+		b.addr = startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) { return dst, nil })
+	default:
+		t.Fatalf("unknown front %q", front)
+	}
+	return b
+}
+
+const forgedResponse = "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nforged"
+
+// lateConn returns a read that starts with forgedResponse only once a request was written after
+// the read began, the schedule in which Go's transport checks for bytes past a response after it
+// handed the connection to the next request.
+type lateConn struct {
+	net.Conn
+	mu    sync.Mutex
+	wrote chan struct{}
+}
+
+func (c *lateConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	c.mu.Lock()
+	if c.wrote != nil {
+		close(c.wrote)
+		c.wrote = nil
+	}
+	c.mu.Unlock()
+	return n, err
+}
+
+func (c *lateConn) Read(b []byte) (int, error) {
+	c.mu.Lock()
+	if c.wrote == nil {
+		c.wrote = make(chan struct{})
+	}
+	wrote := c.wrote
+	c.mu.Unlock()
+	n, err := c.Conn.Read(b)
+	if bytes.HasPrefix(b[:n], []byte(forgedResponse)) {
+		select {
+		case <-wrote:
+		case <-time.After(5 * time.Second):
+		}
+	}
+	return n, err
+}
+
+func readAllHandler(c *HTTPCtx) (*http.Response, error) {
+	resp, err := c.Forward()
+	if err != nil {
+		return nil, err
+	}
+	body, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if err != nil {
+		return nil, err
+	}
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	return resp, nil
 }
 
 // newRefusingBench is a proxy serving origin.test as a byte stream, every dial of which is
@@ -977,7 +1267,28 @@ func newRefusingBench(t *testing.T) *proxyBench {
 	return &proxyBench{p: p, addr: startProxy(t, p)}
 }
 
-func (b *proxyBench) dial(t *testing.T) *wire { return dialWire(t, b.addr) }
+// dial opens a connection on which the requests of a client of the front reach origin.test.
+func (b *proxyBench) dial(t *testing.T) *wire {
+	t.Helper()
+	var c net.Conn
+	switch b.front {
+	case frontExplicit, "":
+		return dialWire(t, b.addr)
+	case frontConnect:
+		c = connectRaw(t, b.addr, "origin.test:80")
+	case frontConnectTLS:
+		c = connectRaw(t, b.addr, "origin.test:443")
+	default:
+		c = dialWire(t, b.addr).Conn
+	}
+	require.NoError(t, c.SetDeadline(time.Now().Add(10*time.Second)))
+	if b.front.secure() {
+		c = tls.Client(c, &tls.Config{ServerName: "origin.test", RootCAs: b.trust, NextProtos: []string{"http/1.1"}, MinVersion: tls.VersionTLS12})
+	}
+	w := newWire(c)
+	w.originForm = true
+	return w
+}
 
 func (b *proxyBench) exchange(t *testing.T, method, raw string) wireResponse {
 	t.Helper()
@@ -994,7 +1305,7 @@ func (b *proxyBench) forwarded(t *testing.T, method, raw string) (wireRequest, w
 
 func (b *proxyBench) connect(t *testing.T) *wire {
 	t.Helper()
-	w := b.dial(t)
+	w := dialWire(t, b.addr)
 	w.send(t, "CONNECT origin.test:80 HTTP/1.1\r\nHost: origin.test:80\r\n\r\n")
 	require.Equal(t, http.StatusOK, headStatus(t, w.readHead(t)))
 	return w
@@ -1136,6 +1447,56 @@ func eachPlainH2Front(t *testing.T, run func(t *testing.T, front string)) {
 	}
 }
 
+// prefaceFronts are the fronts on which HTTP/2 starts with the client preface, over plaintext or
+// over TLS negotiating h2.
+var prefaceFronts = slices.Concat(plainH2Fronts, []string{viaH2, viaConnectH2, viaRedirectedH2})
+
+const viaRedirectedH2CToH1 = "redirected-h2c-h1-upstream"
+
+// h1UpstreamFronts are the HTTP/2 fronts whose requests reach an origin offering HTTP/1.1 alone
+// over HTTP/1.1. redirected-h2c-h1-upstream is redirected-h2c under Transport.AllowHTTP2 false,
+// without which the proxy uses h2c with the origin.
+var h1UpstreamFronts = []string{viaH2C, viaH2, viaConnectH2, viaRedirectedH2, viaRedirectedH2CToH1}
+
+func eachH2Front(t *testing.T, fronts []string, run func(t *testing.T, front string)) {
+	t.Helper()
+	for _, front := range fronts {
+		t.Run(front, func(t *testing.T) { run(t, front) })
+	}
+}
+
+// h2FrontBench returns a proxyBench whose origin is behind TLS when front gives requests the
+// https scheme, and an HTTP/2 connection to front for origin.test.
+func h2FrontBench(t *testing.T, front string, serve func(*rawOrigin, *wire)) (*proxyBench, *h2Wire) {
+	t.Helper()
+	var b *proxyBench
+	switch {
+	case front == viaRedirectedH2CToH1:
+		o := newRawOrigin(t, serve)
+		tr := DefaultTransport()
+		tr.DialContext = pinnedDialer(o.addr)
+		tr.AllowHTTP2 = false
+		p := testProxy(t, WithTransport(tr))
+		p.MustAdd("origin.test/*{any}", forwardHandler)
+		return &proxyBench{p: p, origin: o}, dialH2Wire(t, viaRedirectedH2C, p, "origin.test")
+	case frontScheme(front, "http") == "https":
+		b = newTLSProxyBench(t, serve)
+	default:
+		b = newProxyBench(t, serve)
+	}
+	return b, dialH2Wire(t, front, b.p, "origin.test")
+}
+
+// dialPrefaceFront serves p on front and returns a connection to it on which nothing was
+// written, opened for a.test when front is TLS.
+func dialPrefaceFront(t *testing.T, front string, p *Proxy) net.Conn {
+	t.Helper()
+	if slices.Contains(plainH2Fronts, front) {
+		return dialPlainH2Front(t, front, p, nil)
+	}
+	return dialH2Front(t, front, startHPACKFront(t, front, p, p.cfg.ca), p.cfg.ca, "a.test")
+}
+
 // dialPlainH2Front serves p on front and returns a connection to it on which nothing was
 // written. When wrap is set, the proxy reads and writes through it.
 func dialPlainH2Front(t *testing.T, front string, p *Proxy, wrap func(net.Conn) net.Conn) net.Conn {
@@ -1262,6 +1623,237 @@ func (h *h2Wire) bodies(t *testing.T, streams ...uint32) map[uint32]string {
 func isSettings(f http2.Frame) bool {
 	sf, ok := f.(*http2.SettingsFrame)
 	return ok && !sf.IsAck()
+}
+
+const (
+	viaConnect         = "connect"
+	viaConnectTLSFront = "connect-tls-front"
+	viaConnectH2Front  = "connect-h2-front"
+	viaSOCKS           = "socks"
+	viaSOCKSName       = "socks-name"
+)
+
+// declaredFronts are the fronts on which a client declares the destination of its connection.
+// The h2c front, an unredirected connection and ServeConn declare none and forward through the
+// shared pool, which has no h2c.
+var declaredFronts = []string{viaRedirected, viaConnect, viaConnectTLSFront, viaConnectH2Front, viaSOCKS, viaSOCKSName}
+
+func eachDeclaredFront(t *testing.T, run func(t *testing.T, front string)) {
+	t.Helper()
+	for _, front := range declaredFronts {
+		t.Run(front, func(t *testing.T) { run(t, front) })
+	}
+}
+
+// dialDeclared serves p on front and returns a connection on which nothing was written, headed
+// to dst.
+func dialDeclared(t *testing.T, front string, p *Proxy, dst netip.AddrPort) net.Conn {
+	t.Helper()
+	var c net.Conn
+	switch front {
+	case viaRedirected:
+		addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) { return dst, nil })
+		var err error
+		c, err = net.DialTimeout("tcp", addr, 5*time.Second)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = c.Close() })
+	case viaConnect:
+		c = connectRaw(t, startProxy(t, p), dst.String())
+	case viaConnectTLSFront:
+		ca, err := GenerateCA()
+		require.NoError(t, err)
+		addr, pool := startProxyTLS(t, p, ca)
+		raw, err := net.DialTimeout("tcp", addr, 5*time.Second)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = raw.Close() })
+		require.NoError(t, raw.SetDeadline(time.Now().Add(10*time.Second)))
+		tc := tls.Client(raw, &tls.Config{ServerName: "127.0.0.1", RootCAs: pool, NextProtos: []string{"http/1.1"}, MinVersion: tls.VersionTLS12})
+		w := newWire(tc)
+		w.send(t, "CONNECT "+dst.String()+" HTTP/1.1\r\nHost: "+dst.String()+"\r\n\r\n")
+		require.Equal(t, http.StatusOK, headStatus(t, w.readHead(t)))
+		require.Zero(t, w.br.Buffered(), "nothing follows the response to CONNECT")
+		c = tc
+	case viaConnectH2Front:
+		raw, err := net.DialTimeout("tcp", startProxy(t, p), 5*time.Second)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = raw.Close() })
+		require.NoError(t, raw.SetDeadline(time.Now().Add(10*time.Second)))
+		cc, err := (&http2.Transport{AllowHTTP: true}).NewClientConn(raw)
+		require.NoError(t, err)
+		pr, pw := io.Pipe()
+		req, err := http.NewRequest(http.MethodConnect, "http://"+dst.String(), pr)
+		require.NoError(t, err)
+		resp, err := cc.RoundTrip(req)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		c = &tunnelConn{r: resp.Body, w: pw}
+		t.Cleanup(func() { _ = c.Close() })
+	case viaSOCKS, viaSOCKSName:
+		addr := socksAddrBytes(dst)
+		if front == viaSOCKSName {
+			addr = socksNameBytes("localhost", dst.Port())
+		}
+		w := socksConnect(t, startSOCKS5(t, p), addr)
+		w.want(socksGranted4...)
+		c = w.conn
+	default:
+		t.Fatalf("unknown front %q", front)
+	}
+	require.NoError(t, c.SetDeadline(time.Now().Add(10*time.Second)))
+	return c
+}
+
+// h2cGet sends a GET for origin.test over HTTP/2 with prior knowledge through front to the origin
+// o, and returns the reply.
+func h2cGet(t *testing.T, front string, o *rawOrigin) h2Reply {
+	t.Helper()
+	return h2cRequest(t, front, o, "GET")
+}
+
+// h2cRequest is h2cGet with method and extra, in a HEADERS frame that ends the stream.
+func h2cRequest(t *testing.T, front string, o *rawOrigin, method string, extra ...hpack.HeaderField) h2Reply {
+	t.Helper()
+	return h2cStream(t, front, o, true, method, extra...).reply(t, 1)
+}
+
+// h2cStream opens stream 1 with the HEADERS frame of h2cRequest, which ends the stream when end
+// is true.
+func h2cStream(t *testing.T, front string, o *rawOrigin, end bool, method string, extra ...hpack.HeaderField) *h2Wire {
+	t.Helper()
+	p := testProxy(t)
+	for _, host := range []string{"origin.test", "127.0.0.1", "localhost"} {
+		p.MustAdd(host+"/*{any}", forwardHandler)
+	}
+	c := dialDeclared(t, front, p, netip.MustParseAddrPort(o.addr))
+	_, err := io.WriteString(c, http2.ClientPreface)
+	require.NoError(t, err)
+	h := newH2Wire(c)
+	require.NoError(t, h.fr.WriteSettings())
+	h.headers(t, 1, end, append([]hpack.HeaderField{
+		hf(":method", method), hf(":scheme", "http"), hf(":authority", "origin.test"), hf(":path", "/"),
+	}, extra...)...)
+	return h
+}
+
+// prefaceOrigin is a plaintext origin that notes the first 24 octets of each connection, and
+// runs answer when they are the client connection preface and closes the connection otherwise.
+func prefaceOrigin(t *testing.T, answer func(o *rawOrigin, w *wire, fr *http2.Framer)) *rawOrigin {
+	t.Helper()
+	return newRawOrigin(t, func(o *rawOrigin, w *wire) {
+		preface := make([]byte, len(http2.ClientPreface))
+		n, _ := io.ReadFull(w.br, preface)
+		o.note(string(preface[:n]))
+		if string(preface[:n]) != http2.ClientPreface {
+			return
+		}
+		fr := http2.NewFramer(w.Conn, w.br)
+		fr.ReadMetaHeaders = hpack.NewDecoder(4096, nil)
+		answer(o, w, fr)
+	})
+}
+
+// respondH2 notes the first frame it reads, replies to it with an empty SETTINGS frame and its
+// acknowledgment, then notes the HEADERS frame and the content-length of every request and
+// responds with a 200 and the content "ok".
+func respondH2(o *rawOrigin, _ *wire, fr *http2.Framer) {
+	f, err := fr.ReadFrame()
+	if err != nil {
+		o.note(err.Error())
+		return
+	}
+	o.note(fmt.Sprintf("%v stream=%d ack=%t", f.Header().Type, f.Header().StreamID, f.Header().Flags.Has(http2.FlagSettingsAck)))
+	if err := fr.WriteSettings(); err != nil || !isSettings(f) || fr.WriteSettingsAck() != nil {
+		return
+	}
+	for {
+		f, err := fr.ReadFrame()
+		if err != nil {
+			return
+		}
+		switch f := f.(type) {
+		case *http2.SettingsFrame:
+			if !f.IsAck() {
+				_ = fr.WriteSettingsAck()
+			}
+		case *http2.MetaHeadersFrame:
+			cl, _ := h2Field(f.Fields, "content-length")
+			o.note(fmt.Sprintf("HEADERS stream=%d end_stream=%t content-length=%q", f.StreamID, f.StreamEnded(), cl))
+			if writeOK(fr, f.StreamID) != nil {
+				return
+			}
+		}
+	}
+}
+
+// noteTrailerH1, noteTrailerH2 and noteTrailerH3 note where the X-Check field of a request
+// arrived, in its header section or in its trailer section, and respond with a 200.
+func noteTrailerH1(o *rawOrigin, w *wire) {
+	r, err := w.readRequest()
+	if err != nil {
+		o.note(err.Error())
+		return
+	}
+	o.note(fmt.Sprintf("header=%q trailer=%q", r.req.Header.Get("X-Check"), r.req.Trailer.Get("X-Check")))
+	_, _ = io.WriteString(w, okReply)
+}
+
+func noteTrailerH2(o *rawOrigin, _ *wire, fr *http2.Framer) {
+	if _, err := fr.ReadFrame(); err != nil || fr.WriteSettings() != nil || fr.WriteSettingsAck() != nil {
+		return
+	}
+	var sections [][]hpack.HeaderField
+	for {
+		f, err := fr.ReadFrame()
+		if err != nil {
+			o.note(err.Error())
+			return
+		}
+		if h, ok := f.(*http2.MetaHeadersFrame); ok {
+			sections = append(sections, h.Fields)
+		}
+		if end, ok := f.(interface{ StreamEnded() bool }); !ok || !end.StreamEnded() {
+			continue
+		}
+		header, _ := h2Field(sections[0], "x-check")
+		var trailer string
+		if len(sections) > 1 {
+			trailer, _ = h2Field(sections[1], "x-check")
+		}
+		o.note(fmt.Sprintf("header=%q trailer=%q", header, trailer))
+		_ = writeOK(fr, f.Header().StreamID)
+		sections = nil
+	}
+}
+
+func noteTrailerH3(o *rawOrigin, _ *h3Conn, s *h3Stream) {
+	m := s.message(false)
+	header, _ := h2Field(m.fields, "x-check")
+	trailer, _ := h2Field(m.trailer, "x-check")
+	o.note(fmt.Sprintf("header=%q trailer=%q", header, trailer))
+	if _, err := s.Write(slices.Concat(h3Headers([]hpack.HeaderField{hf(":status", "200")}), h3Data("ok"))); err == nil {
+		_ = s.Close()
+	}
+}
+
+func writeOK(fr *http2.Framer, stream uint32) error {
+	var block bytes.Buffer
+	_ = hpack.NewEncoder(&block).WriteField(hf(":status", "200"))
+	return errors.Join(
+		fr.WriteHeaders(http2.HeadersFrameParam{StreamID: stream, BlockFragment: block.Bytes(), EndHeaders: true}),
+		fr.WriteData(stream, true, []byte("ok")))
+}
+
+// wantGatewayErrorH2 checks that a gateway that received no valid response resets the stream or
+// responds with a server error.
+func wantGatewayErrorH2(t *testing.T, got h2Reply) {
+	t.Helper()
+	if got.reset {
+		return
+	}
+	status, _ := h2Field(got.fields, ":status")
+	code, err := strconv.Atoi(status)
+	require.NoError(t, err, "the stream ended with no status")
+	assert.True(t, code >= 500 && code < 600, "the gateway responded %d with %q to an invalid response", code, got.body)
 }
 
 func drainOrigin(last string) func(*rawOrigin, *wire) {
@@ -1534,9 +2126,19 @@ func h3Open(t *testing.T, qc *quic.Conn, end bool, frames ...[]byte) *h3Stream {
 	s := newH3Stream(str)
 	s.send(t, frames...)
 	if end {
-		require.NoError(t, str.Close())
+		closeRequest(t, str)
 	}
 	return s
+}
+
+// closeRequest ends the request on str. A server may stop reading a request before its end,
+// RFC 9114 sections 4.1 and 4.1.2, and quic-go fails the close once the STOP_SENDING has arrived.
+func closeRequest(t *testing.T, str *quic.Stream) {
+	t.Helper()
+	if err := str.Close(); err != nil {
+		se, ok := errors.AsType[*quic.StreamError](context.Cause(str.Context()))
+		require.True(t, ok && se.Remote, "the close of the request stream failed with %v", err)
+	}
 }
 
 type h3Stream struct {
@@ -1713,7 +2315,7 @@ func (c *h3Conn) open(t *testing.T, frames ...[]byte) *h3Stream {
 func (c *h3Conn) roundTrip(t *testing.T, frames ...[]byte) h3Msg {
 	t.Helper()
 	s := c.open(t, frames...)
-	require.NoError(t, s.Close())
+	closeRequest(t, s.Stream)
 	return s.message(true)
 }
 
@@ -1768,13 +2370,44 @@ func newTLSProxyBench(t *testing.T, serve func(*rawOrigin, *wire)) *proxyBench {
 
 func newH3OriginBench(t *testing.T, serve func(*rawOrigin, *h3Conn, *h3Stream)) *proxyBench {
 	t.Helper()
+	return newH3OriginBenchWith(t, DefaultTransport(), serve)
+}
+
+// newH3OriginBenchWith is newH3OriginBench forwarding through tr.
+func newH3OriginBenchWith(t *testing.T, tr *Transport, serve func(*rawOrigin, *h3Conn, *h3Stream)) *proxyBench {
+	t.Helper()
 	ca, err := GenerateCA()
 	require.NoError(t, err)
 	cert, err := ca.Leaf("origin.test")
 	require.NoError(t, err)
 	o := newRawQUIC(t, *cert, serve)
-	tr := DefaultTransport()
 	tr.AllowHTTP3 = true
+	tr.DialContext = pinnedDialer(o.addr)
+	tr.RootCAs = poolOf(ca)
+	p := testProxy(t, WithTransport(tr))
+	p.MustAdd("origin.test/*{any}", forwardHandler)
+	return &proxyBench{p: p, origin: o, addr: startProxy(t, p)}
+}
+
+// newH2OriginBench is newTLSProxyBench with an origin offering h2 alone, which runs answer past
+// the client connection preface.
+func newH2OriginBench(t *testing.T, answer func(*rawOrigin, *wire, *http2.Framer)) *proxyBench {
+	t.Helper()
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	cert, err := ca.Leaf("origin.test")
+	require.NoError(t, err)
+	o := newRawOrigin(t, func(o *rawOrigin, w *wire) {
+		tw := newWire(tls.Server(w.Conn, &tls.Config{Certificates: []tls.Certificate{*cert}, NextProtos: []string{"h2"}}))
+		preface := make([]byte, len(http2.ClientPreface))
+		if _, err := io.ReadFull(tw.br, preface); err != nil || string(preface) != http2.ClientPreface {
+			return
+		}
+		fr := http2.NewFramer(tw.Conn, tw.br)
+		fr.ReadMetaHeaders = hpack.NewDecoder(4096, nil)
+		answer(o, tw, fr)
+	})
+	tr := DefaultTransport()
 	tr.DialContext = pinnedDialer(o.addr)
 	tr.RootCAs = poolOf(ca)
 	p := testProxy(t, WithTransport(tr))
@@ -2283,7 +2916,7 @@ func upstreamH3(answer string) func(*rawOrigin, *h3Conn, *h3Stream) {
 // the first bytes of a protocol the proxy relays as a byte stream.
 func (b *proxyBench) tunnel(t *testing.T, target, extra string) *wire {
 	t.Helper()
-	w := b.dial(t)
+	w := dialWire(t, b.addr)
 	w.send(t, "CONNECT "+target+" HTTP/1.1\r\nHost: "+target+"\r\n"+extra+"\r\n")
 	require.Equal(t, http.StatusOK, headStatus(t, w.readHead(t)))
 	w.send(t, "\x01ping")
@@ -2327,6 +2960,147 @@ func wantNoTunnel(t *testing.T, w *wire) {
 	}
 	assert.Empty(t, string(rest))
 }
+
+var selfLoopFronts = []string{"explicit", "explicit-tls", "connect", "connect-tls", "redirected", "redirected-tls", "socks5", "quic", "quic-chained"}
+
+// selfLoop sends one request through a proxy configured so that forwarding it reaches the proxy
+// again, on front, and returns the status the client got and how many times the entry handled
+// the request. The dials are bounded, so a loop ends after a few turns and before the sockets
+// of the host run out.
+func selfLoop(t *testing.T, front string) (int, int32) {
+	t.Helper()
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	var dials, handled atomic.Int32
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	bounded := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		if dials.Add(1) > 8 {
+			return nil, &net.OpError{Op: "dial", Net: network, Err: syscall.ECONNREFUSED}
+		}
+		return dialer.DialContext(ctx, network, addr)
+	}
+	tr := DefaultTransport()
+	tr.DialContext = bounded
+	tr.RootCAs = poolOf(ca)
+	handler := func(c *HTTPCtx) (*http.Response, error) {
+		handled.Add(1)
+		return c.Forward()
+	}
+
+	if front == "quic" || front == "quic-chained" {
+		tr.AllowHTTP3 = true
+		var self atomic.Pointer[url.URL]
+		if front == "quic-chained" {
+			tr.Proxy = func(*http.Request) (*url.URL, error) { return self.Load(), nil }
+		}
+		p := testProxyWithCA(t, ca, WithTransport(tr))
+		p.MustAdd("127.0.0.1/*{any}", handler)
+		addr, _ := startQUICFront(t, p, ca)
+		self.Store(&url.URL{Scheme: "https", Host: addr.String()})
+		c, err := newH3Conn(dialQUICFront(t, addr, ca))
+		require.NoError(t, err)
+		got := c.roundTrip(t, h3Request("GET", addr.String(), "/loop"))
+		status, _ := h2Field(got.fields, ":status")
+		code, _ := strconv.Atoi(status)
+		return code, handled.Load()
+	}
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	addr := ln.Addr().String()
+	switch front {
+	case "explicit", "connect", "connect-tls":
+		tr.Proxy = fixedProxy("http://" + addr)
+	case "explicit-tls":
+		tr.Proxy = fixedProxy("https://" + addr)
+	case "socks5":
+		tr.Proxy = fixedProxy("socks5://" + addr)
+	case "redirected-tls":
+		// A redirect that also catches the connections of the proxy, which then reach its
+		// listener with the destination they were dialed to, as SO_ORIGINAL_DST would report it.
+		var redirected sync.Map
+		tr.DialContext = func(ctx context.Context, network, to string) (net.Conn, error) {
+			c, err := bounded(ctx, network, addr)
+			if err != nil {
+				return nil, err
+			}
+			dst := netip.MustParseAddrPort(to)
+			redirected.Store(addrPort(c.LocalAddr()), dst)
+			return natConn{Conn: c, dst: dst}, nil
+		}
+		ln = originListener{Listener: ln, origin: func(c net.Conn) (netip.AddrPort, error) {
+			if dst, ok := redirected.Load(addrPort(c.RemoteAddr())); ok {
+				return dst.(netip.AddrPort), nil
+			}
+			return netip.MustParseAddrPort("192.0.2.1:443"), nil
+		}}
+	}
+	p := testProxyWithCA(t, ca, WithTransport(tr))
+	p.MustAdd("origin.test/*{any}", handler)
+	p.MustAdd("127.0.0.1/*{any}", handler)
+	switch front {
+	case "socks5":
+		go func() { _ = p.ServeSOCKS5(ln) }()
+	case "redirected":
+		self := netip.MustParseAddrPort(addr)
+		go func() {
+			_ = p.ServeTransparent(originListener{Listener: ln, origin: func(net.Conn) (netip.AddrPort, error) { return self, nil }})
+		}()
+	case "redirected-tls":
+		go func() { _ = p.ServeTransparent(ln) }()
+	case "explicit-tls":
+		cert, err := ca.Leaf("127.0.0.1")
+		require.NoError(t, err)
+		go func() { _ = p.ServeTLS(ln, *cert) }()
+	default:
+		go func() { _ = p.Serve(ln) }()
+	}
+	t.Cleanup(func() { _ = p.Close() })
+
+	var c net.Conn
+	req := "GET / HTTP/1.1\r\nHost: origin.test\r\n\r\n"
+	switch front {
+	case "explicit", "explicit-tls":
+		req = "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\n\r\n"
+		c = dialWire(t, addr).Conn
+	case "connect":
+		c = connectRaw(t, addr, "origin.test:80")
+	case "connect-tls":
+		c = connectRaw(t, addr, "origin.test:443")
+	case "redirected":
+		req = "GET /loop HTTP/1.1\r\nHost: " + addr + "\r\n\r\n"
+		c = dialWire(t, addr).Conn
+	case "redirected-tls":
+		c = dialWire(t, addr).Conn
+	case "socks5":
+		w := socksConnect(t, addr, socksNameBytes("origin.test", 80))
+		require.Equal(t, socksGranted4[:2], w.readReply()[:2])
+		c = w.conn
+	}
+	require.NoError(t, c.SetDeadline(time.Now().Add(10*time.Second)))
+	switch front {
+	case "explicit-tls":
+		c = tls.Client(c, &tls.Config{ServerName: "127.0.0.1", RootCAs: ca.CertPool(), NextProtos: []string{"http/1.1"}, MinVersion: tls.VersionTLS12})
+	case "connect-tls", "redirected-tls":
+		c = tls.Client(c, &tls.Config{ServerName: "origin.test", RootCAs: ca.CertPool(), NextProtos: []string{"http/1.1"}, MinVersion: tls.VersionTLS12})
+	}
+	w := newWire(c)
+	w.originForm = !strings.HasPrefix(front, "explicit")
+	w.send(t, req)
+	return w.readResponse(t, "GET").resp.StatusCode, handled.Load()
+}
+
+// natConn reports the destination a redirect diverted it from, as the peer address of a
+// redirected socket does.
+type natConn struct {
+	net.Conn
+	dst netip.AddrPort
+}
+
+func (c natConn) RemoteAddr() net.Addr { return net.TCPAddrFromAddrPort(c.dst) }
+
+// invalidAuthorities are authorities whose host RFC 3986 does not allow.
+var invalidAuthorities = []string{"ori\"gin.test", "ori<gin>.test", "ori\\gin.test", "ori{gin}.test", "origin.test\x80", "ori%zzgin.test"}
 
 // proxyConformance lists the requirements HTTP places on a proxy, checked with a raw client in
 // front of edge and a raw origin behind it.
@@ -2481,164 +3255,353 @@ var proxyConformance = []conformanceCase{
 		id: "rfc9110/6.5.1/1", name: "a chunked response with a trailer field",
 		req: "A recipient MUST NOT merge a trailer field into a header section unless the recipient understands the corresponding header field definition and that definition explicitly permits and defines how trailer field values can be safely merged.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always("HTTP/1.1 200 OK\r\nTrailer: X-Check\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\nX-Check: sum\r\n\r\n"))
-			_, got := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\nTE: trailers\r\n\r\n")
-			require.NoError(t, got.err)
-			assert.Equal(t, "ok", string(got.body))
-			assert.Empty(t, fieldValues(got.head, "X-Check"), "a trailer field is not a header field")
-			assert.Equal(t, "sum", got.resp.Trailer.Get("X-Check"))
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always("HTTP/1.1 200 OK\r\nTrailer: X-Check\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\nX-Check: sum\r\n\r\n"))
+				_, got := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\nTE: trailers\r\n\r\n")
+				require.NoError(t, got.err)
+				assert.Equal(t, "ok", string(got.body))
+				assert.Empty(t, fieldValues(got.head, "X-Check"), "a trailer field is not a header field")
+				assert.Equal(t, "sum", got.resp.Trailer.Get("X-Check"))
+			})
 		},
 	},
 	{
 		id: "rfc9110/6.5.1/2", name: "a chunked request with a trailer field",
 		req: "A recipient MUST NOT merge a trailer field into a header section unless the recipient understands the corresponding header field definition and that definition explicitly permits and defines how trailer field values can be safely merged.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always(okReply))
-			got, _ := b.forwarded(t, "POST", "POST http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\nTrailer: X-Check\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\nX-Check: sum\r\n\r\n")
-			assert.Equal(t, "hi", string(got.body))
-			assert.Empty(t, fieldValues(got.head, "X-Check"), "a trailer field is not a header field")
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always(okReply))
+				got, _ := b.forwarded(t, "POST", "POST http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\nTrailer: X-Check\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\nX-Check: sum\r\n\r\n")
+				assert.Equal(t, "hi", string(got.body))
+				assert.Empty(t, fieldValues(got.head, "X-Check"), "a trailer field is not a header field")
+			})
 		},
 	},
 	{
 		id: "rfc9110/6.5.1/3", name: "a request without TE",
 		req: "The presence of the keyword \"trailers\" in the TE header field (Section 10.1.4) of a request indicates that the client is willing to accept trailer fields, on behalf of itself and any downstream clients.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always(okReply))
-			got, _ := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\n\r\n")
-			assert.Empty(t, fieldValues(got.head, "TE"), "no client promised to accept trailers")
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always(okReply))
+				got, _ := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\n\r\n")
+				assert.Empty(t, fieldValues(got.head, "TE"), "no client promised to accept trailers")
+			})
 		},
+	},
+
+	{
+		id: "rfc9110/6.5.1/4", name: "an HTTP/2 or HTTP/3 request without content with a trailer field",
+		req: "A recipient MUST NOT merge a trailer field into a header section unless the recipient understands the corresponding header field definition and that definition explicitly permits and defines how trailer field values can be safely merged.",
+		run: func(t *testing.T) {
+			const want = `header="" trailer="sum"`
+			request := []hpack.HeaderField{
+				hf(":method", "POST"), hf(":scheme", "http"), hf(":authority", "origin.test"), hf(":path", "/"),
+				hf("content-length", "0"), hf("trailer", "x-check"),
+			}
+			t.Run("h2-to-h1", func(t *testing.T) {
+				eachH2Front(t, h1UpstreamFronts, func(t *testing.T, front string) {
+					b, h := h2FrontBench(t, front, noteTrailerH1)
+					h.headers(t, 1, false, request...)
+					h.headers(t, 1, true, hf("x-check", "sum"))
+					assert.Equal(t, "ok", string(h.reply(t, 1).body))
+					assert.Equal(t, want, b.origin.nextNote(t))
+				})
+			})
+			t.Run("h2-to-h2", func(t *testing.T) {
+				eachDeclaredFront(t, func(t *testing.T, front string) {
+					o := prefaceOrigin(t, noteTrailerH2)
+					h := h2cStream(t, front, o, false, "POST", request[4:]...)
+					h.headers(t, 1, true, hf("x-check", "sum"))
+					assert.Equal(t, "ok", string(h.reply(t, 1).body))
+					require.Equal(t, http2.ClientPreface, o.nextNote(t))
+					assert.Equal(t, want, o.nextNote(t))
+				})
+			})
+			for _, origin := range []string{viaH1, viaH2, viaH3} {
+				t.Run("h3-to-"+origin, func(t *testing.T) {
+					var b *proxyBench
+					switch origin {
+					case viaH1:
+						b = newTLSProxyBench(t, noteTrailerH1)
+					case viaH2:
+						b = newH2OriginBench(t, noteTrailerH2)
+					default:
+						b = newH3OriginBench(t, noteTrailerH3)
+					}
+					got := b.dialH3Front(t).roundTrip(t, h3Request("POST", "origin.test", "/", request[4:]...), h3Headers([]hpack.HeaderField{hf("x-check", "sum")}))
+					require.NoError(t, got.err)
+					assert.Equal(t, "ok", string(got.body))
+					assert.Equal(t, want, b.origin.nextNote(t))
+				})
+			}
+		},
+	},
+
+	{
+		id: "rfc9110/6.5.1/5", name: "a request with content and a trailer field",
+		req: "A recipient MUST NOT merge a trailer field into a header section unless the recipient understands the corresponding header field definition and that definition explicitly permits and defines how trailer field values can be safely merged.",
+		run: func(t *testing.T) {
+			const want = `header="" trailer="sum"`
+			request := []hpack.HeaderField{
+				hf(":method", "POST"), hf(":scheme", "http"), hf(":authority", "origin.test"), hf(":path", "/"), hf("trailer", "x-check"),
+			}
+			t.Run("h1-to-h1", func(t *testing.T) {
+				eachProxyFront(t, func(t *testing.T, front proxyFront) {
+					b := newProxyBenchOn(t, front, noteTrailerH1)
+					got := b.exchange(t, "POST", "POST http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\nTrailer: X-Check\r\n"+
+						"Transfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\nX-Check: sum\r\n\r\n")
+					assert.Equal(t, "ok", string(got.body))
+					assert.Equal(t, want, b.origin.nextNote(t))
+				})
+			})
+			t.Run("h2-to-h1", func(t *testing.T) {
+				eachH2Front(t, h1UpstreamFronts, func(t *testing.T, front string) {
+					b, h := h2FrontBench(t, front, noteTrailerH1)
+					h.headers(t, 1, false, request...)
+					require.NoError(t, h.fr.WriteData(1, false, []byte("hi")))
+					h.headers(t, 1, true, hf("x-check", "sum"))
+					assert.Equal(t, "ok", string(h.reply(t, 1).body))
+					assert.Equal(t, want, b.origin.nextNote(t))
+				})
+			})
+			t.Run("h2-to-h2", func(t *testing.T) {
+				eachDeclaredFront(t, func(t *testing.T, front string) {
+					o := prefaceOrigin(t, noteTrailerH2)
+					h := h2cStream(t, front, o, false, "POST", hf("content-length", "2"), hf("trailer", "x-check"))
+					require.NoError(t, h.fr.WriteData(1, false, []byte("hi")))
+					h.headers(t, 1, true, hf("x-check", "sum"))
+					assert.Equal(t, "ok", string(h.reply(t, 1).body))
+					require.Equal(t, http2.ClientPreface, o.nextNote(t))
+					assert.Equal(t, want, o.nextNote(t))
+				})
+			})
+			for _, origin := range []string{viaH1, viaH2, viaH3} {
+				t.Run("h3-to-"+origin, func(t *testing.T) {
+					var b *proxyBench
+					switch origin {
+					case viaH1:
+						b = newTLSProxyBench(t, noteTrailerH1)
+					case viaH2:
+						b = newH2OriginBench(t, noteTrailerH2)
+					default:
+						b = newH3OriginBench(t, noteTrailerH3)
+					}
+					got := b.dialH3Front(t).roundTrip(t, h3Request("POST", "origin.test", "/", request[4:]...), h3Data("hi"),
+						h3Headers([]hpack.HeaderField{hf("x-check", "sum")}))
+					require.NoError(t, got.err)
+					assert.Equal(t, "ok", string(got.body))
+					assert.Equal(t, want, b.origin.nextNote(t))
+				})
+			}
+		},
+	},
+	{
+		id: "rfc9110/6.5.1/6", name: "an HTTP/2 GET without content with a trailer field, toward an HTTP/1.1 origin",
+		req:  "A recipient MUST NOT merge a trailer field into a header section unless the recipient understands the corresponding header field definition and that definition explicitly permits and defines how trailer field values can be safely merged.",
+		skip: "net/http reads the body of a GET with a Content-Length of 0 before sending it, and a body that ends there is sent with neither chunked framing nor a Trailer field, so the HTTP/1.1 origin receives no trailer section. edge does not choose the framing of an HTTP/1.1 request.",
+	},
+	{
+		id: "rfc9110/6.5.1/7", name: "an HTTP/2 request with a Content-Length and a trailer field, toward an HTTP/1.1 origin",
+		req:  "A recipient MUST NOT merge a trailer field into a header section unless the recipient understands the corresponding header field definition and that definition explicitly permits and defines how trailer field values can be safely merged.",
+		skip: "net/http sends a request with a Content-Length without chunked framing, so the HTTP/1.1 origin receives the content and no trailer section. edge keeps the Content-Length the client sent and does not choose the framing of an HTTP/1.1 request.",
 	},
 
 	// RFC 9110 section 7, routing.
 	{
-		id: "rfc9110/7.1/1", name: "GET with an authority-form target",
+		id: "rfc9110/7.1/1", name: "GET with an authority-form or an asterisk-form target",
 		req: "These forms MUST NOT be used with other methods.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always(okReply))
-			got := b.exchange(t, "GET", "GET origin.test:80 HTTP/1.1\r\nHost: origin.test:80\r\n\r\n")
-			assert.Equal(t, http.StatusForbidden, got.resp.StatusCode)
-			b.origin.none(t)
+			for _, target := range []string{"origin.test:80", "*"} {
+				t.Run(target, func(t *testing.T) {
+					eachProxyFront(t, func(t *testing.T, front proxyFront) {
+						b := newProxyBenchOn(t, front, always(okReply))
+						got := b.exchange(t, "GET", "GET "+target+" HTTP/1.1\r\nHost: origin.test:80\r\n\r\n")
+						assert.Contains(t, []int{http.StatusBadRequest, http.StatusMovedPermanently}, got.resp.StatusCode)
+						assert.Equal(t, int32(0), b.origin.accepted.Load(), "the request was forwarded with a form its method does not allow")
+					})
+				})
+			}
+		},
+	},
+	{
+		id: "rfc9110/7.4/1", name: "a request for a host the certificate of its connection does not cover",
+		req: "In particular, a request for an \"https\" resource MUST be rejected unless it has been received over a connection that has been secured via a certificate valid for that target URI's origin, as defined by Section 4.2.2.",
+		run: func(t *testing.T) {
+			eachTerminatedFront(t, []string{viaH1, viaH1WithoutALPN, viaH2, viaH3}, func(t *testing.T, front, version string) {
+				b := newMisdirectBench(t)
+				_, get := dialTerminated(t, b, front, version, "origin.test")
+				for _, host := range []string{"other.test", "other.test:443", "127.0.0.1"} {
+					code, body := get(t, host)
+					assert.Equal(t, http.StatusMisdirectedRequest, code, host)
+					assert.Equal(t, http.StatusText(http.StatusMisdirectedRequest)+"\n", body, host)
+				}
+				code, _ := get(t, "origin.test")
+				assert.Equal(t, http.StatusOK, code)
+				assert.Equal(t, "origin.test", b.origin.next(t).req.Host, "the first request reaching the origin")
+			})
+		},
+	},
+	{
+		id: "rfc9110/7.4/2", name: "a request for the host of the certificate of its connection, in another case, with a root dot or another port",
+		req: "In particular, a request for an \"https\" resource MUST be rejected unless it has been received over a connection that has been secured via a certificate valid for that target URI's origin, as defined by Section 4.2.2.",
+		run: func(t *testing.T) {
+			eachTerminatedFront(t, []string{viaH1, viaH1WithoutALPN, viaH2, viaH3}, func(t *testing.T, front, version string) {
+				b := newMisdirectBench(t)
+				_, get := dialTerminated(t, b, front, version, "Origin.Test")
+				for _, host := range []string{"origin.test", "ORIGIN.TEST.", "origin.test:8443"} {
+					code, _ := get(t, host)
+					assert.Equal(t, http.StatusOK, code, host)
+					assert.Equal(t, host, b.origin.next(t).req.Host)
+				}
+			})
+		},
+	},
+	{
+		id: "rfc9110/7.4/3", name: "a request on a TLS connection without a server name",
+		req: "In particular, a request for an \"https\" resource MUST be rejected unless it has been received over a connection that has been secured via a certificate valid for that target URI's origin, as defined by Section 4.2.2.",
+		run: func(t *testing.T) {
+			eachTerminatedFront(t, []string{viaH1, viaH1WithoutALPN, viaH2, viaH3}, func(t *testing.T, front, version string) {
+				b := newMisdirectBench(t)
+				leaf, get := dialTerminated(t, b, front, version, "")
+				code, _ := get(t, "other.test")
+				assert.Equal(t, http.StatusMisdirectedRequest, code)
+				host := leafHost(leaf)
+				code, _ = get(t, host)
+				assert.Equal(t, http.StatusOK, code, host)
+				assert.Equal(t, host, b.origin.next(t).req.Host, "the first request reaching the origin")
+			})
 		},
 	},
 	{
 		id: "rfc9110/7.6/1", name: "an unregistered method, field and status code",
 		req: "Intermediaries are expected to forward messages even when protocol elements are not recognized (e.g., new methods, status codes, or field names) since that preserves extensibility for downstream recipients.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always("HTTP/1.1 299 Unregistered\r\nX-Unknown-Reply: r\r\nContent-Length: 2\r\n\r\nok"))
-			got, resp := b.forwarded(t, "FROB", "FROB http://origin.test/x HTTP/1.1\r\nHost: origin.test\r\nX-Unknown-Field: f\r\n\r\n")
-			assert.Equal(t, "FROB /x HTTP/1.1", startLine(got.head))
-			assert.Equal(t, []string{"f"}, fieldValues(got.head, "X-Unknown-Field"))
-			assert.Equal(t, 299, resp.resp.StatusCode)
-			assert.Equal(t, []string{"r"}, fieldValues(resp.head, "X-Unknown-Reply"))
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always("HTTP/1.1 299 Unregistered\r\nX-Unknown-Reply: r\r\nContent-Length: 2\r\n\r\nok"))
+				got, resp := b.forwarded(t, "FROB", "FROB http://origin.test/x HTTP/1.1\r\nHost: origin.test\r\nX-Unknown-Field: f\r\n\r\n")
+				assert.Equal(t, "FROB /x HTTP/1.1", startLine(got.head))
+				assert.Equal(t, []string{"f"}, fieldValues(got.head, "X-Unknown-Field"))
+				assert.Equal(t, 299, resp.resp.StatusCode)
+				assert.Equal(t, []string{"r"}, fieldValues(resp.head, "X-Unknown-Reply"))
+			})
 		},
 	},
 	{
 		id: "rfc9110/7.6/2", name: "a request whose target is the proxy itself",
 		req: "An intermediary MUST NOT forward a message to itself unless it is protected from an infinite request loop.",
 		run: func(t *testing.T) {
-			ln, err := net.Listen("tcp", "127.0.0.1:0")
-			require.NoError(t, err)
-			counted := &countingListener{Listener: ln}
-			p := testProxy(t)
-			p.MustAdd("127.0.0.1/*{any}", forwardHandler)
-			go func() { _ = p.Serve(counted) }()
-			t.Cleanup(func() { _ = p.Close() })
-
-			addr := ln.Addr().String()
-			w := dialWire(t, addr)
-			w.send(t, "GET http://"+addr+"/loop HTTP/1.1\r\nHost: "+addr+"\r\n\r\n")
-			got := w.readResponse(t, "GET")
-			assert.NotEqual(t, http.StatusOK, got.resp.StatusCode)
-			assert.LessOrEqual(t, counted.accepted.Load(), int32(2), "the request came back to the proxy more than once")
+			for _, front := range selfLoopFronts {
+				t.Run(front, func(t *testing.T) {
+					status, handled := selfLoop(t, front)
+					assert.NotEqual(t, http.StatusOK, status)
+					assert.Equal(t, int32(1), handled, "the request came back to the proxy")
+				})
+			}
 		},
 	},
 	{
 		id: "rfc9110/7.6.1/1", name: "a request listing fields in Connection",
 		req: "Intermediaries MUST parse a received Connection header field before a message is forwarded and, for each connection-option in this field, remove any header or trailer field(s) from the message with the same name as the connection-option, and then remove the Connection header field itself (or replace it with the intermediary's own control options for the forwarded message).",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always(okReply))
-			got, _ := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\n"+
-				"Connection: X-Hop-A, keep-alive\r\nconnection: x-hop-b\r\nX-HOP-A: 1\r\nx-hop-b: 2\r\nX-End: 3\r\n\r\n")
-			assert.Empty(t, fieldValues(got.head, "Connection"))
-			assert.Empty(t, fieldValues(got.head, "X-Hop-A"))
-			assert.Empty(t, fieldValues(got.head, "X-Hop-B"))
-			assert.Equal(t, []string{"3"}, fieldValues(got.head, "X-End"))
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always(okReply))
+				got, _ := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\n"+
+					"Connection: X-Hop-A, keep-alive\r\nconnection: x-hop-b\r\nX-HOP-A: 1\r\nx-hop-b: 2\r\nX-End: 3\r\n\r\n")
+				assert.Empty(t, fieldValues(got.head, "Connection"))
+				assert.Empty(t, fieldValues(got.head, "X-Hop-A"))
+				assert.Empty(t, fieldValues(got.head, "X-Hop-B"))
+				assert.Equal(t, []string{"3"}, fieldValues(got.head, "X-End"))
+			})
 		},
 	},
 	{
 		id: "rfc9110/7.6.1/2", name: "a response listing fields in Connection",
 		req: "Intermediaries MUST parse a received Connection header field before a message is forwarded and, for each connection-option in this field, remove any header or trailer field(s) from the message with the same name as the connection-option, and then remove the Connection header field itself (or replace it with the intermediary's own control options for the forwarded message).",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always("HTTP/1.1 200 OK\r\nConnection: X-Hop\r\nX-Hop: 1\r\nX-End: 2\r\nContent-Length: 2\r\n\r\nok"))
-			_, got := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\n\r\n")
-			assert.Empty(t, fieldValues(got.head, "Connection"))
-			assert.Empty(t, fieldValues(got.head, "X-Hop"))
-			assert.Equal(t, []string{"2"}, fieldValues(got.head, "X-End"))
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always("HTTP/1.1 200 OK\r\nConnection: X-Hop\r\nX-Hop: 1\r\nX-End: 2\r\nContent-Length: 2\r\n\r\nok"))
+				_, got := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\n\r\n")
+				assert.Empty(t, fieldValues(got.head, "Connection"))
+				assert.Empty(t, fieldValues(got.head, "X-Hop"))
+				assert.Equal(t, []string{"2"}, fieldValues(got.head, "X-End"))
+			})
 		},
 	},
 	{
 		id: "rfc9110/7.6.1/3", name: "a response trailer field listed in Connection",
 		req: "Intermediaries MUST parse a received Connection header field before a message is forwarded and, for each connection-option in this field, remove any header or trailer field(s) from the message with the same name as the connection-option, and then remove the Connection header field itself (or replace it with the intermediary's own control options for the forwarded message).",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always("HTTP/1.1 200 OK\r\nConnection: X-Hop\r\nTrailer: X-Hop, X-Check\r\nTransfer-Encoding: chunked\r\n\r\n"+
-				"2\r\nok\r\n0\r\nX-Hop: secret\r\nX-Check: sum\r\n\r\n"))
-			_, got := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\nTE: trailers\r\n\r\n")
-			require.NoError(t, got.err)
-			assert.Equal(t, "sum", got.resp.Trailer.Get("X-Check"))
-			assert.Empty(t, got.resp.Trailer.Values("X-Hop"))
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always("HTTP/1.1 200 OK\r\nConnection: X-Hop\r\nTrailer: X-Hop, X-Check\r\nTransfer-Encoding: chunked\r\n\r\n"+
+					"2\r\nok\r\n0\r\nX-Hop: secret\r\nX-Check: sum\r\n\r\n"))
+				_, got := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\nTE: trailers\r\n\r\n")
+				require.NoError(t, got.err)
+				assert.Equal(t, "sum", got.resp.Trailer.Get("X-Check"))
+				assert.Empty(t, got.resp.Trailer.Values("X-Hop"))
+			})
 		},
 	},
 	{
 		id: "rfc9110/7.6.1/4", name: "a request trailer field listed in Connection",
 		req: "Intermediaries MUST parse a received Connection header field before a message is forwarded and, for each connection-option in this field, remove any header or trailer field(s) from the message with the same name as the connection-option, and then remove the Connection header field itself (or replace it with the intermediary's own control options for the forwarded message).",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always(okReply))
-			got, _ := b.forwarded(t, "POST", "POST http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\nConnection: X-Hop\r\n"+
-				"Trailer: X-Hop\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\nX-Hop: secret\r\n\r\n")
-			assert.Empty(t, fieldValues(got.head, "X-Hop"))
-			assert.Empty(t, got.req.Trailer.Values("X-Hop"))
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always(okReply))
+				got, _ := b.forwarded(t, "POST", "POST http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\nConnection: X-Hop\r\n"+
+					"Trailer: X-Hop\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\nX-Hop: secret\r\n\r\n")
+				assert.Empty(t, fieldValues(got.head, "X-Hop"))
+				assert.Empty(t, got.req.Trailer.Values("X-Hop"))
+			})
 		},
 	},
 	{
 		id: "rfc9110/7.6.1/5", name: "a request with Proxy-Connection, Keep-Alive, TE and Upgrade",
 		req: "Furthermore, intermediaries SHOULD remove or replace fields that are known to require removal before forwarding, whether or not they appear as a connection-option, after applying those fields' semantics.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always(okReply))
-			got, _ := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\n"+
-				"Proxy-Connection: keep-alive\r\nKeep-Alive: timeout=5\r\nTE: gzip\r\nUpgrade: h2c\r\n\r\n")
-			for _, name := range []string{"Proxy-Connection", "Keep-Alive", "TE", "Upgrade", "Connection"} {
-				assert.Empty(t, fieldValues(got.head, name), name)
-			}
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always(okReply))
+				got, _ := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\n"+
+					"Proxy-Connection: keep-alive\r\nKeep-Alive: timeout=5\r\nTE: gzip\r\nUpgrade: h2c\r\n\r\n")
+				for _, name := range []string{"Proxy-Connection", "Keep-Alive", "TE", "Upgrade", "Connection"} {
+					assert.Empty(t, fieldValues(got.head, name), name)
+				}
+			})
 		},
 	},
 	{
 		id: "rfc9110/7.6.1/6", name: "a response with Proxy-Connection, Keep-Alive and Upgrade",
 		req: "Furthermore, intermediaries SHOULD remove or replace fields that are known to require removal before forwarding, whether or not they appear as a connection-option, after applying those fields' semantics.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always("HTTP/1.1 200 OK\r\nProxy-Connection: keep-alive\r\nKeep-Alive: timeout=5\r\nUpgrade: h2c\r\nContent-Length: 2\r\n\r\nok"))
-			_, got := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\n\r\n")
-			for _, name := range []string{"Proxy-Connection", "Keep-Alive", "Upgrade"} {
-				assert.Empty(t, fieldValues(got.head, name), name)
-			}
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always("HTTP/1.1 200 OK\r\nProxy-Connection: keep-alive\r\nKeep-Alive: timeout=5\r\nUpgrade: h2c\r\nContent-Length: 2\r\n\r\nok"))
+				_, got := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\n\r\n")
+				for _, name := range []string{"Proxy-Connection", "Keep-Alive", "Upgrade"} {
+					assert.Empty(t, fieldValues(got.head, name), name)
+				}
+			})
 		},
 	},
 	{
 		id: "rfc9110/7.6.2/1", name: "TRACE with Max-Forwards 0",
 		req: "If the received value is zero (0), the intermediary MUST NOT forward the request; instead, the intermediary MUST respond as the final recipient.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always(okReply))
-			got := b.exchange(t, "TRACE", "TRACE http://origin.test/t HTTP/1.1\r\nHost: origin.test\r\nMax-Forwards: 0\r\n\r\n")
-			assert.NotZero(t, got.resp.StatusCode)
-			b.origin.none(t)
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always(okReply))
+				got := b.exchange(t, "TRACE", "TRACE http://origin.test/t HTTP/1.1\r\nHost: origin.test\r\nMax-Forwards: 0\r\n\r\n")
+				assert.NotZero(t, got.resp.StatusCode)
+				b.origin.none(t)
+			})
 		},
 	},
 	{
 		id: "rfc9110/7.6.2/2", name: "OPTIONS with Max-Forwards 5",
 		req: "If the received Max-Forwards value is greater than zero, the intermediary MUST generate an updated Max-Forwards field in the forwarded message with a field value that is the lesser of a) the received value decremented by one (1) or b) the recipient's maximum supported value for Max-Forwards.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always(okReply))
-			got, _ := b.forwarded(t, "OPTIONS", "OPTIONS http://origin.test/o HTTP/1.1\r\nHost: origin.test\r\nMax-Forwards: 5\r\n\r\n")
-			assert.Equal(t, []string{"4"}, fieldValues(got.head, "Max-Forwards"))
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always(okReply))
+				got, _ := b.forwarded(t, "OPTIONS", "OPTIONS http://origin.test/o HTTP/1.1\r\nHost: origin.test\r\nMax-Forwards: 5\r\n\r\n")
+				assert.Equal(t, []string{"4"}, fieldValues(got.head, "Max-Forwards"))
+			})
 		},
 	},
 	{
@@ -2650,59 +3613,72 @@ var proxyConformance = []conformanceCase{
 		id: "rfc9110/7.7/1", name: "an absolute-form target with a fully qualified domain name",
 		req: "A proxy MUST NOT change the host name if the target URI contains a fully qualified domain name.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always(okReply))
-			got, _ := b.forwarded(t, "GET", "GET http://Origin.Test.:8080/x HTTP/1.1\r\nHost: Origin.Test.:8080\r\n\r\n")
-			assert.Equal(t, []string{"Origin.Test.:8080"}, fieldValues(got.head, "Host"))
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always(okReply))
+				got, _ := b.forwarded(t, "GET", "GET http://Origin.Test.:8080/x HTTP/1.1\r\nHost: Origin.Test.:8080\r\n\r\n")
+				assert.Equal(t, []string{"Origin.Test.:8080"}, fieldValues(got.head, "Host"))
+			})
 		},
 	},
 	{
 		id: "rfc9110/7.7/2", name: "a path and a query the origin may not normalize",
 		req: "A proxy MUST NOT modify the \"absolute-path\" and \"query\" parts of the received target URI when forwarding it to the next inbound server except as required by that forwarding protocol.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always(okReply))
-			const target = "/a/%7Euser/./b/../c//d%2Fe;p=1?q=%2F&x=a+b&&y=%7e"
-			got, _ := b.forwarded(t, "GET", "GET http://origin.test"+target+" HTTP/1.1\r\nHost: origin.test\r\n\r\n")
-			assert.Equal(t, "GET "+target+" HTTP/1.1", startLine(got.head))
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always(okReply))
+				const target = "/a/%7Euser/./b/../c//d%2Fe;p=1?q=%2F&x=a+b&&y=%7e"
+				got, _ := b.forwarded(t, "GET", "GET http://origin.test"+target+" HTTP/1.1\r\nHost: origin.test\r\n\r\n")
+				assert.Equal(t, "GET "+target+" HTTP/1.1", startLine(got.head))
+			})
 		},
 	},
 	{
 		id: "rfc9110/7.7/3", name: "an absolute-form target with an empty path",
 		req: "For example, a proxy forwarding a request to an origin server via HTTP/1.1 will replace an empty path with \"/\" (Section 3.2.1 of [HTTP/1.1]) or \"*\" (Section 3.2.4 of [HTTP/1.1]), depending on the request method.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always(okReply))
-			got, _ := b.forwarded(t, "GET", "GET http://origin.test HTTP/1.1\r\nHost: origin.test\r\n\r\n")
-			assert.Equal(t, "GET / HTTP/1.1", startLine(got.head))
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always(okReply))
+				w := b.dial(t)
+				w.originForm = false
+				w.send(t, "GET "+front.scheme()+"://origin.test HTTP/1.1\r\nHost: origin.test\r\n\r\n")
+				w.readResponse(t, "GET")
+				assert.Equal(t, "GET / HTTP/1.1", startLine(b.origin.next(t).head))
+			})
 		},
 	},
 	{
 		id: "rfc9110/7.7/4", name: "a response with the no-transform directive",
 		req: "A proxy MUST NOT transform the content (Section 6.4) of a response message that contains a no-transform cache directive (Section 5.2.2.6 of [CACHING]).",
 		run: func(t *testing.T) {
-			var gz bytes.Buffer
-			zw := gzip.NewWriter(&gz)
-			_, _ = zw.Write([]byte("compressed content"))
-			require.NoError(t, zw.Close())
-			b := newProxyBench(t, always(fmt.Sprintf("HTTP/1.1 200 OK\r\nCache-Control: no-transform\r\nContent-Encoding: gzip\r\n"+
-				"Content-Type: text/plain\r\nContent-Length: %d\r\n\r\n%s", gz.Len(), gz.Bytes())))
-			_, got := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\nAccept-Encoding: gzip\r\n\r\n")
-			require.NoError(t, got.err)
-			assert.Equal(t, gz.Bytes(), got.body)
-			assert.Equal(t, []string{"gzip"}, fieldValues(got.head, "Content-Encoding"))
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				var gz bytes.Buffer
+				zw := gzip.NewWriter(&gz)
+				_, _ = zw.Write([]byte("compressed content"))
+				require.NoError(t, zw.Close())
+				b := newProxyBenchOn(t, front, always(fmt.Sprintf("HTTP/1.1 200 OK\r\nCache-Control: no-transform\r\nContent-Encoding: gzip\r\n"+
+					"Content-Type: text/plain\r\nContent-Length: %d\r\n\r\n%s", gz.Len(), gz.Bytes())))
+				_, got := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\nAccept-Encoding: gzip\r\n\r\n")
+				require.NoError(t, got.err)
+				assert.Equal(t, gz.Bytes(), got.body)
+				assert.Equal(t, []string{"gzip"}, fieldValues(got.head, "Content-Encoding"))
+			})
 		},
 	},
 	{
 		id: "rfc9110/7.7/5", name: "a response describing its representation and its origin",
 		req: "A proxy SHOULD NOT modify header fields that provide information about the endpoints of the communication chain, the resource state, or the selected representation (other than the content) unless the field's definition specifically allows such modification or the modification is deemed necessary for privacy or security.",
 		run: func(t *testing.T) {
-			const date = "Mon, 05 Oct 2026 10:00:00 GMT"
-			b := newProxyBench(t, always("HTTP/1.1 200 OK\r\nServer: origin/1\r\nDate: "+date+"\r\nETag: \"v1\"\r\n"+
-				"Last-Modified: "+date+"\r\nContent-Length: 15\r\n\r\n<html>hi</html>"))
-			_, got := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\n\r\n")
-			assert.Equal(t, []string{"origin/1"}, fieldValues(got.head, "Server"))
-			assert.Equal(t, []string{date}, fieldValues(got.head, "Date"))
-			assert.Equal(t, []string{`"v1"`}, fieldValues(got.head, "ETag"))
-			assert.Equal(t, []string{date}, fieldValues(got.head, "Last-Modified"))
-			assert.Empty(t, fieldValues(got.head, "Content-Type"), "the origin declared no media type")
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				const date = "Mon, 05 Oct 2026 10:00:00 GMT"
+				b := newProxyBenchOn(t, front, always("HTTP/1.1 200 OK\r\nServer: origin/1\r\nDate: "+date+"\r\nETag: \"v1\"\r\n"+
+					"Last-Modified: "+date+"\r\nContent-Length: 15\r\n\r\n<html>hi</html>"))
+				_, got := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\n\r\n")
+				assert.Equal(t, []string{"origin/1"}, fieldValues(got.head, "Server"))
+				assert.Equal(t, []string{date}, fieldValues(got.head, "Date"))
+				assert.Equal(t, []string{`"v1"`}, fieldValues(got.head, "ETag"))
+				assert.Equal(t, []string{date}, fieldValues(got.head, "Last-Modified"))
+				assert.Empty(t, fieldValues(got.head, "Content-Type"), "the origin declared no media type")
+			})
 		},
 	},
 
@@ -2711,42 +3687,46 @@ var proxyConformance = []conformanceCase{
 		id: "rfc9110/7.8/1", name: "an HTTP/1.0 request asking for an upgrade",
 		req: "A server that receives an Upgrade header field in an HTTP/1.0 request MUST ignore that Upgrade field.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always(okReply))
-			got, _ := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.0\r\nHost: origin.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
-			assert.Empty(t, fieldValues(got.head, "Upgrade"))
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always(okReply))
+				got, _ := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.0\r\nHost: origin.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+				assert.Empty(t, fieldValues(got.head, "Upgrade"))
+			})
 		},
 	},
 	{
 		id: "rfc9110/7.8/2", name: "an upgrade answered with 101",
 		req: "A sender of Upgrade MUST also send an \"Upgrade\" connection option in the Connection header field (Section 7.6.1) to inform intermediaries not to forward this field.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, func(o *rawOrigin, w *wire) {
-				r, err := w.readRequest()
-				if err != nil {
-					return
-				}
-				o.got <- r
-				_, _ = io.WriteString(w, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: echo/1\r\n\r\n")
-				_, _ = io.Copy(w, w.br)
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, func(o *rawOrigin, w *wire) {
+					r, err := w.readRequest()
+					if err != nil {
+						return
+					}
+					o.got <- r
+					_, _ = io.WriteString(w, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: echo/1\r\n\r\n")
+					_, _ = io.Copy(w, w.br)
+				})
+				b.p.MustAdd("origin.test", relayStream)
+
+				w := b.dial(t)
+				w.send(t, "GET http://origin.test/up HTTP/1.1\r\nHost: origin.test\r\nConnection: keep-alive, Upgrade\r\nUpgrade: echo/1\r\n\r\n")
+				head := w.readHead(t)
+				require.Equal(t, http.StatusSwitchingProtocols, headStatus(t, head))
+				assert.Equal(t, []string{"echo/1"}, fieldValues(head, "Upgrade"))
+				assert.True(t, headerListContains(http.Header{"Connection": fieldValues(head, "Connection")}, "Connection", "upgrade"))
+
+				got := b.origin.next(t)
+				assert.Equal(t, []string{"echo/1"}, fieldValues(got.head, "Upgrade"))
+				assert.True(t, headerListContains(http.Header{"Connection": fieldValues(got.head, "Connection")}, "Connection", "upgrade"))
+
+				w.send(t, "ping")
+				echo := make([]byte, 4)
+				_, err := io.ReadFull(w.br, echo)
+				require.NoError(t, err)
+				assert.Equal(t, "ping", string(echo))
 			})
-			b.p.MustAdd("origin.test", relayStream)
-
-			w := b.dial(t)
-			w.send(t, "GET http://origin.test/up HTTP/1.1\r\nHost: origin.test\r\nConnection: keep-alive, Upgrade\r\nUpgrade: echo/1\r\n\r\n")
-			head := w.readHead(t)
-			require.Equal(t, http.StatusSwitchingProtocols, headStatus(t, head))
-			assert.Equal(t, []string{"echo/1"}, fieldValues(head, "Upgrade"))
-			assert.True(t, headerListContains(http.Header{"Connection": fieldValues(head, "Connection")}, "Connection", "upgrade"))
-
-			got := b.origin.next(t)
-			assert.Equal(t, []string{"echo/1"}, fieldValues(got.head, "Upgrade"))
-			assert.True(t, headerListContains(http.Header{"Connection": fieldValues(got.head, "Connection")}, "Connection", "upgrade"))
-
-			w.send(t, "ping")
-			echo := make([]byte, 4)
-			_, err := io.ReadFull(w.br, echo)
-			require.NoError(t, err)
-			assert.Equal(t, "ping", string(echo))
 		},
 	},
 
@@ -2965,9 +3945,11 @@ var proxyConformance = []conformanceCase{
 		id: "rfc9110/9.3.7/1", name: "OPTIONS without Max-Forwards",
 		req: "A proxy MUST NOT generate a Max-Forwards header field while forwarding a request unless that request was received with a Max-Forwards field.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always(okReply))
-			got, _ := b.forwarded(t, "OPTIONS", "OPTIONS http://origin.test/o HTTP/1.1\r\nHost: origin.test\r\n\r\n")
-			assert.Empty(t, fieldValues(got.head, "Max-Forwards"))
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always(okReply))
+				got, _ := b.forwarded(t, "OPTIONS", "OPTIONS http://origin.test/o HTTP/1.1\r\nHost: origin.test\r\n\r\n")
+				assert.Empty(t, fieldValues(got.head, "Max-Forwards"))
+			})
 		},
 	},
 
@@ -2976,35 +3958,39 @@ var proxyConformance = []conformanceCase{
 		id: "rfc9110/10.1.1/1", name: "a request expecting 100-continue",
 		req: "Upon receiving an HTTP/1.1 (or later) request that has a method, target URI, and complete header section that contains a 100-continue expectation and indicates a request content will follow, a proxy MUST either: * send an immediate response with a final status code, if that status can be determined by examining just the method, target URI, and header fields, or * forward the request toward the origin server by sending a corresponding request-line and header section to the next inbound server.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, func(o *rawOrigin, w *wire) {
-				req, err := http.ReadRequest(w.br)
-				if err != nil {
-					return
-				}
-				o.got <- wireRequest{head: w.headFrom(0), req: req}
-				_, _ = io.WriteString(w, "HTTP/1.1 100 Continue\r\n\r\n")
-				body, _ := io.ReadAll(req.Body)
-				o.note(string(body))
-				_, _ = io.WriteString(w, okReply)
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, func(o *rawOrigin, w *wire) {
+					req, err := http.ReadRequest(w.br)
+					if err != nil {
+						return
+					}
+					o.got <- wireRequest{head: w.headFrom(0), req: req}
+					_, _ = io.WriteString(w, "HTTP/1.1 100 Continue\r\n\r\n")
+					body, _ := io.ReadAll(req.Body)
+					o.note(string(body))
+					_, _ = io.WriteString(w, okReply)
+				})
+				w := b.dial(t)
+				w.send(t, "PUT http://origin.test/up HTTP/1.1\r\nHost: origin.test\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n")
+				got := b.origin.next(t)
+				assert.Equal(t, []string{"100-continue"}, fieldValues(got.head, "Expect"))
+				assert.Equal(t, http.StatusContinue, w.readResponse(t, "PUT").resp.StatusCode)
+				w.send(t, "hello")
+				assert.Equal(t, http.StatusOK, w.readResponse(t, "PUT").resp.StatusCode)
+				assert.Equal(t, "hello", b.origin.nextNote(t))
 			})
-			w := b.dial(t)
-			w.send(t, "PUT http://origin.test/up HTTP/1.1\r\nHost: origin.test\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n")
-			got := b.origin.next(t)
-			assert.Equal(t, []string{"100-continue"}, fieldValues(got.head, "Expect"))
-			assert.Equal(t, http.StatusContinue, w.readResponse(t, "PUT").resp.StatusCode)
-			w.send(t, "hello")
-			assert.Equal(t, http.StatusOK, w.readResponse(t, "PUT").resp.StatusCode)
-			assert.Equal(t, "hello", b.origin.nextNote(t))
 		},
 	},
 	{
 		id: "rfc9110/10.1.4/1", name: "a request announcing trailers in TE",
 		req: "A sender of TE MUST also send a \"TE\" connection option within the Connection header field (Section 7.6.1) to inform intermediaries not to forward this field.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always(okReply))
-			got, _ := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\nTE: trailers\r\nConnection: TE\r\n\r\n")
-			require.Equal(t, []string{"trailers"}, fieldValues(got.head, "TE"))
-			assert.True(t, headerListContains(http.Header{"Connection": fieldValues(got.head, "Connection")}, "Connection", "te"))
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always(okReply))
+				got, _ := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\nTE: trailers\r\nConnection: TE\r\n\r\n")
+				require.Equal(t, []string{"trailers"}, fieldValues(got.head, "TE"))
+				assert.True(t, headerListContains(http.Header{"Connection": fieldValues(got.head, "Connection")}, "Connection", "te"))
+			})
 		},
 	},
 	{
@@ -3016,21 +4002,25 @@ var proxyConformance = []conformanceCase{
 		id: "rfc9110/15.2/1", name: "a 103 from the origin before its final answer",
 		req: "A proxy MUST forward 1xx responses unless the proxy itself requested the generation of the 1xx response.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always("HTTP/1.1 103 Early Hints\r\nLink: </s.css>; rel=preload\r\n\r\n"+okReply))
-			w := b.dial(t)
-			w.send(t, "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\n\r\n")
-			early := w.readResponse(t, "GET")
-			assert.Equal(t, http.StatusEarlyHints, early.resp.StatusCode)
-			assert.Equal(t, []string{"</s.css>; rel=preload"}, fieldValues(early.head, "Link"))
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always("HTTP/1.1 103 Early Hints\r\nLink: </s.css>; rel=preload\r\n\r\n"+okReply))
+				w := b.dial(t)
+				w.send(t, "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\n\r\n")
+				early := w.readResponse(t, "GET")
+				assert.Equal(t, http.StatusEarlyHints, early.resp.StatusCode)
+				assert.Equal(t, []string{"</s.css>; rel=preload"}, fieldValues(early.head, "Link"))
+			})
 		},
 	},
 	{
 		id: "rfc9110/15.2/2", name: "a 1xx answer to an HTTP/1.0 client",
 		req: "Since HTTP/1.0 did not define any 1xx status codes, a server MUST NOT send a 1xx response to an HTTP/1.0 client.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always("HTTP/1.1 103 Early Hints\r\nLink: </s.css>; rel=preload\r\n\r\n"+okReply))
-			_, got := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.0\r\nHost: origin.test\r\n\r\n")
-			assert.Equal(t, http.StatusOK, got.resp.StatusCode)
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always("HTTP/1.1 103 Early Hints\r\nLink: </s.css>; rel=preload\r\n\r\n"+okReply))
+				_, got := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.0\r\nHost: origin.test\r\n\r\n")
+				assert.Equal(t, http.StatusOK, got.resp.StatusCode)
+			})
 		},
 	},
 	{
@@ -3058,38 +4048,40 @@ var proxyConformance = []conformanceCase{
 		id: "rfc9110/15.2/4", name: "a 103 from the origin to a request expecting 100-continue",
 		req: "A proxy MUST forward 1xx responses unless the proxy itself requested the generation of the 1xx response.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, func(o *rawOrigin, w *wire) {
-				for {
-					req, err := http.ReadRequest(w.br)
-					if err != nil {
-						return
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, func(o *rawOrigin, w *wire) {
+					for {
+						req, err := http.ReadRequest(w.br)
+						if err != nil {
+							return
+						}
+						_, _ = io.WriteString(w, "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </s.css>; rel=preload\r\n\r\n")
+						_, _ = io.ReadAll(req.Body)
+						if _, err := io.WriteString(w, okReply); err != nil {
+							return
+						}
 					}
-					_, _ = io.WriteString(w, "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </s.css>; rel=preload\r\n\r\n")
-					_, _ = io.ReadAll(req.Body)
-					if _, err := io.WriteString(w, okReply); err != nil {
-						return
+				})
+				// The server writes its 100 from the goroutine reading the body, so a 103 written
+				// alongside it is a data race the race detector reports within a few exchanges.
+				for range 5 {
+					w := b.dial(t)
+					w.send(t, "POST http://origin.test/up HTTP/1.1\r\nHost: origin.test\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\nhello")
+					var codes []int
+					for {
+						got := w.readResponse(t, "POST")
+						codes = append(codes, got.resp.StatusCode)
+						if got.resp.StatusCode == http.StatusEarlyHints {
+							assert.Equal(t, []string{"</s.css>; rel=preload"}, fieldValues(got.head, "Link"))
+						}
+						if got.resp.StatusCode >= http.StatusOK {
+							break
+						}
 					}
+					assert.Equal(t, []int{http.StatusContinue, http.StatusEarlyHints, http.StatusOK}, codes)
+					_ = w.Close()
 				}
 			})
-			// The server writes its 100 from the goroutine reading the body, so a 103 written
-			// alongside it is a data race the race detector reports within a few exchanges.
-			for range 5 {
-				w := b.dial(t)
-				w.send(t, "POST http://origin.test/up HTTP/1.1\r\nHost: origin.test\r\nExpect: 100-continue\r\nContent-Length: 5\r\n\r\nhello")
-				var codes []int
-				for {
-					got := w.readResponse(t, "POST")
-					codes = append(codes, got.resp.StatusCode)
-					if got.resp.StatusCode == http.StatusEarlyHints {
-						assert.Equal(t, []string{"</s.css>; rel=preload"}, fieldValues(got.head, "Link"))
-					}
-					if got.resp.StatusCode >= http.StatusOK {
-						break
-					}
-				}
-				assert.Equal(t, []int{http.StatusContinue, http.StatusEarlyHints, http.StatusOK}, codes)
-				_ = w.Close()
-			}
 		},
 	},
 	{
@@ -3217,6 +4209,13 @@ var proxyConformance = []conformanceCase{
 					assert.Equal(t, challenges, got.header.Values("WWW-Authenticate"))
 				})
 			}
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: "+challenges[0]+
+					"\r\nWWW-Authenticate: "+challenges[1]+"\r\nContent-Length: 0\r\n\r\n"))
+				_, got := b.forwarded(t, "GET", "GET http://origin.test/x HTTP/1.1\r\nHost: origin.test\r\n\r\n")
+				assert.Equal(t, http.StatusUnauthorized, got.resp.StatusCode)
+				assert.Equal(t, challenges, fieldValues(got.head, "WWW-Authenticate"))
+			})
 		},
 	},
 	{
@@ -3245,6 +4244,18 @@ var proxyConformance = []conformanceCase{
 		},
 	},
 	{
+		id: "rfc9110/11.6.2/3", name: "a request with Authorization",
+		req: "A proxy forwarding a request MUST NOT modify any Authorization header fields in that request.",
+		run: func(t *testing.T) {
+			const authorization = `Digest username="digest", realm="weirdorealm", nonce="12345", uri="/x", response="304c55b19dbcb9c7e7a3354abd11ba1b"`
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always(okReply))
+				got, _ := b.forwarded(t, "GET", "GET http://origin.test/x HTTP/1.1\r\nHost: origin.test\r\nAuthorization: "+authorization+"\r\n\r\n")
+				assert.Equal(t, []string{authorization}, fieldValues(got.head, "Authorization"))
+			})
+		},
+	},
+	{
 		id: "rfc9110/11.6.3/1", name: "Authentication-Info on a response",
 		req: "A proxy forwarding a response is not allowed to modify the field value in any way.",
 		run: func(t *testing.T) {
@@ -3257,6 +4268,12 @@ var proxyConformance = []conformanceCase{
 					assert.Equal(t, []string{info}, got.header.Values("Authentication-Info"))
 				})
 			}
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always("HTTP/1.1 200 OK\r\nAuthentication-Info: "+info+"\r\nContent-Length: 2\r\n\r\nok"))
+				_, got := b.forwarded(t, "GET", "GET http://origin.test/x HTTP/1.1\r\nHost: origin.test\r\n\r\n")
+				assert.Equal(t, http.StatusOK, got.resp.StatusCode)
+				assert.Equal(t, []string{info}, fieldValues(got.head, "Authentication-Info"))
+			})
 		},
 	},
 	{
@@ -3370,20 +4387,28 @@ var proxyConformance = []conformanceCase{
 		id: "rfc9112/3.2/1", name: "a request with two Host field lines",
 		req: "A server MUST respond with a 400 (Bad Request) status code to any HTTP/1.1 request message that lacks a Host header field and to any request message that contains more than one Host header field line or a Host header field with an invalid field value.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always(okReply))
-			got := b.exchange(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\nHost: other.test\r\n\r\n")
-			assert.Equal(t, http.StatusBadRequest, got.resp.StatusCode)
-			b.origin.none(t)
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always(okReply))
+				got := b.exchange(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\nHost: other.test\r\n\r\n")
+				assert.Equal(t, http.StatusBadRequest, got.resp.StatusCode)
+				b.origin.none(t)
+			})
 		},
 	},
 	{
 		id: "rfc9112/3.2/2", name: "an absolute-form target with userinfo",
 		req: "If the target URI includes an authority component, then a client MUST send a field value for Host that is identical to that authority component, excluding any userinfo subcomponent and its \"@\" delimiter (Section 4.2 of [HTTP]).",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always(okReply))
-			got, _ := b.forwarded(t, "GET", "GET http://user:secret@origin.test:8080/x HTTP/1.1\r\nHost: origin.test:8080\r\n\r\n")
-			assert.Equal(t, []string{"origin.test:8080"}, fieldValues(got.head, "Host"))
-			assert.NotContains(t, got.head, "secret")
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always(okReply))
+				w := b.dial(t)
+				w.originForm = false
+				w.send(t, "GET "+front.scheme()+"://user:secret@origin.test:8080/x HTTP/1.1\r\nHost: origin.test:8080\r\n\r\n")
+				w.readResponse(t, "GET")
+				got := b.origin.next(t)
+				assert.Equal(t, []string{"origin.test:8080"}, fieldValues(got.head, "Host"))
+				assert.NotContains(t, got.head, "secret")
+			})
 		},
 	},
 	{
@@ -3397,12 +4422,90 @@ var proxyConformance = []conformanceCase{
 		},
 	},
 	{
+		id: "rfc9112/3.2/4", name: "a request without Host",
+		req: "A server MUST respond with a 400 (Bad Request) status code to any HTTP/1.1 request message that lacks a Host header field and to any request message that contains more than one Host header field line or a Host header field with an invalid field value.",
+		run: func(t *testing.T) {
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always(okReply))
+				got := b.exchange(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nX-Pad: 1\r\n\r\n")
+				assert.Equal(t, http.StatusBadRequest, got.resp.StatusCode)
+			})
+		},
+	},
+	{
+		id: "rfc9112/3.2/5", name: "a Host with an invalid field value",
+		req: "A server MUST respond with a 400 (Bad Request) status code to any HTTP/1.1 request message that lacks a Host header field and to any request message that contains more than one Host header field line or a Host header field with an invalid field value.",
+		run: func(t *testing.T) {
+			hosts := []string{"origin .test", "origin.test/x", "origin.test:8o", "user@origin.test", "origin.test:80:80",
+				"[origin.test]", "origin.test]", "[::1]x", "[::1]:80:80"}
+			for _, host := range hosts {
+				t.Run(strconv.Quote(host), func(t *testing.T) {
+					// The explicit front receives the absolute-form, whose Host net/http replaces before edge reads it, as rfc9112/3.2.2/1 checks.
+					for _, front := range proxyFronts[1:] {
+						t.Run(string(front), func(t *testing.T) {
+							b := newProxyBenchOn(t, front, always(okReply))
+							got := b.exchange(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nHost: "+host+"\r\n\r\n")
+							assert.Equal(t, http.StatusBadRequest, got.resp.StatusCode)
+						})
+					}
+				})
+			}
+		},
+	},
+	{
+		id: "rfc9112/3.2/6", name: "a request-target in a form its method does not allow",
+		req: "Recipients of an invalid request-line SHOULD respond with either a 400 (Bad Request) error or a 301 (Moved Permanently) redirect with the request-target properly encoded.",
+		run: func(t *testing.T) {
+			for _, line := range []string{"GET origin.test:80", "GET *"} {
+				t.Run(line, func(t *testing.T) {
+					eachProxyFront(t, func(t *testing.T, front proxyFront) {
+						b := newProxyBenchOn(t, front, always(okReply))
+						got := b.exchange(t, "GET", line+" HTTP/1.1\r\nHost: origin.test:80\r\n\r\n")
+						assert.Contains(t, []int{http.StatusBadRequest, http.StatusMovedPermanently}, got.resp.StatusCode)
+					})
+				})
+			}
+		},
+	},
+	{
+		id: "rfc9112/3.2/7", name: "a request-target with a space",
+		req: "Recipients of an invalid request-line SHOULD respond with either a 400 (Bad Request) error or a 301 (Moved Permanently) redirect with the request-target properly encoded.",
+		run: func(t *testing.T) {
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always(okReply))
+				got := b.exchange(t, "GET", "GET http://origin.test/a b HTTP/1.1\r\nHost: origin.test\r\n\r\n")
+				assert.Contains(t, []int{http.StatusBadRequest, http.StatusMovedPermanently}, got.resp.StatusCode)
+			})
+		},
+	},
+	{
+		id: "rfc9112/3.2/8", name: "an absolute-form target whose host RFC 3986 does not allow",
+		req: "Recipients of an invalid request-line SHOULD respond with either a 400 (Bad Request) error or a 301 (Moved Permanently) redirect with the request-target properly encoded.",
+		run: func(t *testing.T) {
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always(okReply))
+				b.p.MustAdd("+{any}/*{any}", forwardHandler)
+				w := b.dial(t)
+				w.originForm = false
+				w.send(t, "GET "+front.scheme()+"://ori\"gin.test/ HTTP/1.1\r\nHost: origin.test\r\n\r\n")
+				got := w.readResponse(t, "GET")
+				assert.Contains(t, []int{http.StatusBadRequest, http.StatusMovedPermanently}, got.resp.StatusCode)
+				assert.Equal(t, int32(0), b.origin.accepted.Load(), "the proxy forwarded an invalid request-line")
+			})
+		},
+	},
+	{
 		id: "rfc9112/3.2.2/1", name: "an absolute-form target with a Host that disagrees",
 		req: "A proxy that forwards such a request MUST generate a new Host field value based on the received request-target rather than forward the received Host field value.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always(okReply))
-			got, _ := b.forwarded(t, "GET", "GET http://origin.test/abs HTTP/1.1\r\nHost: other.test\r\n\r\n")
-			assert.Equal(t, []string{"origin.test"}, fieldValues(got.head, "Host"))
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always(okReply))
+				w := b.dial(t)
+				w.originForm = false
+				w.send(t, "GET "+front.scheme()+"://origin.test/abs HTTP/1.1\r\nHost: other.test\r\n\r\n")
+				w.readResponse(t, "GET")
+				assert.Equal(t, []string{"origin.test"}, fieldValues(b.origin.next(t).head, "Host"))
+			})
 		},
 	},
 	{
@@ -3431,6 +4534,20 @@ var proxyConformance = []conformanceCase{
 		},
 	},
 	{
+		id: "rfc9112/3.2.2/4", name: "an absolute-form request where origin-form is expected",
+		req: "A server MUST accept the absolute-form in requests even though most HTTP/1.1 clients will only send the absolute-form to a proxy.",
+		run: func(t *testing.T) {
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always(okReply))
+				w := b.dial(t)
+				w.originForm = false
+				w.send(t, "GET "+front.scheme()+"://origin.test/abs?q=1 HTTP/1.1\r\nHost: origin.test\r\n\r\n")
+				assert.Equal(t, http.StatusOK, w.readResponse(t, "GET").resp.StatusCode)
+				assert.Equal(t, "GET /abs?q=1 HTTP/1.1", startLine(b.origin.next(t).head))
+			})
+		},
+	},
+	{
 		id: "rfc9112/3.2.3/1", name: "a CONNECT to an IPv6 literal through an upstream proxy",
 		req: "When making a CONNECT request to establish a tunnel through one or more proxies, a client MUST send only the host and port of the tunnel destination as the request-target.",
 		run: func(t *testing.T) {
@@ -3444,10 +4561,37 @@ var proxyConformance = []conformanceCase{
 		id: "rfc9112/3.2.4/1", name: "OPTIONS with an absolute-form target and an empty path",
 		req: "If a proxy receives an OPTIONS request with an absolute-form of request-target in which the URI has an empty path and no query component, then the last proxy on the request chain MUST send a request-target of \"*\" when it forwards the request to the indicated origin server.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always(okReply))
-			got, _ := b.forwarded(t, "OPTIONS", "OPTIONS http://origin.test:8001 HTTP/1.1\r\nHost: origin.test:8001\r\n\r\n")
-			assert.Equal(t, "OPTIONS * HTTP/1.1", startLine(got.head))
-			assert.Equal(t, []string{"origin.test:8001"}, fieldValues(got.head, "Host"))
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always(okReply))
+				w := b.dial(t)
+				w.originForm = false
+				w.send(t, "OPTIONS "+front.scheme()+"://origin.test:8001 HTTP/1.1\r\nHost: origin.test:8001\r\n\r\n")
+				w.readResponse(t, "OPTIONS")
+				got := b.origin.next(t)
+				assert.Equal(t, "OPTIONS * HTTP/1.1", startLine(got.head))
+				assert.Equal(t, []string{"origin.test:8001"}, fieldValues(got.head, "Host"))
+			})
+		},
+	},
+	{
+		id: "rfc9112/3.2.4/2", name: "an OPTIONS with an asterisk-form target",
+		req: "When a client wishes to request OPTIONS for the server as a whole, as opposed to a specific named resource of that server, the client MUST send only \"*\" (%x2A) as the request-target.",
+		run: func(t *testing.T) {
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always(okReply))
+				got := b.exchange(t, "OPTIONS", "OPTIONS * HTTP/1.1\r\nHost: origin.test:8001\r\n\r\n")
+				require.Equal(t, http.StatusOK, got.resp.StatusCode)
+				if front == frontExplicit {
+					// The request is about the proxy, and net/http responds to it.
+					assert.Empty(t, got.body)
+					assert.Equal(t, int32(0), b.origin.accepted.Load())
+					return
+				}
+				assert.Equal(t, "ok", string(got.body))
+				fwd := b.origin.next(t)
+				assert.Equal(t, "OPTIONS * HTTP/1.1", startLine(fwd.head))
+				assert.Equal(t, []string{"origin.test:8001"}, fieldValues(fwd.head, "Host"))
+			})
 		},
 	},
 
@@ -3468,11 +4612,13 @@ var proxyConformance = []conformanceCase{
 		id: "rfc9112/5.1/1", name: "a request with whitespace before the colon of a trailer field",
 		req: "A server MUST reject, with a response status code of 400 (Bad Request), any received request message that contains whitespace between a header field name and colon.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always(okReply))
-			w := b.dial(t)
-			w.send(t, "POST http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\nX-Trailer : 1\r\n\r\n")
-			got := w.readResponse(t, "POST")
-			assert.Equal(t, http.StatusBadRequest, got.resp.StatusCode)
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always(okReply))
+				w := b.dial(t)
+				w.send(t, "POST http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\nTransfer-Encoding: chunked\r\n\r\n1\r\na\r\n0\r\nX-Trailer : 1\r\n\r\n")
+				got := w.readResponse(t, "POST")
+				assert.Equal(t, http.StatusBadRequest, got.resp.StatusCode)
+			})
 		},
 	},
 
@@ -3481,50 +4627,60 @@ var proxyConformance = []conformanceCase{
 		id: "rfc9112/6.1/1", name: "a chunked request",
 		req: "A sender MUST NOT apply the chunked transfer coding more than once to a message body (i.e., chunking an already chunked message is not allowed).",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always(okReply))
-			got, _ := b.forwarded(t, "POST", "POST http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n")
-			assert.Equal(t, "abcde", string(got.body))
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always(okReply))
+				got, _ := b.forwarded(t, "POST", "POST http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n")
+				assert.Equal(t, "abcde", string(got.body))
+			})
 		},
 	},
 	{
 		id: "rfc9112/6.1/2", name: "a chunked response",
 		req: "A sender MUST NOT apply the chunked transfer coding more than once to a message body (i.e., chunking an already chunked message is not allowed).",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n"))
-			_, got := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\n\r\n")
-			require.NoError(t, got.err)
-			assert.Equal(t, "abcde", string(got.body))
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n2\r\nde\r\n0\r\n\r\n"))
+				_, got := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\n\r\n")
+				require.NoError(t, got.err)
+				assert.Equal(t, "abcde", string(got.body))
+			})
 		},
 	},
 	{
 		id: "rfc9112/6.1/3", name: "a request with a transfer coding the proxy does not implement",
 		req: "A server that receives a request message with a transfer coding it does not understand SHOULD respond with 501 (Not Implemented).",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always(okReply))
-			got := b.exchange(t, "POST", "POST http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n")
-			assert.Equal(t, http.StatusNotImplemented, got.resp.StatusCode)
-			b.origin.none(t)
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always(okReply))
+				got := b.exchange(t, "POST", "POST http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\nTransfer-Encoding: gzip, chunked\r\n\r\n0\r\n\r\n")
+				assert.Equal(t, http.StatusNotImplemented, got.resp.StatusCode)
+				b.origin.none(t)
+			})
 		},
 	},
 	{
 		id: "rfc9112/6.1/4", name: "a 204 from the origin declaring a transfer coding",
 		req: "A server MUST NOT send a Transfer-Encoding header field in any response with a status code of 1xx (Informational) or 204 (No Content).",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always("HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n\r\n"))
-			_, got := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\n\r\n")
-			assert.Equal(t, http.StatusNoContent, got.resp.StatusCode)
-			assert.Empty(t, fieldValues(got.head, "Transfer-Encoding"))
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always("HTTP/1.1 204 No Content\r\nTransfer-Encoding: chunked\r\n\r\n"))
+				_, got := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\n\r\n")
+				assert.Equal(t, http.StatusNoContent, got.resp.StatusCode)
+				assert.Empty(t, fieldValues(got.head, "Transfer-Encoding"))
+			})
 		},
 	},
 	{
 		id: "rfc9112/6.1/5", name: "a chunked origin response to an HTTP/1.0 client",
 		req: "A server MUST NOT send a response containing Transfer-Encoding unless the corresponding request indicates HTTP/1.1 (or later minor revisions).",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"))
-			_, got := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.0\r\nHost: origin.test\r\n\r\n")
-			require.NoError(t, got.err)
-			assert.Empty(t, fieldValues(got.head, "Transfer-Encoding"))
-			assert.Equal(t, "hello", string(got.body))
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"))
+				_, got := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.0\r\nHost: origin.test\r\n\r\n")
+				require.NoError(t, got.err)
+				assert.Empty(t, fieldValues(got.head, "Transfer-Encoding"))
+				assert.Equal(t, "hello", string(got.body))
+			})
 		},
 	},
 	{
@@ -3541,39 +4697,45 @@ var proxyConformance = []conformanceCase{
 		id: "rfc9112/6.3/1", name: "a 304 declaring a Content-Length",
 		req: "Any response to a HEAD request and any response with a 1xx (Informational), 204 (No Content), or 304 (Not Modified) status code is always terminated by the first empty line after the header fields, regardless of the header fields present in the message, and thus cannot contain a message body or trailer section.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, replyEach(func(n int, _ wireRequest) string {
-				if n == 0 {
-					return "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nContent-Length: 10\r\n\r\n"
-				}
-				return okReply
-			}))
-			w := b.dial(t)
-			w.send(t, "GET http://origin.test/a HTTP/1.1\r\nHost: origin.test\r\n\r\n")
-			assert.Equal(t, http.StatusNotModified, w.readResponse(t, "GET").resp.StatusCode)
-			w.send(t, "GET http://origin.test/b HTTP/1.1\r\nHost: origin.test\r\n\r\n")
-			got := w.readResponse(t, "GET")
-			assert.Equal(t, "ok", string(got.body))
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, replyEach(func(n int, _ wireRequest) string {
+					if n == 0 {
+						return "HTTP/1.1 304 Not Modified\r\nETag: \"v1\"\r\nContent-Length: 10\r\n\r\n"
+					}
+					return okReply
+				}))
+				w := b.dial(t)
+				w.send(t, "GET http://origin.test/a HTTP/1.1\r\nHost: origin.test\r\n\r\n")
+				assert.Equal(t, http.StatusNotModified, w.readResponse(t, "GET").resp.StatusCode)
+				w.send(t, "GET http://origin.test/b HTTP/1.1\r\nHost: origin.test\r\n\r\n")
+				got := w.readResponse(t, "GET")
+				assert.Equal(t, "ok", string(got.body))
+			})
 		},
 	},
 	{
 		id: "rfc9112/6.3/2", name: "a request with Transfer-Encoding and Content-Length",
 		req: "An intermediary that chooses to forward the message MUST first remove the received Content-Length field and process the Transfer-Encoding (as described below) prior to forwarding the message downstream.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always(okReply))
-			got, _ := b.forwarded(t, "POST", "POST http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n")
-			assert.NotEqual(t, []string{"4"}, fieldValues(got.head, "Content-Length"))
-			assert.Equal(t, "hi", string(got.body))
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always(okReply))
+				got, _ := b.forwarded(t, "POST", "POST http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n")
+				assert.NotEqual(t, []string{"4"}, fieldValues(got.head, "Content-Length"))
+				assert.Equal(t, "hi", string(got.body))
+			})
 		},
 	},
 	{
 		id: "rfc9112/6.3/3", name: "a response with Transfer-Encoding and Content-Length",
 		req: "An intermediary that chooses to forward the message MUST first remove the received Content-Length field and process the Transfer-Encoding (as described below) prior to forwarding the message downstream.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always("HTTP/1.1 200 OK\r\nContent-Length: 100\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n"))
-			_, got := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\n\r\n")
-			require.NoError(t, got.err)
-			assert.Empty(t, fieldValues(got.head, "Content-Length"))
-			assert.Equal(t, "ok", string(got.body))
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always("HTTP/1.1 200 OK\r\nContent-Length: 100\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n"))
+				_, got := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\n\r\n")
+				require.NoError(t, got.err)
+				assert.Empty(t, fieldValues(got.head, "Content-Length"))
+				assert.Equal(t, "ok", string(got.body))
+			})
 		},
 	},
 	{
@@ -3585,70 +4747,93 @@ var proxyConformance = []conformanceCase{
 		id: "rfc9112/6.3/5", name: "a response with an invalid Content-Length",
 		req: "If it is in a response message received by a proxy, the proxy MUST close the connection to the server, discard the received response, and send a 502 (Bad Gateway) response to the client.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always("HTTP/1.1 200 OK\r\nContent-Length: 2, 3\r\n\r\nok"))
-			_, got := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\n\r\n")
-			assert.Equal(t, http.StatusBadGateway, got.resp.StatusCode)
-			assert.NotEqual(t, "ok", string(got.body))
-			b.origin.ended(t)
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always("HTTP/1.1 200 OK\r\nContent-Length: 2, 3\r\n\r\nok"))
+				_, got := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\n\r\n")
+				assert.Equal(t, http.StatusBadGateway, got.resp.StatusCode)
+				assert.NotEqual(t, "ok", string(got.body))
+				b.origin.ended(t)
+			})
 		},
 	},
 	{
 		id: "rfc9112/6.3/6", name: "a request with an invalid Content-Length",
 		req: "If the unrecoverable error is in a request message, the server MUST respond with a 400 (Bad Request) status code and then close the connection.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always(okReply))
-			w := b.dial(t)
-			w.send(t, "POST http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\nContent-Length: 1x\r\n\r\nx")
-			assert.Equal(t, http.StatusBadRequest, w.readResponse(t, "POST").resp.StatusCode)
-			w.wantClosed(t)
-			b.origin.none(t)
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always(okReply))
+				w := b.dial(t)
+				w.send(t, "POST http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\nContent-Length: 1x\r\n\r\nx")
+				assert.Equal(t, http.StatusBadRequest, w.readResponse(t, "POST").resp.StatusCode)
+				w.wantClosed(t)
+				b.origin.none(t)
+			})
 		},
 	},
 	{
 		id: "rfc9112/6.3/7", name: "a response shorter than its Content-Length",
 		req: "If the sender closes the connection or the recipient times out before the indicated number of octets are received, the recipient MUST consider the message to be incomplete and close the connection.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, func(o *rawOrigin, w *wire) {
-				if r, err := w.readRequest(); err == nil {
-					o.got <- r
-					_, _ = io.WriteString(w, "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort")
-				}
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, func(o *rawOrigin, w *wire) {
+					if r, err := w.readRequest(); err == nil {
+						o.got <- r
+						_, _ = io.WriteString(w, "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nshort")
+					}
+				})
+				_, got := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\n\r\n")
+				assert.ErrorIs(t, got.err, io.ErrUnexpectedEOF)
+				assert.Equal(t, "short", string(got.body))
 			})
-			_, got := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\n\r\n")
-			assert.ErrorIs(t, got.err, io.ErrUnexpectedEOF)
-			assert.Equal(t, "short", string(got.body))
 		},
 	},
 	{
 		id: "rfc9112/6.3/8", name: "a response delimited by the close of the connection",
 		req: "Otherwise, this is a response message without a declared message body length, so the message body length is determined by the number of octets received prior to the server closing the connection.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, func(o *rawOrigin, w *wire) {
-				if r, err := w.readRequest(); err == nil {
-					o.got <- r
-					_, _ = io.WriteString(w, "HTTP/1.1 200 OK\r\n\r\nall of it")
-				}
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, func(o *rawOrigin, w *wire) {
+					if r, err := w.readRequest(); err == nil {
+						o.got <- r
+						_, _ = io.WriteString(w, "HTTP/1.1 200 OK\r\n\r\nall of it")
+					}
+				})
+				_, got := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\n\r\n")
+				require.NoError(t, got.err)
+				assert.Equal(t, "all of it", string(got.body))
 			})
-			_, got := b.forwarded(t, "GET", "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\n\r\n")
-			require.NoError(t, got.err)
-			assert.Equal(t, "all of it", string(got.body))
 		},
 	},
 	{
 		id: "rfc9112/6.3/9", name: "a forged response behind the end of a response",
 		req: "A client MUST NOT process, cache, or forward such extra data as a separate response, since such behavior would be vulnerable to cache poisoning.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, replyEach(func(n int, _ wireRequest) string {
-				if n == 0 {
-					return "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirstHTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nforged"
-				}
-				return "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsecond"
-			}))
-			w := b.dial(t)
-			w.send(t, "GET http://origin.test/1 HTTP/1.1\r\nHost: origin.test\r\n\r\n")
-			assert.Equal(t, "first", string(w.readResponse(t, "GET").body))
-			w.send(t, "GET http://origin.test/2 HTTP/1.1\r\nHost: origin.test\r\n\r\n")
-			assert.Equal(t, "second", string(w.readResponse(t, "GET").body))
+			for _, tc := range []struct {
+				name    string
+				size    int
+				handler func(*HTTPCtx) (*http.Response, error)
+			}{
+				{"5 bytes", 5, forwardHandler},
+				{"8200 bytes", 8200, forwardHandler},
+				{"45000 bytes read by the handler", 45000, readAllHandler},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					first := strings.Repeat("a", tc.size)
+					eachProxyFront(t, func(t *testing.T, front proxyFront) {
+						b := newProxyBenchWith(t, front, DefaultTransport(), replyEach(func(n int, _ wireRequest) string {
+							if n == 0 {
+								return "HTTP/1.1 200 OK\r\nContent-Length: " + strconv.Itoa(tc.size) + "\r\n\r\n" + first + forgedResponse
+							}
+							return "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsecond"
+						}), tc.handler, func(c net.Conn) net.Conn { return &lateConn{Conn: c} })
+						w := b.dial(t)
+						w.send(t, "GET http://origin.test/1 HTTP/1.1\r\nHost: origin.test\r\n\r\n")
+						assert.Equal(t, first, string(w.readResponse(t, "GET").body))
+						w.send(t, "GET http://origin.test/2 HTTP/1.1\r\nHost: origin.test\r\n\r\n")
+						assert.Equal(t, "second", string(w.readResponse(t, "GET").body))
+					})
+				})
+			}
 		},
 	},
 
@@ -3657,20 +4842,24 @@ var proxyConformance = []conformanceCase{
 		id: "rfc9112/7.1/1", name: "a chunk size past 64 bits",
 		req: "Therefore, recipients MUST anticipate potentially large hexadecimal numerals and prevent parsing errors due to integer conversion overflows or precision loss due to integer representation.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always(okReply))
-			got := b.exchange(t, "POST", "POST http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\nTransfer-Encoding: chunked\r\n\r\n1fffffffffffffffff\r\nhi\r\n0\r\n\r\n")
-			assert.GreaterOrEqual(t, got.resp.StatusCode, 400)
-			b.origin.none(t)
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always(okReply))
+				got := b.exchange(t, "POST", "POST http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\nTransfer-Encoding: chunked\r\n\r\n1fffffffffffffffff\r\nhi\r\n0\r\n\r\n")
+				assert.GreaterOrEqual(t, got.resp.StatusCode, 400)
+				b.origin.none(t)
+			})
 		},
 	},
 	{
 		id: "rfc9112/7.1.1/1", name: "chunk extensions",
 		req: "A recipient MUST ignore unrecognized chunk extensions.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always(okReply))
-			got, _ := b.forwarded(t, "POST", "POST http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\nTransfer-Encoding: chunked\r\n\r\n"+
-				"2;ext=1\r\nhi\r\n3;q=\"a b\"\r\nyou\r\n0;last\r\n\r\n")
-			assert.Equal(t, "hiyou", string(got.body))
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always(okReply))
+				got, _ := b.forwarded(t, "POST", "POST http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\nTransfer-Encoding: chunked\r\n\r\n"+
+					"2;ext=1\r\nhi\r\n3;q=\"a b\"\r\nyou\r\n0;last\r\n\r\n")
+				assert.Equal(t, "hiyou", string(got.body))
+			})
 		},
 	},
 
@@ -3690,11 +4879,13 @@ var proxyConformance = []conformanceCase{
 		id: "rfc9112/8/2", name: "a request whose client closes before its Content-Length",
 		req: "A server that receives an incomplete request message, usually due to a canceled request or a triggered timeout exception, MAY send an error response prior to closing the connection.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always(okReply))
-			w := b.dial(t)
-			w.send(t, "POST http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\nContent-Length: 10\r\n\r\nabcd")
-			require.NoError(t, w.Conn.(*net.TCPConn).CloseWrite())
-			wantMalformedH1(t, w)
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always(okReply))
+				w := b.dial(t)
+				w.send(t, "POST http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\nContent-Length: 10\r\n\r\nabcd")
+				require.NoError(t, closeWrite(w.Conn))
+				wantMalformedH1(t, w)
+			})
 		},
 	},
 
@@ -3703,16 +4894,18 @@ var proxyConformance = []conformanceCase{
 		id: "rfc9112/9.6/1", name: "a request with close and one pipelined behind it",
 		req: "A server that receives a \"close\" connection option MUST initiate closure of the connection (see below) after it sends the final response to the request that contained the \"close\" connection option.  The server SHOULD send a \"close\" connection option in its final response on that connection.  The server MUST NOT process any further requests received on that connection.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always(okReply))
-			w := b.dial(t)
-			w.send(t, "GET http://origin.test/a HTTP/1.1\r\nHost: origin.test\r\nConnection: close\r\n\r\n"+
-				"GET http://origin.test/b HTTP/1.1\r\nHost: origin.test\r\n\r\n")
-			got := w.readResponse(t, "GET")
-			assert.Equal(t, "ok", string(got.body))
-			assert.True(t, got.resp.Close)
-			w.wantClosed(t)
-			assert.Equal(t, "GET /a HTTP/1.1", startLine(b.origin.next(t).head))
-			b.origin.none(t)
+			eachProxyFront(t, func(t *testing.T, front proxyFront) {
+				b := newProxyBenchOn(t, front, always(okReply))
+				w := b.dial(t)
+				w.send(t, "GET http://origin.test/a HTTP/1.1\r\nHost: origin.test\r\nConnection: close\r\n\r\n"+
+					"GET http://origin.test/b HTTP/1.1\r\nHost: origin.test\r\n\r\n")
+				got := w.readResponse(t, "GET")
+				assert.Equal(t, "ok", string(got.body))
+				assert.True(t, got.resp.Close)
+				w.wantClosed(t)
+				assert.Equal(t, "GET /a HTTP/1.1", startLine(b.origin.next(t).head))
+				b.origin.none(t)
+			})
 		},
 	},
 
@@ -3786,9 +4979,9 @@ var proxyConformance = []conformanceCase{
 		id: "rfc9113/3.4/1", name: "the connection preface, an empty SETTINGS frame and a request in one write",
 		req: "The server connection preface consists of a potentially empty SETTINGS frame (Section 6.5) that MUST be the first frame the server sends in the HTTP/2 connection.",
 		run: func(t *testing.T) {
-			eachPlainH2Front(t, func(t *testing.T, front string) {
+			eachH2Front(t, prefaceFronts, func(t *testing.T, front string) {
 				p, _ := hostEcho(t)
-				c := dialPlainH2Front(t, front, p, nil)
+				c := dialPrefaceFront(t, front, p)
 				block := requestEncoder()
 				sendAsync(c, prefaceThen(t, func(fr *http2.Framer) error {
 					return errors.Join(fr.WriteSettings(), fr.WriteHeaders(http2.HeadersFrameParam{
@@ -3805,9 +4998,9 @@ var proxyConformance = []conformanceCase{
 		id: "rfc9113/3.4/2", name: "the connection preface and a SETTINGS frame, then nothing",
 		req: "The SETTINGS frames received from a peer as part of the connection preface MUST be acknowledged (see Section 6.5.3) after sending the connection preface.",
 		run: func(t *testing.T) {
-			eachPlainH2Front(t, func(t *testing.T, front string) {
+			eachH2Front(t, prefaceFronts, func(t *testing.T, front string) {
 				p, _ := hostEcho(t)
-				c := dialPlainH2Front(t, front, p, nil)
+				c := dialPrefaceFront(t, front, p)
 				sendAsync(c, prefaceThen(t, func(fr *http2.Framer) error {
 					return fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1 << 20})
 				}))
@@ -3842,9 +5035,9 @@ var proxyConformance = []conformanceCase{
 		id: "rfc9113/3.4/4", name: "the connection preface followed by a request in place of SETTINGS",
 		req: "Clients and servers MUST treat an invalid connection preface as a connection error (Section 5.4.1) of type PROTOCOL_ERROR.  A GOAWAY frame (Section 6.8) MAY be omitted in this case, since an invalid preface indicates that the peer is not using HTTP/2.",
 		run: func(t *testing.T) {
-			eachPlainH2Front(t, func(t *testing.T, front string) {
+			eachH2Front(t, prefaceFronts, func(t *testing.T, front string) {
 				p, n := hostEcho(t)
-				c := dialPlainH2Front(t, front, p, nil)
+				c := dialPrefaceFront(t, front, p)
 				block := requestEncoder()
 				sendAsync(c, prefaceThen(t, func(fr *http2.Framer) error {
 					return fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: block("a.test", "/"), EndHeaders: true, EndStream: true})
@@ -3874,74 +5067,297 @@ var proxyConformance = []conformanceCase{
 		skip: "net/http serves HTTP/2 over plaintext only on the exact 24 octets and reads anything else as HTTP/1.1, here a request PRI * HTTP/2.0 that edge answers 400 before net/http closes the connection, with no frame sent and nothing routed.",
 	},
 
+	// RFC 9113 sections 3.3 and 3.4 toward the origin, HTTP/2 with prior knowledge from edge.
+	{
+		id: "rfc9113/3.3/5", name: "an HTTP/2 request to a TLS origin selecting no application protocol or http/1.1",
+		req:  "This only affects the establishment of HTTP/2 connections over cleartext TCP; HTTP/2 connections over TLS MUST use protocol negotiation in TLS [TLS-ALPN].",
+		skip: "net/http uses HTTP/2 over TLS only when ALPN selects h2, and sends such an origin an HTTP/1.1 request.",
+	},
+	{
+		id: "rfc9113/3.4/6", name: "an HTTP/2 request over cleartext to an origin answering in HTTP/2",
+		req: "This sequence MUST be followed by a SETTINGS frame (Section 6.5), which MAY be empty.  The client sends the client connection preface as the first application data octets of a connection.",
+		run: func(t *testing.T) {
+			eachDeclaredFront(t, func(t *testing.T, front string) {
+				o := prefaceOrigin(t, respondH2)
+				got := h2cGet(t, front, o)
+				require.Equal(t, http2.ClientPreface, o.nextNote(t), "the first octets of the connection")
+				assert.Equal(t, "SETTINGS stream=0 ack=false", o.nextNote(t), "the frame after the preface")
+				assert.Equal(t, "ok", string(got.body))
+			})
+		},
+	},
+	{
+		id: "rfc9113/3.4/7", name: "the SETTINGS frame of the connection preface of an h2c origin",
+		req:  "The SETTINGS frames received from a peer as part of the connection preface MUST be acknowledged (see Section 6.5.3) after sending the connection preface.",
+		skip: "Go's HTTP/2 transport acknowledges the SETTINGS frame of the origin's preface after sending its own.",
+	},
+	{
+		id: "rfc9113/3.4/8", name: "an HTTP/1.1 origin answering the connection preface with a 200 response",
+		req:  "Clients and servers MUST treat an invalid connection preface as a connection error (Section 5.4.1) of type PROTOCOL_ERROR.  A GOAWAY frame (Section 6.8) MAY be omitted in this case, since an invalid preface indicates that the peer is not using HTTP/2.",
+		skip: "Go's HTTP/2 transport reads the status line as a frame header past its maximum frame size, fails the request and closes the connection with no GOAWAY.",
+	},
+	{
+		id: "rfc9113/3.4/9", name: "an h2c origin closing its connection after reading the connection preface",
+		req:  "Clients and servers MUST treat an invalid connection preface as a connection error (Section 5.4.1) of type PROTOCOL_ERROR.  A GOAWAY frame (Section 6.8) MAY be omitted in this case, since an invalid preface indicates that the peer is not using HTTP/2.",
+		skip: "Go's HTTP/2 transport fails the request with an unexpected EOF and closes the connection with no GOAWAY.",
+	},
+	{
+		id: "rfc9113/3.4/10", name: "an h2c origin answering the connection preface with a response and no SETTINGS frame",
+		req:  "Clients and servers MUST treat an invalid connection preface as a connection error (Section 5.4.1) of type PROTOCOL_ERROR.  A GOAWAY frame (Section 6.8) MAY be omitted in this case, since an invalid preface indicates that the peer is not using HTTP/2.",
+		skip: "Go's HTTP/2 transport fails the connection with PROTOCOL_ERROR on the HEADERS frame, writes its GOAWAY to the buffered writer of the connection and closes the connection without flushing it, so the GOAWAY reaches the origin only when another write flushed it first.",
+	},
+	{
+		id: "rfc9113/3.4/11", name: "an h2c origin answering the connection preface with a SETTINGS frame with the ACK flag, then a response",
+		req:  "Clients and servers MUST treat an invalid connection preface as a connection error (Section 5.4.1) of type PROTOCOL_ERROR.  A GOAWAY frame (Section 6.8) MAY be omitted in this case, since an invalid preface indicates that the peer is not using HTTP/2.",
+		skip: "Go's HTTP/2 transport takes any SETTINGS frame for the server connection preface, and one with the ACK flag for the acknowledgment of its own SETTINGS frame, and edge relays the response. Whether a SETTINGS frame with the ACK flag is the potentially empty SETTINGS frame of the server connection preface is left open.",
+	},
+	{
+		id: "rfc9113/6.5/1", name: "an h2c origin answering the connection preface with a SETTINGS frame on stream 1",
+		req:  "If an endpoint receives a SETTINGS frame whose Stream Identifier field is anything other than 0x00, the endpoint MUST respond with a connection error (Section 5.4.1) of type PROTOCOL_ERROR.",
+		skip: "Go's HTTP/2 transport fails the connection with PROTOCOL_ERROR and closes it, and edge responds with a 502.",
+	},
+	{
+		id: "rfc9113/6.5/2", name: "an h2c origin answering the connection preface with a SETTINGS frame with the ACK flag and a setting",
+		req:  "Receipt of a SETTINGS frame with the ACK flag set and a length field value other than 0 MUST be treated as a connection error (Section 5.4.1) of type FRAME_SIZE_ERROR.",
+		skip: "Go's HTTP/2 transport fails the connection with FRAME_SIZE_ERROR and closes it, and edge responds with a 502.",
+	},
+	{
+		id: "rfc9113/6.5/3", name: "an h2c origin answering the connection preface with a SETTINGS frame of 5 octets",
+		req:  "A SETTINGS frame with a length other than a multiple of 6 octets MUST be treated as a connection error (Section 5.4.1) of type FRAME_SIZE_ERROR.",
+		skip: "Go's HTTP/2 transport fails the connection with FRAME_SIZE_ERROR and closes it, and edge responds with a 502.",
+	},
+	{
+		id: "rfc9113/6.5.2/1", name: "an h2c origin answering the connection preface with SETTINGS_ENABLE_PUSH set to 2",
+		req:  "Any value other than 0 or 1 MUST be treated as a connection error (Section 5.4.1) of type PROTOCOL_ERROR.",
+		skip: "Go's HTTP/2 transport fails the connection with PROTOCOL_ERROR and closes it, and edge responds with a 502.",
+	},
+	{
+		id: "rfc9113/6.5.2/2", name: "an h2c origin answering the connection preface with SETTINGS_ENABLE_PUSH set to 1, then a response",
+		req:  "A client MUST treat receipt of a SETTINGS frame with SETTINGS_ENABLE_PUSH set to 1 as a connection error (Section 5.4.1) of type PROTOCOL_ERROR.",
+		skip: "Go's HTTP/2 transport ignores SETTINGS_ENABLE_PUSH from a server, acknowledges the frame and keeps the connection, and edge relays the response.",
+	},
+	{
+		id: "rfc9113/6.5.2/3", name: "an h2c origin answering the connection preface with SETTINGS_MAX_FRAME_SIZE set to 100",
+		req:  "Values outside this range MUST be treated as a connection error (Section 5.4.1) of type PROTOCOL_ERROR.",
+		skip: "Go's HTTP/2 transport fails the connection with PROTOCOL_ERROR and closes it, and edge responds with a 502.",
+	},
+	{
+		id: "rfc9113/6.5.2/4", name: "an h2c origin answering the connection preface with SETTINGS_INITIAL_WINDOW_SIZE set to 2^31",
+		req:  "Values above the maximum flow-control window size of 2^31-1 MUST be treated as a connection error (Section 5.4.1) of type FLOW_CONTROL_ERROR.",
+		skip: "Go's HTTP/2 transport fails the connection with FLOW_CONTROL_ERROR and closes it, and edge responds with a 502.",
+	},
+	{
+		id: "rfc9113/6.5.3/1", name: "an h2c origin reading the connection preface and writing nothing",
+		req:  "If the sender of a SETTINGS frame does not receive an acknowledgment within a reasonable amount of time, it MAY issue a connection error (Section 5.4.1) of type SETTINGS_TIMEOUT.",
+		skip: "Go's HTTP/2 transport waits for the SETTINGS frame of the origin only before an extended CONNECT and sends any other request at once, and DefaultTransport sets no ResponseHeaderTimeout, so the client of edge waits for the response until the origin closes the connection.",
+	},
+	{
+		id: "rfc9110/15.6.3/1", name: "an HTTP/1.1 origin answering the connection preface with a 200 response",
+		req: "The 502 (Bad Gateway) status code indicates that the server, while acting as a gateway or proxy, received an invalid response from an inbound server it accessed while attempting to fulfill the request.",
+		run: func(t *testing.T) {
+			eachDeclaredFront(t, func(t *testing.T, front string) {
+				o := newRawOrigin(t, func(_ *rawOrigin, w *wire) {
+					line, err := w.br.ReadString('\n')
+					if err != nil {
+						return
+					}
+					answer := okReply
+					if line == "PRI * HTTP/2.0\r\n" {
+						answer = "HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\npreface"
+					}
+					if _, err := io.WriteString(w, answer); err == nil {
+						_, _ = io.Copy(io.Discard, w.br)
+					}
+				})
+				wantGatewayErrorH2(t, h2cGet(t, front, o))
+			})
+		},
+	},
+	{
+		id: "rfc9110/15.6.3/2", name: "an h2c origin closing its connection after reading the connection preface",
+		req: "The 502 (Bad Gateway) status code indicates that the server, while acting as a gateway or proxy, received an invalid response from an inbound server it accessed while attempting to fulfill the request.",
+		run: func(t *testing.T) {
+			eachDeclaredFront(t, func(t *testing.T, front string) {
+				o := prefaceOrigin(t, func(_ *rawOrigin, w *wire, fr *http2.Framer) {
+					if _, err := fr.ReadFrame(); err == nil && closeWrite(w.Conn) == nil {
+						_, _ = io.Copy(io.Discard, w.br)
+					}
+				})
+				wantGatewayErrorH2(t, h2cGet(t, front, o))
+			})
+		},
+	},
+	{
+		id: "rfc9110/15.6.3/3", name: "an h2c origin answering the connection preface with a response and no SETTINGS frame",
+		req: "The 502 (Bad Gateway) status code indicates that the server, while acting as a gateway or proxy, received an invalid response from an inbound server it accessed while attempting to fulfill the request.",
+		run: func(t *testing.T) {
+			eachDeclaredFront(t, func(t *testing.T, front string) {
+				o := prefaceOrigin(t, func(_ *rawOrigin, _ *wire, fr *http2.Framer) {
+					for {
+						f, err := fr.ReadFrame()
+						if err != nil {
+							return
+						}
+						if _, ok := f.(*http2.MetaHeadersFrame); ok && writeOK(fr, f.Header().StreamID) != nil {
+							return
+						}
+					}
+				})
+				wantGatewayErrorH2(t, h2cGet(t, front, o))
+			})
+		},
+	},
+
 	// RFC 9113, the HTTP/2 front.
 	{
 		id: "rfc9113/8.2.2/1", name: "an HTTP/1.1 response with connection-specific fields to an HTTP/2 client",
 		req: "An intermediary transforming an HTTP/1.x message to HTTP/2 MUST remove connection-specific header fields as discussed in Section 7.6.1 of [HTTP], or their messages will be treated by other HTTP/2 endpoints as malformed (Section 8.1.1).",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always("HTTP/1.1 200 OK\r\nConnection: X-Hop\r\nX-Hop: 1\r\nKeep-Alive: timeout=5\r\n"+
-				"Proxy-Connection: keep-alive\r\nUpgrade: h2c\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n"))
-			h := dialH2(t, b.addr)
-			h.headers(t, 1, true, hf(":method", "GET"), hf(":scheme", "http"), hf(":authority", "origin.test"), hf(":path", "/"))
-			got := h.reply(t, 1)
-			require.False(t, got.reset, "stream reset with %v", got.rst)
-			assert.Equal(t, "ok", string(got.body))
-			for _, name := range []string{"connection", "x-hop", "keep-alive", "proxy-connection", "upgrade", "transfer-encoding"} {
-				_, ok := h2Field(got.fields, name)
-				assert.False(t, ok, name)
-			}
+			eachH2Front(t, h1UpstreamFronts, func(t *testing.T, front string) {
+				_, h := h2FrontBench(t, front, always("HTTP/1.1 200 OK\r\nConnection: X-Hop\r\nX-Hop: 1\r\nKeep-Alive: timeout=5\r\n"+
+					"Proxy-Connection: keep-alive\r\nUpgrade: h2c\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n\r\n"))
+				h.headers(t, 1, true, hf(":method", "GET"), hf(":scheme", "http"), hf(":authority", "origin.test"), hf(":path", "/"))
+				got := h.reply(t, 1)
+				require.False(t, got.reset, "stream reset with %v", got.rst)
+				assert.Equal(t, "ok", string(got.body))
+				// net/http's HTTP/2 server drops Connection and Transfer-Encoding whatever edge forwards.
+				for _, name := range []string{"connection", "x-hop", "keep-alive", "proxy-connection", "upgrade", "transfer-encoding"} {
+					_, ok := h2Field(got.fields, name)
+					assert.False(t, ok, name)
+				}
+			})
 		},
 	},
 	{
 		id: "rfc9113/8.1.1/1", name: "a request whose stream ends before its Content-Length",
 		req: "Malformed requests or responses that are detected MUST be treated as a stream error (Section 5.4.2) of type PROTOCOL_ERROR.  For malformed requests, a server MAY send an HTTP response prior to closing or resetting the stream.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always(okReply))
-			h := dialH2(t, b.addr)
-			h.headers(t, 1, false, hf(":method", "POST"), hf(":scheme", "http"), hf(":authority", "origin.test"), hf(":path", "/"),
-				hf("content-length", "10"))
-			require.NoError(t, h.fr.WriteData(1, true, []byte("abcd")))
-			wantMalformedH2(t, h.reply(t, 1))
+			eachHPACKFront(t, func(t *testing.T, front string) {
+				_, h := h2FrontBench(t, front, drainOrigin(""))
+				h.headers(t, 1, false, hf(":method", "POST"), hf(":scheme", "http"), hf(":authority", "origin.test"), hf(":path", "/"),
+					hf("content-length", "10"))
+				require.NoError(t, h.fr.WriteData(1, true, []byte("abcd")))
+				wantMalformedH2(t, h.reply(t, 1))
+			})
+		},
+	},
+	{
+		id: "rfc9113/8.1.1/2", name: "a request with a Content-Length of 0 and a DATA frame",
+		req: "Intermediaries that process HTTP requests or responses (i.e., any intermediary not acting as a tunnel) MUST NOT forward a malformed request or response.  Malformed requests or responses that are detected MUST be treated as a stream error (Section 5.4.2) of type PROTOCOL_ERROR.",
+		run: func(t *testing.T) {
+			eachH2Front(t, h1UpstreamFronts, func(t *testing.T, front string) {
+				b, h := h2FrontBench(t, front, func(o *rawOrigin, w *wire) {
+					req, err := http.ReadRequest(w.br)
+					if err != nil {
+						return
+					}
+					o.note(req.Method + " " + req.RequestURI)
+					if _, err := io.ReadAll(req.Body); err != nil {
+						return
+					}
+					_, _ = io.WriteString(w, "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok")
+				})
+				h.headers(t, 1, false, hf(":method", "POST"), hf(":scheme", "http"), hf(":authority", "origin.test"), hf(":path", "/"),
+					hf("content-length", "0"))
+				// The response to stream 3 shows the handler of stream 1 started before its DATA frame.
+				h.headers(t, 3, true, hf(":method", "GET"), hf(":scheme", "http"), hf(":authority", "origin.test"), hf(":path", "/next"))
+				require.Equal(t, "ok", string(h.reply(t, 3).body))
+				require.NoError(t, h.fr.WriteData(1, true, []byte("abcd")))
+				wantMalformedH2(t, h.reply(t, 1))
+				for range b.origin.accepted.Load() {
+					b.origin.ended(t)
+				}
+				var got []string
+				for len(b.origin.notes) > 0 {
+					got = append(got, <-b.origin.notes)
+				}
+				assert.Equal(t, []string{"GET /next"}, got, "the requests the origin received")
+			})
+		},
+	},
+	{
+		id: "rfc9113/8.1.1/3", name: "a request with a Content-Length that is no decimal and no content",
+		req: "A request or response is also malformed if the value of a content-length header field does not equal the sum of the DATA frame payload lengths that form the content, unless the message is defined as having no content.",
+		run: func(t *testing.T) {
+			eachH2Front(t, h1UpstreamFronts, func(t *testing.T, front string) {
+				for _, end := range []string{"headers", "empty data"} {
+					t.Run(end, func(t *testing.T) {
+						b, h := h2FrontBench(t, front, always(okReply))
+						h.headers(t, 1, end == "headers", hf(":method", "POST"), hf(":scheme", "http"), hf(":authority", "origin.test"),
+							hf(":path", "/"), hf("content-length", "abc"))
+						if end == "empty data" {
+							require.NoError(t, h.fr.WriteData(1, true, nil))
+						}
+						wantMalformedH2(t, h.reply(t, 1))
+						h.headers(t, 3, true, hf(":method", "GET"), hf(":scheme", "http"), hf(":authority", "origin.test"), hf(":path", "/next"))
+						require.Equal(t, "ok", string(h.reply(t, 3).body))
+						assert.Equal(t, "GET /next HTTP/1.1", startLine(b.origin.next(t).head))
+					})
+				}
+			})
 		},
 	},
 	{
 		id: "rfc9113/8.3/1", name: "a request with a pseudo-header field in its trailer section",
 		req: "Pseudo-header fields MUST NOT appear in a trailer section.  Endpoints MUST treat a request or response that contains undefined or invalid pseudo-header fields as malformed (Section 8.1.1).",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always(okReply))
-			h := dialH2(t, b.addr)
-			h.headers(t, 1, false, hf(":method", "POST"), hf(":scheme", "http"), hf(":authority", "origin.test"), hf(":path", "/"))
-			require.NoError(t, h.fr.WriteData(1, false, []byte("a")))
-			h.headers(t, 1, true, hf(":path", "/"))
-			wantMalformedH2(t, h.reply(t, 1))
+			eachHPACKFront(t, func(t *testing.T, front string) {
+				_, h := h2FrontBench(t, front, drainOrigin(""))
+				h.headers(t, 1, false, hf(":method", "POST"), hf(":scheme", "http"), hf(":authority", "origin.test"), hf(":path", "/"))
+				require.NoError(t, h.fr.WriteData(1, false, []byte("a")))
+				h.headers(t, 1, true, hf(":path", "/"))
+				wantMalformedH2(t, h.reply(t, 1))
+			})
+		},
+	},
+	{
+		id: "rfc9113/8.3/2", name: "a request with an :authority whose host RFC 3986 does not allow",
+		req: "Endpoints MUST treat a request or response that contains undefined or invalid pseudo-header fields as malformed (Section 8.1.1).",
+		run: func(t *testing.T) {
+			eachH2Front(t, h1UpstreamFronts, func(t *testing.T, front string) {
+				b, h := h2FrontBench(t, front, always(okReply))
+				b.p.MustAdd("+{any}/*{any}", forwardHandler)
+				for i, authority := range invalidAuthorities {
+					t.Run(strconv.Quote(authority), func(t *testing.T) {
+						id := uint32(2*i + 1)
+						h.headers(t, id, true, hf(":method", "GET"), hf(":scheme", "http"), hf(":authority", authority), hf(":path", "/"))
+						wantMalformedH2(t, h.reply(t, id))
+					})
+				}
+				assert.Equal(t, int32(0), b.origin.accepted.Load(), "the proxy forwarded a malformed request")
+			})
 		},
 	},
 	{
 		id: "rfc9113/8.3.1/1", name: "a request whose Host differs from :authority",
 		req: "The recipient of an HTTP/2 request MUST NOT use the Host header field to determine the target URI if \":authority\" is present.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always(okReply))
-			b.p.MustAdd("other.test/*{any}", func(*HTTPCtx) (*http.Response, error) {
-				return Text(http.StatusOK, "other"), nil
+			eachHPACKFront(t, func(t *testing.T, front string) {
+				p, _ := hostEcho(t)
+				h := dialH2Wire(t, front, p, "a.test")
+				h.headers(t, 1, true, hf(":method", "GET"), hf(":scheme", "http"), hf(":authority", "a.test"), hf(":path", "/"),
+					hf("host", "b.test"))
+				got := h.reply(t, 1)
+				if status, _ := h2Field(got.fields, ":status"); got.reset || status != "200" {
+					wantMalformedH2(t, got)
+					return
+				}
+				assert.Equal(t, "a.test", string(got.body))
 			})
-			h := dialH2(t, b.addr)
-			h.headers(t, 1, true, hf(":method", "GET"), hf(":scheme", "http"), hf(":authority", "origin.test"), hf(":path", "/"),
-				hf("host", "other.test"))
-			got := h.reply(t, 1)
-			assert.Equal(t, "ok", string(got.body))
 		},
 	},
 	{
 		id: "rfc9113/8.3.1/2", name: "a request forwarded over HTTP/1.1",
 		req: "An intermediary that needs to generate a Host header field (which might be necessary to construct an HTTP/1.1 request) MUST use the value from the \":authority\" pseudo-header field as the value of the Host field, unless the intermediary also changes the request target.",
 		run: func(t *testing.T) {
-			b := newProxyBench(t, always(okReply))
-			h := dialH2(t, b.addr)
-			h.headers(t, 1, true, hf(":method", "GET"), hf(":scheme", "http"), hf(":authority", "origin.test:8080"), hf(":path", "/x"))
-			h.reply(t, 1)
-			got := b.origin.next(t)
-			assert.Equal(t, "GET /x HTTP/1.1", startLine(got.head))
-			assert.Equal(t, []string{"origin.test:8080"}, fieldValues(got.head, "Host"))
+			eachH2Front(t, h1UpstreamFronts, func(t *testing.T, front string) {
+				b, h := h2FrontBench(t, front, always(okReply))
+				h.headers(t, 1, true, hf(":method", "GET"), hf(":scheme", "http"), hf(":authority", "origin.test:8080"), hf(":path", "/x"))
+				h.reply(t, 1)
+				got := b.origin.next(t)
+				assert.Equal(t, "GET /x HTTP/1.1", startLine(got.head))
+				assert.Equal(t, []string{"origin.test:8080"}, fieldValues(got.head, "Host"))
+			})
 		},
 	},
 	{
@@ -4059,6 +5475,27 @@ var proxyConformance = []conformanceCase{
 		},
 	},
 
+	{
+		id: "rfc9113/9.1.1/1", name: "requests for two origins on one HTTP/2 connection",
+		req: "A server that does not wish clients to reuse connections can indicate that it is not authoritative for a request by sending a 421 (Misdirected Request) status code in response to the request (see Section 15.5.20 of [HTTP]).",
+		run: func(t *testing.T) {
+			eachTerminatedFront(t, []string{viaH2}, func(t *testing.T, front, version string) {
+				b := newMisdirectBench(t)
+				_, get := dialTerminated(t, b, front, version, "origin.test")
+				for _, host := range []string{"origin.test", "other.test", "origin.test"} {
+					want := http.StatusOK
+					if host == "other.test" {
+						want = http.StatusMisdirectedRequest
+					}
+					code, _ := get(t, host)
+					assert.Equal(t, want, code, host)
+				}
+				assert.Equal(t, "origin.test", b.origin.next(t).req.Host)
+				assert.Equal(t, "origin.test", b.origin.next(t).req.Host)
+			})
+		},
+	},
+
 	// RFC 9114, the HTTP/3 front.
 	{
 		id: "rfc9114/4.1/1", name: "a HEADERS frame after the trailer section of a request",
@@ -4112,6 +5549,25 @@ var proxyConformance = []conformanceCase{
 		},
 	},
 	{
+		id: "rfc9114/4.1.2/8", name: "a request with a Content-Length of 0 and a DATA frame",
+		req: "Malformed requests or responses that are detected MUST be treated as a stream error of type H3_MESSAGE_ERROR.  For malformed requests, a server MAY send an HTTP response indicating the error prior to closing or resetting the stream.",
+		run: func(t *testing.T) {
+			for _, origin := range []string{viaH1, viaH3} {
+				t.Run(origin, func(t *testing.T) {
+					var b *proxyBench
+					if origin == viaH3 {
+						b = newH3OriginBench(t, h3Reply(h3Headers([]hpack.HeaderField{hf(":status", "200")}), h3Data("ok")))
+					} else {
+						b = newTLSProxyBench(t, always(okReply))
+					}
+					got := b.dialH3Front(t).roundTrip(t, h3Request("POST", "origin.test", "/", hf("content-length", "0")), h3Data("abcd"))
+					wantMalformedRequest(t, got, http3.ErrCodeMessageError)
+					assert.Zero(t, b.origin.accepted.Load(), "the proxy reached the origin")
+				})
+			}
+		},
+	},
+	{
 		id: "rfc9114/4.2/1", name: "an HTTP/1.1 response with connection-specific fields to an HTTP/3 client",
 		req: "An intermediary transforming an HTTP/1.x message to HTTP/3 MUST remove connection-specific header fields as discussed in Section 7.6.1 of [HTTP], or their messages will be treated by other HTTP/3 endpoints as malformed.",
 		run: func(t *testing.T) {
@@ -4128,6 +5584,30 @@ var proxyConformance = []conformanceCase{
 		},
 	},
 	{
+		id: "rfc9114/4.2/3", name: "a request with an uppercase field name in its trailer section",
+		req: "A request or response containing uppercase characters in field names MUST be treated as malformed.",
+		run: func(t *testing.T) {
+			// A request with content and a Content-Length can be complete upstream before its trailer
+			// section, as rfc9114/4.1.2/3 records.
+			for _, tc := range []struct {
+				name    string
+				content string
+				extra   []hpack.HeaderField
+			}{
+				{name: "without content", extra: []hpack.HeaderField{hf("content-length", "0")}},
+				{name: "content of unknown length", content: "a"},
+			} {
+				t.Run(tc.name, func(t *testing.T) {
+					b := newTLSProxyBench(t, always(okReply))
+					got := b.dialH3Front(t).roundTrip(t,
+						h3Request("POST", "origin.test", "/", append(tc.extra, hf("trailer", "x-check"))...),
+						h3Data(tc.content), h3Headers([]hpack.HeaderField{hf("X-Check", "sum")}))
+					wantMalformedRequest(t, got, http3.ErrCodeMessageError)
+				})
+			}
+		},
+	},
+	{
 		id: "rfc9114/4.2/2", name: "an HTTP/2 response with connection-specific fields to an HTTP/3 client",
 		req:  "An endpoint MUST NOT generate an HTTP/3 field section containing connection-specific fields; any message containing connection-specific fields MUST be treated as malformed.",
 		skip: "Go's HTTP/2 transport drops the Connection field of a response before edge reads it, where RFC 9113 makes the response malformed, so a field Connection listed reaches the client.",
@@ -4140,6 +5620,21 @@ var proxyConformance = []conformanceCase{
 			h := b.dialH3Front(t)
 			got := h.roundTrip(t, h3Request("POST", "origin.test", "/"), h3Data("a"), h3Headers([]hpack.HeaderField{hf(":path", "/")}))
 			wantMalformedRequest(t, got, http3.ErrCodeMessageError)
+		},
+	},
+	{
+		id: "rfc9114/4.3/2", name: "a request with an :authority whose host RFC 3986 does not allow",
+		req: "Endpoints MUST treat a request or response that contains undefined or invalid pseudo-header fields as malformed.",
+		run: func(t *testing.T) {
+			b := newTLSProxyBench(t, always(okReply))
+			b.p.MustAdd("+{any}/*{any}", forwardHandler)
+			h := b.dialH3Front(t)
+			for _, authority := range invalidAuthorities {
+				t.Run(strconv.Quote(authority), func(t *testing.T) {
+					wantMalformedRequest(t, h.roundTrip(t, h3Request("GET", authority, "/")), http3.ErrCodeMessageError)
+				})
+			}
+			assert.Equal(t, int32(0), b.origin.accepted.Load(), "the proxy forwarded a malformed request")
 		},
 	},
 	{
@@ -4677,11 +6172,12 @@ func TestHTTP_EarlyHintsReachAnHTTP3Client(t *testing.T) {
 }
 
 func TestHTTP_AsteriskFormNeverReachesAnAdmission(t *testing.T) {
-	b := newProxyBench(t, always(okReply))
-	b.p.MustAdd("origin.test", relayStream)
 	ca, err := GenerateCA()
 	require.NoError(t, err)
-	front, _ := startQUICFront(t, b.p, ca)
+	p := testProxyWithCA(t, ca)
+	p.MustAdd("origin.test", relayStream)
+	p.MustAdd("origin.test/", okHandler)
+	front, _ := startQUICFront(t, p, ca)
 	h3 := &http3.Transport{
 		Dial: func(context.Context, string, *tls.Config, *quic.Config) (*quic.Conn, error) {
 			return dialQUICFront(t, front, ca), nil
@@ -4695,14 +6191,18 @@ func TestHTTP_AsteriskFormNeverReachesAnAdmission(t *testing.T) {
 		Header: http.Header{},
 	})
 	require.NoError(t, err)
+	body, err := io.ReadAll(resp.Body)
 	_ = resp.Body.Close()
-	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "ok", string(body))
 
-	w := b.connect(t)
+	w := newWire(connectRaw(t, startProxy(t, p), "origin.test:80"))
+	require.NoError(t, w.SetDeadline(time.Now().Add(10*time.Second)))
 	w.send(t, "OPTIONS * HTTP/1.1\r\nHost: origin.test\r\n\r\n")
 	got := w.readResponse(t, http.MethodOptions)
-	assert.Equal(t, http.StatusForbidden, got.resp.StatusCode, "net/http answered OPTIONS * in the tunnel itself")
-	b.origin.none(t)
+	assert.Equal(t, http.StatusOK, got.resp.StatusCode)
+	assert.Equal(t, "ok", string(got.body), "net/http responded to OPTIONS * in the tunnel itself")
 }
 
 func TestHTTP_OptionsWithAnEmptyPathOverEveryVersion(t *testing.T) {

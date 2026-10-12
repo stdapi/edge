@@ -131,20 +131,22 @@ func (p *Proxy) connectStream(w http.ResponseWriter, r *http.Request, target Tar
 	}
 
 	stream := newH2Stream(w, r, local, remote)
+	cut := streamCut{stream}
 	sess := newSession(p, r.Context(), nil, target, 0, 0)
 	sess.localAddr, sess.remoteAddr = local, remote
 	sess.identity = identity
 	sess.setDestination(target)
+	sess.closer = cut
 
 	// A refused registration means the proxy is stopping. Returning would let net/http answer
 	// 200 for a connection that is already gone, so the stream is reset instead.
-	if !p.srv.tryTrack(stream) {
+	if !p.srv.tryTrack(cut) {
 		panic(http.ErrAbortHandler)
 	}
 	defer func() {
 		_ = stream.Close()
 		stream.finish()
-		p.srv.untrack(stream)
+		p.srv.untrack(cut)
 		if stream.aborted.Load() {
 			// A return ends the stream cleanly, where the relay failed, and an HTTP/2 handler
 			// has no other way to reset it.
@@ -152,8 +154,7 @@ func (p *Proxy) connectStream(w http.ResponseWriter, r *http.Request, target Tar
 		}
 	}()
 
-	w.WriteHeader(http.StatusOK)
-	_ = http.NewResponseController(w).Flush()
+	stream.writeHeader(http.StatusOK)
 
 	pc := newPeekConn(stream, nil, clientHelloPeekSize)
 	if err := p.terminate(r.Context(), pc, sess); err != nil {
@@ -168,14 +169,13 @@ func targetFromConnect(r *http.Request) (Target, error) {
 	if r.URL != nil && r.URL.Host != "" {
 		authority = r.URL.Host
 	}
-	host, port := splitHostPort(authority)
+	host, port, ok := splitAuthority(authority)
+	if !ok {
+		return Target{}, errors.New("CONNECT target is not a host and a port")
+	}
 	host = canonicalHost(host)
 	if host == "" {
 		return Target{}, errors.New("CONNECT requires an authority target")
-	}
-	port, ok := canonicalPort(port)
-	if !ok {
-		return Target{}, errors.New("CONNECT target port is not a port")
 	}
 	port = cmp.Or(port, "443")
 

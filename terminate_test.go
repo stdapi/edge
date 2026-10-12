@@ -23,7 +23,9 @@ import (
 	"net/url"
 	"regexp"
 	"slices"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -51,6 +53,75 @@ func TestTerminatedTarget_RootDotIsDropped(t *testing.T) {
 	target, ok := terminatedTarget(&http.Request{Host: "Other.Test.:8443"}, sess)
 	require.True(t, ok)
 	assert.Equal(t, "other.test", target.Host)
+}
+
+func TestTerminate_RequestIsRoutedOnItsHostAndDialedToTheDestination(t *testing.T) {
+	for _, front := range []proxyFront{frontConnect, frontRedirected} {
+		t.Run(string(front), func(t *testing.T) {
+			ca, err := GenerateCA()
+			require.NoError(t, err)
+			tr := DefaultTransport()
+			o := newRawOrigin(t, always(okReply))
+			dialed := make(chan string, 4)
+			tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				dialed <- addr
+				return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, network, o.addr)
+			}
+			p := testProxyWithCA(t, ca, WithTransport(tr))
+			p.MustAdd("origin.test/*{any}", okHandler)
+			p.MustAdd("other.test/*{any}", forwardHandler)
+			b := &proxyBench{p: p, origin: o, trust: ca.CertPool(), front: front}
+			destination := "origin.test:80"
+			switch front {
+			case frontConnect:
+				b.addr = startProxy(t, p)
+			default:
+				dst := netip.MustParseAddrPort(o.addr)
+				b.addr = startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) { return dst, nil })
+				destination = o.addr
+			}
+
+			w := b.dial(t)
+			w.send(t, "GET /first HTTP/1.1\r\nHost: origin.test\r\n\r\n")
+			assert.Equal(t, "ok", string(w.readResponse(t, "GET").body))
+			w.send(t, "GET /second HTTP/1.1\r\nHost: other.test\r\n\r\n")
+			assert.Equal(t, http.StatusOK, w.readResponse(t, "GET").resp.StatusCode)
+
+			got := o.next(t)
+			assert.Equal(t, "GET /second HTTP/1.1", startLine(got.head))
+			assert.Equal(t, []string{"other.test"}, fieldValues(got.head, "Host"))
+			assert.Equal(t, destination, <-dialed)
+		})
+	}
+}
+
+func TestTerminate_AbsoluteFormTakesTheSchemeOfTheConnection(t *testing.T) {
+	for _, front := range proxyFronts[1:] {
+		t.Run(string(front), func(t *testing.T) {
+			other := "https"
+			if front.secure() {
+				other = "http"
+			}
+			b := newProxyBenchOn(t, front, always(okReply))
+			w := b.dial(t)
+			w.originForm = false
+			w.send(t, "GET "+other+"://origin.test/x HTTP/1.1\r\nHost: origin.test\r\n\r\n")
+			require.Equal(t, http.StatusOK, w.readResponse(t, "GET").resp.StatusCode)
+			assert.Equal(t, "GET /x HTTP/1.1", startLine(b.origin.next(t).head))
+		})
+	}
+}
+
+func TestTerminate_HTTP2RequestTakesTheSchemeOfTheConnection(t *testing.T) {
+	eachH2Front(t, []string{viaConnectH2, viaRedirectedH2}, func(t *testing.T, front string) {
+		b, h := h2FrontBench(t, front, always(okReply))
+		b.p.MustAdd("origin.test/*{any}", func(*HTTPCtx) (*http.Response, error) {
+			return Text(http.StatusOK, "http"), nil
+		}, WithScheme[HTTP]("http"))
+		h.headers(t, 1, true, hf(":method", "GET"), hf(":scheme", "http"), hf(":authority", "origin.test"), hf(":path", "/x"))
+		assert.Equal(t, "ok", string(h.reply(t, 1).body))
+		assert.Equal(t, "GET /x HTTP/1.1", startLine(b.origin.next(t).head))
+	})
 }
 
 func TestTerminate_PlaintextStreamTargetDropsTheRootDot(t *testing.T) {
@@ -377,6 +448,69 @@ func TestTerminate_RefusedClientHelloAlertBeforeUnreadBytes(t *testing.T) {
 			assert.Equal(t, []byte{tlsAlert, 0x03, 0x03, 0x00, 0x02, 0x02, tc.alert}, head)
 			_, err = c.Read(make([]byte, 1))
 			assert.ErrorIs(t, err, io.EOF)
+		})
+	}
+}
+
+func TestTerminate_RequestHostIsVerifiedOverTLS(t *testing.T) {
+	versions := []string{viaH1, viaH1WithoutALPN, viaH2, viaH3}
+	for _, tc := range []struct {
+		name       string
+		resolvesTo string
+		mode       NameVerification
+		byName     bool
+	}{
+		{name: "confirmed under VerifyReject", mode: VerifyReject, resolvesTo: "127.0.0.1", byName: true},
+		{name: "confirmed under VerifyLoose", mode: VerifyLoose, resolvesTo: "127.0.0.1", byName: true},
+		{name: "dropped under VerifyLoose", mode: VerifyLoose, resolvesTo: "10.0.0.1"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, version := range versions {
+				// The SOCKS5 front declares a hostname, so no destination stands against the name.
+				fronts := []string{viaRedirected, viaConnect, viaConnectTLSFront, viaConnectH2Front, viaSOCKS}
+				if version == viaH3 {
+					fronts = []string{viaTransparentQUIC, viaConnectUDPLiteral}
+				}
+				for _, front := range fronts {
+					t.Run(version+"-"+front, func(t *testing.T) {
+						ca, err := GenerateCA()
+						require.NoError(t, err)
+						originCA, err := GenerateCA()
+						require.NoError(t, err)
+						cert, err := originCA.Leaf("api.example.test")
+						require.NoError(t, err)
+						o := newTLSOrigin(t, *cert, always(okReply))
+						tr := DefaultTransport()
+						tr.DialContext = pinnedDialer(o.addr)
+						tr.InsecureSkipVerify = true
+						resolver := &fakeResolver{addrs: map[string][]netip.Addr{"api.example.test": addrsOf(tc.resolvesTo)}}
+						p := testProxyWithCA(t, ca, WithTransport(tr), WithNameVerification(tc.mode), WithNameResolver(resolver))
+						var byName, byAddr atomic.Int32
+						p.MustAdd("api.example.test/*{any}", func(c *HTTPCtx) (*http.Response, error) {
+							byName.Add(1)
+							return c.Forward()
+						})
+						p.MustAdd("127.0.0.1/*{any}", func(c *HTTPCtx) (*http.Response, error) {
+							byAddr.Add(1)
+							return c.Forward()
+						})
+
+						b := &proxyBench{p: p, origin: o, trust: ca.CertPool()}
+						_, get := dialTerminated(t, b, front, version, "Api.Example.Test")
+						code, _ := get(t, "api.example.test")
+						assert.Equal(t, http.StatusOK, code)
+						assert.Equal(t, "api.example.test", b.origin.next(t).req.Host)
+						if tc.byName {
+							assert.EqualValues(t, 1, byName.Load())
+							assert.Zero(t, byAddr.Load())
+						} else {
+							assert.Zero(t, byName.Load(), "a name that does not resolve to the destination routed the request")
+							assert.EqualValues(t, 1, byAddr.Load())
+						}
+						assert.EqualValues(t, 1, resolver.calls.Load(), "the server name is resolved once per connection")
+					})
+				}
+			}
 		})
 	}
 }
@@ -2022,4 +2156,182 @@ var tlsConformance = []conformanceCase{
 			}
 		},
 	},
+}
+
+const (
+	viaTransparentQUIC   = "transparent-quic"
+	viaConnectUDP        = "connect-udp"
+	viaConnectUDPLiteral = "connect-udp-literal"
+	viaH1WithoutALPN     = "h1-without-alpn"
+)
+
+// eachTerminatedFront runs run on every front on which edge terminates the connection of a
+// client negotiating one of versions.
+func eachTerminatedFront(t *testing.T, versions []string, run func(t *testing.T, front, version string)) {
+	t.Helper()
+	for _, version := range versions {
+		fronts := declaredFronts
+		if version == viaH3 {
+			fronts = []string{viaTransparentQUIC, viaConnectUDP}
+		}
+		for _, front := range fronts {
+			t.Run(version+"-"+front, func(t *testing.T) { run(t, front, version) })
+		}
+	}
+}
+
+// newMisdirectBench is a proxy admitting origin.test, other.test, localhost and 127.0.0.1, with
+// every request forwarded to one origin behind TLS.
+func newMisdirectBench(t *testing.T) *proxyBench {
+	t.Helper()
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	originCA, err := GenerateCA()
+	require.NoError(t, err)
+	cert, err := originCA.Leaf("origin.test")
+	require.NoError(t, err)
+	o := newTLSOrigin(t, *cert, always(okReply))
+	tr := DefaultTransport()
+	tr.DialContext = pinnedDialer(o.addr)
+	tr.InsecureSkipVerify = true
+	resolver := &fakeResolver{addrs: map[string][]netip.Addr{"origin.test": {netip.MustParseAddr("127.0.0.1")}}}
+	p := testProxyWithCA(t, ca, WithTransport(tr), WithNameResolver(resolver))
+	for _, host := range []string{"origin.test", "other.test", "localhost", "127.0.0.1"} {
+		p.MustAdd(host+"/*{any}", forwardHandler)
+	}
+	return &proxyBench{p: p, origin: o, trust: ca.CertPool()}
+}
+
+// dialTerminated opens a connection to the origin of b through front for version, with sni as the
+// server name unless empty, and returns the certificate edge presented and a function that sends
+// a GET for host on that connection and returns the status and the content of the response.
+func dialTerminated(t *testing.T, b *proxyBench, front, version, sni string) (*x509.Certificate, func(t *testing.T, host string) (int, string)) {
+	t.Helper()
+	dst := netip.MustParseAddrPort(b.origin.addr)
+	cfg := &tls.Config{ServerName: sni, RootCAs: b.trust, InsecureSkipVerify: sni == "", MinVersion: tls.VersionTLS12}
+	if version == viaH3 {
+		qc := dialTerminatedQUIC(t, b.p, front, dst, cfg)
+		c, err := newH3Conn(qc)
+		require.NoError(t, err)
+		return qc.ConnectionState().TLS.PeerCertificates[0], func(t *testing.T, host string) (int, string) {
+			t.Helper()
+			got := c.roundTrip(t, h3Request("GET", host, "/"))
+			require.NoError(t, got.err)
+			return parseStatus(t, got.status()), string(got.body)
+		}
+	}
+
+	alpn := map[string]string{viaH1: "http/1.1", viaH2: "h2"}[version]
+	if alpn != "" {
+		cfg.NextProtos = []string{alpn}
+	}
+	tc := tls.Client(dialDeclared(t, front, b.p, dst), cfg)
+	require.NoError(t, tc.Handshake())
+	require.Equal(t, alpn, tc.ConnectionState().NegotiatedProtocol)
+	leaf := tc.ConnectionState().PeerCertificates[0]
+	if version == viaH2 {
+		_, err := io.WriteString(tc, http2.ClientPreface)
+		require.NoError(t, err)
+		h := newH2Wire(tc)
+		require.NoError(t, h.fr.WriteSettings())
+		id := uint32(1)
+		return leaf, func(t *testing.T, host string) (int, string) {
+			t.Helper()
+			h.headers(t, id, true, hf(":method", "GET"), hf(":scheme", "https"), hf(":authority", host), hf(":path", "/"))
+			got := h.reply(t, id)
+			id += 2
+			require.False(t, got.reset, "stream reset with %v", got.rst)
+			status, _ := h2Field(got.fields, ":status")
+			return parseStatus(t, status), string(got.body)
+		}
+	}
+	w := newWire(tc)
+	return leaf, func(t *testing.T, host string) (int, string) {
+		t.Helper()
+		w.send(t, "GET / HTTP/1.1\r\nHost: "+host+"\r\n\r\n")
+		got := w.readResponse(t, "GET")
+		require.NoError(t, got.err)
+		return got.resp.StatusCode, string(got.body)
+	}
+}
+
+// dialTerminatedQUIC opens a QUIC connection negotiating h3 to dst through front.
+func dialTerminatedQUIC(t *testing.T, p *Proxy, front string, dst netip.AddrPort, cfg *tls.Config) *quic.Conn {
+	t.Helper()
+	cfg = cfg.Clone()
+	cfg.NextProtos = []string{http3.NextProtoH3}
+	cfg.MinVersion = tls.VersionTLS13
+	qcfg := &quic.Config{MaxIdleTimeout: 10 * time.Second, HandshakeIdleTimeout: 3 * time.Second}
+	var pc net.PacketConn
+	to := dst
+	switch front {
+	case viaTransparentQUIC:
+		to = startQUICRedirected(t, p, dst)
+		udp, err := loopbackUDP()
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = udp.Close() })
+		pc = udp
+	case viaConnectUDP, viaConnectUDPLiteral:
+		frontCA, err := GenerateCA()
+		require.NoError(t, err)
+		addr, _ := startQUICFront(t, p, frontCA)
+		target := fmt.Sprintf("origin.test:%d", dst.Port())
+		if front == viaConnectUDPLiteral {
+			target = dst.String()
+		}
+		mc, _, err := openTunnel(t, masqueClient(t, addr, frontCA), addr, target, nil)
+		require.NoError(t, err)
+		pc = mc
+		qcfg.DisablePathMTUDiscovery = true
+	default:
+		t.Fatalf("unknown front %q", front)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	qc, err := quic.Dial(ctx, pc, net.UDPAddrFromAddrPort(to), cfg, qcfg)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = qc.CloseWithError(0, "") })
+	return qc
+}
+
+func parseStatus(t *testing.T, status string) int {
+	t.Helper()
+	code, err := strconv.Atoi(status)
+	require.NoError(t, err, "status %q", status)
+	return code
+}
+
+// leafHost returns the host a certificate minted by a [CA] is valid for.
+func leafHost(leaf *x509.Certificate) string {
+	if len(leaf.DNSNames) > 0 {
+		return leaf.DNSNames[0]
+	}
+	return leaf.IPAddresses[0].String()
+}
+
+func TestLeafCovers(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	for _, tc := range []struct {
+		leaf, host string
+		want       bool
+	}{
+		{leaf: "origin.test", host: "origin.test", want: true},
+		{leaf: "Origin.Test.", host: "origin.test", want: true},
+		{leaf: "origin.test", host: "other.test"},
+		{leaf: "origin.test", host: "www.origin.test"},
+		{leaf: "origin.test", host: "127.0.0.1"},
+		{leaf: "127.0.0.1", host: "127.0.0.1", want: true},
+		{leaf: "127.0.0.1", host: "::ffff:127.0.0.1", want: true},
+		{leaf: "::ffff:127.0.0.1", host: "127.0.0.1", want: true},
+		{leaf: "127.0.0.1", host: "127.0.0.2"},
+		{leaf: "127.0.0.1", host: "localhost"},
+		{leaf: "2001:db8::1", host: "2001:db8::1", want: true},
+		{leaf: "2001:db8::1", host: "2001:db8:0:0::1", want: true},
+		{leaf: "fe80::1", host: "fe80::1%eth0"},
+	} {
+		cert, err := ca.Leaf(tc.leaf)
+		require.NoError(t, err)
+		assert.Equal(t, tc.want, leafCovers(cert.Leaf, tc.host), "%s for %s", tc.leaf, tc.host)
+	}
 }

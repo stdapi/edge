@@ -24,6 +24,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -510,7 +511,7 @@ func TestQUIC_ClientTakesTheResetOfARestartedProxy(t *testing.T) {
 		t.Fatal("the client did not take the reset")
 	}
 	var reset *quic.StatelessResetError
-	require.ErrorAs(t, context.Cause(conn.Context()), &reset)
+	require.True(t, errors.As(context.Cause(conn.Context()), &reset))
 }
 
 func TestQUIC_SniffDropsAnInitialUnder1200Bytes(t *testing.T) {
@@ -1600,5 +1601,63 @@ func BenchmarkStatelessResetKey(b *testing.B) {
 	b.ReportAllocs()
 	for b.Loop() {
 		_ = secret.addrKey(origin)
+	}
+}
+
+func TestQUICDemux_DatagramFromItsOwnSocketIsDropped(t *testing.T) {
+	logger, dropped := recordLogger("the proxy sent it upstream")
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	self := pc.LocalAddr().String()
+	var dials, handled atomic.Int32
+	tr := DefaultTransport()
+	// A redirect that also catches the datagrams of the proxy and reports every one headed to dst.
+	tr.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+		if dials.Add(1) > 8 {
+			return nil, &net.OpError{Op: "dial", Net: network, Err: syscall.ECONNREFUSED}
+		}
+		return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, network, self)
+	}
+	dst := netip.MustParseAddrPort("192.0.2.1:53")
+	p := testProxy(t, WithTransport(tr), WithLogger(logger))
+	p.MustAdd[UDP](dst.String(), func(c *DatagramCtx) error {
+		handled.Add(1)
+		return c.Forward()
+	})
+	go func() { _ = p.ServeTransparentUDP(fixedOriginPacketConn{PacketConn: pc, origin: dst}) }()
+	t.Cleanup(func() { _ = p.Close() })
+
+	client, err := loopbackUDP()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = client.Close() })
+	_, err = client.WriteTo([]byte("ping"), pc.LocalAddr())
+	require.NoError(t, err)
+	select {
+	case <-dropped:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the proxy did not drop the datagram it sent itself")
+	}
+	assert.Equal(t, int32(1), handled.Load(), "the datagram came back to the proxy")
+	assert.Equal(t, int32(1), dials.Load())
+}
+
+func TestQUICDemux_InitialFromItsOwnSocketIsRefused(t *testing.T) {
+	logger, refused := recordLogger("the proxy opened it upstream")
+	p := testProxy(t, WithLogger(logger))
+	p.MustAdd("origin.test/*{any}", okHandler)
+	addr := startQUICRedirected(t, p, netip.MustParseAddrPort("192.0.2.1:443"))
+
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	_, err := p.srv.fwd.up.dialQUIC(ctx, addr.String(),
+		&tls.Config{ServerName: "origin.test", NextProtos: []string{http3.NextProtoH3}, MinVersion: tls.VersionTLS13}, &quic.Config{})
+	te, ok := errors.AsType[*quic.TransportError](err)
+	require.True(t, ok, "the dial ended on %v", err)
+	assert.Equal(t, quic.ConnectionRefused, te.ErrorCode)
+	assert.True(t, te.Remote)
+	select {
+	case <-refused:
+	default:
+		t.Fatal("the refusal was not logged")
 	}
 }

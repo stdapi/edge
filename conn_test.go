@@ -6,6 +6,7 @@ package edge
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -129,7 +130,7 @@ func TestH2Stream_CloseWriteOnHTTP3KeepsReceiving(t *testing.T) {
 
 	select {
 	case res := <-done:
-		assert.ErrorIs(t, res.late, net.ErrClosed)
+		assert.True(t, errors.Is(res.late, net.ErrClosed), "%v", res.late)
 		assert.NoError(t, res.again)
 		assert.Equal(t, "more", res.got)
 	case <-time.After(5 * time.Second):

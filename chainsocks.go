@@ -42,7 +42,7 @@ func socks5Addr(addr string) (socks5.Addr, error) {
 }
 
 func (u *upstreamDialer) socks5Open(ctx context.Context, proxy *url.URL, cmd byte, target socks5.Addr) (net.Conn, socks5.Addr, error) {
-	conn, err := u.t.dialer()(ctx, "tcp", proxyAddr(proxy))
+	conn, err := u.dialRaw(ctx, "tcp", proxyAddr(proxy))
 	if err != nil {
 		return nil, socks5.Addr{}, fmt.Errorf("%w %s: %w", errDialProxy, proxy.Redacted(), err)
 	}
@@ -131,7 +131,7 @@ func (u *upstreamDialer) associate(ctx context.Context, proxy *url.URL, addr str
 	if bound.Name == "" && bound.IP.IsUnspecified() {
 		bound.IP = addrPort(ctrl.RemoteAddr()).Addr()
 	}
-	sock, err := u.t.dialer()(ctx, "udp", bound.String())
+	sock, err := u.dialRaw(ctx, "udp", bound.String())
 	if err != nil {
 		_ = ctrl.Close()
 		return nil, fmt.Errorf("dial the relay %s: %w", bound, err)

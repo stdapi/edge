@@ -222,7 +222,7 @@ func (p *Proxy) serveFront(ln net.Listener) error {
 	// and closing it here as well would make its own Shutdown report the second close.
 	// The limit on a field the schemeConn decodes is above the server's, which refuses the
 	// request first.
-	err := p.srv.h1.Serve(schemeListener{ln, p.cfg.server.maxHeaderBytes + 64<<10})
+	err := p.srv.h1.Serve(schemeListener{Listener: ln, p: p, maxHeaderBytes: p.cfg.server.maxHeaderBytes + 64<<10})
 	if errors.Is(err, http.ErrServerClosed) {
 		return ErrProxyClosed
 	}
@@ -271,7 +271,7 @@ func (p *Proxy) ListenAndServeQUIC(addr string, cert tls.Certificate) error {
 // [Proxy.ListenAndServeQUIC]. It always returns a non-nil error. After [Proxy.Shutdown] or
 // [Proxy.Close] has returned, the returned error is [ErrProxyClosed].
 func (p *Proxy) ServeQUIC(pc net.PacketConn, cert tls.Certificate) error {
-	front := &quicFront{logger: p.cfg.logger, conns: make(map[*quic.Conn]struct{})}
+	front := &quicFront{logger: p.cfg.logger, own: p.srv.fwd.up.own, conns: make(map[*quic.Conn]struct{})}
 	if !p.srv.tryTrackFront(front) {
 		return ErrProxyClosed
 	}
@@ -311,6 +311,7 @@ func (p *Proxy) ServeQUIC(pc net.PacketConn, cert tls.Certificate) error {
 // a CONNECTION_CLOSE before the transport under them.
 type quicFront struct {
 	logger *slog.Logger
+	own    *ownSockets
 	conns  map[*quic.Conn]struct{}
 	mu     sync.Mutex
 }
@@ -323,6 +324,14 @@ func (f *quicFront) accept(ctx context.Context, ln *quic.Listener, h3 *http3.Ser
 		c, err := ln.Accept(ctx)
 		if err != nil {
 			return err
+		}
+		// Once the handshake is over, a connection from a socket the proxy recorded upstream is
+		// the proxy itself.
+		if f.own.datagram(addrPort(c.RemoteAddr())) {
+			f.logger.Debug("edge: HTTP/3 connection refused", slog.String("client", c.RemoteAddr().String()),
+				slog.String("reason", "the proxy opened it upstream, a request loop"))
+			_ = c.CloseWithError(quic.ApplicationErrorCode(http3.ErrCodeExcessiveLoad), "")
+			continue
 		}
 		f.add(c)
 		go f.serve(h3, c)
@@ -386,7 +395,12 @@ func (p *Proxy) Shutdown(ctx context.Context) error {
 	// Past the deadline, whatever draining could not end is cut: streams, upgraded pipes, and
 	// connections still handshaking. Cutting them is what unblocks the waits below.
 	stop := context.AfterFunc(ctx, p.srv.closeActive)
-	defer stop()
+	defer func() {
+		// A return on the deadline can stop the cut before the cancellation of ctx starts it.
+		if stop() && ctx.Err() != nil {
+			go p.srv.closeActive()
+		}
+	}()
 
 	p.srv.mu.Lock()
 	demuxes := slices.Collect(maps.Keys(p.srv.quics))
@@ -537,6 +551,10 @@ func (p *Proxy) serveProxyRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if !validRequestTarget(r) {
+		p.writeStatus(w, r, http.StatusBadRequest, errRequestTargetForm.Error())
+		return
+	}
 	target, err := proxyTarget(r, scheme)
 	if err != nil {
 		p.writeStatus(w, r, http.StatusBadRequest, err.Error())
@@ -827,23 +845,38 @@ func proxyTarget(r *http.Request, scheme string) (Target, error) {
 	if scheme == "" {
 		return Target{}, errors.New("the request has no scheme")
 	}
-	host, port := splitHostPort(r.Host)
-	port, ok := canonicalPort(port)
+	host, port, ok := splitAuthority(r.Host)
 	if !ok {
-		return Target{}, errRequestTargetPort
+		return Target{}, errRequestAuthority
 	}
 	port = cmp.Or(port, defaultPort(scheme))
 	return Target{Scheme: scheme, Host: canonicalHost(stringsutil.ToLowerASCIIString(host)), Port: port}, nil
 }
 
-var errRequestTargetPort = errors.New("request target port is not a port")
+var errRequestAuthority = errors.New("request authority is not a host and a port")
+
+var errRequestTargetForm = errors.New("request target is in no form its method allows")
+
+// validRequestTarget reports whether the target of r is in a form RFC 9112 section 3.2 allows
+// for its method. The authority-form is left to CONNECT, which a front serves on its own.
+func validRequestTarget(r *http.Request) bool {
+	u := r.URL
+	switch {
+	case r.Method == http.MethodConnect:
+		return true
+	case u == nil:
+		return false
+	case u.Scheme == "":
+		return u.Path != "*" || r.Method == http.MethodOptions
+	}
+	return (u.Scheme == "http" || u.Scheme == "https") && u.Host != ""
+}
 
 func targetFromURL(u *url.URL) (Target, error) {
 	scheme := cmp.Or(u.Scheme, "http")
-	host, port := splitHostPort(u.Host)
-	port, ok := canonicalPort(port)
+	host, port, ok := splitAuthority(u.Host)
 	if !ok {
-		return Target{}, errRequestTargetPort
+		return Target{}, errRequestAuthority
 	}
 	port = cmp.Or(port, defaultPort(scheme))
 	return Target{Scheme: scheme, Host: canonicalHost(stringsutil.ToLowerASCIIString(host)), Port: port}, nil

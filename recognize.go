@@ -132,6 +132,9 @@ const (
 	sniffNo
 )
 
+// scanRequestLine reads a token method and a space, then reports sniffYes at the first later
+// space followed by an HTTP version. A target containing a space is still HTTP, so that the server
+// replies 400 to the invalid request line, RFC 9112 section 3.2.
 func scanRequestLine(b []byte) sniffVerdict {
 	// method
 	i := 0
@@ -148,47 +151,39 @@ func scanRequestLine(b []byte) sniffVerdict {
 		return sniffNo
 	}
 
-	// target, anything without a space or a control byte
-	i++
-	start := i
-	for i < len(b) && b[i] != ' ' {
-		if b[i] < 0x21 || b[i] == 0x7f {
-			return sniffNo
-		}
-		i++
-	}
-	// The end of the buffer comes first, a target that has not arrived yet is not empty.
-	if i == len(b) {
-		return sniffMore
-	}
-	if i == start {
-		return sniffNo
-	}
-
-	// version
-	i++
-	const version = "HTTP/"
-	rest := b[i:]
-	if len(rest) < len(version)+3 {
-		if len(rest) < len(version) {
-			if string(rest) != version[:len(rest)] {
-				return sniffNo
+	// target and version, up to the end of the line
+	for i++; i < len(b); i++ {
+		switch c := b[i]; {
+		case c == ' ':
+			switch scanVersion(b[i+1:]) {
+			case sniffYes:
+				return sniffYes
+			case sniffMore:
+				return sniffMore
 			}
-			return sniffMore
-		}
-		if string(rest[:len(version)]) != version {
+		case c < ' ' && c != '\t', c == 0x7f:
+			// A control byte, the end of a line without a version among them.
 			return sniffNo
 		}
-		return sniffMore
 	}
-	if string(rest[:len(version)]) != version {
+	return sniffMore
+}
+
+// scanVersion reports whether b starts with "HTTP/", a digit, "." and a digit.
+func scanVersion(b []byte) sniffVerdict {
+	const version = "HTTP/"
+	if len(b) >= len(version)+3 {
+		if string(b[:len(version)]) == version && isDigit(b[5]) && b[6] == '.' && isDigit(b[7]) {
+			return sniffYes
+		}
 		return sniffNo
 	}
-	rest = rest[len(version):]
-	if !isDigit(rest[0]) || rest[1] != '.' || !isDigit(rest[2]) {
-		return sniffNo
+	for i, c := range b {
+		if i < len(version) && c != version[i] || i == len(version) && !isDigit(c) || i == len(version)+1 && c != '.' {
+			return sniffNo
+		}
 	}
-	return sniffYes
+	return sniffMore
 }
 
 func isDigit(b byte) bool { return b >= '0' && b <= '9' }

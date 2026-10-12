@@ -120,6 +120,10 @@ func (p *Proxy) ServeConn(conn net.Conn) error {
 	if err != nil {
 		return nil
 	}
+	if p.fromItself(conn.RemoteAddr(), conn.LocalAddr(), origin) {
+		abort(conn)
+		return nil
+	}
 
 	if head[0] == tlsHandshakeRecord {
 		return p.serveTransparentTLS(ctx, peeked, origin)

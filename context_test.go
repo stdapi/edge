@@ -181,6 +181,7 @@ func TestContext_RoutingPathCanonicalization(t *testing.T) {
 		assert.Equal(t, tc.want, routingPath(req), "routingPath(%q)", tc.target)
 	}
 
+	assert.Equal(t, "/", routingPath(httptest.NewRequest(http.MethodOptions, "*", nil)))
 	assert.Empty(t, routingPath(nil))
 }
 

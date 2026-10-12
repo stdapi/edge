@@ -8,11 +8,13 @@ import (
 	"cmp"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"slices"
 	"time"
 
@@ -174,6 +176,7 @@ func (p *Proxy) placeTLS(ctx context.Context, conn *peekConn, sess *Session) err
 	sess.target = target
 	if hello != nil {
 		sess.clientHello.Store(hello)
+		p.seedVerified(sess, hello.ServerName, target)
 	}
 	return nil
 }
@@ -250,8 +253,9 @@ func (p *Proxy) placePlain(ctx context.Context, conn *peekConn, sess *Session) p
 	if isTimeout(err) {
 		return plainTimedOut
 	}
-	host, _ := splitHostPort(authority)
-	if host == "" {
+	host, _, ok := splitAuthority(authority)
+	if !ok || host == "" {
+		// A malformed authority gets a 400 on the request it opens.
 		return plainNameless
 	}
 	target := sess.target
@@ -299,7 +303,9 @@ func (p *Proxy) serveHTTPConnection(conn net.Conn, sess *Session, state *tls.Con
 func (p *Proxy) serveTerminatedStream(ctx context.Context, conn net.Conn, sess *Session,
 	state *tls.ConnectionState, e *entry, params []Param,
 ) error {
-	sess.closer = conn
+	if sess.closer == nil {
+		sess.closer = conn
+	}
 	sess.entry.Store(e)
 	if sess.remoteAddr == nil {
 		sess.remoteAddr = conn.RemoteAddr()
@@ -380,7 +386,11 @@ func (p *Proxy) serverTLSConfig(sess *Session, decided bool) *tls.Config {
 				MinVersion: tls.VersionTLS12,
 				NextProtos: next,
 				GetCertificate: func(*tls.ClientHelloInfo) (*tls.Certificate, error) {
-					return p.cfg.ca.Leaf(name)
+					leaf, err := p.cfg.ca.Leaf(name)
+					if err == nil {
+						sess.leaf.Store(leaf.Leaf)
+					}
+					return leaf, err
 				},
 			}, nil
 		},
@@ -400,7 +410,9 @@ func (p *Proxy) serveTerminatedHTTP(conn net.Conn, sess *Session, state *tls.Con
 
 	// Every terminated connection settles here, however it arrived, so this is the single
 	// point where its session is registered with a target a reader can rely on.
-	sess.closer = conn
+	if sess.closer == nil {
+		sess.closer = conn
+	}
 	if !p.srv.admitSession(sess) {
 		return ErrConnectionRejected
 	}
@@ -439,13 +451,27 @@ func (p *Proxy) serveTerminatedRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	target, ok := terminatedTarget(r, sess)
-	if !ok {
-		p.writeStatus(w, r, http.StatusBadRequest, errRequestTargetPort.Error())
+	if !validRequestTarget(r) {
+		p.writeStatus(w, r, http.StatusBadRequest, errRequestTargetForm.Error())
 		return
 	}
-	if sess.upstream.IsValid() && sess.TLS() == nil {
-		// The server name of a TLS connection was checked in placeTLS.
+	target, ok := terminatedTarget(r, sess)
+	if !ok {
+		p.writeStatus(w, r, http.StatusBadRequest, errRequestAuthority.Error())
+		return
+	}
+	if r.TLS != nil || sess.TLS() != nil {
+		if leaf := sess.leaf.Load(); leaf == nil || !leafCovers(leaf, target.Host) {
+			p.writeStatus(w, r, http.StatusMisdirectedRequest, "the certificate of the connection is not valid for the host")
+			return
+		}
+	}
+	if r.URL.IsAbs() {
+		// The connection is the target, so its scheme is the scheme of the request, for the
+		// forward as for the routing.
+		r.URL.Scheme = target.Scheme
+	}
+	if sess.upstream.IsValid() {
 		if target, ok = p.verifyRequestHost(r.Context(), sess, target, KindHTTP); !ok {
 			p.writeStatus(w, r, http.StatusForbidden, "the host does not resolve to the destination")
 			return
@@ -458,10 +484,25 @@ func (p *Proxy) serveTerminatedRequest(w http.ResponseWriter, r *http.Request) {
 	p.dispatchRequest(w, r, sess, target, sess.identity)
 }
 
-// terminatedTarget resolves the target of a request read off a terminated connection. The Host
-// header is what the client addressed the request to and is what an origin would route on, so
-// it wins over the authority of the connection. The port comes from the connection, since an
-// origin-form request has none of its own.
+// leafCovers reports whether leaf, minted by a [CA], is valid for host, a hostname in lower
+// case without its root dot or an IP address. A zoned address is valid for no leaf, as with
+// x509.Certificate.VerifyHostname.
+func leafCovers(leaf *x509.Certificate, host string) bool {
+	if addr, err := netip.ParseAddr(host); err == nil {
+		for _, ip := range leaf.IPAddresses {
+			if a, ok := netip.AddrFromSlice(ip); ok && a.Unmap() == addr.Unmap() {
+				return true
+			}
+		}
+		return false
+	}
+	return slices.Contains(leaf.DNSNames, host)
+}
+
+// terminatedTarget resolves the target of a request read off a terminated connection from its
+// Host header, with the port of the connection when the header has none. The caller then checks
+// that host against the certificate of the connection and, under name verification, against
+// its destination.
 func terminatedTarget(r *http.Request, sess *Session) (Target, bool) {
 	scheme := sess.target.Scheme
 	if scheme == "" {
@@ -472,8 +513,7 @@ func terminatedTarget(r *http.Request, sess *Session) (Target, bool) {
 		}
 	}
 
-	host, port := splitHostPort(r.Host)
-	port, ok := canonicalPort(port)
+	host, port, ok := splitAuthority(r.Host)
 	if !ok {
 		return Target{}, false
 	}

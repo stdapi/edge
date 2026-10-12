@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -56,7 +57,7 @@ func startQUICFront(t *testing.T, p *Proxy, ca *CA) (netip.AddrPort, <-chan erro
 		}
 		select {
 		case err := <-served:
-			assert.ErrorIs(t, err, ErrProxyClosed)
+			assert.True(t, errors.Is(err, ErrProxyClosed), "%v", err)
 		default:
 		}
 		_ = pc.Close()
@@ -149,7 +150,7 @@ func TestServeQUIC_AbsoluteRequest(t *testing.T) {
 	require.NoError(t, p.Shutdown(ctx))
 	select {
 	case err := <-served:
-		assert.ErrorIs(t, err, ErrProxyClosed)
+		assert.True(t, errors.Is(err, ErrProxyClosed), "%v", err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("ServeQUIC did not return after Shutdown")
 	}
@@ -236,6 +237,35 @@ func TestProxyTarget_RootDotIsDropped(t *testing.T) {
 	target, err = proxyTarget(&http.Request{URL: &url.URL{Path: "/x"}, Host: "127.0.0.1.:8443", ProtoMajor: 2}, "https")
 	require.NoError(t, err)
 	assert.Equal(t, "127.0.0.1", target.Host)
+}
+
+func TestProxyTarget_MalformedAuthorityIsRefused(t *testing.T) {
+	_, err := proxyTarget(&http.Request{URL: &url.URL{Path: "/x"}, Host: "origin.test:80:80", ProtoMajor: 2}, "http")
+	require.Error(t, err)
+	_, err = proxyTarget(&http.Request{URL: &url.URL{Scheme: "http", Host: "[origin.test]", Path: "/x"}, ProtoMajor: 1}, "")
+	require.Error(t, err)
+}
+
+func TestValidRequestTarget(t *testing.T) {
+	for _, tc := range []struct {
+		method, target string
+		want           bool
+	}{
+		{http.MethodGet, "/x", true},
+		{http.MethodGet, "http://origin.test/x", true},
+		{http.MethodGet, "HTTPS://origin.test", true},
+		{http.MethodOptions, "*", true},
+		{http.MethodConnect, "origin.test:443", true},
+		{http.MethodGet, "*", false},
+		{http.MethodGet, "origin.test:80", false},
+		{http.MethodGet, "ftp://origin.test/x", false},
+		{http.MethodGet, "http:///x", false},
+		{http.MethodGet, "http:x", false},
+	} {
+		r, err := http.ReadRequest(bufio.NewReader(strings.NewReader(tc.method + " " + tc.target + " HTTP/1.1\r\nHost: origin.test\r\n\r\n")))
+		require.NoError(t, err, tc.target)
+		assert.Equal(t, tc.want, validRequestTarget(r), "%s %s", tc.method, tc.target)
+	}
 }
 
 func TestLifecycle_ShutdownStopsAccepting(t *testing.T) {
@@ -641,7 +671,7 @@ func TestLifecycle_ShutdownDrainsInterceptedHTTP3(t *testing.T) {
 
 	select {
 	case err := <-served:
-		assert.ErrorIs(t, err, ErrProxyClosed)
+		assert.True(t, errors.Is(err, ErrProxyClosed), "%v", err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("ServeTransparentUDP did not return after Shutdown")
 	}
@@ -667,7 +697,7 @@ func TestLifecycle_ShutdownStopsQUIC(t *testing.T) {
 
 	select {
 	case err := <-served:
-		assert.ErrorIs(t, err, ErrProxyClosed)
+		assert.True(t, errors.Is(err, ErrProxyClosed), "%v", err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("ServeTransparentUDP did not return after Shutdown")
 	}
@@ -675,7 +705,8 @@ func TestLifecycle_ShutdownStopsQUIC(t *testing.T) {
 	pc2, err := net.ListenPacket("udp", "127.0.0.1:0")
 	require.NoError(t, err)
 	defer func() { _ = pc2.Close() }()
-	assert.ErrorIs(t, p.ServeTransparentUDP(pc2), ErrProxyClosed)
+	err = p.ServeTransparentUDP(pc2)
+	assert.True(t, errors.Is(err, ErrProxyClosed), "%v", err)
 	_, err = pc2.WriteTo([]byte("x"), pc2.LocalAddr())
 	assert.ErrorIs(t, err, net.ErrClosed, "a refused ServeTransparentUDP closes pc")
 }
@@ -710,7 +741,7 @@ func TestLifecycle_ShutdownDeadlineBoundsAStuckHandler(t *testing.T) {
 	err = p.Shutdown(ctx)
 	elapsed := time.Since(start)
 
-	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.True(t, errors.Is(err, context.DeadlineExceeded), "%v", err)
 	assert.Less(t, elapsed, 3*time.Second, "the deadline must bound Shutdown, not the handler")
 
 	select {
@@ -789,11 +820,11 @@ func TestLifecycle_ShutdownDeadlineBoundsAStuckHTTP3Handler(t *testing.T) {
 	err = p.Shutdown(ctx)
 	elapsed := time.Since(start)
 
-	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.True(t, errors.Is(err, context.DeadlineExceeded), "%v", err)
 	assert.Less(t, elapsed, 3*time.Second, "the deadline must bound Shutdown, not the handler")
 	select {
 	case err := <-served:
-		assert.ErrorIs(t, err, ErrProxyClosed)
+		assert.True(t, errors.Is(err, ErrProxyClosed), "%v", err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("ServeTransparentUDP did not return after the deadline")
 	}
@@ -895,10 +926,77 @@ func TestLifecycle_ShutdownDrainsTheHTTP3Front(t *testing.T) {
 	}
 	select {
 	case err := <-served:
-		assert.ErrorIs(t, err, ErrProxyClosed)
+		assert.True(t, errors.Is(err, ErrProxyClosed), "%v", err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("ServeQUIC did not return after Shutdown")
 	}
+}
+
+// lateCtx is a context whose cancellation reaches the contexts derived from it only once
+// propagate is called.
+type lateCtx struct {
+	context.Context
+	done       chan struct{}
+	registered chan struct{}
+	funcs      []func()
+	mu         sync.Mutex
+}
+
+func newLateCtx() *lateCtx {
+	return &lateCtx{Context: context.Background(), done: make(chan struct{}), registered: make(chan struct{}, 1)}
+}
+
+func (c *lateCtx) Done() <-chan struct{} { return c.done }
+
+func (c *lateCtx) Err() error {
+	select {
+	case <-c.done:
+		return context.DeadlineExceeded
+	default:
+		return nil
+	}
+}
+
+func (c *lateCtx) AfterFunc(f func()) func() bool {
+	c.mu.Lock()
+	c.funcs = append(c.funcs, f)
+	c.mu.Unlock()
+	select {
+	case c.registered <- struct{}{}:
+	default:
+	}
+	return func() bool { return true }
+}
+
+func (c *lateCtx) propagate() {
+	c.mu.Lock()
+	funcs := c.funcs
+	c.mu.Unlock()
+	for _, f := range funcs {
+		f()
+	}
+}
+
+func TestLifecycle_ShutdownDeadlineCutsWhenTheCancellationLags(t *testing.T) {
+	p, _, resp := openH2Connect(t, sinkOrigin(t))
+
+	ctx := newLateCtx()
+	shutdown := make(chan error, 1)
+	go func() { shutdown <- p.Shutdown(ctx) }()
+	select {
+	case <-ctx.registered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Shutdown never watched its context")
+	}
+	close(ctx.done)
+	select {
+	case err := <-shutdown:
+		assert.True(t, errors.Is(err, context.DeadlineExceeded), "%v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Shutdown did not return after the deadline")
+	}
+	ctx.propagate()
+	assertStreamReset(t, resp)
 }
 
 func TestLifecycle_ShutdownDeadlineCutsTheHTTP3Front(t *testing.T) {
@@ -944,21 +1042,21 @@ func TestLifecycle_ShutdownDeadlineCutsTheHTTP3Front(t *testing.T) {
 	defer cancel()
 	start := time.Now()
 	err = p.Shutdown(ctx)
-	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.True(t, errors.Is(err, context.DeadlineExceeded), "%v", err)
 	assert.Less(t, time.Since(start), 3*time.Second, "the deadline must bound Shutdown, not the handler")
 
 	select {
 	case <-conn.Context().Done():
 		var appErr *quic.ApplicationError
 		cause := context.Cause(conn.Context())
-		require.ErrorAs(t, cause, &appErr, "the client is told in QUIC terms: %v", cause)
+		require.True(t, errors.As(cause, &appErr), "the close reached the client as %v", cause)
 		assert.True(t, appErr.Remote, "the close comes from the proxy: %v", cause)
 	case <-time.After(5 * time.Second):
 		t.Fatal("the client never learned of the cut")
 	}
 	select {
 	case err := <-served:
-		assert.ErrorIs(t, err, ErrProxyClosed)
+		assert.True(t, errors.Is(err, ErrProxyClosed), "%v", err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("ServeQUIC did not return after the deadline")
 	}
@@ -1058,14 +1156,14 @@ func assertCutDoesNotWait(t *testing.T, served <-chan error, conn *quic.Conn, cu
 	case <-conn.Context().Done():
 		var appErr *quic.ApplicationError
 		cause := context.Cause(conn.Context())
-		require.ErrorAs(t, cause, &appErr, "the client is told in QUIC terms: %v", cause)
+		require.True(t, errors.As(cause, &appErr), "the close reached the client as %v", cause)
 		assert.True(t, appErr.Remote, "the close comes from the proxy: %v", cause)
 	case <-time.After(5 * time.Second):
 		t.Fatal("the client never learned of the cut")
 	}
 	select {
 	case err := <-served:
-		assert.ErrorIs(t, err, ErrProxyClosed)
+		assert.True(t, errors.Is(err, ErrProxyClosed), "%v", err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("the socket was not released before the handler ended")
 	}
@@ -1096,7 +1194,7 @@ func TestLifecycle_ShutdownExpiredContextCutsTheHTTP3Front(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	err := assertCutDoesNotWait(t, served, conn, func() error { return p.Shutdown(ctx) })
-	assert.ErrorIs(t, err, context.Canceled)
+	assert.True(t, errors.Is(err, context.Canceled), "%v", err)
 }
 
 func TestLifecycle_ShutdownExpiredContextCutsTheTransparentHTTP3(t *testing.T) {
@@ -1104,7 +1202,7 @@ func TestLifecycle_ShutdownExpiredContextCutsTheTransparentHTTP3(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	err := assertCutDoesNotWait(t, served, conn, func() error { return p.Shutdown(ctx) })
-	assert.ErrorIs(t, err, context.Canceled)
+	assert.True(t, errors.Is(err, context.Canceled), "%v", err)
 }
 
 func TestLifecycle_CloseDoesNotWaitForAStuckDatagramHandler(t *testing.T) {
@@ -1157,7 +1255,7 @@ func TestLifecycle_CloseDoesNotWaitForAStuckDatagramHandler(t *testing.T) {
 	}
 	select {
 	case err := <-served:
-		assert.ErrorIs(t, err, ErrProxyClosed)
+		assert.True(t, errors.Is(err, ErrProxyClosed), "%v", err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("ServeTransparentUDP did not return after Close")
 	}
@@ -1189,7 +1287,7 @@ func TestLifecycle_ShutdownCutsTunnelsAtTheDeadline(t *testing.T) {
 	err = p.Shutdown(ctx)
 	elapsed := time.Since(start)
 
-	assert.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.True(t, errors.Is(err, context.DeadlineExceeded), "%v", err)
 	assert.Less(t, elapsed, 3*time.Second, "cutting the tunnel must release the wait promptly")
 
 	require.NoError(t, conn.SetReadDeadline(time.Now().Add(2*time.Second)))
@@ -1241,7 +1339,7 @@ func TestLifecycle_CloseDropsTheQueuedDatagrams(t *testing.T) {
 	close(release)
 	select {
 	case err := <-served:
-		assert.ErrorIs(t, err, ErrProxyClosed)
+		assert.True(t, errors.Is(err, ErrProxyClosed), "%v", err)
 	case <-time.After(5 * time.Second):
 		t.Fatal("ServeTransparentUDP did not return after Close")
 	}

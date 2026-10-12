@@ -204,31 +204,32 @@ func TestUpgrade_TransparentPlaintextPipeIsListedAndClosed(t *testing.T) {
 }
 
 func TestUpgrade_HostDivergesFromTheConnectAuthority(t *testing.T) {
-	origin := upgradeOrigin(t)
+	origin := plainUpgradeOrigin(t)
 	originURL, _ := url.Parse(origin.URL)
 
-	ca, _ := GenerateCA()
 	tr := DefaultTransport()
 	tr.DialContext = pinnedDialer(originURL.Host)
-	tr.InsecureSkipVerify = true
 
-	p, err := New(WithCA(ca), WithTransport(tr))
-	require.NoError(t, err)
+	p := testProxy(t, WithTransport(tr))
 	p.MustAdd("a.example.test/*{rest}", noopHandler)
 	p.MustAdd[TCP]("b.example.test", relayStream)
 	p.MustAdd("b.example.test/ws", func(c *HTTPCtx) (*http.Response, error) {
 		return c.Forward()
 	}, WithMethods[HTTP](http.MethodGet))
 
-	raw, err := dialThroughProxy(t, startProxy(t, p), "a.example.test:443", ca)
+	raw := connectRaw(t, startProxy(t, p), "a.example.test:80")
+	br := bufio.NewReader(raw)
+	_, err := io.WriteString(raw, "GET / HTTP/1.1\r\nHost: a.example.test\r\n\r\n")
 	require.NoError(t, err)
-	defer func() { _ = raw.Close() }()
+	resp, err := http.ReadResponse(br, nil)
+	require.NoError(t, err)
+	_, err = io.Copy(io.Discard, resp.Body)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	_, err = fmt.Fprintf(raw, upgradeRequest, "/ws", "b.example.test")
 	require.NoError(t, err)
-
-	br := bufio.NewReader(raw)
-	resp, err := http.ReadResponse(br, nil)
+	resp, err = http.ReadResponse(br, nil)
 	require.NoError(t, err)
 	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
 
@@ -254,7 +255,7 @@ func TestUpgrade_HostDivergesFromTheConnectAuthority(t *testing.T) {
 		}
 	}
 	assert.Equal(t, 1, closed, "the pipe is swept while its connection stays allowed")
-	assert.Equal(t, true, p.Admits(target("a.example.test:443"), KindHTTP))
+	assert.Equal(t, true, p.Admits(target("a.example.test:80"), KindHTTP))
 }
 
 func TestUpgrade_RefusedWhenTheRouteGoesAwayFirst(t *testing.T) {

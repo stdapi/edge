@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"net"
 	"net/http"
+	"net/netip"
 	"slices"
 	"strings"
 
@@ -58,6 +59,9 @@ const (
 	schemeUndecided uint8 = iota
 	schemeFrames
 	schemeRaw
+	// schemeRefused ends every read of a connection the proxy opened itself. net/http reads
+	// again after an error and would find the buffered request.
+	schemeRefused
 )
 
 // schemeConn adds the :scheme of each HTTP/2 request as schemeHeader, at the end of its
@@ -65,8 +69,10 @@ const (
 // on the Request (golang/go#68365).
 type schemeConn struct {
 	net.Conn
-	br     *bufio.Reader
-	dec    *hpack.Decoder
+	br  *bufio.Reader
+	dec *hpack.Decoder
+	// p refuses a connection the proxy opened itself, nil where nothing is refused.
+	p      *Proxy
 	scheme string
 	out    []byte
 	outPos int
@@ -166,6 +172,8 @@ func (c *schemeConn) Read(p []byte) (int, error) {
 				return 0, err
 			}
 			continue
+		case schemeRefused:
+			return 0, errFromItself
 		case schemeRaw:
 			if c.br != nil {
 				if c.br.Buffered() > 0 {
@@ -188,7 +196,23 @@ func (c *schemeConn) Read(p []byte) (int, error) {
 // it decides on the first byte that leaves the preface, so a short HTTP/1.1 request is never
 // delayed.
 func (c *schemeConn) decide() error {
-	if cs, ok := c.Conn.(connectionStater); ok && cs.ConnectionState().NegotiatedProtocol != "h2" {
+	cs, isTLS := c.Conn.(connectionStater)
+	if !isTLS {
+		if c.br == nil {
+			c.br = bufio.NewReader(c.Conn)
+		}
+		if _, err := c.br.Peek(1); err != nil {
+			return err
+		}
+	}
+	// net/http has run the handshake of a TLS connection before its first read.
+	if c.p != nil && c.p.fromItself(c.RemoteAddr(), c.LocalAddr(), netip.AddrPort{}) {
+		abort(c.Conn)
+		c.state = schemeRefused
+		c.br = nil
+		return errFromItself
+	}
+	if isTLS && cs.ConnectionState().NegotiatedProtocol != "h2" {
 		c.state = schemeRaw
 		return nil
 	}
@@ -403,6 +427,7 @@ func (c *schemeConn) field() string {
 // schemeListener wraps each connection a front accepts in a schemeConn.
 type schemeListener struct {
 	net.Listener
+	p              *Proxy
 	maxHeaderBytes int
 }
 
@@ -411,7 +436,9 @@ func (l schemeListener) Accept() (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return newSchemeConn(c, l.maxHeaderBytes), nil
+	sc := newSchemeConn(c, l.maxHeaderBytes)
+	schemeConnOf(sc).p = l.p
+	return sc, nil
 }
 
 // takeScheme returns the scheme of an HTTP/2 or HTTP/3 request and removes schemeHeader from

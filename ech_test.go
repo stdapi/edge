@@ -290,6 +290,7 @@ func connectRaw(t *testing.T, addr, authority string) net.Conn {
 	conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = conn.Close() })
+	require.NoError(t, conn.SetDeadline(time.Now().Add(10*time.Second)))
 
 	_, err = fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", authority, authority)
 	require.NoError(t, err)
@@ -306,6 +307,7 @@ func connectRaw(t *testing.T, addr, authority string) net.Conn {
 		}
 	}
 	require.Zero(t, br.Buffered(), "nothing should follow the CONNECT response")
+	require.NoError(t, conn.SetDeadline(time.Time{}))
 	return conn
 }
 

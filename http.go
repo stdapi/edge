@@ -202,6 +202,8 @@ func (c *HTTPCtx) ForwardRequest(r *http.Request) (*http.Response, error) {
 	relay := c.r.infoRelay(ctx)
 	if relay != nil {
 		ctx = httptrace.WithClientTrace(ctx, &relay.trace)
+	} else {
+		ctx = withReuseGate(ctx)
 	}
 	out, err := c.outboundRequest(ctx, r)
 	if err != nil {
@@ -216,12 +218,26 @@ func (c *HTTPCtx) ForwardRequest(r *http.Request) (*http.Response, error) {
 		fixed = c.r.sess.dialAddr()
 	}
 	var body *clientBody
-	// The HTTP/2 server gives a request without content a body of its own, and a declared
-	// length of zero leaves nothing to check.
-	if cr := c.r.client; cr != nil && cr.ContentLength != 0 && out.Body != nil && out.Body != http.NoBody &&
-		out.Body == c.r.body {
-		body = &clientBody{ReadCloser: out.Body, req: cr, remaining: cr.ContentLength}
-		out.Body = body
+	if cr := c.r.client; cr != nil && cr.ContentLength == 0 && out.Body == c.r.body && !zeroLength(cr.Header["Content-Length"]) {
+		return nil, fmt.Errorf("forward %s %s: %w", out.Method, out.URL.Redacted(), malformedRequest{errInvalidContentLength})
+	}
+	if cr := c.r.client; cr != nil && out.Body != nil && out.Body != http.NoBody && out.Body == c.r.body {
+		switch {
+		case cr.ContentLength != 0:
+			body = &clientBody{ReadCloser: out.Body, req: cr, trailer: out.Trailer, remaining: cr.ContentLength}
+			out.Body = body
+		case out.ContentLength == 0:
+			// Content past a declared length of zero fails only a read, and every upstream transport
+			// sends a body of zero ContentLength as one of unknown length, quic-go even http.NoBody.
+			// Go's HTTP/2 transport leaves open a stream announcing trailers without a body.
+			if err = readEmptyBody(out.Body); err != nil {
+				return nil, fmt.Errorf("forward %s %s: %w", out.Method, out.URL.Redacted(), err)
+			}
+			if len(out.Trailer) == 0 {
+				out.Body = nil
+			}
+			fillTrailer(out.Trailer, cr.Trailer)
+		}
 	}
 	var resp *http.Response
 	if relay == nil {
@@ -283,6 +299,13 @@ func (c *HTTPCtx) outboundRequest(ctx context.Context, r *http.Request) (*http.R
 		upgrade = ""
 	}
 	trailers := headerListContains(r.Header, "Te", "trailers")
+	if conn := out.Header["Connection"]; len(out.Trailer) > 0 && listsAny(conn, out.Trailer) {
+		for _, value := range conn {
+			for field := range strings.SplitSeq(value, ",") {
+				out.Trailer.Del(textproto.TrimString(field))
+			}
+		}
+	}
 	stripHopByHop(out.Header)
 	stripPseudoHeaders(out.Header)
 	if _, ok := out.Header["User-Agent"]; !ok {
@@ -363,8 +386,24 @@ func newInfoRelay() *infoRelay {
 		done:   make(chan struct{}),
 	}
 	i.trace.Got1xxResponse = i.got1xx
+	i.trace.GotConn = i.gotConn
 	i.run = i.roundTrip
 	return i
+}
+
+func (i *infoRelay) gotConn(info httptrace.GotConnInfo) { gateReuse(info, i.out.Context().Done()) }
+
+// reuseGate is the trace of a request forwarded without an [infoRelay]. Shared, it cannot reach
+// the request and waits without a bound, which the transport keeps short by reading or closing the
+// connection right after it put it back in the pool.
+var reuseGate = &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) { gateReuse(info, nil) }}
+
+func withReuseGate(ctx context.Context) context.Context {
+	if httptrace.ContextClientTrace(ctx) != nil {
+		// WithClientTrace composes the trace it is given with the one already there.
+		return httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{GotConn: reuseGate.GotConn})
+	}
+	return httptrace.WithClientTrace(ctx, reuseGate)
 }
 
 // infoRelay returns the relay of the next round trip, or nil when the client cannot be sent a
@@ -485,17 +524,62 @@ func (malformedRequest) Is(target error) bool { return target == errMalformedReq
 type clientBody struct {
 	io.ReadCloser
 	req *http.Request
+	// trailer is the trailer of the forwarded request, filled from the client's at the end of
+	// the body.
+	trailer http.Header
 	// remaining is negative when the request declares no Content-Length.
 	remaining int64
 	malformed atomic.Bool
 }
 
 // malformedBodyErrors are the texts of the errors net/http and quic-go return for a body short
-// of its Content-Length or a malformed trailer section, which neither exports.
+// of its Content-Length or past it, or a malformed trailer section, which neither exports.
 var malformedBodyErrors = [...]string{
 	"request declared a Content-Length",
+	"sender tried to send more than declared Content-Length",
+	"peer sent too much data",
 	"pseudo header in trailer",
 	"frame received after trailers",
+	"header field is not lower-case",
+	"invalid header field name",
+	"invalid header field value",
+	"invalid trailer field name",
+}
+
+func isMalformedBody(err error) bool {
+	for _, text := range malformedBodyErrors {
+		if strings.Contains(err.Error(), text) {
+			return true
+		}
+	}
+	return false
+}
+
+var errInvalidContentLength = errors.New("invalid Content-Length")
+
+// zeroLength reports whether every Content-Length value is a decimal zero. Go's HTTP/2 server
+// reads a value that is no decimal as a length of zero, RFC 9113 section 8.1.1.
+func zeroLength(values []string) bool {
+	for _, v := range values {
+		if v == "" || strings.Trim(v, "0") != "" {
+			return false
+		}
+	}
+	return true
+}
+
+// readEmptyBody reads to its end the body of a request declaring a length of zero.
+func readEmptyBody(body io.Reader) error {
+	n, err := io.Copy(io.Discard, body)
+	switch {
+	case err != nil && isMalformedBody(err):
+		return malformedRequest{err}
+	case err != nil:
+		return err
+	case n > 0:
+		return malformedRequest{errors.New("content past a declared length of zero")}
+	}
+	return nil
 }
 
 func (b *clientBody) Read(p []byte) (int, error) {
@@ -512,16 +596,23 @@ func (b *clientBody) Read(p []byte) (int, error) {
 		if !validFieldNames(b.req.Trailer) {
 			err = errors.New("invalid field name in the trailer section")
 			b.malformed.Store(true)
+			break
 		}
-	default:
-		for _, text := range malformedBodyErrors {
-			if strings.Contains(err.Error(), text) {
-				b.malformed.Store(true)
-				break
-			}
-		}
+		fillTrailer(b.trailer, b.req.Trailer)
+	case isMalformedBody(err):
+		b.malformed.Store(true)
 	}
 	return n, err
+}
+
+// fillTrailer sets the values of the fields announced in dst from src. The client's trailer
+// values arrive with the end of its body, after the forwarded request was cloned.
+func fillTrailer(dst, src http.Header) {
+	for k := range dst {
+		if vv := src[k]; len(vv) > 0 {
+			dst[k] = vv
+		}
+	}
 }
 
 func validFieldNames(h http.Header) bool {

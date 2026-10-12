@@ -30,6 +30,8 @@ func TestSniff_ShortFirstWriteDecidesWithoutWaiting(t *testing.T) {
 		{name: "request line", write: "GET / HTTP/1.1\r\n", want: true},
 		{name: "h2 preface", write: "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n", want: true},
 		{name: "binary", write: "\x00\x01\x02", want: false},
+		{name: "redis inline command", write: "SET key value\r\n", want: false},
+		{name: "request line with a space in the target", write: "GET /a b HTTP/1.1\r\n", want: true},
 		{name: "undecided prefix waits", write: "GET /", want: false, waits: true},
 	}
 	for _, tc := range cases {
@@ -61,13 +63,14 @@ func TestSniff_ShortFirstWriteDecidesWithoutWaiting(t *testing.T) {
 }
 
 func TestScanRequestLine(t *testing.T) {
-	for _, line := range []string{"GET / HTTP/1.1", "PRI * HTTP/2.0"} {
+	for _, line := range []string{"GET / HTTP/1.1", "PRI * HTTP/2.0", "GET /a b HTTP/1.1", "GET  / HTTP/1.1", "GET /a\tb\xff HTTP/1.0"} {
 		for n := range len(line) {
 			assert.Equal(t, sniffMore, scanRequestLine([]byte(line[:n])), "%q", line[:n])
 		}
 		assert.Equal(t, sniffYes, scanRequestLine([]byte(line)), "%q", line)
 	}
-	for _, b := range []string{" ", " GET", "GET  ", "PRI  ", "GET /\x00", "GET / HTTP/x.1", "GET / FTP/1.1", "G(T / HTTP/1.1"} {
+	for _, b := range []string{" ", " GET", "GET\r\n", "GET  \r\n", "PRI  \n", "GET /\x00", "GET /a b\x7f", "GET /a\rb HTTP/1.1",
+		"GET / HTTP/x.1\r\n", "GET / HTTP/d.d\r\n", "GET / FTP/1.1\r\n", "SET key value\r\n", "G(T / HTTP/1.1"} {
 		assert.Equal(t, sniffNo, scanRequestLine([]byte(b)), "%q", b)
 	}
 }

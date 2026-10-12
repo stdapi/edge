@@ -14,9 +14,11 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -562,6 +564,9 @@ func FuzzSplitHostPort(f *testing.F) {
 		"[",
 		"]",
 		"[]:1",
+		"origin.test:80:80",
+		"[::1]x",
+		"[fe80::1%25en0]:80",
 	}
 	for _, s := range seeds {
 		f.Add(s)
@@ -578,6 +583,17 @@ func FuzzSplitHostPort(f *testing.F) {
 		host2, port2 := splitHostPort(joined)
 		if host2 != host || port2 != port {
 			t.Fatalf("split(%q) = (%q, %q), then split(join(...)) = (%q, %q)", authority, host, port, host2, port2)
+		}
+
+		host, port, ok := splitAuthority(authority)
+		if !ok {
+			return
+		}
+		if _, err := netip.ParseAddr(host); strings.Contains(host, ":") && err != nil {
+			t.Fatalf("splitAuthority(%q) returned the host %q", authority, host)
+		}
+		if host2, port2, ok := splitAuthority(joinHostPort(host, port)); !ok || host2 != host || port2 != port {
+			t.Fatalf("splitAuthority(%q) = (%q, %q), then splitAuthority(join(...)) = (%q, %q, %v)", authority, host, port, host2, port2, ok)
 		}
 	})
 }
@@ -602,6 +618,42 @@ func TestCanonicalPort(t *testing.T) {
 		got, ok := canonicalPort(in)
 		assert.Equal(t, want.ok, ok, in)
 		assert.Equal(t, want.port, got, in)
+	}
+}
+
+func TestSplitAuthority(t *testing.T) {
+	for _, tc := range []struct {
+		authority, host, port string
+	}{
+		{"", "", ""},
+		{"origin.test", "origin.test", ""},
+		{"origin.test:", "origin.test", ""},
+		{"origin.test:0443", "origin.test", "443"},
+		{"127.0.0.1:80", "127.0.0.1", "80"},
+		{"[::1]", "::1", ""},
+		{"[::1]:", "::1", ""},
+		{"[::1]:8080", "::1", "8080"},
+		{"[fe80::1%25en0]:80", "fe80::1%25en0", "80"},
+		{"[::ffff:127.0.0.1]:80", "::ffff:127.0.0.1", "80"},
+		{"a-b_c~d.test", "a-b_c~d.test", ""},
+		{"!$&'()*+,;=.test:80", "!$&'()*+,;=.test", "80"},
+		{"a%41%c3%A9.test", "a%41%c3%A9.test", ""},
+	} {
+		host, port, ok := splitAuthority(tc.authority)
+		assert.True(t, ok, tc.authority)
+		assert.Equal(t, tc.host, host, tc.authority)
+		assert.Equal(t, tc.port, port, tc.authority)
+	}
+	for _, authority := range []string{
+		"origin.test:80:80", "::1", "::1:80", "[::1", "[::1]x", "[::1]:80:80", "[::1]]:80", "[origin.test]",
+		"[127.0.0.1]:80", "origin.test]", "origin.test[", "user@origin.test", "origin.test/x", "origin.test?",
+		"origin.test#", "origin .test", "origin\x00.test", "origin.test:8o", "origin.test:65536",
+		"ori\"gin.test", "ori<gin>.test", "ori\\gin.test", "ori^gin.test", "ori`gin.test", "ori{gin}.test",
+		"ori|gin.test", "origin.test\x7f", "origin.test\x80", "caf\xc3\xa9.test", "a%4.test", "a%zz.test",
+		"a%.test", "a.test%", "a.test%4", "a.test%4:80",
+	} {
+		_, _, ok := splitAuthority(authority)
+		assert.False(t, ok, authority)
 	}
 }
 

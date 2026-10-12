@@ -94,6 +94,10 @@ func (p *Proxy) serveSOCKS5(conn net.Conn) error {
 	if err != nil {
 		return err
 	}
+	if p.fromItself(conn.RemoteAddr(), conn.LocalAddr(), netip.AddrPort{}) {
+		abort(conn)
+		return nil
+	}
 	bound := socks5Bound(conn.LocalAddr())
 	cmd, addr, err := socks5.ReadRequest(conn)
 	if err != nil {
@@ -430,6 +434,9 @@ func (a *socksAssociation) accepts(from netip.AddrPort) bool {
 		return from == *bound
 	}
 	if from.Addr() != a.expect.Addr() || (a.expect.Port() != 0 && from.Port() != a.expect.Port()) {
+		return false
+	}
+	if a.p.srv.fwd.up.own.datagram(from) {
 		return false
 	}
 	a.bound.Store(&from)

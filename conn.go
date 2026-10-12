@@ -389,6 +389,20 @@ func (s *h2Stream) Read(b []byte) (int, error) {
 	return n, err
 }
 
+// writeHeader writes and flushes the response header under the write lock, so a stream closed
+// first gets no header and a reset waits for a header being written before it flushes the writer.
+func (s *h2Stream) writeHeader(code int) {
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	if s.closed.Load() {
+		return
+	}
+	s.w.WriteHeader(code)
+	if s.flusher != nil {
+		s.flusher.Flush()
+	}
+}
+
 func (s *h2Stream) Write(b []byte) (int, error) {
 	s.wmu.Lock()
 	defer s.wmu.Unlock()
@@ -440,6 +454,15 @@ func (s *h2Stream) Abort() {
 		return
 	}
 	s.reset(hs, http3.ErrCodeConnectError)
+}
+
+// streamCut ends a CONNECT stream with a reset when [Session.Close] or a shutdown cut closes it.
+// A clean end would read as the origin closing the connection, RFC 9113 section 8.5.
+type streamCut struct{ s *h2Stream }
+
+func (c streamCut) Close() error {
+	c.s.Abort()
+	return nil
 }
 
 func (s *h2Stream) reset(hs http3.HTTPStreamer, code http3.ErrCode) {

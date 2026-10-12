@@ -1570,7 +1570,10 @@ var socksConformance = []conformanceCase{
 		run: func(t *testing.T) {
 			conn, ctrl, _ := socksExitAssociate(t, "127.0.0.1:53")
 			require.NoError(t, ctrl.conn.Close())
-			require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+			if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+				require.ErrorIs(t, err, net.ErrClosed)
+				return
+			}
 			_, err := conn.Read(make([]byte, 64))
 			require.Error(t, err)
 			require.NotErrorIs(t, err, os.ErrDeadlineExceeded, "the association outlived its connection")
@@ -1877,4 +1880,19 @@ var socksConformance = []conformanceCase{
 			}
 		},
 	},
+}
+
+func TestSOCKS5_RelayIsNotBoundToASocketOfTheProxy(t *testing.T) {
+	p := testProxy(t)
+	sink := listenUDP(t, "127.0.0.1:0")
+	own, err := p.srv.fwd.up.dialRaw(t.Context(), "udp", sink.LocalAddr().String())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = own.Close() })
+	client, err := loopbackUDP()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = client.Close() })
+
+	a := newSOCKSAssociation(t.Context(), p, nil, socks5.Addr{}, netip.MustParseAddr("127.0.0.1"))
+	assert.False(t, a.accepts(addrPort(own.LocalAddr())))
+	assert.True(t, a.accepts(addrPort(client.LocalAddr())))
 }

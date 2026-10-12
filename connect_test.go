@@ -198,11 +198,40 @@ func floodingOrigin(t *testing.T) net.Listener {
 	return origin
 }
 
+// sinkOrigin is a TCP origin that reads every connection to its end and then closes it.
+func sinkOrigin(t *testing.T) net.Listener {
+	t.Helper()
+	origin, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = origin.Close() })
+	go func() {
+		for {
+			c, aerr := origin.Accept()
+			if aerr != nil {
+				return
+			}
+			go func() {
+				_, _ = io.Copy(io.Discard, c)
+				_ = c.Close()
+			}()
+		}
+	}()
+	return origin
+}
+
 // stalledH2Connect opens a CONNECT over HTTP/2 to an origin that floods, reads nothing back,
 // and returns once the relay has filled the stream's window and stalled in its write.
 func stalledH2Connect(t *testing.T) (*Proxy, *Session, *http.Response) {
 	t.Helper()
-	origin := floodingOrigin(t)
+	p, sess, resp := openH2Connect(t, floodingOrigin(t))
+	time.Sleep(300 * time.Millisecond)
+	return p, sess, resp
+}
+
+// openH2Connect opens a CONNECT over HTTP/2 to origin, reads nothing back, and returns once the
+// relay serving it is reported.
+func openH2Connect(t *testing.T, origin net.Listener) (*Proxy, *Session, *http.Response) {
+	t.Helper()
 	ca, err := GenerateCA()
 	require.NoError(t, err)
 	p, err := New(WithCA(ca))
@@ -223,13 +252,10 @@ func stalledH2Connect(t *testing.T) (*Proxy, *Session, *http.Response) {
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
-	// One byte decides the stream is a plaintext relay. Nothing reads the response, so the
-	// relay fills the stream's window and stalls.
+	// One byte decides the stream is a plaintext relay.
 	_, err = io.WriteString(pw, "x")
 	require.NoError(t, err)
-	sess := waitForSessions(t, p, 1)[0]
-	time.Sleep(300 * time.Millisecond)
-	return p, sess, resp
+	return p, waitForSessions(t, p, 1)[0], resp
 }
 
 // assertStreamReset checks that the client sees its CONNECT stream reset, how a cut reaches
@@ -268,8 +294,72 @@ func TestConnect_ShutdownDeadlineCutsAStalledH2Stream(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
 	defer cancel()
-	assert.ErrorIs(t, p.Shutdown(ctx), context.DeadlineExceeded)
+	err := p.Shutdown(ctx)
+	assert.True(t, errors.Is(err, context.DeadlineExceeded), "%v", err)
 	assertStreamReset(t, resp)
+}
+
+func TestConnect_CloseOnAnIdleH2StreamResets(t *testing.T) {
+	_, sess, resp := openH2Connect(t, sinkOrigin(t))
+	require.NoError(t, sess.Close())
+	assertStreamReset(t, resp)
+}
+
+func TestConnect_ShutdownDeadlineCutsAnIdleH2Stream(t *testing.T) {
+	p, _, resp := openH2Connect(t, sinkOrigin(t))
+
+	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+	defer cancel()
+	err := p.Shutdown(ctx)
+	assert.True(t, errors.Is(err, context.DeadlineExceeded), "%v", err)
+	assertStreamReset(t, resp)
+}
+
+// openH3Connect opens a CONNECT over HTTP/3 to origin and returns once its response header
+// arrived, with nothing sent on it.
+func openH3Connect(t *testing.T, origin net.Listener) (*Proxy, *http3.RequestStream) {
+	t.Helper()
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+	p.MustAdd[TCP](origin.Addr().String(), relayStream)
+	front, _ := startQUICFront(t, p, ca)
+
+	tr := &http3.Transport{}
+	t.Cleanup(func() { _ = tr.Close() })
+	cc := tr.NewClientConn(dialQUICFront(t, front, ca))
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	rstr, err := cc.OpenRequestStream(ctx)
+	require.NoError(t, err)
+	req, err := http.NewRequest(http.MethodConnect, "https://"+origin.Addr().String(), nil)
+	require.NoError(t, err)
+	require.NoError(t, rstr.SendRequestHeader(req))
+	resp, err := rstr.ReadResponse()
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.NoError(t, rstr.SetReadDeadline(time.Now().Add(5*time.Second)))
+	return p, rstr
+}
+
+func TestConnect_CloseOnAnIdleH3StreamResets(t *testing.T) {
+	p, rstr := openH3Connect(t, sinkOrigin(t))
+	_, err := rstr.Write([]byte("x"))
+	require.NoError(t, err)
+
+	require.NoError(t, waitForSessions(t, p, 1)[0].Close())
+	_, err = io.Copy(io.Discard, rstr)
+	code, reset := h3ResetCode(err)
+	require.True(t, reset, "the stream ended with %v", err)
+	assert.Equal(t, http3.ErrCodeConnectError, code)
+}
+
+func TestConnect_ProxyCloseEndsAnH3StreamAnsweredAndUnread(t *testing.T) {
+	p, rstr := openH3Connect(t, sinkOrigin(t))
+	require.NoError(t, p.Close())
+	_, err := io.Copy(io.Discard, rstr)
+	require.Error(t, err)
 }
 
 func TestConnect_CloseOnAStalledH3StreamReturns(t *testing.T) {
@@ -412,11 +502,11 @@ func TestConnect_CloseOnAnH2StreamEndsOnlyThatTunnel(t *testing.T) {
 	if ended == nil {
 		ended = err2
 	}
-	// net/http ends the stream cleanly once the handler returned, and closes the request
-	// body with it. Which of the two the client trips on first depends on the side it was
-	// using at that moment, and either is the end.
-	assert.True(t, errors.Is(ended, io.EOF) || errors.Is(ended, io.ErrClosedPipe),
-		"the client observes the end of the stream, got %v", ended)
+	// The stream is reset, and the transport closes the request body with it. Which of the
+	// two the client trips on first depends on the side it was using at that moment.
+	var reset http2.StreamError
+	assert.True(t, errors.As(ended, &reset) || errors.Is(ended, io.ErrClosedPipe),
+		"the client observes the reset of the stream, got %v", ended)
 
 	third := open()
 	line, err = echo(third, "three\n")
@@ -522,6 +612,16 @@ func TestTargetFromConnect_RootDotIsDropped(t *testing.T) {
 		_, err := targetFromConnect(&http.Request{Method: http.MethodConnect, URL: &url.URL{Host: authority}, Host: authority})
 		assert.Error(t, err, authority)
 	}
+}
+
+func TestTargetFromConnect_MalformedAuthorityIsRefused(t *testing.T) {
+	for _, authority := range []string{"origin.test:80:80", "[origin.test]:443", "[::1]x", "::1"} {
+		_, err := targetFromConnect(&http.Request{Method: http.MethodConnect, URL: &url.URL{Host: authority}, Host: authority})
+		assert.Error(t, err, authority)
+	}
+	target, err := targetFromConnect(&http.Request{Method: http.MethodConnect, URL: &url.URL{Host: "[::1]:443"}, Host: "[::1]:443"})
+	require.NoError(t, err)
+	assert.Equal(t, "::1", target.Host)
 }
 
 func TestConnect_PlaintextIsPlacedOnItsFirstAuthority(t *testing.T) {

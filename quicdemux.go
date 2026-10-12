@@ -1020,6 +1020,7 @@ func (d *quicDemux) quicTLSConfig() *tls.Config {
 			if err != nil {
 				return nil, err
 			}
+			sess.leaf.Store(leaf.Leaf)
 			return &tls.Config{
 				MinVersion:   tls.VersionTLS13,
 				NextProtos:   negotiateALPN(chi.SupportedProtos, KindQUIC),
@@ -1160,6 +1161,11 @@ func (d *quicDemux) dispatchLong(addr net.Addr, from flowKey, datagram []byte, o
 		return
 	}
 	if initial && len(dcid) >= 8 {
+		if flow == nil && d.ownSource(from) {
+			d.mu.Unlock()
+			d.refuseOwn(addr, from, version, dcid, scid)
+			return
+		}
 		conn := d.admitConnLocked(from, addr, string(dcid), now)
 		if conn != nil {
 			conn.version = version
@@ -1383,7 +1389,31 @@ func (d *quicDemux) dispatchDatagram(client net.Addr, from flowKey, datagram []b
 		u.enqueue(datagram, owned)
 		return true
 	}
+	if flow == nil && d.ownSource(from) {
+		d.p.cfg.logger.Debug("edge: datagram dropped",
+			slog.String("client", from.String()),
+			slog.String("origin", origin.String()),
+			slog.String("reason", "the proxy sent it upstream, a request loop"))
+		return true
+	}
 	return d.openUDPFlow(client, from, origin, datagram, owned)
+}
+
+// ownSource reports whether from is a socket the proxy opened upstream. It is called for a
+// source without a flow only, and never for a tunnel, which a front checked when it opened.
+func (d *quicDemux) ownSource(from flowKey) bool {
+	return from.tunnel == nil && d.p.srv.fwd.up.own.datagram(from.addr)
+}
+
+// refuseOwn replies to the Initial of a QUIC connection the proxy opened upstream with a
+// CONNECTION_CLOSE, so that its dial fails at once instead of waiting out its handshake timeout.
+func (d *quicDemux) refuseOwn(addr net.Addr, from flowKey, version uint32, dcid, scid []byte) {
+	d.logRefused(from, "the proxy opened it upstream, a request loop")
+	pkt, err := quicsniff.CloseInitial(version, dcid, scid, dcid, uint64(quic.ConnectionRefused))
+	if err != nil {
+		return
+	}
+	d.answer(addr, d.originalDst(addr), pkt, true)
 }
 
 // openUDPFlow admits the first datagram of a flow and publishes the flow, whose goroutine
@@ -2085,6 +2115,7 @@ func (d *quicDemux) beginTermination(from flowKey, client net.Addr, conn *quicCo
 	d.fillSession(sess, client)
 	sess.setUpstream(conn.origin)
 	sess.clientHello.Store(hello)
+	d.p.seedVerified(sess, hello.ServerName, target)
 	sess.servableAs = candidates
 	sess.closer = &quicConnCloser{d: d, conn: conn, flow: from, odcid: conn.odcid}
 

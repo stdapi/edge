@@ -13,8 +13,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/textproto"
 	"net/url"
 	"slices"
@@ -55,6 +57,8 @@ var (
 	// errMalformedAnswer is a CONNECT-UDP answer RFC 9297 section 3.2 treats as malformed, a
 	// 204, 205 or 206 or a success with a content field.
 	errMalformedAnswer = errors.New("malformed answer")
+	// errFromItself ends a connection the proxy opened upstream to one of its own fronts.
+	errFromItself = errors.New("edge: connection opened by the proxy itself")
 )
 
 // refusal is the status a proxy answered a CONNECT or a CONNECT-UDP with.
@@ -104,6 +108,7 @@ type upstreamDialer struct {
 	remembered map[string]time.Time
 	h3Dialing  map[string]*dialCall
 	tcpDialing map[string]chan struct{}
+	own        *ownSockets
 	// draining holds the HTTP/2 connections replaced after a GOAWAY while their last tunnels
 	// end, so that close reaches them.
 	draining []*h2tunnel.Conn
@@ -121,7 +126,18 @@ func newUpstreamDialer(t *Transport) *upstreamDialer {
 		remembered: make(map[string]time.Time),
 		h3Dialing:  make(map[string]*dialCall),
 		tcpDialing: make(map[string]chan struct{}),
+		own:        newOwnSockets(),
 	}
+}
+
+// dialRaw dials with [Transport.DialContext] and records the socket it returns until it is
+// closed. Every connection the proxy opens upstream starts here.
+func (u *upstreamDialer) dialRaw(ctx context.Context, network, addr string) (net.Conn, error) {
+	c, err := u.t.dialer()(ctx, network, addr)
+	if err != nil || c == nil {
+		return c, err
+	}
+	return u.own.track(network, c), nil
 }
 
 func (u *upstreamDialer) close() {
@@ -208,7 +224,7 @@ func (u *upstreamDialer) dial(ctx context.Context, network, addr, scheme string)
 // dialThrough opens a connection to addr on network, through proxy when it is not nil.
 func (u *upstreamDialer) dialThrough(ctx context.Context, network, addr string, proxy *url.URL) (net.Conn, error) {
 	if proxy == nil {
-		return u.t.dialer()(ctx, network, addr)
+		return u.dialRaw(ctx, network, addr)
 	}
 	socks := isSOCKS5(proxy)
 	switch {
@@ -482,7 +498,7 @@ func overTCP[T any](ctx context.Context, u *upstreamDialer, proxy *url.URL, d tc
 	}
 	defer known()
 
-	nc, err := u.t.dialer()(ctx, "tcp", proxyAddr(proxy))
+	nc, err := u.dialRaw(ctx, "tcp", proxyAddr(proxy))
 	if err != nil {
 		return zero, false, fmt.Errorf("%w %s: %w", errDialProxy, proxy.Redacted(), err)
 	}
@@ -1115,7 +1131,7 @@ func (u *upstreamDialer) dropH3Conn(proxy *url.URL, cc *h3ProxyConn) {
 
 func (u *upstreamDialer) openProxyConn(ctx context.Context, proxy *url.URL, addr string) (*h3ProxyConn, error) {
 	// The proxy itself is dialed directly, it cannot be reached through itself.
-	sock, err := u.t.dialer()(ctx, "udp", addr)
+	sock, err := u.dialRaw(ctx, "udp", addr)
 	if err != nil {
 		return nil, err
 	}
@@ -1300,3 +1316,186 @@ func (c *connectUDPConn) RemoteAddr() net.Addr               { return c.remote }
 func (c *connectUDPConn) SetDeadline(t time.Time) error      { return c.SetReadDeadline(t) }
 func (c *connectUDPConn) SetReadDeadline(t time.Time) error  { return c.pipe.setReadDeadline(t) }
 func (c *connectUDPConn) SetWriteDeadline(t time.Time) error { return c.pipe.setWriteDeadline(t) }
+
+// ownSockets records the sockets the proxy has open upstream, so that a front refuses a
+// connection one of them opened to the proxy itself. Linux gives one local port to
+// several connections toward distinct peers, so a stream socket is matched on both its addresses
+// and a datagram socket on its local address alone.
+type ownSockets struct {
+	shards [ownShards]ownShard
+}
+
+// ownShards is a power of two, and the low bits of the local port of a record select its shard.
+const ownShards = 16
+
+type ownShard struct {
+	m  map[ownKey]int32
+	mu sync.Mutex
+	_  [cacheLine - 16]byte
+}
+
+const cacheLine = 64
+
+// ownKey is the two addresses of a stream socket, or the local address of a datagram socket
+// and a zero remote.
+type ownKey struct {
+	local, remote netip.AddrPort
+}
+
+func newOwnSockets() *ownSockets {
+	o := new(ownSockets)
+	for i := range o.shards {
+		o.shards[i].m = make(map[ownKey]int32)
+	}
+	return o
+}
+
+func (o *ownSockets) shard(key ownKey) *ownShard {
+	return &o.shards[key.local.Port()&(ownShards-1)]
+}
+
+// ownAddr returns the address and port of a, unmapped and without a zone, so that both ends of
+// a socket report it alike.
+func ownAddr(a net.Addr) netip.AddrPort {
+	ap := addrPort(a)
+	return netip.AddrPortFrom(ap.Addr().WithZone(""), ap.Port())
+}
+
+// track records c and returns it wrapped so that closing it releases the record. A socket
+// whose addresses are not IP addresses is returned as it is.
+func (o *ownSockets) track(network string, c net.Conn) net.Conn {
+	key := ownKey{local: ownAddr(c.LocalAddr())}
+	if !key.local.IsValid() {
+		return c
+	}
+	if !strings.HasPrefix(network, "udp") {
+		if key.remote = ownAddr(c.RemoteAddr()); !key.remote.IsValid() {
+			return c
+		}
+	}
+	sh := o.shard(key)
+	sh.mu.Lock()
+	sh.m[key]++
+	sh.mu.Unlock()
+	switch c := c.(type) {
+	case *net.TCPConn:
+		return &ownTCPConn{TCPConn: c, own: ownRecord{o: o, key: key}}
+	case *net.UDPConn:
+		return &ownUDPConn{UDPConn: c, own: ownRecord{o: o, key: key}}
+	}
+	return &ownConn{Conn: c, own: ownRecord{o: o, key: key}}
+}
+
+func (o *ownSockets) has(key ownKey) bool {
+	sh := o.shard(key)
+	sh.mu.Lock()
+	n := sh.m[key]
+	sh.mu.Unlock()
+	return n > 0
+}
+
+// stream reports whether a connection from remote to local, or to dst it was redirected
+// from, is one the proxy opened.
+func (o *ownSockets) stream(remote, local net.Addr, dst netip.AddrPort) bool {
+	key := ownKey{local: ownAddr(remote), remote: ownAddr(local)}
+	if !key.local.IsValid() {
+		return false
+	}
+	if key.remote.IsValid() && o.has(key) {
+		return true
+	}
+	if dst.IsValid() {
+		key.remote = netip.AddrPortFrom(dst.Addr().Unmap().WithZone(""), dst.Port())
+		return o.has(key)
+	}
+	return false
+}
+
+// fromItself reports whether the stream connection from remote to local, or to dst it was
+// redirected from, is one the proxy opened upstream, and logs it. A front calls it once the
+// first bytes have arrived, which the proxy writes only after recording the socket.
+func (p *Proxy) fromItself(remote, local net.Addr, dst netip.AddrPort) bool {
+	if !p.srv.fwd.up.own.stream(remote, local, dst) {
+		return false
+	}
+	p.cfg.logger.Debug("edge: connection refused", slog.String("client", remote.String()),
+		slog.String("reason", "the proxy opened it upstream, a request loop"))
+	return true
+}
+
+// datagram reports whether a datagram from addr was sent by a socket the proxy opened.
+func (o *ownSockets) datagram(addr netip.AddrPort) bool {
+	addr = netip.AddrPortFrom(addr.Addr().Unmap().WithZone(""), addr.Port())
+	return addr.IsValid() && o.has(ownKey{local: addr})
+}
+
+// ownRecord releases one record of ownSockets, once. A socket releases it before it closes,
+// so a peer that saw the close finds the record gone.
+type ownRecord struct {
+	o        *ownSockets
+	key      ownKey
+	released atomic.Bool
+}
+
+func (r *ownRecord) release() {
+	if !r.released.CompareAndSwap(false, true) {
+		return
+	}
+	sh := r.o.shard(r.key)
+	sh.mu.Lock()
+	if sh.m[r.key]--; sh.m[r.key] <= 0 {
+		delete(sh.m, r.key)
+	}
+	sh.mu.Unlock()
+}
+
+// ownTCPConn keeps the methods of *net.TCPConn, the half-close and the splice net/http and the
+// relays reach for.
+type ownTCPConn struct {
+	*net.TCPConn
+	own ownRecord
+}
+
+func (c *ownTCPConn) Close() error {
+	c.own.release()
+	return c.TCPConn.Close()
+}
+
+func (c *ownTCPConn) Abort() {
+	_ = c.SetLinger(0)
+	_ = c.Close()
+}
+
+// ownUDPConn keeps the methods of *net.UDPConn, the batched reads quic-go reaches for through
+// packetConnOf and the socket options.
+type ownUDPConn struct {
+	*net.UDPConn
+	own ownRecord
+}
+
+func (c *ownUDPConn) Close() error {
+	c.own.release()
+	return c.UDPConn.Close()
+}
+
+type ownConn struct {
+	net.Conn
+	own ownRecord
+}
+
+func (c *ownConn) Close() error {
+	c.own.release()
+	return c.Conn.Close()
+}
+
+func (c *ownConn) CloseWrite() error {
+	if cw, ok := c.Conn.(closeWriter); ok {
+		return cw.CloseWrite()
+	}
+	return c.Close()
+}
+
+func (c *ownConn) Abort() {
+	c.own.release()
+	abort(c.Conn)
+}

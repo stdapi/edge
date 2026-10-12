@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/fox-toolkit/edge/internal/h2tunnel"
+	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -1347,7 +1348,7 @@ func TestChain_TunnelOverHTTP3IsAConnection(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, conn.SetReadDeadline(time.Now().Add(100*time.Millisecond)))
 	_, err = conn.Read(make([]byte, 16))
-	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+	require.True(t, errors.Is(err, os.ErrDeadlineExceeded), "%v", err)
 	require.NoError(t, conn.SetReadDeadline(time.Time{}))
 	banner := make([]byte, 6)
 	_, err = io.ReadFull(conn, banner)
@@ -1523,7 +1524,8 @@ func TestChain_WaiterDialsWhenTheHTTP3DialWasCancelled(t *testing.T) {
 	}()
 	time.Sleep(100 * time.Millisecond)
 	cancel()
-	require.ErrorIs(t, <-initErr, context.Canceled)
+	err = <-initErr
+	require.True(t, errors.Is(err, context.Canceled), "%v", err)
 	require.NoError(t, <-waiter, "the waiter took the cancellation of another caller")
 	assert.EqualValues(t, 2, udpDials.Load())
 }
@@ -2258,5 +2260,296 @@ func TestChain_NoUserAgentToTheProxy(t *testing.T) {
 				assert.Empty(t, header.Values("User-Agent"))
 			}
 		})
+	})
+}
+
+// ownCount is the number of sockets p records as its own.
+func ownCount(p *Proxy) int {
+	n := 0
+	for i := range p.srv.fwd.up.own.shards {
+		sh := &p.srv.fwd.up.own.shards[i]
+		sh.mu.Lock()
+		n += len(sh.m)
+		sh.mu.Unlock()
+	}
+	return n
+}
+
+func TestChain_OwnSocketIsReleasedOnEveryClose(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			t.Cleanup(func() { _ = c.Close() })
+		}
+	}()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = pc.Close() })
+
+	p := testProxy(t)
+	up := p.srv.fwd.up
+	dial := func(t *testing.T, network, addr string) net.Conn {
+		t.Helper()
+		c, err := up.dialRaw(t.Context(), network, addr)
+		require.NoError(t, err)
+		require.Equal(t, 1, ownCount(p))
+		return c
+	}
+
+	t.Run("close", func(t *testing.T) {
+		c := dial(t, "tcp", ln.Addr().String())
+		require.NoError(t, c.Close())
+		assert.Zero(t, ownCount(p))
+		_ = c.Close()
+		assert.Zero(t, ownCount(p))
+	})
+	t.Run("abort", func(t *testing.T) {
+		abort(dial(t, "tcp", ln.Addr().String()))
+		assert.Zero(t, ownCount(p))
+	})
+	t.Run("tls", func(t *testing.T) {
+		_ = tls.Client(dial(t, "tcp", ln.Addr().String()), &tls.Config{ServerName: "origin.test", MinVersion: tls.VersionTLS12}).Close()
+		assert.Zero(t, ownCount(p))
+	})
+	t.Run("udp", func(t *testing.T) {
+		c := dial(t, "udp", pc.LocalAddr().String())
+		local := addrPort(c.LocalAddr())
+		assert.True(t, up.own.datagram(local))
+		require.NoError(t, c.Close())
+		assert.False(t, up.own.datagram(local))
+	})
+	t.Run("dial error", func(t *testing.T) {
+		refused, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		require.NoError(t, refused.Close())
+		_, err = up.dialRaw(t.Context(), "tcp", refused.Addr().String())
+		require.Error(t, err)
+		assert.Zero(t, ownCount(p))
+	})
+}
+
+func TestChain_PooledOwnSocketIsReleased(t *testing.T) {
+	for _, path := range []string{"idle", "shutdown", "no keep-alives"} {
+		t.Run(path, func(t *testing.T) {
+			closed := make(chan struct{}, 1)
+			origin := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(w, "ok")
+			}))
+			origin.Config.ConnState = func(_ net.Conn, s http.ConnState) {
+				if s == http.StateClosed {
+					closed <- struct{}{}
+				}
+			}
+			origin.Start()
+			t.Cleanup(origin.Close)
+
+			tr := DefaultTransport()
+			switch path {
+			case "idle":
+				tr.IdleConnTimeout = 50 * time.Millisecond
+			case "no keep-alives":
+				tr.DisableKeepAlives = true
+			}
+			p := testProxy(t, WithTransport(tr))
+			p.MustAdd("127.0.0.1/*{any}", forwardHandler)
+			resp, err := proxyClient(startProxy(t, p), nil).Get(origin.URL)
+			require.NoError(t, err)
+			_, _ = io.Copy(io.Discard, resp.Body)
+			require.NoError(t, resp.Body.Close())
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+
+			if path == "shutdown" {
+				require.Equal(t, 1, ownCount(p))
+				require.NoError(t, p.Close())
+			}
+			select {
+			case <-closed:
+			case <-time.After(10 * time.Second):
+				t.Fatal("the upstream connection was not closed")
+			}
+			assert.Zero(t, ownCount(p))
+		})
+	}
+}
+
+func TestChain_QUICOwnSocketIsReleased(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	cert, err := ca.Leaf("origin.test")
+	require.NoError(t, err)
+	ln, err := quic.ListenAddr("127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{*cert}, NextProtos: []string{"test"}, MinVersion: tls.VersionTLS13}, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept(context.Background())
+			if err != nil {
+				return
+			}
+			t.Cleanup(func() { _ = c.CloseWithError(0, "") })
+		}
+	}()
+
+	p := testProxy(t)
+	conn, err := p.srv.fwd.up.dialQUIC(t.Context(), ln.Addr().String(),
+		&tls.Config{ServerName: "origin.test", RootCAs: poolOf(ca), NextProtos: []string{"test"}, MinVersion: tls.VersionTLS13}, &quic.Config{})
+	require.NoError(t, err)
+	local := addrPort(conn.LocalAddr())
+	require.True(t, p.srv.fwd.up.own.datagram(local))
+	require.NoError(t, conn.CloseWithError(0, ""))
+	require.Eventually(t, func() bool { return !p.srv.fwd.up.own.datagram(local) }, 5*time.Second, 5*time.Millisecond,
+		"the socket outlived its connection")
+}
+
+func TestChain_ClosedOwnSocketLeavesItsPortToAClient(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}))
+	t.Cleanup(origin.Close)
+	p := testProxy(t)
+	p.MustAdd("127.0.0.1/*{any}", forwardHandler)
+	addr := startProxy(t, p)
+
+	own, err := p.srv.fwd.up.dialRaw(t.Context(), "tcp", addr)
+	require.NoError(t, err)
+	require.NoError(t, own.SetDeadline(time.Now().Add(5*time.Second)))
+	_, err = io.WriteString(own, "GET "+origin.URL+"/ HTTP/1.1\r\nHost: "+origin.Listener.Addr().String()+"\r\n\r\n")
+	require.NoError(t, err)
+	n, err := own.Read(make([]byte, 1))
+	require.Zero(t, n)
+	require.Error(t, err, "the front served a connection the proxy opened")
+	local := own.LocalAddr().(*net.TCPAddr)
+	require.NoError(t, own.Close())
+
+	d := &net.Dialer{LocalAddr: local, Timeout: 5 * time.Second}
+	c, err := d.Dial("tcp", addr)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = c.Close() })
+	require.NoError(t, c.SetDeadline(time.Now().Add(5*time.Second)))
+	w := newWire(c)
+	w.send(t, "GET "+origin.URL+"/ HTTP/1.1\r\nHost: "+origin.Listener.Addr().String()+"\r\n\r\n")
+	assert.Equal(t, http.StatusOK, w.readResponse(t, "GET").resp.StatusCode)
+}
+
+func TestChain_OwnSocketTowardAnotherPeerIsNotTheClient(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	p := testProxy(t)
+	own, err := p.srv.fwd.up.dialRaw(t.Context(), "tcp", ln.Addr().String())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = own.Close() })
+
+	front := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 3128}
+	assert.True(t, p.srv.fwd.up.own.stream(own.LocalAddr(), own.RemoteAddr(), netip.AddrPort{}))
+	assert.False(t, p.srv.fwd.up.own.stream(own.LocalAddr(), front, netip.AddrPort{}),
+		"a client may use the local port of a socket of the proxy toward another peer")
+	assert.True(t, p.srv.fwd.up.own.stream(own.LocalAddr(), front, addrPort(own.RemoteAddr())),
+		"a connection redirected from the peer of a socket of the proxy is that socket")
+	assert.False(t, p.srv.fwd.up.own.datagram(addrPort(own.LocalAddr())))
+}
+
+func TestChain_SocketsToAProxyAreOwn(t *testing.T) {
+	t.Run("socks5", func(t *testing.T) {
+		back := testProxy(t)
+		back.MustAdd[UDP]("127.0.0.1", forwardDatagram)
+		tr := DefaultTransport()
+		tr.Proxy = fixedProxy("socks5://" + startSOCKS5(t, back))
+		p := testProxy(t, WithTransport(tr))
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		c, err := p.srv.fwd.up.dial(ctx, "udp", "127.0.0.1:9", "https")
+		require.NoError(t, err)
+		sc := c.(*socks5UDPConn)
+		assert.True(t, p.srv.fwd.up.own.stream(sc.ctrl.LocalAddr(), sc.ctrl.RemoteAddr(), netip.AddrPort{}))
+		assert.True(t, p.srv.fwd.up.own.datagram(addrPort(sc.sock.LocalAddr())))
+		require.NoError(t, c.Close())
+		assert.Zero(t, ownCount(p))
+	})
+	t.Run("h2", func(t *testing.T) {
+		ca, err := GenerateCA()
+		require.NoError(t, err)
+		back := testProxyWithCA(t, ca)
+		back.MustAdd[TCP]("127.0.0.1", relayStream)
+		echo := tcpEchoOn(t, "127.0.0.1:0")
+		front, trust := startProxyTLS(t, back, ca)
+		tr := DefaultTransport()
+		tr.Proxy = fixedProxy("https://" + front)
+		tr.RootCAs = trust
+		p := testProxy(t, WithTransport(tr))
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		c, err := p.srv.fwd.up.dial(ctx, "tcp", echo.String(), "http")
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = c.Close() })
+		proxy, err := url.Parse("https://" + front)
+		require.NoError(t, err)
+		require.NotNil(t, p.srv.fwd.up.h2Conn(proxy), "the tunnel did not go over HTTP/2")
+		assert.Equal(t, 1, ownCount(p))
+		require.NoError(t, p.Close())
+		require.Eventually(t, func() bool { return ownCount(p) == 0 }, 5*time.Second, 5*time.Millisecond,
+			"the socket to the proxy outlived the proxy")
+	})
+	t.Run("h3", func(t *testing.T) {
+		ca, err := GenerateCA()
+		require.NoError(t, err)
+		back := testProxyWithCA(t, ca)
+		back.MustAdd[UDP]("127.0.0.1", forwardDatagram)
+		front, _ := startQUICFront(t, back, ca)
+		tr := DefaultTransport()
+		tr.Proxy = fixedProxy("https://" + front.String())
+		tr.RootCAs = poolOf(ca)
+		p := testProxy(t, WithTransport(tr))
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		c, err := p.srv.fwd.up.dial(ctx, "udp", "127.0.0.1:9", "https")
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = c.Close() })
+		proxy, err := url.Parse("https://" + front.String())
+		require.NoError(t, err)
+		cc := p.srv.fwd.up.h3Conn(proxy)
+		require.NotNil(t, cc)
+		local := addrPort(cc.local)
+		assert.True(t, p.srv.fwd.up.own.datagram(local))
+		require.NoError(t, p.Close())
+		require.Eventually(t, func() bool { return !p.srv.fwd.up.own.datagram(local) }, 5*time.Second, 5*time.Millisecond,
+			"the socket to the proxy outlived the proxy")
+	})
+}
+
+// addrConn is a connection with addresses only, in place of a dialed socket.
+type addrConn struct {
+	net.Conn
+	local, remote *net.TCPAddr
+}
+
+func (c *addrConn) LocalAddr() net.Addr  { return c.local }
+func (c *addrConn) RemoteAddr() net.Addr { return c.remote }
+func (*addrConn) Close() error           { return nil }
+
+func BenchmarkOwnSockets(b *testing.B) {
+	o := newOwnSockets()
+	front := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 3128}
+	client := &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8080}
+	for i := range 1000 {
+		o.track("tcp", &addrConn{local: &net.TCPAddr{IP: net.IPv4(10, 0, 0, 1), Port: i}, remote: front})
+	}
+	var seq atomic.Uint32
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			n := seq.Add(1)
+			local := &net.TCPAddr{IP: net.IPv4(127, 0, byte(n>>16), 1), Port: int(n & 0xffff)}
+			c := o.track("tcp", &addrConn{local: local, remote: front})
+			_ = o.stream(local, client, netip.AddrPort{})
+			_ = o.stream(local, front, netip.AddrPort{})
+			_ = c.Close()
+		}
 	})
 }

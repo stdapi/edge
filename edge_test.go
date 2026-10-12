@@ -12,12 +12,14 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -346,3 +348,34 @@ func runConformance(t *testing.T, cases []conformanceCase) {
 }
 
 func okHandler(*HTTPCtx) (*http.Response, error) { return Text(http.StatusOK, "ok"), nil }
+
+// recordLogger returns a logger and a channel closed once the logger handles a record whose
+// message or attributes contain substr.
+func recordLogger(substr string) (*slog.Logger, <-chan struct{}) {
+	h := &recordHandler{substr: substr, seen: make(chan struct{}), once: new(sync.Once)}
+	return slog.New(h), h.seen
+}
+
+type recordHandler struct {
+	seen   chan struct{}
+	once   *sync.Once
+	substr string
+}
+
+func (*recordHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *recordHandler) Handle(_ context.Context, r slog.Record) error {
+	text := r.Message
+	r.Attrs(func(a slog.Attr) bool {
+		text += " " + a.String()
+		return true
+	})
+	if strings.Contains(text, h.substr) {
+		h.once.Do(func() { close(h.seen) })
+	}
+	return nil
+}
+
+func (h *recordHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+
+func (h *recordHandler) WithGroup(string) slog.Handler { return h }

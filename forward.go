@@ -7,14 +7,19 @@ package edge
 import (
 	"cmp"
 	"context"
+	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/textproto"
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/fox-toolkit/edge/internal/simplelru"
 )
@@ -62,7 +67,7 @@ type upstreamPool struct {
 
 func newUpstreamPool(up *upstreamDialer, scheme, fixed string, proxy *url.URL) *upstreamPool {
 	t := up.t
-	dial := t.dialer()
+	dial := up.dialRaw
 	var via func(*http.Request) (*url.URL, error)
 	if fixed != "" || scheme == "https" {
 		// net/http offers a proxy the ALPN list meant for the origin, so the tunnel is
@@ -74,20 +79,132 @@ func newUpstreamPool(up *upstreamDialer, scheme, fixed string, proxy *url.URL) *
 	} else if proxy != nil {
 		via = http.ProxyURL(proxy)
 	}
-	pool := &upstreamPool{h1: t.httpTransport(false, fixed != "", dial, via), absolute: via != nil}
+	gated := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		c, err := dial(ctx, network, addr)
+		if err != nil || c == nil {
+			return c, err
+		}
+		return &gatedConn{Conn: c}, nil
+	}
+	pool := &upstreamPool{h1: t.httpTransport(false, fixed != "", gated, via), absolute: via != nil}
 	if t.AllowHTTP2 {
 		if scheme == "http" && fixed != "" {
 			// The client used h2c with a destination it declared, and no ALPN can ask the
 			// origin.
 			pool.h2 = t.h2cTransport(dial)
 		} else {
-			pool.h2 = t.httpTransport(true, fixed != "", dial, via)
+			pool.h2 = t.httpTransport(true, fixed != "", gated, via)
 		}
 	}
 	if t.AllowHTTP3 && scheme == "https" {
 		pool.h3 = newHTTP3Transport(up, fixed, proxy)
 	}
 	return pool
+}
+
+// gatedConn is a connection a transport of an [upstreamPool] dialed, which may serve HTTP/1.1.
+// Go's transport returns it to the pool when a response ends and only then checks whether bytes
+// past that end arrived with it, so a request given the connection in between reads them as its
+// response.
+type gatedConn struct {
+	net.Conn
+	waiter  atomic.Pointer[chan struct{}]
+	reading atomic.Bool
+	closed  atomic.Bool
+	// alpn is the protocol a connection over TLS negotiated, alpnH1 or alpnH2, once a request
+	// reused it.
+	alpn atomic.Uint32
+}
+
+const (
+	alpnH1 = 1 + iota
+	alpnH2
+)
+
+func (c *gatedConn) Read(b []byte) (int, error) {
+	c.reading.Store(true)
+	c.wake()
+	n, err := c.Conn.Read(b)
+	c.reading.Store(false)
+	return n, err
+}
+
+func (c *gatedConn) Close() error {
+	c.closed.Store(true)
+	c.wake()
+	return c.Conn.Close()
+}
+
+// ReadFrom keeps the splice of *net.TCPConn for a request body.
+func (c *gatedConn) ReadFrom(r io.Reader) (int64, error) {
+	if rf, ok := c.Conn.(io.ReaderFrom); ok {
+		return rf.ReadFrom(r)
+	}
+	return io.Copy(struct{ io.Writer }{c.Conn}, r)
+}
+
+// CloseWrite forwards the half-close, which the embedded net.Conn does not promote.
+func (c *gatedConn) CloseWrite() error { return closeWrite(c.Conn) }
+
+func (c *gatedConn) wake() {
+	if w := c.waiter.Load(); w != nil && c.waiter.CompareAndSwap(w, nil) {
+		close(*w)
+	}
+}
+
+// awaitRead returns once a read is in progress or the connection is closed, or once done is.
+// The transport reads an idle connection again only when nothing is buffered past the last
+// response, and closes it when something is, as long as no request was handed to it.
+func (c *gatedConn) awaitRead(done <-chan struct{}) {
+	if c.reading.Load() || c.closed.Load() {
+		return
+	}
+	// Read stores its flag before it loads the waiter, and this the reverse, so one of the two
+	// finds the other.
+	ch := make(chan struct{})
+	c.waiter.Store(&ch)
+	if c.reading.Load() || c.closed.Load() {
+		c.waiter.CompareAndSwap(&ch, nil)
+		return
+	}
+	select {
+	case <-ch:
+	case <-done:
+		c.waiter.CompareAndSwap(&ch, nil)
+	}
+}
+
+// gateReuse waits, for a request given a reused HTTP/1.1 connection, until the transport has
+// refused what it read past the last response, RFC 9112 section 6.3. Bytes still in the socket then
+// are read as the response, which in plaintext [tailBody] limits to those behind a response that
+// ended where a read of the transport's buffer did.
+func gateReuse(info httptrace.GotConnInfo, done <-chan struct{}) {
+	if !info.Reused {
+		return
+	}
+	c := info.Conn
+	tc, isTLS := c.(*tls.Conn)
+	if isTLS {
+		c = tc.NetConn()
+	}
+	g, ok := c.(*gatedConn)
+	if !ok {
+		return
+	}
+	if isTLS {
+		alpn := g.alpn.Load()
+		if alpn == 0 {
+			alpn = alpnH1
+			if tc.ConnectionState().NegotiatedProtocol == "h2" {
+				alpn = alpnH2
+			}
+			g.alpn.Store(alpn)
+		}
+		if alpn == alpnH2 {
+			return
+		}
+	}
+	g.awaitRead(done)
 }
 
 // closeIdle leaves a connection in flight open until [Transport.IdleConnTimeout].
@@ -190,7 +307,7 @@ func (f *forwarder) roundTrip(req *http.Request, proto Protocol, fixed string) (
 	}
 	switch {
 	case proto == HTTP3 && pool.h3 != nil:
-		resp, err := pool.h3.RoundTrip(req)
+		resp, err := f.roundTripH3(pool.h3, req)
 		if err == nil && resp.ContentLength > 0 && resp.Body != nil && resp.Body != http.NoBody &&
 			bodyAllowed(req.Method, resp.StatusCode) {
 			resp.Body = &fullLength{ReadCloser: resp.Body, remaining: resp.ContentLength}
@@ -199,15 +316,87 @@ func (f *forwarder) roundTrip(req *http.Request, proto Protocol, fixed string) (
 	case (proto == HTTP2 || proto == HTTP3) && pool.h2 != nil:
 		// Over TLS h2 is reached through ALPN, so an origin that does not offer it is
 		// served over HTTP/1.1 by the same transport.
-		return pool.refuseProxyAuth(pool.h2.RoundTrip(req))
+		resp, err := pool.refuseProxyAuth(pool.h2.RoundTrip(req))
+		return bufferTail(req.Method, resp, err)
 	default:
 		if _, ok := req.Header["Te"]; ok {
 			// RFC 9110 10.1.4. Only HTTP/1.1 has connection options, an HTTP/2 or HTTP/3
 			// transport refuses the request when Connection lists one.
 			addConnectionOption(req.Header, "TE")
 		}
-		return pool.refuseProxyAuth(pool.h1.RoundTrip(req))
+		resp, err := pool.refuseProxyAuth(pool.h1.RoundTrip(req))
+		return bufferTail(req.Method, resp, err)
 	}
+}
+
+var errResponseHeaderTimeout = errors.New("edge: timeout awaiting the response header")
+
+// roundTripH3 applies [Transport.ResponseHeaderTimeout], which quic-go's transport does not
+// have, counted from the end of the request as net/http counts it. Past it the request is
+// canceled, which resets its stream with H3_REQUEST_CANCELLED.
+func (f *forwarder) roundTripH3(rt http.RoundTripper, req *http.Request) (*http.Response, error) {
+	d := f.up.t.ResponseHeaderTimeout
+	if d <= 0 {
+		return rt.RoundTrip(req)
+	}
+	ctx, cancel := context.WithCancelCause(req.Context())
+	h := &headerTimer{d: d, cancel: cancel}
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{WroteRequest: h.wrote})
+	resp, err := rt.RoundTrip(req.WithContext(ctx))
+	if h.stop() {
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+		cancel(errResponseHeaderTimeout)
+		return nil, errResponseHeaderTimeout
+	}
+	if err != nil {
+		cancel(err)
+		return nil, err
+	}
+	if resp.Body == nil || resp.Body == http.NoBody {
+		cancel(nil)
+		return resp, nil
+	}
+	// The context outlives the round trip. Canceling it resets the stream the body is read from.
+	resp.Body = &cancelOnClose{ReadCloser: resp.Body, cancel: cancel}
+	return resp, nil
+}
+
+// headerTimer cancels a request whose response header has not arrived d after it was written.
+type headerTimer struct {
+	timer   *time.Timer
+	cancel  context.CancelCauseFunc
+	d       time.Duration
+	mu      sync.Mutex
+	stopped bool
+}
+
+func (h *headerTimer) wrote(httptrace.WroteRequestInfo) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if !h.stopped && h.timer == nil {
+		h.timer = time.AfterFunc(h.d, func() { h.cancel(errResponseHeaderTimeout) })
+	}
+}
+
+// stop disarms the timer and reports whether it had already fired.
+func (h *headerTimer) stop() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.stopped = true
+	return h.timer != nil && !h.timer.Stop()
+}
+
+type cancelOnClose struct {
+	io.ReadCloser
+	cancel context.CancelCauseFunc
+}
+
+func (b *cancelOnClose) Close() error {
+	err := b.ReadCloser.Close()
+	b.cancel(nil)
+	return err
 }
 
 // refuseProxyAuth fails the 407 of a proxy that was sent the request in absolute form. Its
@@ -218,6 +407,39 @@ func (u *upstreamPool) refuseProxyAuth(resp *http.Response, err error) (*http.Re
 	}
 	_ = resp.Body.Close()
 	return nil, fmt.Errorf("proxy %w", newRefusal(resp.StatusCode))
+}
+
+// h1ReadBuffer is the read buffer of every upstream HTTP/1.1 transport.
+const h1ReadBuffer = 4 << 10
+
+func bufferTail(method string, resp *http.Response, err error) (*http.Response, error) {
+	if err == nil && resp.ProtoMajor == 1 && resp.TLS == nil && resp.ContentLength >= h1ReadBuffer &&
+		bodyAllowed(method, resp.StatusCode) {
+		resp.Body = &tailBody{ReadCloser: resp.Body, remaining: resp.ContentLength}
+	}
+	return resp, err
+}
+
+// tailBody has the last byte of a plaintext HTTP/1.1 body read through the transport's buffer. A
+// read into a buffer at least as large goes to the socket directly and leaves there the bytes past
+// the response, which the transport refuses only once buffered, RFC 9112 section 6.3.
+type tailBody struct {
+	io.ReadCloser
+	remaining int64
+}
+
+func (b *tailBody) Read(p []byte) (int, error) {
+	if b.remaining >= h1ReadBuffer {
+		if int64(len(p)) >= b.remaining {
+			p = p[:b.remaining-1]
+		} else if len(p) > h1ReadBuffer && b.remaining-int64(len(p)) == h1ReadBuffer {
+			// A fill of exactly what is left would end where the body does.
+			p = p[:len(p)-1]
+		}
+	}
+	n, err := b.ReadCloser.Read(p)
+	b.remaining -= int64(n)
+	return n, err
 }
 
 // fullLength fails a body that ends before its Content-Length with io.ErrUnexpectedEOF. quic-go

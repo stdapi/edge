@@ -204,7 +204,7 @@ func TestQUIC_CloseCarriesTheProtocolsNoErrorCode(t *testing.T) {
 			defer cancel()
 			_, err = conn.AcceptStream(ctx)
 			var appErr *quic.ApplicationError
-			require.ErrorAs(t, err, &appErr, "the close must reach the client as an application close")
+			require.True(t, errors.As(err, &appErr), "the close must reach the client as an application close")
 			assert.True(t, appErr.Remote)
 			assert.Equal(t, tc.code, appErr.ErrorCode)
 		})
@@ -1095,7 +1095,7 @@ func TestQUICDemux_ShutdownRacesServeQUICStartup(t *testing.T) {
 
 		select {
 		case err := <-served:
-			assert.ErrorIs(t, err, ErrProxyClosed)
+			assert.True(t, errors.Is(err, ErrProxyClosed), "%v", err)
 		case <-time.After(5 * time.Second):
 			t.Fatal("ServeTransparentUDP did not return after Shutdown")
 		}

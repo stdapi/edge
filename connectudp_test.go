@@ -579,7 +579,7 @@ func TestConnectUDP_IdleTunnelIsClosed(t *testing.T) {
 	require.NoError(t, pconn.SetReadDeadline(time.Now().Add(3*time.Second)))
 	_, _, err = pconn.ReadFrom(make([]byte, 16))
 	require.Error(t, err)
-	assert.NotErrorIs(t, err, os.ErrDeadlineExceeded)
+	assert.False(t, errors.Is(err, os.ErrDeadlineExceeded), "%v", err)
 }
 
 func FuzzTargetFromConnectUDP(f *testing.F) {
@@ -635,6 +635,16 @@ func TestTargetFromWire_RootDotIsDropped(t *testing.T) {
 	assert.Equal(t, "127.0.0.1", target.Host)
 	_, err = targetFromWire(".", "443")
 	assert.Error(t, err)
+}
+
+func TestTargetFromWire_HostIsANameOrAnAddress(t *testing.T) {
+	target, err := targetFromWire("2001:DB8::1", "443")
+	require.NoError(t, err)
+	assert.Equal(t, "2001:db8::1", target.Host)
+	for _, host := range []string{"origin.test:80", "[::1]", "a]b", "a b", "a/b", "a@b", "a?b", "a#b"} {
+		_, err := targetFromWire(host, "443")
+		assert.Error(t, err, host)
+	}
 }
 
 func TestConnectUDP_NoServerNameGetsTheTargetsCertificate(t *testing.T) {
@@ -2135,6 +2145,9 @@ func udpSocketOf(d *quicDemux) *net.UDPConn {
 			if n, ok := c.(noICMPConn); ok {
 				c = n.Conn
 			}
+			if own, ok := c.(*ownUDPConn); ok {
+				return own.UDPConn
+			}
 			if uc, ok := c.(*net.UDPConn); ok {
 				return uc
 			}
@@ -3459,7 +3472,7 @@ var connectUDPConformance = []conformanceCase{
 					assert.Equal(t, http3.ErrCodeMessageError, code)
 				case viaH2:
 					var se http2.StreamError
-					assert.ErrorAs(t, err, &se, "the stream ended cleanly")
+					assert.True(t, errors.As(err, &se), "the stream ended cleanly")
 				default:
 					require.Error(t, err)
 					assert.NotErrorIs(t, err, io.EOF, "the connection ended cleanly")

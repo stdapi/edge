@@ -256,19 +256,11 @@ func targetFromConnectUDP(r *http.Request) (Target, error) {
 // authority written back would not be the one routed on.
 func targetFromWire(host, port string) (Target, error) {
 	host = canonicalHost(stringsutil.ToLowerASCIIString(host))
-	if host == "" || strings.ContainsAny(host, "/[] ") {
-		return Target{}, errors.New("target host is not a hostname or an address")
-	}
-	if strings.Contains(host, ":") {
-		if _, perr := netip.ParseAddr(host); perr != nil {
-			return Target{}, errors.New("target host is not an IPv6 address")
-		}
-	}
 	port, ok := canonicalPort(port)
 	if !ok {
 		return Target{}, errors.New("target port is not a port")
 	}
-	if h, p := splitHostPort(joinHostPort(host, port)); h != host || p != port {
+	if h, _, ok := splitAuthority(joinHostPort(host, port)); !ok || h == "" || h != host {
 		return Target{}, errors.New("target host is not a hostname or an address")
 	}
 	return Target{Scheme: schemeForPort(port), Host: host, Port: port}, nil

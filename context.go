@@ -38,8 +38,8 @@ type RequestContext interface {
 	// RoutingPath returns the canonical form of the path the client sent, which is the form
 	// the tree matched on. Percent-encoded RFC 3986 unreserved characters are decoded, bytes
 	// that must be escaped in a path are encoded in place, and every other escape keeps
-	// uppercase hex and stays distinct from its decoded form, so %2F never matches /, and an
-	// empty path is /.
+	// uppercase hex and stays distinct from its decoded form, so %2F never matches /. An empty
+	// path is /, and so is the "*" of an asterisk-form target.
 	RoutingPath() string
 	// QueryParams parses the raw query and caches the result.
 	QueryParams() url.Values
@@ -146,9 +146,10 @@ func routingPath(r *http.Request) string {
 	}
 	u := r.URL
 	if u.RawPath == "" {
-		if u.Path == "" {
+		if u.Path == "" || u.Path == "*" {
 			// An absolute-form target may have an empty path, and a lookup without one
-			// reaches the admission of its authority.
+			// reaches the admission of its authority. The asterisk-form has an empty path
+			// too, RFC 9112 section 3.3.
 			return "/"
 		}
 		// The wire path was the default encoding of Path, which is always canonical.

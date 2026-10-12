@@ -7,6 +7,7 @@ package edge
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"io"
 	"net"
@@ -140,13 +141,15 @@ type Session struct {
 	// so TLS() can read the state once it exists.
 	tlsConn     *tls.Conn
 	clientHello atomic.Pointer[ClientHello]
+	// leaf is the certificate the proxy presented on a terminated connection.
+	leaf atomic.Pointer[x509.Certificate]
 	// upgrade is a copy of the request that switched the connection to the frames a WebSocket
 	// session serves.
 	upgrade *http.Request
 	// via is the CONNECT-UDP tunnel this session arrived through, nil off a socket.
 	via *Session
-	// verified is the decision a plaintext connection took on the last Host it checked. The
-	// requests of an h2c connection read and write it concurrently.
+	// verified is the decision a connection took on the last name it checked. The requests of
+	// an HTTP/2 or HTTP/3 connection read and write it concurrently.
 	verified atomic.Pointer[verifiedHost]
 	target   Target
 	// upstream is the destination of a redirected connection or the literal a CONNECT
@@ -518,6 +521,49 @@ func splitHostPort(authority string) (host, port string) {
 	}
 	return authority[:i], authority[i+1:]
 }
+
+// splitAuthority splits an authority of the form "host", "host:port", "[host]" or "[host]:port"
+// into host and port, the port in canonical form. It reports false when authority is not of that
+// form, when a bracketed host is not an IPv6 address or when another host is not a reg-name of
+// RFC 3986.
+func splitAuthority(authority string) (host, port string, ok bool) {
+	host, port = splitHostPort(authority)
+	if strings.HasPrefix(authority, "[") {
+		if addr, err := netip.ParseAddr(host); err != nil || !addr.Is6() {
+			return "", "", false
+		}
+		// splitHostPort drops what follows the bracket when it is not a port.
+		if rest := authority[len(host)+2:]; rest != "" && (rest[0] != ':' || rest[1:] != port) {
+			return "", "", false
+		}
+	} else {
+		for i := 0; i < len(host); i++ {
+			switch {
+			case host[i] == '%':
+				if i+2 >= len(host) {
+					return "", "", false
+				}
+				if _, hex := stringsutil.DecodeHexPair(host[i+1], host[i+2]); !hex {
+					return "", "", false
+				}
+				i += 2
+			case notInHost[host[i]]:
+				return "", "", false
+			}
+		}
+	}
+	port, ok = canonicalPort(port)
+	return host, port, ok
+}
+
+// notInHost marks every byte other than the unreserved characters and the sub-delims of RFC 3986,
+// which a reg-name contains only percent-encoded. An IPv4 address is also a reg-name.
+var notInHost = func() (t [256]bool) {
+	for c := range 256 {
+		t[c] = !stringsutil.IsUnreserved(byte(c)) && strings.IndexByte("!$&'()*+,;=", byte(c)) < 0
+	}
+	return t
+}()
 
 // defaultPort returns the well-known port for scheme.
 func defaultPort(scheme string) string {

@@ -247,7 +247,9 @@ func WithRejectECH(enable bool) ProxyOption {
 // [WithNameResolver] can point the check at the resolver the clients use.
 //
 // A name is resolved at most once per connection. A CONNECT to a hostname has no destination
-// the name could disagree with, so it is not verified.
+// the name could disagree with, so it is not verified. A CONNECT-UDP to a hostname is resolved
+// by the proxy, and the server name of a QUIC connection inside the tunnel is checked against
+// that address.
 func WithNameVerification(mode NameVerification) ProxyOption {
 	return proxyOption(func(s sealedOption) error {
 		if mode >= verifySentinel {

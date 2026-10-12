@@ -2,6 +2,7 @@ package edge
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -417,26 +418,87 @@ func TestServe_HTTP2OverpaddedHeadersIgnoresItsContinuations(t *testing.T) {
 
 func TestConformanceHPACK(t *testing.T) { runConformance(t, hpackConformance) }
 
-const viaH2C = "h2c"
+const (
+	viaH2C           = "h2c"
+	viaConnectH2     = "connect-h2"
+	viaRedirectedH2  = "redirected-h2"
+	viaRedirectedH2C = "redirected-h2c"
+)
 
-var hpackFronts = []string{viaH2C, viaH2}
+var hpackFronts = []string{viaH2C, viaH2, viaConnectH2, viaRedirectedH2, viaRedirectedH2C}
 
 func eachHPACKFront(t *testing.T, run func(t *testing.T, front string)) {
 	t.Helper()
-	for _, front := range hpackFronts {
-		t.Run(front, func(t *testing.T) { run(t, front) })
-	}
+	eachH2Front(t, hpackFronts, run)
 }
 
-// startHPACKFront serves p on a plaintext front, where HTTP/2 starts with the connection
-// preface, or on a TLS front negotiating h2.
+// startHPACKFront serves p on front: the explicit front over plaintext or TLS, the explicit
+// front for a CONNECT tunnel, or a transparent front whose connections were headed to port 443
+// or to unroutedDestination.
 func startHPACKFront(t *testing.T, front string, p *Proxy, ca *CA) string {
 	t.Helper()
-	if front == viaH2 {
+	switch front {
+	case viaH2:
 		addr, _ := startProxyTLS(t, p, ca)
 		return addr
+	case viaRedirectedH2:
+		return startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) {
+			return netip.MustParseAddrPort("192.0.2.1:443"), nil
+		})
+	case viaRedirectedH2C:
+		return startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) {
+			return unroutedDestination, nil
+		})
 	}
 	return startProxy(t, p)
+}
+
+// dialH2Front returns a connection to front at addr on which HTTP/2 starts with the client
+// preface. A CONNECT tunnel or a transparent TLS connection is opened for name.
+func dialH2Front(t *testing.T, front, addr string, ca *CA, name string) net.Conn {
+	t.Helper()
+	var c net.Conn
+	switch front {
+	case viaH2:
+		c = dialFront(t, netip.MustParseAddrPort(addr), ca, viaH2)
+	case viaConnectH2:
+		c = connectRaw(t, addr, name+":443")
+	default:
+		var err error
+		c, err = net.DialTimeout("tcp", addr, 5*time.Second)
+		require.NoError(t, err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	require.NoError(t, c.SetDeadline(time.Now().Add(10*time.Second)))
+	if front == viaConnectH2 || front == viaRedirectedH2 {
+		tc := tls.Client(c, &tls.Config{ServerName: name, RootCAs: poolOf(ca), NextProtos: []string{"h2"}, MinVersion: tls.VersionTLS12})
+		require.NoError(t, tc.Handshake())
+		require.Equal(t, "h2", tc.ConnectionState().NegotiatedProtocol)
+		c = tc
+	}
+	return c
+}
+
+// dialH2Wire serves p on front and returns an HTTP/2 connection to it past the client preface.
+func dialH2Wire(t *testing.T, front string, p *Proxy, name string) *h2Wire {
+	t.Helper()
+	c := dialH2Front(t, front, startHPACKFront(t, front, p, p.cfg.ca), p.cfg.ca, name)
+	_, err := io.WriteString(c, http2.ClientPreface)
+	require.NoError(t, err)
+	h := newH2Wire(c)
+	require.NoError(t, h.fr.WriteSettings())
+	return h
+}
+
+// frontScheme returns sent, or the scheme of the connection on a connection edge terminates.
+func frontScheme(front, sent string) string {
+	switch front {
+	case viaConnectH2, viaRedirectedH2:
+		return "https"
+	case viaRedirectedH2C:
+		return "http"
+	}
+	return sent
 }
 
 type hpackSeen struct {
@@ -474,7 +536,13 @@ func newHPACKBench(t *testing.T, front string, opts ...ProxyOption) *hpackBench 
 
 func (b *hpackBench) dial(t *testing.T) *hpackConn {
 	t.Helper()
-	return dialHPACK(t, b.front, b.addr, b.ca)
+	return b.dialFor(t, "origin.test")
+}
+
+// dialFor is dial with a TLS connection opened for name.
+func (b *hpackBench) dialFor(t *testing.T, name string) *hpackConn {
+	t.Helper()
+	return dialHPACK(t, b.front, b.addr, b.ca, name)
 }
 
 func (b *hpackBench) next(t *testing.T) hpackSeen {
@@ -503,28 +571,21 @@ func (b *hpackBench) served(t *testing.T, c *hpackConn, stream uint32, block []b
 	c.block(t, stream, block)
 	require.Equal(t, h2Outcome{status: "200"}, c.outcome(t, stream))
 	s := b.next(t)
-	assert.Equal(t, scheme, s.scheme)
+	assert.Equal(t, b.scheme(scheme), s.scheme)
 	assert.Empty(t, s.header.Values(schemeHeader))
 	return s
 }
+
+func (b *hpackBench) scheme(sent string) string { return frontScheme(b.front, sent) }
 
 type hpackConn struct {
 	*h2Wire
 	settings map[http2.SettingID]uint32
 }
 
-func dialHPACK(t *testing.T, front, addr string, ca *CA) *hpackConn {
+func dialHPACK(t *testing.T, front, addr string, ca *CA, name string) *hpackConn {
 	t.Helper()
-	var c net.Conn
-	if front == viaH2 {
-		c = dialFront(t, netip.MustParseAddrPort(addr), ca, viaH2)
-	} else {
-		var err error
-		c, err = net.DialTimeout("tcp", addr, 5*time.Second)
-		require.NoError(t, err)
-	}
-	t.Cleanup(func() { _ = c.Close() })
-	require.NoError(t, c.SetDeadline(time.Now().Add(10*time.Second)))
+	c := dialH2Front(t, front, addr, ca, name)
 	_, err := io.WriteString(c, http2.ClientPreface)
 	require.NoError(t, err)
 
@@ -731,7 +792,7 @@ type hpackStory struct {
 const hpackNeverIndexed = "edge forwards fields through http.Header, which has no never-indexed representation, and net/http's HTTP/2 encoders index any field not marked sensitive that fits the table"
 
 // hpackConformance lists the requirements RFC 7541 and RFC 9113 place on the field blocks of
-// HTTP/2 requests, checked with a raw client in front of the h2c and h2 fronts.
+// HTTP/2 requests, checked with a raw client on each of hpackFronts.
 var hpackConformance = []conformanceCase{
 	// RFC 7541 section 2.1, header list ordering.
 	{
@@ -745,7 +806,7 @@ var hpackConformance = []conformanceCase{
 					hpLiteral("x-a", "3"), hpLiteral("edge-scheme", "h"), hpLiteral("x-a", "4")))
 				require.Equal(t, h2Outcome{status: "200"}, c.outcome(t, 1))
 				s := b.next(t)
-				assert.Equal(t, "http", s.scheme)
+				assert.Equal(t, b.scheme("http"), s.scheme)
 				assert.Equal(t, []string{"1", "3", "4"}, s.header.Values("X-A"))
 				assert.Equal(t, []string{"2"}, s.header.Values("X-B"))
 				assert.Equal(t, []string{"s", "h"}, s.header.Values("Edge-Scheme"))
@@ -821,13 +882,13 @@ var hpackConformance = []conformanceCase{
 		run: func(t *testing.T) {
 			eachHPACKFront(t, func(t *testing.T, front string) {
 				b := newHPACKBench(t, front)
-				c := b.dial(t)
+				c := b.dialFor(t, "www.example.com")
 				s := b.served(t, c, 1, hpackVector(t, "c3.1"), "http")
-				assert.Equal(t, hpackSeen{header: http.Header{}, scheme: "http", host: "www.example.com", path: "/"}, s)
+				assert.Equal(t, hpackSeen{header: http.Header{}, scheme: b.scheme("http"), host: "www.example.com", path: "/"}, s)
 				s = b.served(t, c, 3, hpackVector(t, "c3.2"), "http")
-				assert.Equal(t, hpackSeen{header: http.Header{"Cache-Control": {"no-cache"}}, scheme: "http", host: "www.example.com", path: "/"}, s)
+				assert.Equal(t, hpackSeen{header: http.Header{"Cache-Control": {"no-cache"}}, scheme: b.scheme("http"), host: "www.example.com", path: "/"}, s)
 				s = b.served(t, c, 5, hpackVector(t, "c3.3"), "https")
-				assert.Equal(t, hpackSeen{header: http.Header{"Custom-Key": {"custom-value"}}, scheme: "https", host: "www.example.com", path: "/index.html"}, s)
+				assert.Equal(t, hpackSeen{header: http.Header{"Custom-Key": {"custom-value"}}, scheme: b.scheme("https"), host: "www.example.com", path: "/index.html"}, s)
 			})
 		},
 	},
@@ -837,13 +898,13 @@ var hpackConformance = []conformanceCase{
 		run: func(t *testing.T) {
 			eachHPACKFront(t, func(t *testing.T, front string) {
 				b := newHPACKBench(t, front)
-				c := b.dial(t)
+				c := b.dialFor(t, "www.example.com")
 				s := b.served(t, c, 1, hpackVector(t, "c4.1"), "http")
-				assert.Equal(t, hpackSeen{header: http.Header{}, scheme: "http", host: "www.example.com", path: "/"}, s)
+				assert.Equal(t, hpackSeen{header: http.Header{}, scheme: b.scheme("http"), host: "www.example.com", path: "/"}, s)
 				s = b.served(t, c, 3, hpackVector(t, "c4.2"), "http")
-				assert.Equal(t, hpackSeen{header: http.Header{"Cache-Control": {"no-cache"}}, scheme: "http", host: "www.example.com", path: "/"}, s)
+				assert.Equal(t, hpackSeen{header: http.Header{"Cache-Control": {"no-cache"}}, scheme: b.scheme("http"), host: "www.example.com", path: "/"}, s)
 				s = b.served(t, c, 5, hpackVector(t, "c4.3"), "https")
-				assert.Equal(t, hpackSeen{header: http.Header{"Custom-Key": {"custom-value"}}, scheme: "https", host: "www.example.com", path: "/index.html"}, s)
+				assert.Equal(t, hpackSeen{header: http.Header{"Custom-Key": {"custom-value"}}, scheme: b.scheme("https"), host: "www.example.com", path: "/index.html"}, s)
 			})
 		},
 	},
@@ -1105,7 +1166,7 @@ var hpackConformance = []conformanceCase{
 				require.NoError(t, c.fr.WriteContinuation(1, true, block[len(block)-100:]))
 				require.Equal(t, h2Outcome{status: "200"}, c.outcome(t, 1))
 				s := b.next(t)
-				assert.Equal(t, "https", s.scheme)
+				assert.Equal(t, b.scheme("https"), s.scheme)
 				assert.Equal(t, []string{"1"}, s.header.Values("X-A"))
 				assert.Equal(t, []string{strings.Repeat("b", 200)}, s.header.Values("X-B"))
 				assert.Equal(t, []string{"a"}, s.header.Values("X-C"))
@@ -1180,7 +1241,7 @@ var hpackConformance = []conformanceCase{
 				}))
 				require.Equal(t, h2Outcome{status: "200"}, c.outcome(t, 1))
 				s := b.next(t)
-				assert.Equal(t, "https", s.scheme)
+				assert.Equal(t, b.scheme("https"), s.scheme)
 				assert.Equal(t, []string{"1"}, s.header.Values("X-A"))
 				assert.Empty(t, s.header.Values(schemeHeader))
 			})
@@ -1257,7 +1318,7 @@ var hpackConformance = []conformanceCase{
 				require.NoError(t, c.fr.WriteHeaders(maxFrameRequest(t, size, "x-big")))
 				require.Equal(t, h2Outcome{status: "200"}, c.outcome(t, 1))
 				s := b.next(t)
-				assert.Equal(t, "https", s.scheme)
+				assert.Equal(t, b.scheme("https"), s.scheme)
 				assert.NotEmpty(t, s.header.Get("X-Big"))
 				assert.Empty(t, s.header.Values(schemeHeader))
 			})
@@ -1366,28 +1427,57 @@ var hpackConformance = []conformanceCase{
 				}
 				require.Equal(t, h2Outcome{status: "200"}, got)
 				s := b.next(t)
-				assert.Equal(t, "http", s.scheme)
+				assert.Equal(t, b.scheme("http"), s.scheme)
 			})
 		},
 	},
 
 	// RFC 9113 section 10.5.1, limits on field block size.
 	{
-		id: "rfc9113/10.5.1/1", name: "a field value longer than the header limit, then a request",
+		id: "rfc9113/10.5.1/1", name: "a field section over SETTINGS_MAX_HEADER_LIST_SIZE inserting a field, then a request referencing it",
 		req: "The field block MUST be processed to ensure a consistent connection state, unless the connection is closed.",
 		run: func(t *testing.T) {
 			eachHPACKFront(t, func(t *testing.T, front string) {
 				b := newHPACKBench(t, front, WithMaxHeaderBytes(1024))
 				c := b.dial(t)
-				c.block(t, 1, hpRequest(hpHTTP, hpLiteral("x-long", strings.Repeat("v", 1124))))
+				size := int(c.setting(http2.SettingMaxHeaderListSize, 0))
+				require.NotZero(t, size)
+				c.block(t, 1, hpRequest(hpHTTP, hpIndexing("x-small", "1"), hpLiteral("x-long", strings.Repeat("v", size))))
 				got := c.outcome(t, 1)
 				b.none(t)
 				if got.closed {
 					return
 				}
 				require.Equal(t, h2Outcome{status: "431"}, got)
-				b.served(t, c, 3, hpRequest(hpHTTP), "http")
+				s := b.served(t, c, 3, hpRequest(hpHTTP, hpIndexed(62)), "http")
+				assert.Equal(t, []string{"1"}, s.header.Values("X-Small"))
 			})
 		},
 	},
+}
+
+func TestSchemeConn_RefusedConnectionStaysRefused(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	p := testProxy(t)
+	own, err := p.srv.fwd.up.dialRaw(t.Context(), "tcp", ln.Addr().String())
+	require.NoError(t, err)
+	srv, err := ln.Accept()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = srv.Close() })
+	require.NoError(t, srv.SetDeadline(time.Now().Add(5*time.Second)))
+	c := newSchemeConn(srv, 1<<20)
+	schemeConnOf(c).p = p
+
+	_, err = io.WriteString(own, "GET http://origin.test/ HTTP/1.1\r\nHost: origin.test\r\n\r\n")
+	require.NoError(t, err)
+	b := make([]byte, 64)
+	n, err := c.Read(b)
+	require.ErrorIs(t, err, errFromItself)
+	require.Zero(t, n)
+	require.NoError(t, own.Close())
+	n, err = c.Read(b)
+	assert.ErrorIs(t, err, errFromItself)
+	assert.Zero(t, n, "a read after the refusal returned %q", b[:n])
 }

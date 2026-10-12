@@ -31,6 +31,11 @@ type Transport struct {
 	// for a QUIC one, and a QUIC connection runs on the socket it returns. It defaults to a
 	// net.Dialer with a 30s timeout and keep-alives enabled. Override it to pin a resolver,
 	// force a source address, or route upstream traffic through a tunnel.
+	//
+	// The proxy refuses a connection to one of its listeners when its addresses are those of a
+	// connection DialContext returned. It does not recognize a connection without IP addresses,
+	// one whose addresses were translated after the dial, as by NAT or a tunnel, or one dialed by
+	// another Proxy.
 	DialContext func(ctx context.Context, network, addr string) (net.Conn, error)
 
 	// Proxy specifies a function to return a proxy for a given Request. An upstream reached
@@ -141,6 +146,7 @@ func (t *Transport) httpTransport(allowH2, fixed bool, dial func(context.Context
 		DisableKeepAlives:     t.DisableKeepAlives,
 		DisableCompression:    true,
 		ForceAttemptHTTP2:     allowH2,
+		ReadBufferSize:        h1ReadBuffer,
 	}
 	if !allowH2 {
 		// A non-nil map is what tells net/http never to hand the connection to the HTTP/2
@@ -224,7 +230,11 @@ func newHTTP3Transport(up *upstreamDialer, fixed string, proxy *url.URL) http.Ro
 
 // packetConnOf presents a connected socket as the packet connection quic-go reads and writes.
 func packetConnOf(c net.Conn) net.PacketConn {
-	if u, ok := c.(*net.UDPConn); ok {
+	u, ok := c.(*net.UDPConn)
+	if own, isOwn := c.(*ownUDPConn); isOwn {
+		u, ok = own.UDPConn, true
+	}
+	if ok {
 		return &connectedUDPConn{UDPConn: u, batch: ipv4.NewPacketConn(u)}
 	}
 	return connectedConn{noICMPConn{c}}
