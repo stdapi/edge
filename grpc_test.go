@@ -28,6 +28,8 @@ import (
 	"testing/iotest"
 	"time"
 
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/net/http2"
@@ -1105,6 +1107,74 @@ func TestKindGRPC_HTTP11CallToTheProxyIsForwardedOverHTTP11(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.Equal(t, []string{"HTTP/1.1"}, seen.all())
+}
+
+func TestKindGRPC_HTTP3CallToTheProxyIsForwarded(t *testing.T) {
+	cases := []struct {
+		name       string
+		allowHTTP3 bool
+		want       string
+	}{
+		{name: "h2 origin", want: "HTTP/2.0"},
+		{name: "h3 origin with AllowHTTP3", allowHTTP3: true, want: "HTTP/3.0"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ca, err := GenerateCA()
+			require.NoError(t, err)
+			cert := selfSignedFor(t, ca, "origin.test")
+			seen := new(recorder)
+
+			var addr string
+			if tc.allowHTTP3 {
+				pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+				require.NoError(t, err)
+				srv := &http3.Server{
+					Handler:   grpcEchoHandler(seen),
+					TLSConfig: http3.ConfigureTLSConfig(&tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13}),
+				}
+				go func() { _ = srv.Serve(pc) }()
+				t.Cleanup(func() {
+					_ = srv.Close()
+					_ = pc.Close()
+				})
+				addr = pc.LocalAddr().String()
+			} else {
+				origin := httptest.NewUnstartedServer(grpcEchoHandler(seen))
+				origin.EnableHTTP2 = true
+				origin.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
+				origin.StartTLS()
+				t.Cleanup(origin.Close)
+				addr = origin.Listener.Addr().String()
+			}
+
+			tr := DefaultTransport()
+			tr.AllowHTTP3 = tc.allowHTTP3
+			tr.DialContext = pinnedDialer(addr)
+			tr.RootCAs = poolOf(ca)
+			p := testProxyWithCA(t, ca, WithTransport(tr))
+			p.MustAdd("origin.test/pkg.Svc/Method", forwardCall)
+			front, _ := startQUICFront(t, p, ca)
+			h3 := &http3.Transport{
+				Dial: func(context.Context, string, *tls.Config, *quic.Config) (*quic.Conn, error) {
+					return dialQUICFront(t, front, ca), nil
+				},
+			}
+			t.Cleanup(func() { _ = h3.Close() })
+
+			client := &http.Client{Timeout: 10 * time.Second, Transport: h3}
+			resp := grpcDo(t, client, "https://origin.test/pkg.Svc/Method", grpcPayload("hello"))
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			_ = resp.Body.Close()
+
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			assert.Equal(t, "HTTP/3.0", resp.Proto)
+			assert.Equal(t, grpcPayload("hello"), body)
+			assert.Equal(t, "0", resp.Trailer.Get("Grpc-Status"))
+			assert.Equal(t, []string{tc.want}, seen.all())
+		})
+	}
 }
 
 func TestKindGRPC_CallToAPlaintextOriginThroughAnUpstreamProxyIsTunneled(t *testing.T) {
