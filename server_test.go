@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -1526,6 +1527,49 @@ func TestServe_OriginFormIsStillRefusedOverHTTP1(t *testing.T) {
 	require.NoError(t, err)
 	_ = resp.Body.Close()
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
+func TestServe_RefusalLogRedactsThePassword(t *testing.T) {
+	cases := []struct {
+		name    string
+		request string
+		want    string
+	}{
+		{
+			name:    "absolute-form",
+			request: "GET http://alice:s3cret@origin.test/ HTTP/1.1\r\nHost: origin.test\r\n\r\n",
+			want:    "request=http://alice:xxxxx@origin.test/",
+		},
+		{
+			name:    "authority-form",
+			request: "CONNECT alice:s3cret@origin.test:443 HTTP/1.1\r\nHost: origin.test:443\r\n\r\n",
+			want:    "request=//alice:xxxxx@origin.test:443",
+		},
+		{
+			name:    "authority-form without userinfo",
+			request: "CONNECT origin.test:443 HTTP/1.1\r\nHost: origin.test:443\r\n\r\n",
+			want:    "request=origin.test:443",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := &syncBuffer{}
+			p := testProxy(t, WithLogger(slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))))
+			conn, err := net.Dial("tcp", startProxy(t, p))
+			require.NoError(t, err)
+			defer func() { _ = conn.Close() }()
+
+			_, err = io.WriteString(conn, tc.request)
+			require.NoError(t, err)
+			resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+			require.NoError(t, err)
+			_ = resp.Body.Close()
+
+			assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+			assert.Contains(t, logs.String(), tc.want)
+			assert.NotContains(t, logs.String(), "s3cret")
+		})
+	}
 }
 
 func TestServe_SessionTLSOnATLSFrontListener(t *testing.T) {

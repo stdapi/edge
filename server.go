@@ -604,11 +604,15 @@ func (p *Proxy) authenticate(w http.ResponseWriter, r *http.Request) (string, bo
 // request, so the client reads the status and nothing else.
 func (p *Proxy) writeStatus(w http.ResponseWriter, r *http.Request, code int, reason string) {
 	if p.cfg.logger.Enabled(r.Context(), slog.LevelDebug) {
+		request := r.RequestURI
+		if r.URL != nil && r.URL.User != nil {
+			request = r.URL.Redacted()
+		}
 		p.cfg.logger.LogAttrs(r.Context(), slog.LevelDebug, "edge: "+reason,
 			slog.Int("status", code),
 			slog.String("method", r.Method),
 			slog.String("host", r.Host),
-			slog.String("request", r.RequestURI),
+			slog.String("request", request),
 			slog.String("client", r.RemoteAddr),
 		)
 	}
