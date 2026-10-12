@@ -447,6 +447,33 @@ func h2cOrigin(t *testing.T, h http.Handler) *httptest.Server {
 	return origin
 }
 
+func h2cOnlyOrigin(t *testing.T, h http.Handler) *httptest.Server {
+	t.Helper()
+	origin := httptest.NewUnstartedServer(h)
+	origin.Config.Protocols = new(http.Protocols)
+	origin.Config.Protocols.SetUnencryptedHTTP2(true)
+	origin.Start()
+	t.Cleanup(origin.Close)
+	return origin
+}
+
+// h2cFrontClient sends each request to the proxy at addr over unencrypted HTTP/2, with no
+// CONNECT.
+func h2cFrontClient(addr string) *http.Client {
+	protocols := new(http.Protocols)
+	protocols.SetUnencryptedHTTP2(true)
+	return &http.Client{
+		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			Protocols: protocols,
+			DialContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, network, addr)
+			},
+		},
+	}
+}
+
 func h2cTunnelClient(t *testing.T, addr, authority string) *http.Client {
 	t.Helper()
 	raw := connectRaw(t, addr, authority)

@@ -80,7 +80,8 @@ type Transport struct {
 	InsecureSkipVerify bool
 
 	// AllowHTTP2 lets the proxy negotiate h2 with upstreams, and use h2c with a plaintext
-	// upstream when the client did. It defaults to true.
+	// upstream when the client did, or when it sent a gRPC call over HTTP/2. It defaults to
+	// true.
 	AllowHTTP2 bool
 
 	// AllowHTTP3 lets the proxy speak h3 to upstreams that advertise it. It defaults to
@@ -162,8 +163,8 @@ func (t *Transport) httpTransport(allowH2, fixed bool, dial func(context.Context
 
 // h2cTransport builds the transport for h2c. It is given no proxy, net/http would start
 // HTTP/2 with the proxy itself.
-func (t *Transport) h2cTransport(dial func(context.Context, string, string) (net.Conn, error)) *http.Transport {
-	tr := t.httpTransport(true, true, dial, nil)
+func (t *Transport) h2cTransport(dial func(context.Context, string, string) (net.Conn, error), fixed bool) *http.Transport {
+	tr := t.httpTransport(true, fixed, dial, nil)
 	tr.Protocols = new(http.Protocols)
 	tr.Protocols.SetUnencryptedHTTP2(true)
 	return tr

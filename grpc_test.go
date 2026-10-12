@@ -5,6 +5,7 @@
 package edge
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/tls"
@@ -14,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -1022,6 +1024,143 @@ func TestKindGRPC_CallInTheClearIsForwardedOverHTTP2(t *testing.T) {
 	assert.Equal(t, grpcPayload("hello"), body)
 	assert.Equal(t, "0", resp.Trailer.Get("Grpc-Status"))
 	assert.Equal(t, []string{"HTTP/2.0 tls=false"}, seen.all())
+}
+
+func TestKindGRPC_CallToAPlaintextOriginIsForwardedOverHTTP2(t *testing.T) {
+	seen := new(recorder)
+	origin := h2cOnlyOrigin(t, grpcEchoHandler(seen))
+	originURL, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p := testProxyWithCA(t, ca)
+	p.MustAdd(originHost(originURL)+"/pkg.Svc/Method", func(c *GRPCCtx) error { return c.Forward() })
+	plain := startProxy(t, p)
+	secure, trust := startProxyTLS(t, p, ca)
+
+	fronts := []struct {
+		client *http.Client
+		name   string
+	}{
+		{name: "h2c", client: h2cFrontClient(plain)},
+		{name: "h2", client: &http.Client{Timeout: 10 * time.Second, Transport: &http2.Transport{
+			AllowHTTP: true,
+			DialTLSContext: func(ctx context.Context, _, _ string, _ *tls.Config) (net.Conn, error) {
+				d := tls.Dialer{Config: &tls.Config{RootCAs: trust, ServerName: "127.0.0.1", NextProtos: []string{"h2"}, MinVersion: tls.VersionTLS12}}
+				return d.DialContext(ctx, "tcp", secure)
+			},
+		}}},
+	}
+	for _, f := range fronts {
+		t.Run(f.name, func(t *testing.T) {
+			before := len(seen.all())
+			resp := grpcDo(t, f.client, origin.URL+"/pkg.Svc/Method", grpcPayload("hello"))
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			_ = resp.Body.Close()
+
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			assert.Equal(t, grpcPayload("hello"), body)
+			assert.Equal(t, "0", resp.Trailer.Get("Grpc-Status"))
+			assert.Equal(t, []string{"HTTP/2.0"}, seen.all()[before:])
+		})
+	}
+}
+
+func TestKindGRPC_CallToAPlaintextHTTP11OriginFails(t *testing.T) {
+	origin := httptest.NewUnstartedServer(grpcEchoHandler(nil))
+	origin.Config.Protocols = new(http.Protocols)
+	origin.Config.Protocols.SetHTTP1(true)
+	origin.Start()
+	t.Cleanup(origin.Close)
+	originURL, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+
+	p := testProxy(t)
+	p.MustAdd(originHost(originURL)+"/pkg.Svc/Method", func(c *GRPCCtx) error { return c.Forward() })
+
+	resp := grpcDo(t, h2cFrontClient(startProxy(t, p)), origin.URL+"/pkg.Svc/Method", grpcPayload("hello"))
+	_, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+
+	code, _ := grpcStatus(resp)
+	assert.Equal(t, "14", code)
+}
+
+func TestKindGRPC_HTTP11CallToTheProxyIsForwardedOverHTTP11(t *testing.T) {
+	seen := new(recorder)
+	origin := h2cOrigin(t, grpcEchoHandler(seen))
+	originURL, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+
+	p := testProxy(t)
+	p.MustAdd(originHost(originURL)+"/pkg.Svc/Method", func(c *GRPCCtx) error { return c.Forward() })
+
+	resp := grpcDo(t, proxyClient(startProxy(t, p), nil), origin.URL+"/pkg.Svc/Method", grpcPayload("hello"))
+	_, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, []string{"HTTP/1.1"}, seen.all())
+}
+
+func TestKindGRPC_CallToAPlaintextOriginThroughAnUpstreamProxyIsTunneled(t *testing.T) {
+	seen := new(recorder)
+	origin := h2cOnlyOrigin(t, grpcEchoHandler(seen))
+	originURL, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+
+	requests := new(recorder)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer func() { _ = conn.Close() }()
+				br := bufio.NewReader(conn)
+				req, err := http.ReadRequest(br)
+				if err != nil {
+					requests.add(err.Error())
+					return
+				}
+				requests.add(req.Method + " " + req.RequestURI)
+				if req.Method != http.MethodConnect {
+					return
+				}
+				up, err := net.Dial("tcp", req.RequestURI)
+				if err != nil {
+					return
+				}
+				defer func() { _ = up.Close() }()
+				_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\n\r\n")
+				go func() { _, _ = io.Copy(up, br) }()
+				_, _ = io.Copy(conn, up)
+			}()
+		}
+	}()
+
+	tr := DefaultTransport()
+	tr.Proxy = fixedProxy("http://" + ln.Addr().String())
+	p := testProxy(t, WithTransport(tr))
+	p.MustAdd(originHost(originURL)+"/pkg.Svc/Method", func(c *GRPCCtx) error { return c.Forward() })
+
+	resp := grpcDo(t, h2cFrontClient(startProxy(t, p)), origin.URL+"/pkg.Svc/Method", grpcPayload("hello"))
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, grpcPayload("hello"), body)
+	assert.Equal(t, []string{"HTTP/2.0"}, seen.all())
+	assert.Equal(t, []string{"CONNECT " + originURL.Host}, requests.all())
 }
 
 // grpcEchoHandler echoes every message, recording the protocol of each call on seen when it is

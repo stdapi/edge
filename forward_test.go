@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptrace"
+	"net/url"
 	"slices"
 	"strings"
 	"testing"
@@ -64,6 +65,26 @@ func BenchmarkStripHopByHop(b *testing.B) {
 			stripHopByHop(base.Clone())
 		}
 	})
+}
+
+func TestForward_HTTPEntryForwardsAGRPCCallOverHTTP2(t *testing.T) {
+	seen := new(recorder)
+	origin := h2cOnlyOrigin(t, grpcEchoHandler(seen))
+	originURL, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+
+	p := testProxy(t)
+	p.MustAdd(originHost(originURL)+"/*{any}", forwardHandler)
+
+	resp := grpcDo(t, h2cFrontClient(startProxy(t, p)), origin.URL+"/pkg.Svc/Method", grpcPayload("hello"))
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, grpcPayload("hello"), body)
+	assert.Equal(t, "0", resp.Trailer.Get("Grpc-Status"))
+	assert.Equal(t, []string{"HTTP/2.0"}, seen.all())
 }
 
 func TestForward_HTTP3ResponseHeaderTimeoutCancelsTheRequest(t *testing.T) {

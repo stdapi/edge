@@ -58,9 +58,10 @@ type poolKey struct {
 }
 
 type upstreamPool struct {
-	h1 *http.Transport
-	h2 *http.Transport
-	h3 http.RoundTripper
+	h1  *http.Transport
+	h2  *http.Transport
+	h3  http.RoundTripper
+	h2c *http.Transport
 	// absolute is set when net/http sends the absolute form to a proxy.
 	absolute bool
 }
@@ -91,9 +92,15 @@ func newUpstreamPool(up *upstreamDialer, scheme, fixed string, proxy *url.URL) *
 		if scheme == "http" && fixed != "" {
 			// The client used h2c with a destination it declared, and no ALPN can ask the
 			// origin.
-			pool.h2 = t.h2cTransport(dial)
+			pool.h2 = t.h2cTransport(dial, true)
 		} else {
 			pool.h2 = t.httpTransport(true, fixed != "", gated, via)
+		}
+		if scheme == "http" && fixed == "" {
+			// A gRPC call requires HTTP/2 at the origin.
+			pool.h2c = t.h2cTransport(func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return up.dialThrough(ctx, network, addr, proxy)
+			}, false)
 		}
 	}
 	if t.AllowHTTP3 && scheme == "https" {
@@ -213,6 +220,9 @@ func (u *upstreamPool) closeIdle() {
 	if u.h2 != nil {
 		u.h2.CloseIdleConnections()
 	}
+	if u.h2c != nil {
+		u.h2c.CloseIdleConnections()
+	}
 	if c, ok := u.h3.(interface{ CloseIdleConnections() }); ok {
 		c.CloseIdleConnections()
 	}
@@ -313,6 +323,8 @@ func (f *forwarder) roundTrip(req *http.Request, proto Protocol, fixed string) (
 			resp.Body = &fullLength{ReadCloser: resp.Body, remaining: resp.ContentLength}
 		}
 		return resp, err
+	case (proto == HTTP2 || proto == HTTP3) && pool.h2c != nil && isGRPCRequest(req):
+		return pool.h2c.RoundTrip(req)
 	case (proto == HTTP2 || proto == HTTP3) && pool.h2 != nil:
 		// Over TLS h2 is reached through ALPN, so an origin that does not offer it is
 		// served over HTTP/1.1 by the same transport.
