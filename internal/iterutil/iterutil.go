@@ -9,7 +9,7 @@ import (
 	"iter"
 	"strings"
 
-	"github.com/fox-toolkit/edge/internal/constraints"
+	"github.com/stdapi/edge/internal/constraints"
 )
 
 func SeqOf[E any](elems ...E) iter.Seq[E] {

@@ -1,6 +1,6 @@
 // Copyright 2025 Sylvain Müller. All rights reserved.
 // Mount of this source code is governed by a Apache-2.0 license that can be found
-// at https://github.com/fox-toolkit/edge/blob/master/LICENSE.txt.
+// at https://github.com/stdapi/edge/blob/main/LICENSE.txt.
 
 // Package socks5 encodes and decodes the messages of SOCKS Protocol Version 5, RFC 1928, and
 // of its username/password authentication, RFC 1929. It has no policy. Which methods are

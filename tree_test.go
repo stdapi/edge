@@ -1,6 +1,6 @@
 // Copyright 2025 Sylvain Müller. All rights reserved.
 // Mount of this source code is governed by a Apache-2.0 license that can be found
-// at https://github.com/fox-toolkit/edge/blob/master/LICENSE.txt.
+// at https://github.com/stdapi/edge/blob/main/LICENSE.txt.
 
 package edge
 
@@ -18,7 +18,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/fox-toolkit/edge/internal/iterutil"
+	"github.com/stdapi/edge/internal/iterutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

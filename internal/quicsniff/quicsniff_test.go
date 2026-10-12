@@ -1,6 +1,6 @@
 // Copyright 2025 Sylvain Müller. All rights reserved.
 // Mount of this source code is governed by a Apache-2.0 license that can be found
-// at https://github.com/fox-toolkit/edge/blob/master/LICENSE.txt.
+// at https://github.com/stdapi/edge/blob/main/LICENSE.txt.
 
 package quicsniff_test
 
@@ -23,9 +23,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/fox-toolkit/edge/internal/quicsniff"
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/quicvarint"
+	"github.com/stdapi/edge/internal/quicsniff"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )

@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/fox-toolkit/edge/internal/stringsutil"
+	"github.com/stdapi/edge/internal/stringsutil"
 )
 
 type node struct {

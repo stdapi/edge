@@ -8,7 +8,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/fox-toolkit/edge/internal/simplelru"
+	"github.com/stdapi/edge/internal/simplelru"
 )
 
 const defaultModifiedCache = 4096
