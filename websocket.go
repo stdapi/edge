@@ -124,7 +124,7 @@ func (r *FrameReader) ReadFrame() (*FrameCtx, error) { return r.read() }
 // the other is still read, and the merged reader ends with io.EOF once both have ended. Any
 // other error ends it immediately. a and b must not be read elsewhere afterwards.
 func MergeFrames(a, b *FrameReader) *FrameReader {
-	m := &merged[*FrameCtx]{ctx: a.ctx, a: a.read, b: b.read}
+	m := &merged[*FrameCtx]{ctx: a.ctx, a: a.read, b: b.read, apart: a.ctx != b.ctx}
 	return &FrameReader{ctx: a.ctx, read: m.read}
 }
 
@@ -165,7 +165,7 @@ func NewFrame(op Opcode, payload []byte) Frame {
 // did.
 type WebSocketCtx struct {
 	ctx      context.Context
-	cancel   context.CancelFunc
+	cancel   context.CancelCauseFunc
 	p        *Proxy
 	sess     *Session
 	entry    *entry
@@ -366,9 +366,6 @@ func (h *wsHop) write(f Frame) error {
 	}
 	if f.opcode == OpClose {
 		h.closeCrossed(&h.sentClose)
-		h.c.mu.Lock()
-		h.c.cancelIfEndedLocked()
-		h.c.mu.Unlock()
 	}
 	return nil
 }
@@ -378,6 +375,7 @@ func (h *wsHop) closeCrossed(flag *bool) {
 	h.c.mu.Lock()
 	*flag = true
 	end := h.settleLocked()
+	h.c.cancelIfEndedLocked()
 	h.c.mu.Unlock()
 	h.finish(end)
 }
@@ -411,6 +409,7 @@ func (h *wsHop) readEnded(err error) error {
 		toSelf, toPeer := !h.sentClose && !h.ended, !h.peer.sentClose && !h.peer.ended
 		h.sentClose, h.peer.sentClose = true, true
 		self, peer := h.endLocked(hopClose), h.peer.endLocked(hopClose)
+		c.cancelIfEndedLocked()
 		c.mu.Unlock()
 		if toSelf {
 			h.writeClose(fe.code)
@@ -441,6 +440,7 @@ func (h *wsHop) readEnded(err error) error {
 	default:
 		self, peer = h.endLocked(hopClose), h.peer.endLocked(hopAbort)
 	}
+	c.cancelIfEndedLocked()
 	c.mu.Unlock()
 	h.finish(self)
 	h.peer.finish(peer)
@@ -482,11 +482,9 @@ func (h *wsHop) endLocked(how hopEnd) hopEnd {
 	return how
 }
 
-// cancelIfEndedLocked cancels the context once both hops ended. A read that ends them leaves
-// the cancel to the handler's return, so the end it reports reaches a merged reader first.
 func (c *WebSocketCtx) cancelIfEndedLocked() {
 	if c.toClient.ended && c.toOrigin.ended {
-		c.cancel()
+		c.cancel(errSourcesEnded)
 	}
 }
 

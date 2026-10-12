@@ -112,7 +112,7 @@ func (r *MessageReader) ReadMessage() (*MessageCtx, error) { return r.read() }
 // io.EOF the other is still read, and the merged reader ends with io.EOF once both have
 // ended. Any other error ends it immediately. a and b must not be read elsewhere afterwards.
 func MergeMessages(a, b *MessageReader) *MessageReader {
-	m := &merged[*MessageCtx]{ctx: a.ctx, a: a.read, b: b.read}
+	m := &merged[*MessageCtx]{ctx: a.ctx, a: a.read, b: b.read, apart: a.ctx != b.ctx}
 	return &MessageReader{ctx: a.ctx, read: m.read}
 }
 

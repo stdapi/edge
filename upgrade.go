@@ -102,7 +102,7 @@ func (p *Proxy) spliceWebSocket(c *routeCtx, w http.ResponseWriter, r *http.Requ
 	}
 
 	ctx, cancel := p.webSocketContext(r)
-	defer cancel()
+	defer cancel(nil)
 	wc := &WebSocketCtx{
 		ctx:      ctx,
 		cancel:   cancel,
@@ -125,12 +125,20 @@ func (p *Proxy) spliceWebSocket(c *routeCtx, w http.ResponseWriter, r *http.Requ
 // webSocketContext returns the context of a WebSocket handler, with the values of the
 // connection's context and an end of its own. Edge closes the client connection while the
 // closing handshake goes on toward the origin.
-func (p *Proxy) webSocketContext(r *http.Request) (context.Context, context.CancelFunc) {
+func (p *Proxy) webSocketContext(r *http.Request) (context.Context, context.CancelCauseFunc) {
 	base := r.Context()
 	if s := sessionFromRequest(r); s != nil {
 		base = s.Context()
 	}
-	return p.untilShutdown(context.WithoutCancel(base))
+	ctx, cancel := context.WithCancelCause(context.WithoutCancel(base))
+	go func() {
+		select {
+		case <-p.srv.ctx.Done():
+			cancel(nil)
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
 }
 
 // serveUpgradedStream serves what an upgrade left behind as the byte stream it now is. HTTP

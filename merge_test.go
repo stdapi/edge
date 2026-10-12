@@ -5,6 +5,7 @@
 package edge
 
 import (
+	"context"
 	"errors"
 	"io"
 	"sync/atomic"
@@ -91,4 +92,43 @@ func TestMerge_SourceHeldUntilTheNextRead(t *testing.T) {
 	require.Equal(t, 2, v)
 	time.Sleep(50 * time.Millisecond)
 	assert.Equal(t, int32(2), reads.Load())
+}
+
+func TestMerge_SourcesEndingTheContextStillEndWithEOF(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(t.Context())
+	release := make(chan struct{})
+	m := &merged[int]{
+		ctx: ctx,
+		a:   listSource([]int{1}, io.EOF),
+		b: func() (int, error) {
+			<-release
+			return 0, io.EOF
+		},
+	}
+
+	v, err := m.read()
+	require.NoError(t, err)
+	require.Equal(t, 1, v)
+
+	close(release)
+	cancel(errSourcesEnded)
+	_, err = m.read()
+	assert.ErrorIs(t, err, io.EOF)
+}
+
+func TestMerge_ContextEndingFirstEndsTheMerge(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	m := &merged[int]{
+		ctx: ctx,
+		a:   listSource([]int{1}, io.EOF),
+		b:   blockedSource(t),
+	}
+
+	v, err := m.read()
+	require.NoError(t, err)
+	require.Equal(t, 1, v)
+
+	cancel()
+	_, err = m.read()
+	assert.ErrorIs(t, err, context.Canceled)
 }

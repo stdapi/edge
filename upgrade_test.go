@@ -483,7 +483,7 @@ func TestUpgrade_WebSocketCloseTowardTheOriginIsBounded(t *testing.T) {
 	t.Parallel()
 	client := &stalledPeer{wake: make(chan struct{})}
 	origin := &stalledPipe{closed: make(chan struct{})}
-	wc := &WebSocketCtx{ctx: context.Background(), cancel: func() {}}
+	wc := &WebSocketCtx{ctx: context.Background(), cancel: func(error) {}}
 	wc.setHops(client, bytes.NewReader((wsFrame{head: 0x81, payload: []byte("x")}).bytes()), origin)
 
 	done := make(chan error, 1)
@@ -508,7 +508,7 @@ func (discardPipe) Close() error                { return nil }
 
 func TestUpgrade_WebSocketCloseOnAFailureIsBounded(t *testing.T) {
 	client := &stalledPeer{wake: make(chan struct{})}
-	wc := &WebSocketCtx{ctx: context.Background(), cancel: func() {}}
+	wc := &WebSocketCtx{ctx: context.Background(), cancel: func(error) {}}
 	// Unmasked, which fails the connection toward a client that stopped reading.
 	wc.setHops(client, bytes.NewReader((wsFrame{head: 0x81, payload: []byte("x")}).bytes()), discardPipe{})
 
@@ -528,6 +528,72 @@ func TestUpgrade_WebSocketCloseOnAFailureIsBounded(t *testing.T) {
 	defer client.mu.Unlock()
 	require.NotEmpty(t, client.deadlines)
 	assert.True(t, client.deadlines[len(client.deadlines)-1].IsZero(), "the write deadline is left set")
+}
+
+// pipeWebSocket returns a WebSocket connection over two pipes, and the ends of the client and
+// of the origin.
+func pipeWebSocket(t *testing.T) (*WebSocketCtx, net.Conn, net.Conn) {
+	ctx, cancel := context.WithCancelCause(t.Context())
+	client, clientEnd := net.Pipe()
+	origin, originEnd := net.Pipe()
+	t.Cleanup(func() {
+		cancel(nil)
+		_ = clientEnd.Close()
+		_ = originEnd.Close()
+	})
+	wc := &WebSocketCtx{ctx: ctx, cancel: cancel}
+	wc.setHops(client, client, origin)
+	return wc, clientEnd, originEnd
+}
+
+func sendClientFrame(t *testing.T, conn net.Conn) {
+	t.Helper()
+	go func() {
+		_, _ = conn.Write(wsFrame{head: 0x81, payload: []byte("x"), masked: true, key: wsKey}.bytes())
+	}()
+}
+
+func TestUpgrade_WebSocketMergedReaderEndsWithEOFWhenTheConnectionExpires(t *testing.T) {
+	wc, client, _ := pipeWebSocket(t)
+	src := MergeFrames(wc.Outbound(), wc.Inbound())
+	sendClientFrame(t, client)
+	f, err := src.ReadFrame()
+	require.NoError(t, err)
+	require.False(t, f.Inbound())
+
+	wc.expire()
+	_, err = src.ReadFrame()
+	assert.ErrorIs(t, err, io.EOF)
+}
+
+func TestUpgrade_WebSocketContextEndsWhenAReadEndsTheConnection(t *testing.T) {
+	wc, client, _ := pipeWebSocket(t)
+	require.NoError(t, client.Close())
+	_, err := wc.Outbound().ReadFrame()
+	require.ErrorIs(t, err, io.EOF)
+	assert.ErrorIs(t, context.Cause(wc.Context()), errSourcesEnded)
+}
+
+func TestUpgrade_WebSocketMergeAcrossConnectionsEndsWithTheContext(t *testing.T) {
+	c1, client, _ := pipeWebSocket(t)
+	c2, _, _ := pipeWebSocket(t)
+	src := MergeFrames(c1.Outbound(), c2.Inbound())
+	sendClientFrame(t, client)
+	_, err := src.ReadFrame()
+	require.NoError(t, err)
+
+	c1.expire()
+	done := make(chan error, 1)
+	go func() {
+		_, err := src.ReadFrame()
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		assert.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the merged reader outlived its context while the other connection is open")
+	}
 }
 
 func TestConformanceWebSocket(t *testing.T) {
