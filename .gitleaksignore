@@ -1,0 +1,9 @@
+ad66f2dc133f3308fdf1e6c17fea82dbb0aae2a8:recognize_test.go:stripe-access-token:134
+e72f1907e635a448185db2bcda55b2c779d563d6:http_test.go:generic-api-key:3109
+7e6622193591f0839d45165266c696e1002aef32:upgrade_test.go:generic-api-key:903
+d59c25883414cfd2f861af2cc7e7d71f2d5a8490:session_test.go:generic-api-key:663
+c49824ef959f2583cf3cdc2baa36347460c94f13:kind_test.go:generic-api-key:429
+bc826e733585b7585ba573180ba116fed65b30a0:kinds_test.go:generic-api-key:149
+fbe2ea1418966a9ef84f47bb296097b24a153bfc:README.md:generic-api-key:97
+f0ca08c593f062427d3ddbc000892a43054aa467:parser_test.go:generic-api-key:33
+fbe2ea1418966a9ef84f47bb296097b24a153bfc:path_test.go:generic-api-key:153

@@ -1,0 +1,284 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 4 * * 1'
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  GO_VERSION: '1.27.x'
+  GOTOOLCHAIN: local
+  EDGE_CI: '1'
+  TOOL: go tool -modfile=tools/go.mod
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+          cache-dependency-path: |
+            go.sum
+            tools/go.sum
+      - name: Tidy
+        run: |
+          go mod tidy -diff
+          (cd tools && go mod tidy -diff)
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Vet for darwin
+        run: GOOS=darwin go vet ./...
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        with:
+          version: v2.14.0
+      - name: Field alignment
+        run: $TOOL betteralign ./...
+
+  test:
+    name: Test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+          cache-dependency-path: |
+            go.sum
+            tools/go.sum
+      - name: Test
+        run: $TOOL gotestsum --format testname --jsonfile test.json -- -count=1 -skip '^(TestCurl|TestGRPCurl)|Allocs$' ./...
+      - name: Allocations
+        run: go test -count=1 -run 'Allocs$' ./...
+      - name: Skipped tests
+        if: ${{ !cancelled() }}
+        run: .github/scripts/skips.sh test.json
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
+        with:
+          name: test-json
+          path: test.json
+          retention-days: 7
+
+  race:
+    name: Race
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    env:
+      GODEBUG: http2xconnect=1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+          cache-dependency-path: |
+            go.sum
+            tools/go.sum
+      - name: Test with the race detector
+        run: $TOOL gotestsum --format testname --jsonfile race.json -- -race -count=1 -skip '^(TestCurl|TestGRPCurl)|Allocs$' ./...
+      - name: Skipped tests
+        if: ${{ !cancelled() }}
+        run: .github/scripts/skips.sh race.json 'run with GODEBUG=http2xconnect=1|GODEBUG=http2xconnect=1 is not set'
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
+        with:
+          name: race-json
+          path: race.json
+          retention-days: 7
+
+  macos:
+    name: Race (macOS)
+    if: ${{ !github.event.repository.private }}
+    runs-on: macos-15
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      GODEBUG: http2xconnect=1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+          cache-dependency-path: |
+            go.sum
+            tools/go.sum
+      - name: Test with the race detector
+        run: $TOOL gotestsum --format testname --jsonfile race-macos.json -- -race -count=1 -skip '^(TestCurl|TestGRPCurl)|Allocs$' ./...
+      - name: Skipped tests
+        if: ${{ !cancelled() }}
+        run: .github/scripts/skips.sh race-macos.json 'run with GODEBUG=http2xconnect=1|GODEBUG=http2xconnect=1 is not set'
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ !cancelled() }}
+        with:
+          name: race-macos-json
+          path: race-macos.json
+          retention-days: 7
+
+  conformance:
+    name: Conformance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+          cache-dependency-path: |
+            go.sum
+            tools/go.sum
+      - name: Install curl with HTTP/3 and grpcurl
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin"
+          /home/linuxbrew/.linuxbrew/bin/brew install --quiet curl
+          ln -s "$(/home/linuxbrew/.linuxbrew/bin/brew --prefix curl)/bin/curl" "$RUNNER_TEMP/bin/curl3"
+          go build -modfile=tools/go.mod -o "$RUNNER_TEMP/bin/grpcurl" github.com/fullstorydev/grpcurl/cmd/grpcurl
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Check curl speaks HTTP/3
+        run: |
+          curl3 --version
+          curl3 --version | grep -qw HTTP3
+      - name: Conformance
+        run: $TOOL gotestsum --format testname --jsonfile conformance.json -- -race -count=1 -run '^(TestCurl|TestGRPCurl)' .
+      - name: Skipped tests
+        if: ${{ !cancelled() }}
+        run: .github/scripts/skips.sh conformance.json
+
+  fuzz:
+    name: Fuzz
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ github.event_name == 'schedule' && 75 || 15 }}
+    permissions:
+      contents: read
+    env:
+      FUZZTIME: ${{ github.event_name == 'schedule' && '3m' || '15s' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+          cache-dependency-path: |
+            go.sum
+            tools/go.sum
+      - name: Fuzz
+        run: |
+          failed=0
+          while read -r pkg target; do
+            echo "::group::$target ($pkg)"
+            go test -run '^$' -fuzz "^${target}\$" -fuzztime "$FUZZTIME" "$pkg" || { echo "::error::$target failed"; failed=1; }
+            echo "::endgroup::"
+          done < <(go test -list '^Fuzz' ./... | awk '/^Fuzz/ { t[++n] = $1; next } /^ok / { for (i = 1; i <= n; i++) print $2, t[i]; n = 0 }')
+          exit "$failed"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: ${{ failure() }}
+        with:
+          name: fuzz-corpus
+          path: '**/testdata/fuzz/**'
+          retention-days: 30
+
+  vuln:
+    name: Vulnerabilities
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+          cache-dependency-path: |
+            go.sum
+            tools/go.sum
+      - name: govulncheck
+        run: $TOOL govulncheck ./...
+
+  workflows:
+    name: Workflows
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+          cache-dependency-path: |
+            go.sum
+            tools/go.sum
+      - name: actionlint
+        run: $TOOL actionlint
+      - uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482 # v0.6.4
+        with:
+          advanced-security: false
+          persona: pedantic
+
+  secrets:
+    name: Secrets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          check-latest: true
+          cache-dependency-path: |
+            go.sum
+            tools/go.sum
+      - name: gitleaks
+        run: $TOOL gitleaks git --redact --no-banner .
