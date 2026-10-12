@@ -1,318 +1,214 @@
 # Edge
 
-Edge is a forward HTTP proxy library for Go. It intercepts the authorities you name, terminating TLS with a local certificate authority so your code can inspect and rewrite requests and responses in flight, tunnels the ones you want left alone, and refuses everything else.
+Edge is an intercepting forward proxy library for [Go](https://go.dev/), designed for building debugging proxies,
+fault injection tools, traffic recorders, egress gateways, or other applications that need to inspect and control the
+traffic a client sends over the network. It terminates TLS with certificates issued on demand by a certificate
+authority the client trusts, and supports HTTP/1.1, HTTP/2, HTTP/3, gRPC, WebSocket, TCP, QUIC and UDP. Edge aims to
+give every kind of traffic, from an HTTP request to a UDP datagram, its own handler, as simple to write as an HTTP
+handler.
 
-It was built to capture the outbound traffic of an application under end-to-end test without the application being able to tell. What goes upstream is what the client sent, byte for byte, minus only the hop-by-hop headers a proxy must not relay. The HTTP version is mirrored in both directions. Bodies are never decompressed on the way through. Nothing is added: no `Via`, no `X-Forwarded-For`, no `Accept-Encoding` of the proxy's own.
+Edge supports **mutation on its routing tree while proxying traffic concurrently**. Internally, it uses a Radix Tree
+adapted from [Fox](https://github.com/fox-toolkit/fox) that supports **lock-free** reads while allowing a concurrent
+writer. Entries support flexible patterns on the hostname, the port and the path, with named parameters, catch-all
+wildcards, regexp constraints, address ranges and request matchers. Edge enforces clear priority rules and performs strict
+validation to prevent misconfigurations.
 
-Routing uses an immutable radix tree with lock-free reads and single-writer semantics, adapted from [Fox](https://github.com/fox-toolkit/fox). Nothing is configured at construction: interceptors and tunnels are added and removed while traffic flows, without blocking a lookup.
+> [!WARNING]
+> Edge is experimental. The API is not stabilized, and breaking changes may occur at any time.
+
+## Features
+### Client to proxy
+
+<table>
+<thead>
+<tr>
+  <th colspan="2" rowspan="2">Traffic</th>
+  <th colspan="4">Explicit<sup>1</sup></th>
+  <th rowspan="2">Transparent<sup>2</sup><br><sub>routed on</sub></th>
+</tr>
+<tr>
+  <th>HTTP/1.1</th>
+  <th>HTTP/2</th>
+  <th>HTTP/3</th>
+  <th>SOCKS5</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <th rowspan="4">Over TCP</th>
+  <th>HTTP<br><sub>HTTP/1.1, HTTP/2</sub></th>
+  <td>request<br>CONNECT</td>
+  <td>request<br>CONNECT</td>
+  <td>request<br>CONNECT</td>
+  <td>CONNECT</td>
+  <td>SNI, Host<br>or destination</td>
+</tr>
+<tr>
+  <th>gRPC</th>
+  <td colspan="5">as HTTP, HTTP/3 included</td>
+</tr>
+<tr>
+  <th>WebSocket</th>
+  <td colspan="5">as HTTP/1.1</td>
+</tr>
+<tr>
+  <th>TCP</th>
+  <td colspan="4">CONNECT</td>
+  <td>SNI, Host<br>or destination</td>
+</tr>
+<tr>
+  <th rowspan="3">Over UDP</th>
+  <th>HTTP<br><sub>HTTP/3</sub></th>
+  <td colspan="2" rowspan="3">CONNECT-UDP<sup>3</sup><br>DATAGRAM capsules</td>
+  <td>request<br>CONNECT-UDP<br>QUIC DATAGRAM frames</td>
+  <td rowspan="3">UDP ASSOCIATE</td>
+  <td rowspan="2">SNI<br>or destination</td>
+</tr>
+<tr>
+  <th>QUIC</th>
+  <td rowspan="2">CONNECT-UDP<br>QUIC DATAGRAM frames</td>
+</tr>
+<tr>
+  <th>UDP</th>
+  <td>destination</td>
+</tr>
+</tbody>
+</table>
+
+1. Proxy authentication with HTTP Basic or a custom `ProxyAuthenticator`, and with a username and a password on SOCKS5.
+2. Requires Linux with REDIRECT or TPROXY, TPROXY for UDP, or macOS with pf and read access to `/dev/pf`.
+3. CONNECT-UDP over HTTP/2 requires `GODEBUG=http2xconnect=1`, which enables extended CONNECT in the Go HTTP/2 server.
+
+### Proxy to origin
+
+<table>
+<thead>
+<tr>
+  <th colspan="2" rowspan="2">Traffic</th>
+  <th rowspan="2">Direct</th>
+  <th colspan="4">Chained</th>
+</tr>
+<tr>
+  <th><code>http</code>, <code>https</code><br><sub>HTTP/1.1</sub></th>
+  <th><code>https</code><br><sub>HTTP/2</sub></th>
+  <th><code>https</code><br><sub>HTTP/3</sub></th>
+  <th><code>socks5</code>, <code>socks5h</code></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+  <th rowspan="4">Over TCP</th>
+  <th>HTTP<br><sub>HTTP/1.1, HTTP/2</sub></th>
+  <td rowspan="2">HTTP/1.1, HTTP/2, h2c<sup>1</sup></td>
+  <td colspan="3" rowspan="4">CONNECT</td>
+  <td rowspan="4">CONNECT</td>
+</tr>
+<tr>
+  <th>gRPC</th>
+</tr>
+<tr>
+  <th>WebSocket</th>
+  <td>HTTP/1.1</td>
+</tr>
+<tr>
+  <th>TCP</th>
+  <td>TCP or TLS</td>
+</tr>
+<tr>
+  <th rowspan="3">Over UDP</th>
+  <th>HTTP<br><sub>HTTP/3</sub></th>
+  <td>HTTP/3<sup>2</sup></td>
+  <td colspan="2" rowspan="3">CONNECT-UDP<br>DATAGRAM capsules</td>
+  <td rowspan="3">CONNECT-UDP<br>QUIC DATAGRAM frames</td>
+  <td rowspan="3">UDP ASSOCIATE</td>
+</tr>
+<tr>
+  <th>QUIC</th>
+  <td>QUIC</td>
+</tr>
+<tr>
+  <th>UDP</th>
+  <td>UDP</td>
+</tr>
+</tbody>
+</table>
+
+1. h2c for gRPC, and for HTTP only when the client used h2c through a tunnel or a transparent listener.
+2. Opt-in with `Transport.AllowHTTP3`.
+
+---
+* [Getting started](#getting-started)
+  * [Install](#install)
+  * [Basic example](#basic-example)
+* [License](#license)
+---
+
+## Getting started
+#### Install
+With a [correctly configured](https://go.dev/doc/install#testing) Go toolchain:
+```shell
+go get -u github.com/stdapi/edge
+```
+This library requires Go 1.27 or above.
+
+#### Basic example
+The proxy below intercepts the outbound traffic of a checkout service under test. It refuses a Stripe charge sent
+without an idempotency key, fails one method of a gRPC inventory service, and throttles the responses of a Redis cache
+to 64 KiB/s.
 
 ```go
-ca, _ := edge.GenerateCA()
+package main
 
-p, _ := edge.New(edge.WithCA(ca))
+import (
+	"log"
+	"net/http"
 
-// An interceptor names the authority it intercepts, so this arms api.stripe.com on its own.
-p.MustAddInterceptor([]string{"POST"}, "api.stripe.com/v1/charges", func(c *edge.Context) (*http.Response, error) {
-    // 1. inspect the request, block it or change it
-    if c.Request().Header.Get("Idempotency-Key") == "" {
-        return edge.Text(400, "missing idempotency key"), nil
-    }
-    c.Request().Header.Set("X-Test-Run", runID)
-
-    // 2. forward to the real upstream
-    resp, err := c.Forward()
-    if err != nil {
-        return nil, err
-    }
-
-    // 3. inspect and rewrite the response
-    body, err := edge.ReadBody(resp, 0)
-    if err != nil {
-        return nil, err
-    }
-    return edge.Rewrite(resp, injectFault(body)), nil
-})
-
-// Leave this one alone: its TLS stays end to end and the proxy never sees the plaintext.
-p.MustAddTunnel("checkout.stripe.com")
-
-log.Fatal(p.ListenAndServe(":8080"))
-```
-
-Point the application at it with `HTTPS_PROXY=http://localhost:8080` and install `ca.CertificatePEM()` in its trust store.
-
-## What it supports
-
-|                      | HTTP/1.1 | HTTP/2 | HTTP/3 |
-| -------------------- | -------- | ------ | ------ |
-| Explicit proxy       | yes      | yes    | yes    |
-| Transparent redirect | yes      | yes    | yes    |
-| Tunnel end to end    | yes      | yes    | yes    |
-| Intercept and route  | yes      | yes    | yes    |
-
-A classic proxy setting sends an HTTP/3 client back to TCP, since `CONNECT` tunnels a stream and HTTP/3 needs datagrams. `CONNECT-UDP` (RFC 9298, the MASQUE tunnel) tunnels them. `ListenAndServeQUIC` serves it over an HTTP/3 front, and the TCP fronts serve it as capsules on the stream, an extended CONNECT over HTTP/2 or a GET the proxy upgrades over HTTP/1.1, for a client that cannot reach the proxy over UDP. A client that speaks it reaches HTTP/3 origins and any other UDP through a proxy setting, and the tunnel and everything inside it show up in `Sessions()`. A client that does not is reached by routing it to the transparent listener instead. Go's HTTP/2 server accepts an extended CONNECT only with `GODEBUG=http2xconnect=1` in the environment.
-
-A client with no notion of an HTTP proxy, `ssh -D`, git, a database driver, a JVM with `socksProxyHost`, reaches the same entries through `ListenAndServeSOCKS5` (RFC 1928). A `CONNECT` there is terminated and routed as an HTTP `CONNECT` is, and a `UDP ASSOCIATE` is a tunnel routing every datagram on the destination it is addressed to, an address or a hostname the proxy resolves. Upstream, a `socks5://` value in `Transport.Proxy` chains through a SOCKS5 proxy, `CONNECT` for TCP and `UDP ASSOCIATE` for QUIC and UDP.
-
-Protocol upgrades, including WebSocket, are spliced through in both modes. Server-sent events and other streamed bodies are relayed as they are produced, not buffered. Trailers are forwarded.
-
-## Two axes, not one
-
-It is worth separating two things that both get called "transparent":
-
-**How the client reaches the proxy.** Either *explicitly*, configured with a proxy setting, sending `CONNECT` or an absolute request target; or *transparently*, not configured at all, with its packets redirected by the network, leaving the proxy to work out where they were headed.
-
-**What the proxy does with the connection.** Either *tunnel*, relaying bytes so the client's TLS stays end to end and the proxy never sees the plaintext; or *intercept*, terminating TLS with a minted certificate so handlers can see and change what goes past.
-
-The two combine freely. Most test setups want an explicit proxy that intercepts a handful of authorities and tunnels the rest. An application that ignores proxy environment variables needs the transparent listener instead.
-
-## What happens to a connection
-
-The decision is taken from the authority alone, before any request is parsed, and the most specific pattern wins. A hostname is decided among the name patterns, a static authority beating a parameter, which beats a wildcard. An address is decided among the address patterns, the longest registered prefix winning like a routing table entry, an exact address being the longest of all. A host is one or the other, never both, so the two kinds of pattern never compete for a connection. The decision is taken again for every request that names another authority, through its `Host` header or through a transparent listener carrying many, so nothing is reached on the strength of a decision taken for something else.
-
-```go
-// Watch every Stripe subdomain, forwarding untouched unless a narrower interceptor matches.
-p.MustAddInterceptor(nil, "+{sub}.stripe.com/*{any}", edge.DefaultNoInterceptorHandler)
-
-// Except this one, whose TLS must stay end to end. Static beats the wildcard.
-p.MustAddTunnel("checkout.stripe.com")
-```
-
-There are only these two ways to admit an authority, and both name it explicitly. An interceptor arms the authority in its own pattern, so a handler always sees the traffic it was written for; the entry it implies is reference counted and disappears with the last interceptor that needed it.
-
-**Everything else is refused.** A proxy that captures the traffic of an application under test should say what it expects that application to reach, and hear about it when the application reaches somewhere else. A permissive proxy is restored by naming hostnames and addresses separately, and every line is visible in the code:
-
-```go
-p.MustAddTunnel("+{any}")      // relay any hostname not named above
-p.MustAddTunnel("[0.0.0.0/0]") // relay any IPv4 address
-p.MustAddTunnel("[::/0]")      // relay any IPv6 address
-```
-
-The split is deliberate. An application reaching a raw IP instead of a name is often exactly what a test wants to hear about, and allowing it is a decision worth a line of its own.
-
-An authority cannot be both tunneled and intercepted by the same pattern. Declaring the second is an error rather than a silent no-op, in either order, because one of the two would otherwise be dead.
-
-`p.ActionFor(target)` answers what would happen to an authority without opening a connection, and `p.Iter().Authorities()` iterates what is registered.
-
-## Patterns
-
-A pattern is an authority and a path. The authority is required: it is what the interceptor arms.
-
-```
-api.stripe.com/v1/charges           any scheme, any port
-api.stripe.com:8443/v1/charges      one port
-+{sub}.corp.internal/health         every subdomain
-+{any}/v1/charges                   every hostname
-api.stripe.com/*{any}               every path on one host, which is how to just watch it
-127.0.0.1/health                    address literal
-[::1]:8080/health                   IPv6, bracketed
-[10.0.0.0/8]/health                 every address in a range
-[::/0]/health                       every IPv6 address
-```
-
-Parameters use Fox's syntax:
-
-- Named: `{name}`, or `{name:[a-z]+}` with `WithRegexpParam` enabled
-- Wildcards: `*{param}` matches empty, suffix only; `+{param}` needs at least one character and works as a prefix, infix or suffix
-
-Matching priority is static, then regex parameter, then parameter, then regex wildcard, then wildcard, with backtracking to the last decision point.
-
-A pattern names either hostnames or addresses, never both. A parameter or a wildcard captures name labels only, so `{a}/api` matches no address and `127.0.{a}.1` is a four label hostname, not a range. RFC 3986 decides the kind of an incoming host the same way, address first, and the lookup reduces whatever spelling the client wrote to the canonical one, so `2001:0db8::1` and `2001:db8::1` reach the same entry.
-
-An address literal has one spelling, the one an authority carries: `[::1]`, not `::1` or `[::0001]`. A range is bracketed for its `/`, masked, and shorter than a full address: `[10.0.0.0/8]`, not `10.0.0.0/8`, `[10.0.0.1/8]` or `[10.0.0.1/32]`. Every other spelling is refused with the one to write. Ranges may overlap freely, the longest deciding, and a range matches the address a client names, never what a hostname resolves to.
-
-### Port
-
-The port is part of the pattern:
-
-```go
-p.MustAddInterceptor([]string{"GET"}, "localhost:8080/api", api)
-p.MustAddInterceptor([]string{"GET"}, "localhost:3000/", ui)
-```
-
-Two patterns differing only by their port are two interceptors, and each arms only its own authority. An interceptor naming no port matches every port, and one naming a port is tried first, ahead of a method or a matcher. The port compared against is always explicit, so `api.test:443/v1` matches a plain `https://api.test/v1` target.
-
-An authority pattern carries its port the same way: `p.MustAddTunnel("localhost:8080")`.
-
-### Scheme
-
-The scheme is a matcher, not part of the pattern:
-
-```go
-p.MustAddInterceptor([]string{"POST"}, "api.test/v1", h, edge.WithScheme[edge.HTTP]("https"))
-```
-
-Writing one in a pattern is an error describing what is refused.
-
-## Message framing
-
-Intercepted traffic is parsed and re-serialized, never relayed as bytes. A message whose framing is ambiguous, a request carrying both a `Content-Length` and a `Transfer-Encoding` for example, is resolved once, by the proxy, and what reaches the origin is what the proxy read. Client and origin cannot end up disagreeing about where a message ends, and nothing reaches the origin without having been routed first.
-
-Tunneled traffic is relayed byte for byte and is not parsed at all, which is what makes a tunnel transparent in the first place.
-
-## Handlers
-
-```go
-type HandlerFunc func(c *edge.Context) (*http.Response, error)
-```
-
-An interceptor is registered for a set of methods. An empty or nil set matches every method, which is the only way to say it: there is no separate constant for it and no single-method form of the call.
-
-Returning a response from `c.Forward()` relays the upstream answer without buffering it. Returning one built locally short-circuits the upstream entirely and the request never leaves the proxy. Returning an error hands it to the configured `ErrorHandler`, which answers 502 by default. A panicking handler is recovered and reaches the same `ErrorHandler` as a `PanicError` carrying the value and the stack; the default logs it and answers 500.
-
-A request matching no interceptor is forwarded unchanged, so watching an authority without rewriting anything stays non-disruptive. `WithNoInterceptorHandler` changes that.
-
-Response helpers: `Text`, `Textf`, `HTML`, `JSON`, `Bytes`, `Stream`, `Status`, `Redirect`. Body helpers: `ReadBody` returns the bytes as they came off the wire, `DecodeBody` decompresses first and drops the `Content-Encoding`, and `Rewrite` puts a new body back with the length headers fixed up.
-
-Middleware composes the way it does in Fox:
-
-```go
-p, _ := edge.New(
-    edge.WithCA(ca),
-    edge.WithMiddleware(logging, recordToHAR),
+	"github.com/stdapi/edge"
 )
-p.MustAddInterceptor([]string{"GET"}, "api.stripe.com/v1/charges", h, edge.WithMiddleware(retry))
-```
 
-A gRPC call is not decoded by middleware. `KindGRPC` serves it message by message, on the hostname and the full method name, and a WebSocket connection is served frame by frame by `KindWebSocket`.
+func main() {
+	ca, err := edge.LoadCAFile("ca.pem", "ca-key.pem")
+	if err != nil {
+		log.Fatal(err)
+	}
 
-## Sessions
+	p := edge.Must(edge.WithCA(ca))
 
-A `Session` is the client connection a request arrived on, shared by every request multiplexed onto it. It carries the peer address, the negotiated protocol, the TLS state, what the client offered in its ClientHello, and a context canceled when the connection ends.
+	// Refuse a charge without an idempotency key, forward the others to Stripe.
+	p.MustAdd("api.stripe.com/v1/charges", func(c *edge.HTTPCtx) (*http.Response, error) {
+		if c.Header("Idempotency-Key") == "" {
+			return edge.Text(http.StatusBadRequest, "missing idempotency key"), nil
+		}
+		return c.Forward()
+	}, edge.WithMethods[edge.HTTP](http.MethodPost))
 
-```go
-p.MustAddInterceptor([]string{"GET"}, "api.stripe.com/v1/charges", func(c *edge.Context) (*http.Response, error) {
-    log.Printf("%s over %s, client offered ALPN %v",
-        c.Authority(), c.Protocol(), c.Session().ClientHello().ALPN)
-    return c.Forward()
-})
-```
+	// Every other Stripe endpoint is forwarded unchanged.
+	p.MustAdd("api.stripe.com/*{any}", func(c *edge.HTTPCtx) (*http.Response, error) {
+		return c.Forward()
+	})
 
-A change to the entries reaches the next request or datagram and leaves a connection already open as it was. `Stale()` reports a session whose client would be served differently if it connected again now, once an Add, an Update or a Delete leaves its authority admitted by nothing, by a handler of a more specific kind, or by another handler of the same kind. Closing it makes the client connect again, and the current handlers serve it.
+	// One gRPC method fails with UNAVAILABLE, the other methods are forwarded.
+	p.MustAdd("inventory.internal/inventory.v1.Inventory/Reserve", func(c *edge.GRPCCtx) error {
+		return c.Fail(edge.CodeUnavailable, "inventory unavailable")
+	})
+	p.MustAdd("inventory.internal/*{method}", func(c *edge.GRPCCtx) error {
+		return c.Forward()
+	})
 
-```go
-for s := range p.Sessions() {
-    if s.Stale() {
-        s.Close()
-    }
+	// Throttle the responses of the cache to 64 KiB/s.
+	p.MustAdd("cache.internal:6379", func(c *edge.TCPCtx) error {
+		up, err := c.Dial()
+		if err != nil {
+			return err
+		}
+		_, _, err = edge.Relay(edge.Throttled(c.Client(), 64<<10), up)
+		return err
+	})
+
+	go func() { log.Fatal(p.ListenAndServeSOCKS5(":1080")) }()
+	log.Fatal(p.ListenAndServe(":8080"))
 }
-```
-
-## Proxy authentication
-
-Clients of the explicit proxy can be made to authenticate. A request the authenticator refuses is answered with `407 Proxy Authentication Required` carrying the challenges it offers, or with `403 Forbidden` when it offers none.
-
-```go
-p, _ := edge.New(
-    edge.WithCA(ca),
-    edge.WithProxyAuth(edge.BasicAuth("edge", func(user, pass string) bool {
-        hash, ok := store.Lookup(user)
-        return ok && bcrypt.CompareHashAndPassword(hash, []byte(pass)) == nil
-    })),
-)
-```
-
-The check runs before the authority is resolved, so an unauthenticated client cannot tell an authority the proxy admits from one it refuses. `BasicAuth` parses the credentials and hands them to the callback, which looks them up wherever they live, so the proxy never holds one of its own. Basic sends them on every request, encoded rather than encrypted, so reach the proxy over TLS or they cross the network in the clear.
-
-The identity the authenticator reports reaches a handler as `c.Identity()`. A `CONNECT` is one authenticated request whose grant covers the tunnel it opens, so its whole session reports that identity and nothing inside the tunnel is challenged again. `Session.Identity()` is what a revocation sweeps on, and it is the only lever a tunnel offers since no handler ever runs on one:
-
-```go
-for s := range p.Sessions() {
-    if s.Identity() == revoked {
-        s.Close()
-    }
-}
-```
-
-Implementing `ProxyAuthenticator` yourself covers Bearer or anything else: `Authenticate` reads the request, `Challenges` says what a 407 should offer.
-
-The same option serves the SOCKS5 front, where a client presents a username and a password (RFC 1929). `BasicAuth` is a `PasswordAuthenticator` as well, so the callback above verifies both fronts. An authenticator of your own serves SOCKS5 once it implements `AuthenticatePassword`, and `ServeSOCKS5` refuses to start with one that does not.
-
-A transparently redirected client does not know a proxy exists and can carry no proxy credentials, so this applies to the explicit listeners only. That is the limit of the protocol, not of the proxy. There, a client is identified by where it comes from.
-
-## Certificate authority
-
-```go
-ca, _ := edge.GenerateCA(edge.WithCASubject("acme test CA", "ACME"))
-os.WriteFile("ca.pem", ca.CertificatePEM(), 0o600)
-```
-
-Or bring your own with `edge.LoadCA(certPEM, keyPEM)` or `edge.LoadCAFile(certPath, keyPath)`.
-
-Leaf certificates are minted on demand for the name the client asked for, cached, and share one key pair. Signing a new leaf costs about 60µs; reading a cached one back costs about 60ns. Concurrent connections to the same authority wait on a single signature rather than each producing their own.
-
-## Transparent mode
-
-```go
-p, _ := edge.New(edge.WithCA(ca))
-
-go p.ListenAndServeTransparent(":8443") // TCP, redirected
-go p.ListenAndServeTransparentUDP(":8443")        // UDP, redirected
-```
-
-Transparent means the client is not configured, not that a particular mechanism brought its traffic here. Two get it here:
-
-- **Resolve the authority to the proxy**, with a dedicated resolver, a hosts entry or a split-horizon zone, and listen on the port the client expects. Costs no privilege and works from another machine.
-- **Redirect the packets**, with an iptables or nftables `REDIRECT` on Linux or an `rdr` rule in pf on macOS. Needs the rule and the proxy on the same host, and an exclusion for the proxy's own user so its upstream connections are not redirected back into it.
-
-A connection is routed on the server name of its TLS ClientHello, or on the authority of the first request of a plaintext HTTP connection, and dialed to the address it was headed to before the redirect. That address is only needed to recover the port, to reach the exact address the client had resolved, or to place a client that sends no name, which a connection opening with the HTTP/2 preface is until the server has sent its SETTINGS.
-
-The two `ListenAndServe` calls above set that up on the sockets they open. Bring your own and you wrap them yourself:
-
-```go
-ln, _ := net.Listen("tcp", ":8443")
-go p.ServeTransparent(edge.TransparentListener(ln))
-
-pc, _ := net.ListenPacket("udp", ":8443")
-conn, _ := edge.TransparentPacketConn(pc)
-go p.ServeTransparentUDP(conn)
-```
-
-The connection reports where it was headed and the proxy asks it, through the `OriginalDestination` and `PacketOriginalDestination` interfaces, so a setup neither of these covers is a connection type of your own.
-
-For TCP the lookup reads `SO_ORIGINAL_DST` on Linux and asks the pf state table on macOS, which needs read access to `/dev/pf`. For UDP, netfilter reports the address with each datagram through `IP_RECVORIGDSTADDR`, while pf reports nothing with the datagram, so the socket asks for the address it arrived on and the destination comes from a `DIOCNATLOOK`.
-
-For QUIC, the proxy reads the server name out of the Initial packets by deriving their protection keys from the connection ID they carry in clear, reassembling the ClientHello across as many packets as it spans. That is what lets a connection be tunneled without being terminated first.
-
-## Runtime changes
-
-Interceptors and tunnels are transactional and can change together under load:
-
-```go
-p.Updates(func(txn *edge.Txn) error {
-    if _, err := txn.AddInterceptor([]string{"POST"}, "api.stripe.com/v1/charges", failOnce); err != nil {
-        return err
-    }
-    _, err := txn.DeleteInterceptor([]string{"GET"}, "api.stripe.com/v1/health")
-    return err
-})
-```
-
-A write transaction takes the proxy write lock; lookups never take it and never block. Interceptors and authorities share one tree, so an interceptor and the authority entry it implies are published together and cannot disagree.
-
-## Performance
-
-On an M4 Max, with zero allocations on every lookup:
-
-```
-BenchmarkLookup/static-16                 19.2 ns/op    0 B/op   0 allocs/op
-BenchmarkLookup/param-16                  27.8 ns/op    0 B/op   0 allocs/op
-BenchmarkLookup/wildcard_host-16          38.7 ns/op    0 B/op   0 allocs/op
-BenchmarkLookupDeepTree-16                39.5 ns/op    0 B/op   0 allocs/op
-BenchmarkActionFor/hit_static-16          16.5 ns/op    0 B/op   0 allocs/op
-BenchmarkLeafCached-16                    58.1 ns/op   48 B/op   1 allocs/op
-BenchmarkLeafMint-16                      63.9 µs/op
-```
-
-## Testing
-
-The curl tests drive the proxy with `curl`. A Go client shares its HTTP implementation with the proxy and would agree with it on anything both get wrong. They use `curl3`, the Homebrew build that supports HTTP/3 and reports the negotiated version, and fall back to whatever `curl` is on `PATH`.
-
-```bash
-go test -race ./...
-go test -run 'TestCurl|TestGRPCurl' -v .
 ```
 
 ## License
-
 Apache-2.0. The routing core is adapted from [Fox](https://github.com/fox-toolkit/fox), under the same license.
