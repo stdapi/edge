@@ -314,6 +314,26 @@ func TestCurl_ChunkedResponse(t *testing.T) {
 	}
 }
 
+// requireCurlFlag skips the test when the curl on PATH does not list flag in its help.
+func requireCurlFlag(t *testing.T, flag string) {
+	t.Helper()
+	out, err := exec.Command(requireCurl(t), "--help", "all").Output()
+	if err != nil || !strings.Contains(string(out), " "+flag+" ") {
+		t.Skipf("curl on PATH has no %s", flag)
+	}
+}
+
+// protoAuth admits every request and records its method and the protocol of the proxy
+// connection.
+type protoAuth struct{ seen recorder }
+
+func (a *protoAuth) Authenticate(r *http.Request) (string, bool) {
+	a.seen.add(r.Method + " " + protoOfRequest(r).String())
+	return "", true
+}
+
+func (a *protoAuth) Challenges(*http.Request) []string { return nil }
+
 func TestCurl_OverHTTPSProxy(t *testing.T) {
 	origin := curlOrigin(t)
 	originURL, _ := url.Parse(origin.URL)
@@ -322,13 +342,18 @@ func TestCurl_OverHTTPSProxy(t *testing.T) {
 	tr := DefaultTransport()
 	tr.RootCAs = originPool(t, origin)
 
-	p, err := New(WithCA(ca), WithTransport(tr))
+	auth := new(protoAuth)
+	p, err := New(WithCA(ca), WithTransport(tr), WithProxyAuth(auth))
 	if err != nil {
 		t.Fatalf("new proxy: %v", err)
 	}
-	p.MustAdd(originHost(originURL)+"/*{any}", forwardHandler)
+	seen := new(recorder)
+	p.MustAdd(originHost(originURL)+"/*{any}", func(c *HTTPCtx) (*http.Response, error) {
+		seen.add(c.Protocol().String() + " " + c.Request().URL.RequestURI())
+		return c.Forward()
+	})
 
-	// The proxy port itself speaks TLS, so curl reaches it with an HTTPS proxy URL. The
+	// The proxy port itself is TLS, so curl reaches it with an HTTPS proxy URL. The
 	// certificate authenticating the proxy is minted by the same CA curl already trusts.
 	proxyCert := selfSignedFor(t, ca, "localhost")
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -342,19 +367,26 @@ func TestCurl_OverHTTPSProxy(t *testing.T) {
 	caFile := writeCAFile(t, ca)
 
 	cases := []struct {
-		name  string
-		flags []string
+		name    string
+		flags   []string
+		front   Protocol
+		inner   Protocol
+		version string
 	}{
-		{name: "h1 to proxy, h1 to origin", flags: []string{"--http1.1"}},
-		{name: "h1 to proxy, h2 to origin", flags: []string{"--http2"}},
-		// --proxy-http2 makes curl speak HTTP/2 to the proxy itself, so the tunnel is an
-		// HTTP/2 CONNECT stream rather than a hijacked HTTP/1.1 connection.
-		{name: "h2 to proxy, h1 to origin", flags: []string{"--proxy-http2", "--http1.1"}},
-		{name: "h2 to proxy, h2 to origin", flags: []string{"--proxy-http2", "--http2"}},
+		{name: "h1 to proxy, h1 to origin", flags: []string{"--http1.1"}, front: HTTP11, inner: HTTP11, version: "1.1"},
+		{name: "h1 to proxy, h2 to origin", flags: []string{"--http2"}, front: HTTP11, inner: HTTP2, version: "2"},
+		// --proxy-http2 makes curl negotiate h2 with the proxy, so the tunnel is an HTTP/2
+		// CONNECT stream.
+		{name: "h2 to proxy, h1 to origin", flags: []string{"--proxy-http2", "--http1.1"}, front: HTTP2, inner: HTTP11, version: "1.1"},
+		{name: "h2 to proxy, h2 to origin", flags: []string{"--proxy-http2", "--http2"}, front: HTTP2, inner: HTTP2, version: "2"},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.front == HTTP2 {
+				requireCurlFlag(t, "--proxy-http2")
+			}
+			fronts, handled := len(auth.seen.all()), len(seen.all())
 			args := append(slices.Clone(tc.flags),
 				"--proxy", "https://localhost:"+port,
 				"--proxy-cacert", caFile,
@@ -369,6 +401,9 @@ func TestCurl_OverHTTPSProxy(t *testing.T) {
 			if !strings.Contains(res.body, "path=/echo") {
 				t.Fatalf("unexpected body %q", res.body)
 			}
+			assert.Equal(t, tc.version, res.version)
+			assert.Equal(t, []string{"CONNECT " + tc.front.String()}, auth.seen.all()[fronts:])
+			assert.Equal(t, []string{tc.inner.String() + " /echo"}, seen.all()[handled:])
 		})
 	}
 }
@@ -381,11 +416,16 @@ func TestCurl_PlainHTTPOverHTTPSProxy(t *testing.T) {
 	originURL, _ := url.Parse(origin.URL)
 
 	ca, _ := GenerateCA()
-	p, err := New(WithCA(ca))
+	auth := new(protoAuth)
+	p, err := New(WithCA(ca), WithProxyAuth(auth))
 	if err != nil {
 		t.Fatalf("new proxy: %v", err)
 	}
-	p.MustAdd(originHost(originURL)+"/*{any}", forwardHandler)
+	seen := new(recorder)
+	p.MustAdd(originHost(originURL)+"/*{any}", func(c *HTTPCtx) (*http.Response, error) {
+		seen.add(c.Session().Protocol().String() + " " + c.Request().URL.RequestURI())
+		return c.Forward()
+	})
 
 	proxyCert := selfSignedFor(t, ca, "localhost")
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -397,17 +437,33 @@ func TestCurl_PlainHTTPOverHTTPSProxy(t *testing.T) {
 	_, port, _ := net.SplitHostPort(ln.Addr().String())
 	caFile := writeCAFile(t, ca)
 
-	for _, flags := range [][]string{{"--http1.1"}, {"--proxy-http2"}} {
-		t.Run(flags[0], func(t *testing.T) {
-			res := runCurl(t, append(flags,
+	cases := []struct {
+		flag    string
+		front   Protocol
+		version string
+	}{
+		{flag: "--http1.1", front: HTTP11, version: "1.1"},
+		{flag: "--proxy-http2", front: HTTP2, version: "2"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.flag, func(t *testing.T) {
+			if tc.front == HTTP2 {
+				requireCurlFlag(t, "--proxy-http2")
+			}
+			fronts, handled := len(auth.seen.all()), len(seen.all())
+			res := runCurl(t,
+				tc.flag,
 				"--proxy", "https://localhost:"+port,
 				"--proxy-cacert", caFile,
 				"--resolve", "localhost:"+port+":127.0.0.1",
 				origin.URL+"/plain",
-			)...)
+			)
 			if res.status != "200" || res.body != "path=/plain" {
 				t.Fatalf("status = %s, body %q", res.status, res.body)
 			}
+			assert.Equal(t, tc.version, res.version)
+			assert.Equal(t, []string{"GET " + tc.front.String()}, auth.seen.all()[fronts:])
+			assert.Equal(t, []string{tc.front.String() + " /plain"}, seen.all()[handled:])
 		})
 	}
 }
