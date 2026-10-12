@@ -183,7 +183,7 @@ func TestNormalizeRawPath(t *testing.T) {
 	}
 }
 
-func TestNormalizeRawPathNoAlloc(t *testing.T) {
+func TestNormalizeRawPathAllocs(t *testing.T) {
 	noAllocCases := []struct {
 		name string
 		raw  string

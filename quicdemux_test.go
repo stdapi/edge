@@ -1584,6 +1584,10 @@ func TestQUICResetSecret_KeyIsHKDFExpand(t *testing.T) {
 		key := secret.key(id)
 		assert.Equal(t, want, key[:])
 	}
+}
+
+func TestQUICResetSecret_AddrKeyAllocs(t *testing.T) {
+	secret := quicResetSecret(randomBytes(t, 32))
 	origin := netip.MustParseAddrPort("192.0.2.1:443")
 	assert.Zero(t, testing.AllocsPerRun(100, func() { _ = secret.addrKey(origin) }))
 }
