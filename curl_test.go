@@ -31,11 +31,11 @@ const curlBin = "curl3"
 func requireCurl(t *testing.T) string {
 	t.Helper()
 	path, err := exec.LookPath(curlBin)
-	if err != nil {
+	if err != nil && !requireTools() {
 		path, err = exec.LookPath("curl")
-		if err != nil {
-			t.Skipf("no curl on PATH: %v", err)
-		}
+	}
+	if err != nil {
+		skipWithoutTool(t, "no curl on PATH: %v", err)
 	}
 	return path
 }
@@ -319,7 +319,7 @@ func requireCurlFlag(t *testing.T, flag string) {
 	t.Helper()
 	out, err := exec.Command(requireCurl(t), "--help", "all").Output()
 	if err != nil || !strings.Contains(string(out), " "+flag+" ") {
-		t.Skipf("curl on PATH has no %s", flag)
+		skipWithoutTool(t, "curl on PATH has no %s", flag)
 	}
 }
 

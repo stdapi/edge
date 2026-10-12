@@ -26,7 +26,7 @@ func requireGRPCurl(t *testing.T) string {
 	t.Helper()
 	path, err := exec.LookPath("grpcurl")
 	if err != nil {
-		t.Skipf("no grpcurl on PATH: %v", err)
+		skipWithoutTool(t, "no grpcurl on PATH: %v", err)
 	}
 	return path
 }

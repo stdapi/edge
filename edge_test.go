@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"slices"
 	"strings"
 	"sync"
@@ -323,6 +324,19 @@ func TestProxy_DeleteErrors(t *testing.T) {
 	_, err = p.Delete[UDP]("smtp.test:25")
 	assert.ErrorIs(t, err, ErrEntryNotFound, "another connection kind")
 	assert.Equal(t, 2, p.Len())
+}
+
+// The CI sets EDGE_CI, so a missing tool fails the test instead of skipping it.
+func requireTools() bool {
+	return os.Getenv("EDGE_CI") != ""
+}
+
+func skipWithoutTool(t *testing.T, format string, args ...any) {
+	t.Helper()
+	if requireTools() {
+		t.Fatalf(format, args...)
+	}
+	t.Skipf(format, args...)
 }
 
 func selfSignedFor(t *testing.T, ca *CA, host string) tls.Certificate {
