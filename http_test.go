@@ -354,6 +354,76 @@ func TestHTTP_ZeroLengthEndsWithItsHeadersOverHTTP3(t *testing.T) {
 	assert.Equal(t, "end EOF", b.origin.nextNote(t), "a DATA frame followed the header section")
 }
 
+func TestHTTP_CompleteResponseStopsTheClientWithNoErrorOverHTTP3(t *testing.T) {
+	b := newH2OriginBench(t, respondH2)
+	s := b.dialH3Front(t).open(t, h3Request("POST", "origin.test", "/"), h3Data("a"))
+	m := s.message(true)
+	require.NoError(t, m.err)
+	assert.Equal(t, "200", m.status())
+	assert.Equal(t, "ok", string(m.body))
+	assert.Equal(t, http3.ErrCodeNoError, stopSending(t, s, h3Data("b")))
+}
+
+func TestHTTP_ResetOfTheRequestStreamResetsTheResponseOverHTTP3(t *testing.T) {
+	b := newH2OriginBench(t, func(o *rawOrigin, _ *wire, fr *http2.Framer) {
+		f, err := fr.ReadFrame()
+		if err != nil || !isSettings(f) || fr.WriteSettings() != nil || fr.WriteSettingsAck() != nil {
+			return
+		}
+		for {
+			f, err := fr.ReadFrame()
+			if err != nil {
+				return
+			}
+			switch f := f.(type) {
+			case *http2.SettingsFrame:
+				if !f.IsAck() {
+					_ = fr.WriteSettingsAck()
+				}
+			case *http2.DataFrame:
+				if len(f.Data()) > 0 {
+					o.note("DATA")
+				}
+			case *http2.RSTStreamFrame:
+				o.note("RST_STREAM " + f.ErrCode.String())
+			}
+		}
+	})
+	s := b.dialH3Front(t).open(t, h3Request("POST", "origin.test", "/"), h3Data("a"))
+	require.Equal(t, "DATA", b.origin.nextNote(t))
+	s.CancelWrite(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+	m := s.message(true)
+	code, ok := h3ErrCode(m.err)
+	require.True(t, ok, "the response ended with %v", m.err)
+	assert.Equal(t, http3.ErrCodeRequestCanceled, code)
+	assert.Nil(t, m.fields, "a response preceded the reset")
+	assert.Equal(t, "RST_STREAM CANCEL", b.origin.nextNote(t))
+}
+
+func TestHTTP_ForwardThroughAWriterWithoutAReadDeadlineCompletesOverHTTP3(t *testing.T) {
+	o := newGRPCOrigin(t, func(_ *grpcOrigin, w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	})
+	b := newGRPCBench(t, o, nil)
+	b.p.MustAdd(b.host+"/*{p}", forwardHandler)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	str, err := b.h3Mounted(t).OpenRequestStream(ctx)
+	require.NoError(t, err)
+	require.NoError(t, str.SetDeadline(time.Now().Add(10*time.Second)))
+	req, err := http.NewRequest(http.MethodPost, "https://"+b.authority+"/upload", http.NoBody)
+	require.NoError(t, err)
+	require.NoError(t, str.SendRequestHeader(req))
+	_, err = str.Write([]byte("a"))
+	require.NoError(t, err)
+	resp, err := str.ReadResponse()
+	require.NoError(t, err)
+	body, err := io.ReadAll(str)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "ok", string(body))
+}
+
 func TestHTTP_HTTP3TrailerSectionRefusedByQUICGoIsMalformed(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -2231,6 +2301,20 @@ func h3ErrCode(err error) (http3.ErrCode, bool) {
 		return http3.ErrCode(e.ErrorCode), true
 	}
 	return 0, false
+}
+
+// stopSending writes frame until the peer stops the stream, and returns the code it stopped it
+// with.
+func stopSending(t *testing.T, w io.Writer, frame []byte) http3.ErrCode {
+	t.Helper()
+	for {
+		if _, err := w.Write(frame); err != nil {
+			code, ok := h3ResetCode(err)
+			require.True(t, ok, "the write failed with %v", err)
+			return code
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // h3Conn is a QUIC connection with an HTTP/3 control stream of its own, and the control stream

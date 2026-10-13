@@ -33,7 +33,8 @@ const (
 //	}
 type Middleware[H Handler] = func(next H) H
 
-// ErrorHandler writes a response for a request that failed. err is never nil.
+// ErrorHandler writes a response for a request that failed. err is never nil. The response is
+// not sent when the client reset its HTTP/3 request stream.
 type ErrorHandler func(c *HTTPCtx, err error) *http.Response
 
 // middleware is one registered wrapper, kept with the kind it wraps so an entry only picks

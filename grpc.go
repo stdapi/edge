@@ -35,6 +35,8 @@ var errSendCut = errors.New("edge: call ended before the end of its request stre
 
 var errNotGRPCResponse = errors.New("edge: the origin answered with a response that is not gRPC")
 
+var errOriginStopped = errors.New("edge: the origin no longer reads the request stream")
+
 // upstreamError is a failure reaching the origin, before it answered.
 type upstreamError struct{ error }
 
@@ -136,14 +138,16 @@ func (m *MessageCtx) Compressed() bool { return m.flag != 0 }
 // Inbound reports whether the server sent the message toward the client.
 func (m *MessageCtx) Inbound() bool { return m.inbound }
 
-// Forward sends the message unchanged, its flag byte included.
+// Forward sends the message unchanged, its flag byte included. The limits of
+// [MessageCtx.Send] apply.
 func (m *MessageCtx) Forward() error {
 	return m.call.writeMessage(m.inbound, m.flag, m.payload)
 }
 
 // Send sends b in place of the message, in its direction, with the compressed flag clear. A
-// send toward the origin fails once the request stream is half-closed, and a send toward the
-// client fails until the origin has answered.
+// send toward the origin fails once the request stream is half-closed or the origin stops
+// reading it, and is dropped once [GRPCCtx.Outbound] has ended on the end of the response. A
+// send toward the client fails until the origin has answered.
 func (m *MessageCtx) Send(b []byte) error { return m.call.writeMessage(m.inbound, 0, b) }
 
 // SendCompressed sends b in place of the message, in its direction, with the compressed flag
@@ -265,14 +269,24 @@ func (r *grpcRoute) admitted() bool {
 	return admitted
 }
 
-// markRefused puts the status of a refused call in the trailers of a response being relayed,
-// where the client reads it once the body ends.
-func markRefused(resp *http.Response) {
+// markStatus puts the status the proxy ends a forwarded call on in the trailers of the response
+// being relayed, where the client reads it once the body ends.
+func markStatus(resp *http.Response, code Code) {
 	if resp.Trailer == nil {
 		resp.Trailer = make(http.Header, 2)
 	}
-	resp.Trailer.Set("Grpc-Status", strconv.FormatUint(uint64(CodeUnavailable), 10))
-	resp.Trailer.Set("Grpc-Message", grpcPercentEncode(CodeUnavailable.String()))
+	resp.Trailer.Set("Grpc-Status", strconv.FormatUint(uint64(code), 10))
+	resp.Trailer.Set("Grpc-Message", grpcPercentEncode(code.String()))
+}
+
+// callEnd is the status the proxy ends a forwarded call on, the first one set.
+type callEnd struct{ v atomic.Uint32 }
+
+func (e *callEnd) set(code Code) { e.v.CompareAndSwap(0, uint32(code)+1) }
+
+func (e *callEnd) get() (Code, bool) {
+	v := e.v.Load()
+	return Code(v - 1), v != 0
 }
 
 // messageGate passes a stream of length-prefixed messages through and asks, once the header
@@ -281,7 +295,7 @@ func markRefused(resp *http.Response) {
 type messageGate struct {
 	r      io.ReadCloser
 	admit  func() bool
-	refuse func()
+	end    *callEnd
 	err    error
 	left   int64
 	hdr    [5]byte
@@ -307,12 +321,14 @@ func (g *messageGate) Read(b []byte) (int, error) {
 		if g.left == 0 {
 			g.hdrN, g.hdrOut = 0, 0
 		}
+		g.noteReset(err)
 		return n, err
 	}
 	for g.hdrN < len(g.hdr) {
 		n, err := g.r.Read(g.hdr[g.hdrN:])
 		g.hdrN += n
 		if err != nil {
+			g.noteReset(err)
 			g.err = err
 			if g.hdrN < len(g.hdr) {
 				// What was read is handed out first, so the far side sees the same
@@ -326,7 +342,7 @@ func (g *messageGate) Read(b []byte) (int, error) {
 		}
 	}
 	if !g.admit() {
-		g.refuse()
+		g.end.set(CodeUnavailable)
 		g.err = errCallRefused
 		return 0, g.err
 	}
@@ -345,6 +361,12 @@ func (g *messageGate) handOut(b []byte) int {
 	return n
 }
 
+func (g *messageGate) noteReset(err error) {
+	if _, ok := errors.AsType[requestReset](err); ok {
+		g.end.set(CodeCanceled)
+	}
+}
+
 func (g *messageGate) Close() error { return g.r.Close() }
 
 // grpcCall is the state of a call the handler owns. It is allocated per call, since a pump
@@ -358,6 +380,7 @@ type grpcCall struct {
 	req          *http.Request
 	outBody      io.Reader
 	outPw        *io.PipeWriter
+	send         sendBody
 	inPw         *io.PipeWriter
 	inPr         *io.PipeReader
 	upResp       *http.Response
@@ -373,7 +396,7 @@ type grpcCall struct {
 	wg           sync.WaitGroup
 	sendWg       sync.WaitGroup // the relay of the request messages the handler left
 	max          int
-	mu           sync.Mutex // opened, outClosed, respCh and the readers
+	mu           sync.Mutex // opened, outClosed, originDone, sendStopped, respCh and the readers
 	outMu        sync.Mutex // writes toward the origin
 	outSrcMu     sync.Mutex // reads of the request stream
 	inMu         sync.Mutex // writes toward the client
@@ -387,6 +410,22 @@ type grpcCall struct {
 	inDone       bool
 	ended        bool
 	passthrough  bool
+	trailersOnly bool
+	originDone   bool
+	sendStopped  bool
+}
+
+// sendBody is the request stream of an open call as the upstream transport reads it. The
+// transport closes it once it stops reading, the only sign of an origin that ended a response
+// the handler does not read.
+type sendBody struct {
+	*io.PipeReader
+	call *grpcCall
+}
+
+func (b *sendBody) Close() error {
+	b.call.originStoppedReading()
+	return b.PipeReader.Close()
 }
 
 func (c *GRPCCtx) routeOf() grpcRoute {
@@ -558,15 +597,14 @@ func (c *GRPCCtx) Forward() error {
 		return errors.New("edge: request stream already read")
 	}
 	route := c.routeOf()
-	var refused atomic.Bool
-	refuse := func() { refused.Store(true) }
+	end := new(callEnd)
 
 	req := c.http.r.req
 	if req != nil && req.Body != nil && req.Body != http.NoBody {
 		// The transport keeps reading the body after Forward returns, so the gate is its
 		// own allocation and the request is handed back as it was.
 		body := req.Body
-		req.Body = &messageGate{r: body, admit: route.admitted, refuse: refuse}
+		req.Body = &messageGate{r: body, admit: route.admitted, end: end}
 		defer func() { req.Body = body }()
 	}
 
@@ -577,29 +615,36 @@ func (c *GRPCCtx) Forward() error {
 		return err
 	}
 	if resp.Body != nil && resp.Body != http.NoBody {
-		gate := &messageGate{r: resp.Body, admit: route.admitted, refuse: refuse}
-		resp.Body = &refusedBody{gate: gate, resp: resp, refused: &refused}
+		gate := &messageGate{r: resp.Body, admit: route.admitted, end: end}
+		resp.Body = &refusedBody{gate: gate, resp: resp, end: end}
 	}
 	c.setResponse(resp)
 	return nil
 }
 
 // refusedBody is the response body of a forwarded call. A refusal in either direction ends
-// it, and the status the client reads is put in the trailers as it ends.
+// it, as does a reset of the request stream by the client, and the status the client reads is
+// put in the trailers as it ends.
 type refusedBody struct {
-	gate    *messageGate
-	resp    *http.Response
-	refused *atomic.Bool
+	gate *messageGate
+	resp *http.Response
+	end  *callEnd
 }
 
 func (b *refusedBody) Read(p []byte) (int, error) {
 	n, err := b.gate.Read(p)
-	if err != nil && b.refused.Load() {
-		markRefused(b.resp)
-		// The call ends on the status in the trailers, and any other error would reset it.
-		return n, io.EOF
+	if err == nil {
+		return n, nil
 	}
-	return n, err
+	code, ended := b.end.get()
+	if !ended || code == CodeCanceled && errors.Is(err, io.EOF) {
+		// An origin that completes its response after the reset ends the call on its own
+		// trailers.
+		return n, err
+	}
+	markStatus(b.resp, code)
+	// The call ends on the status in the trailers, and any other error would reset it.
+	return n, io.EOF
 }
 
 func (b *refusedBody) Close() error { return b.gate.Close() }
@@ -645,7 +690,10 @@ func (c *GRPCCtx) CloseSend() error {
 // so a handler can decide on the first message and fail the call before the origin is
 // reached. Its end is sticky, a read that reaches it while the call is open half-closes the
 // call toward the origin, and a read that fails or a return with an error before that end
-// resets it.
+// resets it. It also ends once the origin has answered with no message, or once
+// [GRPCCtx.Inbound] has reached its end. When an origin reached over HTTP/2 stops reading the
+// request stream before Inbound is asked for, a read returns an error, and a handler that
+// returns it without asking for Inbound ends the call on the response of the origin.
 func (c *GRPCCtx) Outbound() *MessageReader {
 	var body io.Reader = http.NoBody
 	if req := c.http.r.req; req != nil && req.Body != nil {
@@ -694,7 +742,8 @@ func (k *grpcCall) open(h *HTTPCtx, req *http.Request, w http.ResponseWriter) er
 	k.mu.Unlock()
 
 	out := req.WithContext(ctx)
-	out.Body = outPr
+	k.send = sendBody{PipeReader: outPr, call: k}
+	out.Body = &k.send
 	// The handler decides which messages go up, so the declared length no longer holds.
 	out.ContentLength = -1
 
@@ -710,6 +759,8 @@ func (k *grpcCall) open(h *HTTPCtx, req *http.Request, w http.ResponseWriter) er
 		} else {
 			k.upResp = resp
 			k.passthrough = resp.StatusCode != http.StatusOK || !isGRPCContentType(resp.Header.Get("Content-Type"))
+			_, status := resp.Header["Grpc-Status"]
+			k.trailersOnly = !k.passthrough && status
 			// The trailer names are known with the headers, and the values are written by
 			// the body read that returns EOF. The names are copied before that read can
 			// happen.
@@ -718,6 +769,9 @@ func (k *grpcCall) open(h *HTTPCtx, req *http.Request, w http.ResponseWriter) er
 			}
 		}
 		close(k.respCh)
+		if k.trailersOnly {
+			k.originEnded()
+		}
 	})
 	k.wg.Go(k.serveResponse)
 	return nil
@@ -731,6 +785,40 @@ func (k *grpcCall) closeSend() error {
 	}
 	k.outClosed = true
 	return k.outPw.Close()
+}
+
+// originEnded ends the request stream once the origin has ended its response, as a forwarded
+// call does. A read of the client's request stream in progress returns.
+func (k *grpcCall) originEnded() {
+	k.mu.Lock()
+	if k.originDone {
+		k.mu.Unlock()
+		return
+	}
+	k.originDone = true
+	body := k.outBody
+	k.mu.Unlock()
+	// The HTTP/1.1 server does not end a read in progress on a Close, it waits for it.
+	if c, ok := body.(io.Closer); ok && k.req.ProtoMajor >= 2 {
+		_ = c.Close()
+	}
+}
+
+// originStoppedReading ends the request stream once the transport stops reading it, before
+// Inbound is asked for. The origin may have ended its response or reset it, so the call ends
+// on the response once the handler returns.
+func (k *grpcCall) originStoppedReading() {
+	k.mu.Lock()
+	if k.outClosed || k.inR != nil {
+		k.mu.Unlock()
+		return
+	}
+	k.outClosed, k.sendStopped = true, true
+	body := k.outBody
+	k.mu.Unlock()
+	if c, ok := body.(io.Closer); ok && k.req.ProtoMajor >= 2 {
+		_ = c.Close()
+	}
 }
 
 // endSend ends the request stream toward the origin, cleanly when the outbound source reached
@@ -779,19 +867,34 @@ func (k *grpcCall) outbound(body io.Reader) *MessageReader {
 	k.outR = &MessageReader{ctx: k.ctx, read: func() (*MessageCtx, error) {
 		k.mu.Lock()
 		k.outRead = true
+		originDone, sendStopped := k.originDone, k.sendStopped
 		k.mu.Unlock()
+		if sendStopped && !originDone {
+			return nil, errOriginStopped
+		}
 		// A pump of MergeMessages may still be reading when the relay that follows the
 		// handler starts.
 		k.outSrcMu.Lock()
 		defer k.outSrcMu.Unlock()
-		payload, flag, err := src.next()
+		var payload []byte
+		var flag byte
+		err := io.EOF
+		if !originDone {
+			payload, flag, err = src.next()
+		}
 		if err != nil {
+			k.mu.Lock()
+			switch {
+			case k.originDone:
+				err = io.EOF
+			case k.sendStopped:
+				err = errOriginStopped
+			}
+			k.outEOF = errors.Is(err, io.EOF)
+			k.mu.Unlock()
 			if errors.Is(err, errCallRefused) {
 				k.refuse()
 			}
-			k.mu.Lock()
-			k.outEOF = errors.Is(err, io.EOF)
-			k.mu.Unlock()
 			k.endSend(err)
 			return nil, err
 		}
@@ -828,6 +931,9 @@ func (k *grpcCall) inbound() *MessageReader {
 			k.inDone = true
 		}
 		k.bodyMu.Unlock()
+		if errors.Is(err, io.EOF) {
+			k.originEnded()
+		}
 		if err != nil {
 			if errors.Is(err, errCallRefused) {
 				k.refuse()
@@ -887,9 +993,17 @@ func (k *grpcCall) waitResponse() error {
 func (k *grpcCall) writeMessage(inbound bool, flag byte, b []byte) error {
 	k.mu.Lock()
 	opened, ch, maxBytes := k.opened, k.respCh, k.max
+	originDone, sendStopped := k.originDone, k.sendStopped
 	k.mu.Unlock()
 	if !opened {
 		return errNotOpened
+	}
+	switch {
+	case inbound:
+	case originDone:
+		return nil
+	case sendStopped:
+		return errOriginStopped
 	}
 	if len(b) > maxBytes {
 		return errMessageTooLarge
@@ -915,6 +1029,17 @@ func (k *grpcCall) writeMessage(inbound bool, flag byte, b []byte) error {
 	defer mu.Unlock()
 	*buf = appendGRPCFrame((*buf)[:0], flag, b)
 	_, err := w.Write(*buf)
+	if err != nil && !inbound {
+		k.mu.Lock()
+		originDone, sendStopped = k.originDone, k.sendStopped
+		k.mu.Unlock()
+		switch {
+		case originDone:
+			return nil
+		case sendStopped:
+			return errOriginStopped
+		}
+	}
 	return err
 }
 
@@ -937,10 +1062,13 @@ func (k *grpcCall) serveResponse() {
 	}
 
 	if k.passthrough {
-		if err := writeResponse(k.w, k.req, k.upResp); errors.Is(err, errBodyCut) {
+		err := writeResponse(k.w, k.req, k.upResp)
+		if errors.Is(err, errBodyCut) {
 			k.mu.Lock()
 			k.cut = err
 			k.mu.Unlock()
+		} else if err == nil {
+			k.originEnded()
 		}
 		return
 	}
@@ -948,6 +1076,9 @@ func (k *grpcCall) serveResponse() {
 	resp := k.upResp
 	dst := k.w.Header()
 	for name, vv := range resp.Header {
+		if k.trailersOnly && isGRPCStatusField(name) {
+			continue
+		}
 		dst[name] = append(vv[:0:0], vv...)
 	}
 	// The handler decides which messages go down, so the declared length no longer holds.
@@ -955,11 +1086,20 @@ func (k *grpcCall) serveResponse() {
 	if len(k.trailerNames) > 0 {
 		dst.Set("Trailer", strings.Join(k.trailerNames, ", "))
 	}
-	k.w.WriteHeader(resp.StatusCode)
+	var w io.Writer
+	var late *lateHeader
+	if k.trailersOnly {
+		// The status of a trailers-only response is sent once the call ends, in the header
+		// section when no message preceded it and in the trailers otherwise.
+		late = &lateHeader{w: k.w, rc: http.NewResponseController(k.w), code: resp.StatusCode}
+		w = late
+	} else {
+		k.w.WriteHeader(resp.StatusCode)
+		w = flushWriter{w: k.w, rc: http.NewResponseController(k.w)}
+	}
 
-	rc := http.NewResponseController(k.w)
 	buf := getCopyBuf()
-	_, cerr := io.CopyBuffer(flushWriter{w: k.w, rc: rc}, k.inPr, buf)
+	_, cerr := io.CopyBuffer(w, k.inPr, buf)
 	putCopyBuf(buf)
 	if cerr != nil {
 		// Nothing reads the pipe once the client is gone, and a handler still sending toward
@@ -970,27 +1110,63 @@ func (k *grpcCall) serveResponse() {
 
 	k.bodyMu.Lock()
 	defer k.bodyMu.Unlock()
+	prefix, statusKey, msgKey := http.TrailerPrefix, http.TrailerPrefix+"Grpc-Status", http.TrailerPrefix+"Grpc-Message"
+	if late != nil && !late.wrote {
+		prefix, statusKey, msgKey = "", "Grpc-Status", "Grpc-Message"
+		defer k.w.WriteHeader(resp.StatusCode)
+	}
 	if code, msg, ended := k.status(); ended {
 		// The origin's trailers never arrived or no longer apply, and the client reads this
 		// status instead.
-		dst.Set(http.TrailerPrefix+"Grpc-Status", strconv.FormatUint(uint64(code), 10))
-		dst.Set(http.TrailerPrefix+"Grpc-Message", grpcPercentEncode(msg))
+		dst.Set(statusKey, strconv.FormatUint(uint64(code), 10))
+		dst.Set(msgKey, grpcPercentEncode(msg))
 		return
 	}
 	if !k.inDone {
 		return
 	}
-	for name, vv := range resp.Trailer {
+	trailer := resp.Trailer
+	if late != nil {
+		trailer = resp.Header
+	}
+	for name, vv := range trailer {
+		if late != nil && !isGRPCStatusField(name) {
+			continue
+		}
 		for _, v := range vv {
-			dst.Add(http.TrailerPrefix+name, v)
+			dst.Add(prefix+name, v)
 		}
 	}
+}
+
+func isGRPCStatusField(name string) bool {
+	return name == "Grpc-Status" || name == "Grpc-Message" || name == "Grpc-Status-Details-Bin"
+}
+
+// lateHeader writes the header section of a response at its first write, and flushes every
+// write.
+type lateHeader struct {
+	w     http.ResponseWriter
+	rc    *http.ResponseController
+	code  int
+	wrote bool
+}
+
+func (l *lateHeader) Write(b []byte) (int, error) {
+	if !l.wrote {
+		l.wrote = true
+		l.w.WriteHeader(l.code)
+	}
+	return flushWriter{w: l.w, rc: l.rc}.Write(b)
 }
 
 // finish tears the call down once the handler has returned with err. The goroutines are
 // joined before the context returns to its pool. It returns an error wrapping errBodyCut when
 // the client stream must be reset.
 func (k *grpcCall) finish(err error) error {
+	if errors.Is(err, errOriginStopped) {
+		err = nil
+	}
 	k.mu.Lock()
 	untouched := k.inR == nil && !k.ended
 	relay := err == nil && !k.ended && !k.outClosed
@@ -1019,6 +1195,9 @@ func (k *grpcCall) finish(err error) error {
 	k.mu.Lock()
 	handlerEnded := k.ended
 	k.mu.Unlock()
+	// A pump of MergeMessages may be in a read of the response under bodyMu, and an HTTP/3
+	// upstream keeps the response open past a reset of the request stream.
+	k.cancel()
 	k.bodyMu.Lock()
 	done := k.inDone
 	k.bodyMu.Unlock()
@@ -1029,7 +1208,6 @@ func (k *grpcCall) finish(err error) error {
 	case !done:
 		k.end(CodeInternal, CodeInternal.String())
 	}
-	k.cancel()
 	_ = k.inPw.Close()
 	if relay {
 		// The response has ended, and the client may never end a request stream nothing
@@ -1181,18 +1359,20 @@ func (c *GRPCCtx) response() (*http.Response, error) {
 }
 
 // statusOf maps a failure of the proxy's own to the status a gRPC client reads. A canceled
-// or expired context is reported as such, a message over the bound as the resource it
-// exhausted, a refused call or a failure before the origin answered as the origin being
-// unavailable, anything else as unknown.
+// or expired context is reported as such, and so is a reset of the request stream by the
+// client, a message over the bound as the resource it exhausted, a refused call or a failure
+// before the origin answered as the origin being unavailable, anything else as unknown.
 func statusOf(err error) Code {
+	_, reset := errors.AsType[requestReset](err)
+	_, upstream := errors.AsType[upstreamError](err)
 	switch {
-	case errors.Is(err, context.Canceled):
+	case errors.Is(err, context.Canceled), reset:
 		return CodeCanceled
 	case errors.Is(err, context.DeadlineExceeded):
 		return CodeDeadlineExceeded
 	case errors.Is(err, errMessageTooLarge):
 		return CodeResourceExhausted
-	case errors.Is(err, errCallRefused), errors.As(err, new(upstreamError)):
+	case errors.Is(err, errCallRefused), upstream:
 		return CodeUnavailable
 	}
 	return CodeUnknown

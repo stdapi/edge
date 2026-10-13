@@ -11,6 +11,9 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
@@ -49,6 +52,11 @@ func (p *Proxy) dispatchRequest(w http.ResponseWriter, r *http.Request, sess *Se
 		p.writeStatus(w, r, http.StatusForbidden, "no entry matches this request")
 		return
 	}
+	if r.ProtoMajor == 3 {
+		body := &h3Body{ReadCloser: r.Body, w: w}
+		r.Body, c.body = body, body
+		defer body.handlerReturned()
+	}
 
 	switch c.entry.kind {
 	case KindGRPC:
@@ -77,6 +85,13 @@ func (p *Proxy) serveHTTPEntry(c *routeCtx, w http.ResponseWriter, r *http.Reque
 	resp, err := runHTTPHandler(&c.http, handler)
 	if err != nil {
 		resp = p.onError(&c.http, err)
+		if _, ok := errors.AsType[requestReset](err); ok {
+			// HTTP has no status for a canceled request.
+			if resp != nil && resp.Body != nil {
+				_ = resp.Body.Close()
+			}
+			abortResponse(w)
+		}
 	}
 	if resp == nil {
 		resp = Status(http.StatusBadGateway)
@@ -253,9 +268,12 @@ var errBodyCut = errors.New("response body cut short")
 // abortIfCut resets the response when err is errBodyCut. A return would end it cleanly and the
 // client would read a complete body.
 func abortIfCut(w http.ResponseWriter, err error) {
-	if !errors.Is(err, errBodyCut) {
-		return
+	if errors.Is(err, errBodyCut) {
+		abortResponse(w)
 	}
+}
+
+func abortResponse(w http.ResponseWriter) {
 	if hs, ok := w.(http3.HTTPStreamer); ok {
 		// RFC 9114 4.1.1 resets an abandoned response with H3_REQUEST_CANCELLED, where quic-go
 		// resets an aborted handler with H3_INTERNAL_ERROR.
@@ -320,4 +338,59 @@ func isClientGone(err error) bool {
 		errors.Is(err, http.ErrHandlerTimeout) ||
 		errors.Is(err, io.ErrUnexpectedEOF) ||
 		errors.Is(err, io.EOF)
+}
+
+// requestReset is a read of an HTTP/3 request body that failed on a RESET_STREAM of the client.
+// The client cancels the request that way and may still read the response.
+type requestReset struct{ error }
+
+func (e requestReset) Unwrap() error { return e.error }
+
+// h3Body is the body of an HTTP/3 request. The upstream transports close it from goroutines of
+// their own, after the handler may have returned.
+type h3Body struct {
+	io.ReadCloser
+	w        http.ResponseWriter
+	mu       sync.Mutex // the use of w against the return of the handler
+	returned bool
+	closed   atomic.Bool
+}
+
+func (b *h3Body) handlerReturned() {
+	b.mu.Lock()
+	b.returned = true
+	b.mu.Unlock()
+}
+
+func (b *h3Body) Read(p []byte) (int, error) {
+	if b.closed.Load() {
+		return 0, http.ErrBodyReadAfterClose
+	}
+	n, err := b.ReadCloser.Read(p)
+	switch {
+	case err == nil, errors.Is(err, io.EOF):
+	case b.closed.Load():
+		err = http.ErrBodyReadAfterClose
+	default:
+		if se, ok := errors.AsType[*quic.StreamError](err); ok && se.Remote {
+			err = requestReset{err}
+		}
+	}
+	return n, err
+}
+
+// Close ends a read in progress with a read deadline, and with the Close of quic-go when the
+// writer sets none. That Close sends STOP_SENDING with H3_REQUEST_CANCELLED, which gRPC maps to
+// CANCELLED, where quic-go sends STOP_SENDING with H3_NO_ERROR when the handler returns, and
+// past that return the stream is the server's.
+func (b *h3Body) Close() error {
+	if b.closed.Swap(true) {
+		return nil
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.returned || http.NewResponseController(b.w).SetReadDeadline(time.Unix(1, 0)) == nil {
+		return nil
+	}
+	return b.ReadCloser.Close()
 }

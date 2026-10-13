@@ -1339,14 +1339,319 @@ func TestKindGRPC_CallOnTheHTTP3FrontIsForwarded(t *testing.T) {
 				c.read(len(lpm(0, "one")))
 				c.str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
 				assert.Error(t, b.origin.call(t).readErr, "the origin read a request stream the client never ended")
-				if _, err := c.rest(); err != nil {
-					var h3err *http3.Error
-					assert.ErrorAs(t, err, &h3err, "the response did not end on a reset")
+				body, err := c.rest()
+				require.NoError(t, err)
+				assert.Empty(t, body)
+				code, msg := c.status()
+				assert.Equal(t, "1", code)
+				assert.Equal(t, "Canceled", msg)
+			})
+		}},
+		{name: "the client resets its request stream before the origin answers", run: func(t *testing.T) {
+			eachMode(t, func(t *testing.T, h GRPC) {
+				reached := make(chan struct{})
+				o := newGRPCOrigin(t, func(o *grpcOrigin, w http.ResponseWriter, r *http.Request) {
+					close(reached)
+					o.record(r)
+				})
+				b := newGRPCBench(t, o, h)
+				c := b.h3Call(t, b.h3Client(t), "/pkg.Svc/Chat")
+				c.send(lpm(0, "one"))
+				select {
+				case <-reached:
+				case <-time.After(5 * time.Second):
+					t.Fatal("the origin received no call")
+				}
+				c.str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+				assert.Error(t, b.origin.call(t).readErr, "the origin read a request stream the client never ended")
+				body, err := c.rest()
+				require.NoError(t, err)
+				assert.Empty(t, body)
+				code, msg := c.status()
+				assert.Equal(t, "1", code)
+				assert.Equal(t, "Canceled", msg)
+			})
+		}},
+		{name: "a complete answer to a request still open stops the client with H3_NO_ERROR", run: func(t *testing.T) {
+			eachMode(t, func(t *testing.T, h GRPC) {
+				b := newGRPCBench(t, trailersOnlyOrigin(t, "12"), h)
+				c := b.h3Call(t, b.h3Client(t), "/pkg.Svc/Chat")
+				c.send(lpm(0, "one"))
+				body, err := c.rest()
+				require.NoError(t, err)
+				assert.Empty(t, body)
+				assert.Equal(t, "12", c.response().Header.Get("Grpc-Status"))
+				assert.Empty(t, c.response().Trailer)
+				assert.Equal(t, http3.ErrCodeNoError, stopSending(t, c.str, lpm(0, "two")))
+			})
+		}},
+		{name: "a handler reading the request stream alone returns once the origin answered", run: func(t *testing.T) {
+			b := newGRPCBench(t, trailersOnlyOrigin(t, "12"), func(c *GRPCCtx) error {
+				if err := c.Open(); err != nil {
+					return err
+				}
+				for {
+					m, err := c.Outbound().ReadMessage()
+					if errors.Is(err, io.EOF) {
+						return nil
+					}
+					if err != nil {
+						return err
+					}
+					if err := m.Forward(); err != nil {
+						return err
+					}
+				}
+			})
+			c := b.h3Call(t, b.h3Client(t), "/pkg.Svc/Chat")
+			c.send(lpm(0, "one"))
+			body, err := c.rest()
+			require.NoError(t, err)
+			assert.Empty(t, body)
+			assert.Equal(t, "12", c.response().Header.Get("Grpc-Status"))
+			assert.Empty(t, c.response().Trailer)
+		}},
+		{name: "a handler reading the request stream alone returns once the origin stopped reading it", run: func(t *testing.T) {
+			returned := make(chan error, 1)
+			o := newGRPCOrigin(t, func(_ *grpcOrigin, w http.ResponseWriter, _ *http.Request) {
+				answerOK(w, lpm(0, "r"))
+			})
+			b := newGRPCBench(t, o, outboundOnly(returned))
+			c := b.h3Call(t, b.h3Client(t), "/pkg.Svc/Chat")
+			c.send(lpm(0, "one"))
+			select {
+			case err := <-returned:
+				require.Error(t, err)
+				assert.NotErrorIs(t, err, io.EOF)
+			case <-time.After(5 * time.Second):
+				t.Fatal("the handler did not return")
+			}
+			body, err := c.rest()
+			require.NoError(t, err)
+			assert.Equal(t, lpm(0, "r"), body)
+			code, _ := c.status()
+			assert.Equal(t, "0", code)
+		}},
+		{name: "a handler reading the request stream alone relays a reset of the origin", run: func(t *testing.T) {
+			returned := make(chan error, 1)
+			o := newGRPCOrigin(t, func(_ *grpcOrigin, w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/grpc")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(lpm(0, "r"))
+				_ = http.NewResponseController(w).Flush()
+				panic(http.ErrAbortHandler)
+			})
+			b := newGRPCBench(t, o, outboundOnly(returned))
+			c := b.h3Call(t, b.h3Client(t), "/pkg.Svc/Chat")
+			c.send(lpm(0, "one"))
+			select {
+			case err := <-returned:
+				require.Error(t, err)
+				assert.NotErrorIs(t, err, io.EOF)
+			case <-time.After(5 * time.Second):
+				t.Fatal("the handler did not return")
+			}
+			_, err := c.str.ReadResponse()
+			if err == nil {
+				_, err = io.ReadAll(c.str)
+			}
+			code, ok := h3ResetCode(err)
+			require.True(t, ok, "the response ended with %v", err)
+			assert.Equal(t, http3.ErrCodeRequestCanceled, code)
+		}},
+		{name: "a message forwarded after the origin answered is dropped", run: func(t *testing.T) {
+			b := newGRPCBench(t, trailersOnlyOrigin(t, "12"), func(c *GRPCCtx) error {
+				m, err := c.Outbound().ReadMessage()
+				if err != nil {
+					return err
+				}
+				if err := c.Open(); err != nil {
+					return err
+				}
+				if _, err := c.Inbound().ReadMessage(); !errors.Is(err, io.EOF) {
+					return fmt.Errorf("inbound: %w", err)
+				}
+				return m.Forward()
+			})
+			c := b.h3Call(t, b.h3Client(t), "/pkg.Svc/Method")
+			c.send(lpm(0, "x"))
+			require.NoError(t, c.str.Close())
+			body, err := c.rest()
+			require.NoError(t, err)
+			assert.Empty(t, body)
+			assert.Equal(t, "12", c.response().Header.Get("Grpc-Status"))
+			assert.Empty(t, c.response().Trailer)
+		}},
+		{name: "a message forwarded once the origin stopped reading fails", run: func(t *testing.T) {
+			ended := make(chan struct{})
+			o := newGRPCOrigin(t, func(o *grpcOrigin, w http.ResponseWriter, r *http.Request) {
+				defer close(ended)
+				m := make([]byte, len(lpm(0, "m1")))
+				if _, err := io.ReadFull(r.Body, m); err != nil {
 					return
 				}
-				code, _ := c.status()
-				assert.NotContains(t, []string{"", "0"}, code, "the cut call ended as complete")
+				answerOK(w, lpm(0, "r"))
 			})
+			forwarded := make(chan error, 1)
+			b := newGRPCBench(t, o, func(c *GRPCCtx) error {
+				if err := c.Open(); err != nil {
+					return err
+				}
+				m, err := c.Outbound().ReadMessage()
+				if err != nil {
+					return err
+				}
+				if err := m.Forward(); err != nil {
+					return err
+				}
+				r, err := c.Inbound().ReadMessage()
+				if err != nil {
+					return err
+				}
+				if err := r.Forward(); err != nil {
+					return err
+				}
+				<-ended
+				// The transport receives the end of the stream after the origin handler returns.
+				time.Sleep(100 * time.Millisecond)
+				if m, err = c.Outbound().ReadMessage(); err != nil {
+					return err
+				}
+				forwarded <- m.Forward()
+				if _, err := c.Inbound().ReadMessage(); !errors.Is(err, io.EOF) {
+					return fmt.Errorf("inbound: %w", err)
+				}
+				return nil
+			})
+			c := b.h3Call(t, b.h3Client(t), "/pkg.Svc/Chat")
+			c.send(lpm(0, "m1"))
+			assert.Equal(t, lpm(0, "r"), c.read(len(lpm(0, "r"))))
+			c.send(lpm(0, "m2"))
+			body, err := c.rest()
+			require.NoError(t, err)
+			assert.Empty(t, body)
+			assert.ErrorIs(t, <-forwarded, io.ErrClosedPipe)
+			code, msg := c.status()
+			assert.Equal(t, "0", code, msg)
+		}},
+		{name: "a send toward an origin that reset the call fails", run: func(t *testing.T) {
+			type result struct{ inbound, send, outbound error }
+			results := make(chan result, 1)
+			o := newGRPCOrigin(t, func(_ *grpcOrigin, w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/grpc")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(lpm(0, "one"))
+				_ = http.NewResponseController(w).Flush()
+				panic(http.ErrAbortHandler)
+			})
+			b := newGRPCBench(t, o, func(c *GRPCCtx) error {
+				if err := c.Open(); err != nil {
+					return err
+				}
+				m, err := c.Outbound().ReadMessage()
+				if err != nil {
+					return err
+				}
+				if err := m.Forward(); err != nil {
+					return err
+				}
+				var res result
+				for {
+					in, err := c.Inbound().ReadMessage()
+					if err != nil {
+						res.inbound = err
+						break
+					}
+					_ = in.Forward()
+				}
+				// The transport closes the request stream from a goroutine of its own.
+				time.Sleep(50 * time.Millisecond)
+				res.send = m.Send([]byte("again"))
+				_, res.outbound = c.Outbound().ReadMessage()
+				results <- res
+				return res.inbound
+			})
+			c := b.h3Call(t, b.h3Client(t), "/pkg.Svc/Chat")
+			c.send(lpm(0, "x"))
+			c.send(lpm(0, "y"))
+			select {
+			case res := <-results:
+				assert.Error(t, res.inbound)
+				assert.Error(t, res.send)
+				assert.NotErrorIs(t, res.outbound, io.EOF)
+			case <-time.After(5 * time.Second):
+				t.Fatal("the handler did not return")
+			}
+			_, err := c.str.ReadResponse()
+			if err == nil {
+				_, err = io.ReadAll(c.str)
+			}
+			code, ok := h3ResetCode(err)
+			require.True(t, ok, "the response ended with %v", err)
+			assert.Equal(t, http3.ErrCodeRequestCanceled, code)
+		}},
+		{name: "a call through a writer without a read deadline completes", run: func(t *testing.T) {
+			eachMode(t, func(t *testing.T, h GRPC) {
+				o := newGRPCOrigin(t, func(_ *grpcOrigin, w http.ResponseWriter, _ *http.Request) {
+					answerOK(w, lpm(0, "r"))
+				})
+				b := newGRPCBench(t, o, h)
+				c := b.h3Call(t, b.h3Mounted(t), "/pkg.Svc/Chat")
+				c.send(lpm(0, "one"))
+				body, err := c.rest()
+				require.NoError(t, err)
+				assert.Equal(t, lpm(0, "r"), body)
+				code, _ := c.status()
+				assert.Equal(t, "0", code)
+			})
+		}},
+		{name: "Fail after a trailers-only answer ends the call on its status alone", run: func(t *testing.T) {
+			b := newGRPCBench(t, trailersOnlyOrigin(t, "12"), func(c *GRPCCtx) error {
+				if err := c.Open(); err != nil {
+					return err
+				}
+				if _, err := c.Inbound().ReadMessage(); !errors.Is(err, io.EOF) {
+					return fmt.Errorf("inbound: %w", err)
+				}
+				return c.Fail(CodeAborted, "aborted")
+			})
+			c := b.h3Call(t, b.h3Client(t), "/pkg.Svc/Method")
+			c.send(lpm(0, "x"))
+			require.NoError(t, c.str.Close())
+			body, err := c.rest()
+			require.NoError(t, err)
+			assert.Empty(t, body)
+			resp := c.response()
+			assert.Equal(t, "10", resp.Header.Get("Grpc-Status"))
+			assert.Equal(t, "aborted", resp.Header.Get("Grpc-Message"))
+			assert.Empty(t, resp.Trailer)
+		}},
+		{name: "a message sent after a trailers-only answer moves its status to the trailers", run: func(t *testing.T) {
+			b := newGRPCBench(t, trailersOnlyOrigin(t, "12"), func(c *GRPCCtx) error {
+				m, err := c.Outbound().ReadMessage()
+				if err != nil {
+					return err
+				}
+				if err := c.Open(); err != nil {
+					return err
+				}
+				if _, err := c.Inbound().ReadMessage(); !errors.Is(err, io.EOF) {
+					return fmt.Errorf("inbound: %w", err)
+				}
+				return m.Reply([]byte("r"))
+			})
+			c := b.h3Call(t, b.h3Client(t), "/pkg.Svc/Method")
+			c.send(lpm(0, "x"))
+			require.NoError(t, c.str.Close())
+			body, err := c.rest()
+			require.NoError(t, err)
+			assert.Equal(t, lpm(0, "r"), body)
+			resp := c.response()
+			assert.Empty(t, resp.Header.Get("Grpc-Status"))
+			assert.Equal(t, "application/grpc", resp.Header.Get("Content-Type"))
+			assert.NotEmpty(t, resp.Header.Get("Date"))
+			assert.Equal(t, "12", resp.Trailer.Get("Grpc-Status"))
+			assert.Empty(t, resp.Trailer.Get("Date"))
 		}},
 		{name: "the origin resets the stream after one message", run: func(t *testing.T) {
 			eachMode(t, func(t *testing.T, h GRPC) {
@@ -1407,10 +1712,149 @@ func TestKindGRPC_CallOnTheHTTP3FrontIsForwarded(t *testing.T) {
 				assert.Equal(t, "Unavailable", msg)
 			})
 		}},
+		{name: "the entry deleted mid-call stops a client still sending with H3_NO_ERROR", run: func(t *testing.T) {
+			eachMode(t, func(t *testing.T, h GRPC) {
+				b := newGRPCBench(t, streamOrigin(t), h)
+				c := b.h3Call(t, b.h3Client(t), "/pkg.Svc/Chat")
+				c.send(lpm(0, "one"))
+				assert.Equal(t, lpm(0, "one"), c.read(len(lpm(0, "one"))))
+				_, err := b.p.Delete[GRPC](b.host + "/*{method}")
+				require.NoError(t, err)
+				c.send(lpm(0, "two"))
+				body, err := c.rest()
+				require.NoError(t, err)
+				assert.Empty(t, body)
+				code, _ := c.status()
+				assert.Equal(t, "14", code)
+				assert.Equal(t, http3.ErrCodeNoError, stopSending(t, c.str, lpm(0, "three")))
+			})
+		}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, tc.run)
 	}
+}
+
+func TestKindGRPC_CompleteAnswerToARequestStillOpenOverHTTP2(t *testing.T) {
+	eachMode(t, func(t *testing.T, h GRPC) {
+		b := newGRPCBench(t, trailersOnlyOrigin(t, "12"), h)
+		c := b.client(t)
+		id := c.call("/pkg.Svc/Chat")
+		c.data(id, false, lpm(0, "one"))
+		r := c.await(id)
+		require.True(t, r.ended, "the stream was reset with %v", r.rst)
+		assert.True(t, r.endOnBlock)
+		assert.Equal(t, "12", grpcStatusOf(r))
+		for !r.reset {
+			c.step(id, &r)
+		}
+		assert.Equal(t, http2.ErrCodeNo, r.rst)
+	})
+}
+
+func TestKindGRPC_HandlerReadingTheRequestStreamAloneOverHTTP2(t *testing.T) {
+	returned := make(chan error, 1)
+	o := newGRPCOrigin(t, func(_ *grpcOrigin, w http.ResponseWriter, _ *http.Request) {
+		answerOK(w, lpm(0, "r"))
+	})
+	b := newGRPCBench(t, o, outboundOnly(returned))
+	c := b.client(t)
+	id := c.call("/pkg.Svc/Chat")
+	c.data(id, false, lpm(0, "one"))
+	select {
+	case err := <-returned:
+		require.Error(t, err)
+		assert.NotErrorIs(t, err, io.EOF)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the handler did not return")
+	}
+	r := c.await(id)
+	require.True(t, r.ended, "the stream was reset with %v", r.rst)
+	assert.Equal(t, lpm(0, "r"), r.data)
+	assert.Equal(t, "0", grpcStatusOf(r))
+}
+
+func TestKindGRPC_RequestStreamResetReachesAnHTTP3Origin(t *testing.T) {
+	cases := []struct {
+		h      GRPC
+		name   string
+		answer bool
+		want   string
+	}{
+		{h: forwardCall, name: "Forward ends on the answer of the origin", answer: true, want: "10"},
+		{h: openCall, name: "Open ends on CANCELLED without waiting for the origin", want: "1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			reset := make(chan error, 1)
+			b := newH3OriginGRPCBench(t, tc.h, func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/grpc")
+				w.WriteHeader(http.StatusOK)
+				rc := http.NewResponseController(w)
+				_ = rc.Flush()
+				buf := make([]byte, 64<<10)
+				for {
+					n, err := r.Body.Read(buf)
+					if n > 0 {
+						_, _ = w.Write(buf[:n])
+						_ = rc.Flush()
+					}
+					if err != nil {
+						reset <- err
+						if tc.answer {
+							w.Header().Set(http.TrailerPrefix+"Grpc-Status", "10")
+							return
+						}
+						<-r.Context().Done()
+						return
+					}
+				}
+			})
+			c := b.h3Call(t, b.h3Client(t), "/pkg.Svc/Chat")
+			c.send(lpm(0, "one"))
+			assert.Equal(t, lpm(0, "one"), c.read(len(lpm(0, "one"))))
+			c.str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+			select {
+			case err := <-reset:
+				code, ok := h3ResetCode(err)
+				require.True(t, ok, "the origin read %v", err)
+				assert.Equal(t, http3.ErrCodeRequestCanceled, code)
+			case <-time.After(5 * time.Second):
+				t.Fatal("the origin read no reset")
+			}
+			body, err := c.rest()
+			require.NoError(t, err)
+			assert.Empty(t, body)
+			code, _ := c.status()
+			assert.Equal(t, tc.want, code)
+		})
+	}
+}
+
+func TestKindGRPC_StatusOfAllocs(t *testing.T) {
+	err := errors.New("handler failed")
+	allocs := testing.AllocsPerRun(100, func() { _ = statusOf(err) })
+	assert.Zero(t, allocs)
+}
+
+func TestKindGRPC_GateReadToItsEndAllocs(t *testing.T) {
+	msg := lpm(0, "hello")
+	rd := new(bytes.Reader)
+	body := io.NopCloser(rd)
+	admit := func() bool { return true }
+	end := new(callEnd)
+	g := new(messageGate)
+	buf := make([]byte, 64)
+	allocs := testing.AllocsPerRun(100, func() {
+		rd.Reset(msg)
+		*g = messageGate{r: body, admit: admit, end: end}
+		for {
+			if _, err := g.Read(buf); err != nil {
+				break
+			}
+		}
+	})
+	assert.Zero(t, allocs)
 }
 
 func TestKindGRPC_HTTP3CallInterceptedOnUDPIsForwarded(t *testing.T) {
@@ -1668,6 +2112,33 @@ func newGRPCBench(t *testing.T, origin *grpcOrigin, h GRPC, opts ...ProxyOption)
 	return b
 }
 
+// newH3OriginGRPCBench is newGRPCBench with an origin served over HTTP/3 alone, reached under
+// the name origin.test.
+func newH3OriginGRPCBench(t *testing.T, h GRPC, origin http.HandlerFunc) *grpcBench {
+	t.Helper()
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	cert := selfSignedFor(t, ca, "origin.test")
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	srv := &http3.Server{
+		Handler:   origin,
+		TLSConfig: http3.ConfigureTLSConfig(&tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13}),
+	}
+	go func() { _ = srv.Serve(pc) }()
+	t.Cleanup(func() {
+		_ = srv.Close()
+		_ = pc.Close()
+	})
+	tr := DefaultTransport()
+	tr.AllowHTTP3 = true
+	tr.DialContext = pinnedDialer(pc.LocalAddr().String())
+	tr.RootCAs = poolOf(ca)
+	p := testProxyWithCA(t, ca, WithTransport(tr))
+	p.MustAdd("origin.test/*{method}", h)
+	return &grpcBench{p: p, ca: ca, host: "origin.test", authority: "origin.test"}
+}
+
 // grpcClient writes its own frames. The rows depend on DATA frame boundaries a net/http
 // client chooses itself.
 type grpcClient struct {
@@ -1851,6 +2322,30 @@ func (b *grpcBench) h3Client(t *testing.T) *http3.ClientConn {
 	return tr.NewClientConn(dialQUICFront(t, front, b.ca))
 }
 
+// h3Mounted serves the proxy through ServeHTTP on an http3.Server of the test, behind a
+// writer without a read deadline.
+func (b *grpcBench) h3Mounted(t *testing.T) *http3.ClientConn {
+	t.Helper()
+	cert, err := b.ca.Leaf("127.0.0.1")
+	require.NoError(t, err)
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	srv := &http3.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			b.p.ServeHTTP(plainWriter{w}, r)
+		}),
+		TLSConfig: http3.ConfigureTLSConfig(&tls.Config{Certificates: []tls.Certificate{*cert}, MinVersion: tls.VersionTLS13}),
+	}
+	go func() { _ = srv.Serve(pc) }()
+	t.Cleanup(func() {
+		_ = srv.Close()
+		_ = pc.Close()
+	})
+	tr := &http3.Transport{DisableCompression: true}
+	t.Cleanup(func() { _ = tr.Close() })
+	return tr.NewClientConn(dialQUICFront(t, netip.MustParseAddrPort(pc.LocalAddr().String()), b.ca))
+}
+
 // h3Call drives a request stream directly. A round trip cannot reset one direction of a call.
 type h3Call struct {
 	t    *testing.T
@@ -1944,6 +2439,40 @@ func eachMode(t *testing.T, run func(t *testing.T, h GRPC)) {
 	for _, m := range grpcModes {
 		t.Run(m.name, func(t *testing.T) { run(t, m.h) })
 	}
+}
+
+// outboundOnly opens the call and forwards the request messages without reading the response,
+// and reports the error that ended its loop.
+func outboundOnly(returned chan<- error) GRPC {
+	return func(c *GRPCCtx) error {
+		if err := c.Open(); err != nil {
+			return err
+		}
+		for {
+			m, err := c.Outbound().ReadMessage()
+			if err == nil {
+				err = m.Forward()
+			}
+			if err != nil {
+				returned <- err
+				if errors.Is(err, io.EOF) {
+					return nil
+				}
+				return err
+			}
+		}
+	}
+}
+
+// trailersOnlyOrigin answers every call with a trailers-only response of status code, without
+// reading the request.
+func trailersOnlyOrigin(t *testing.T, code string) *grpcOrigin {
+	t.Helper()
+	return newGRPCOrigin(t, func(_ *grpcOrigin, w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/grpc")
+		w.Header().Set("Grpc-Status", code)
+		w.WriteHeader(http.StatusOK)
+	})
 }
 
 // streamOrigin echoes each chunk as it arrives, so a test can wait for one message before
