@@ -1386,8 +1386,9 @@ func warmQUIC(t *testing.T, p *Proxy, addr netip.AddrPort, placed func(net.Addr)
 }
 
 // cidConn records the connection IDs a quic-go client uses on pc, the source connection ID of
-// its first long header and the destination connection ID of the last short header it wrote
-// and of the last it read, both 8 bytes.
+// its first long header and the destination connection ID of the last short header packet it
+// wrote and of the last it read, both 8 bytes. A short header packet can follow the
+// long header packets of a datagram, RFC 9000 section 12.2.
 type cidConn struct {
 	net.PacketConn
 	first   atomic.Pointer[[]byte]
@@ -1397,22 +1398,67 @@ type cidConn struct {
 
 func (c *cidConn) ReadFrom(b []byte) (int, net.Addr, error) {
 	n, addr, err := c.PacketConn.ReadFrom(b)
-	if err == nil && n > 9 && b[0]&0x80 == 0 {
-		cid := bytes.Clone(b[1:9])
-		c.read.Store(&cid)
+	if err == nil {
+		if cid, ok := shortHeaderCID(b[:n]); ok {
+			c.read.Store(&cid)
+		}
 	}
 	return n, addr, err
 }
 
 func (c *cidConn) WriteTo(b []byte, addr net.Addr) (int, error) {
-	if len(b) > 9 && b[0]&0x80 == 0 {
-		cid := bytes.Clone(b[1:9])
+	if cid, ok := shortHeaderCID(b); ok {
 		c.written.Store(&cid)
-	} else if _, _, scid, ok := quicsniff.ParseLongHeader(b); ok && c.first.Load() == nil {
+	}
+	if _, _, scid, ok := quicsniff.ParseLongHeader(b); ok && c.first.Load() == nil {
 		scid = bytes.Clone(scid)
 		c.first.Store(&scid)
 	}
 	return c.PacketConn.WriteTo(b, addr)
+}
+
+func shortHeaderCID(b []byte) ([]byte, bool) {
+	for len(b) > 0 && b[0]&0x80 != 0 {
+		n, ok := longHeaderPacketLen(b)
+		if !ok {
+			return nil, false
+		}
+		b = b[n:]
+	}
+	if len(b) <= 9 {
+		return nil, false
+	}
+	return bytes.Clone(b[1:9]), true
+}
+
+// longHeaderPacketLen returns the length of the long header packet at the start of b, the
+// Length field included, RFC 9000 section 17.2. A Version Negotiation or a Retry packet has
+// no length and runs to the end of the datagram.
+func longHeaderPacketLen(b []byte) (int, bool) {
+	version, dcid, scid, ok := quicsniff.ParseLongHeader(b)
+	if !ok || version == 0 || isRetry(b[0], version) {
+		return 0, false
+	}
+	pos := 7 + len(dcid) + len(scid)
+	if quicsniff.IsInitial(b[0], version) {
+		tokenLen, n, err := quicvarint.Parse(b[pos:])
+		if err != nil {
+			return 0, false
+		}
+		pos += n + int(tokenLen)
+		if pos > len(b) {
+			return 0, false
+		}
+	}
+	length, n, err := quicvarint.Parse(b[pos:])
+	if err != nil {
+		return 0, false
+	}
+	pos += n + int(length)
+	if pos > len(b) {
+		return 0, false
+	}
+	return pos, true
 }
 
 func (c *cidConn) firstSource() []byte { return loadBytes(&c.first) }
@@ -1420,6 +1466,16 @@ func (c *cidConn) firstSource() []byte { return loadBytes(&c.first) }
 func (c *cidConn) lastWritten() []byte { return loadBytes(&c.written) }
 
 func (c *cidConn) lastRead() []byte { return loadBytes(&c.read) }
+
+// isRetry reports whether a long header packet is a Retry, type 3 under RFC 9000 and 0 under
+// RFC 9369.
+func isRetry(first byte, version uint32) bool {
+	typ := (first & 0x30) >> 4
+	if version == quicsniff.Version2 {
+		return typ == 0
+	}
+	return typ == 3
+}
 
 func loadBytes(p *atomic.Pointer[[]byte]) []byte {
 	if b := p.Load(); b != nil {
