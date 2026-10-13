@@ -5,10 +5,12 @@
 package edge
 
 import (
+	"crypto/tls"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/exec"
@@ -666,4 +668,49 @@ func TestCurl_HTTP3HandlerCanShortCircuit(t *testing.T) {
 	assert.Equal(t, "403", res.status)
 	assert.Equal(t, "3", res.version)
 	assert.Contains(t, res.body, "blocked by edge over HTTP/3.0")
+}
+
+func TestCurl_GRPCOverHTTP3(t *testing.T) {
+	requireCurl(t)
+
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	seen := new(recorder)
+	origin := httptest.NewUnstartedServer(grpcEchoHandler(seen))
+	origin.EnableHTTP2 = true
+	origin.TLS = &tls.Config{Certificates: []tls.Certificate{selfSignedFor(t, ca, "origin.test")}}
+	origin.StartTLS()
+	t.Cleanup(origin.Close)
+
+	tr := DefaultTransport()
+	tr.DialContext = pinnedDialer(origin.Listener.Addr().String())
+	tr.RootCAs = poolOf(ca)
+	p := testProxyWithCA(t, ca, WithTransport(tr))
+	p.MustAdd("origin.test/pkg.Svc/Method", forwardCall)
+	port := fmt.Sprint(startQUICRedirected(t, p, netip.MustParseAddrPort("127.0.0.1:443")).Port())
+
+	dir := t.TempDir()
+	payload := filepath.Join(dir, "payload")
+	require.NoError(t, os.WriteFile(payload, grpcPayload("hello"), 0o600))
+	headers := filepath.Join(dir, "headers")
+	res := runCurl(t,
+		"--http3-only",
+		"--resolve", "origin.test:"+port+":127.0.0.1",
+		"--cacert", writeCAFile(t, ca),
+		"-H", "Content-Type: application/grpc",
+		"-H", "TE: trailers",
+		"--data-binary", "@"+payload,
+		"--dump-header", headers,
+		"https://origin.test:"+port+"/pkg.Svc/Method",
+	)
+	dump, err := os.ReadFile(headers)
+	require.NoError(t, err)
+	_, trailers, ok := strings.Cut(string(dump), "\r\n\r\n")
+	require.True(t, ok, "no header block in %q", dump)
+
+	require.Equal(t, "200", res.status, "body %q", res.body)
+	assert.Equal(t, "3", res.version)
+	assert.Equal(t, string(grpcPayload("hello")), res.body)
+	assert.Contains(t, strings.ToLower(trailers), "grpc-status: 0", "headers and trailers %q", dump)
+	assert.Equal(t, []string{"HTTP/2.0"}, seen.all())
 }

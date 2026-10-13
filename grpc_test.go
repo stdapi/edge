@@ -18,6 +18,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"slices"
 	"strconv"
@@ -1177,6 +1178,294 @@ func TestKindGRPC_HTTP3CallToTheProxyIsForwarded(t *testing.T) {
 	}
 }
 
+func TestKindGRPC_CallOnTheHTTP3FrontIsForwarded(t *testing.T) {
+	cases := []struct {
+		run  func(t *testing.T)
+		name string
+	}{
+		{name: "server streaming forwards each message as written", run: func(t *testing.T) {
+			eachMode(t, func(t *testing.T, h GRPC) {
+				release := make(chan struct{})
+				o := newGRPCOrigin(t, func(o *grpcOrigin, w http.ResponseWriter, r *http.Request) {
+					o.record(r)
+					w.Header().Set("Content-Type", "application/grpc")
+					w.WriteHeader(http.StatusOK)
+					rc := http.NewResponseController(w)
+					_, _ = w.Write(lpm(0, "one"))
+					_ = rc.Flush()
+					select {
+					case <-release:
+					case <-r.Context().Done():
+						return
+					}
+					_, _ = w.Write(lpm(0, "two"))
+					w.Header().Set(http.TrailerPrefix+"Grpc-Status", "0")
+				})
+				b := newGRPCBench(t, o, h)
+				c := b.h3Call(t, b.h3Client(t), "/pkg.Svc/Watch")
+				c.send(lpm(0, "x"))
+				require.NoError(t, c.str.Close())
+				assert.Equal(t, lpm(0, "one"), c.read(len(lpm(0, "one"))))
+				close(release)
+				body, err := c.rest()
+				require.NoError(t, err)
+				assert.Equal(t, lpm(0, "two"), body)
+				code, _ := c.status()
+				assert.Equal(t, "0", code)
+			})
+		}},
+		{name: "client streaming forwards each message as written", run: func(t *testing.T) {
+			eachMode(t, func(t *testing.T, h GRPC) {
+				got := make(chan []byte, 3)
+				o := newGRPCOrigin(t, func(o *grpcOrigin, w http.ResponseWriter, r *http.Request) {
+					for range 3 {
+						m := make([]byte, len(lpm(0, "m0")))
+						if _, err := io.ReadFull(r.Body, m); err != nil {
+							return
+						}
+						got <- m
+					}
+					_, _ = io.Copy(io.Discard, r.Body)
+					answerOK(w, lpm(0, "done"))
+				})
+				b := newGRPCBench(t, o, h)
+				c := b.h3Call(t, b.h3Client(t), "/pkg.Svc/Upload")
+				for i := range 3 {
+					c.send(lpm(0, fmt.Sprintf("m%d", i)))
+					select {
+					case m := <-got:
+						assert.Equal(t, lpm(0, fmt.Sprintf("m%d", i)), m)
+					case <-time.After(5 * time.Second):
+						t.Fatalf("message %d did not reach the origin", i)
+					}
+				}
+				require.NoError(t, c.str.Close())
+				body, err := c.rest()
+				require.NoError(t, err)
+				assert.Equal(t, lpm(0, "done"), body)
+				code, _ := c.status()
+				assert.Equal(t, "0", code)
+			})
+		}},
+		{name: "bidirectional streaming, each message sent once the previous one came back", run: func(t *testing.T) {
+			eachMode(t, func(t *testing.T, h GRPC) {
+				b := newGRPCBench(t, streamOrigin(t), h)
+				c := b.h3Call(t, b.h3Client(t), "/pkg.Svc/Chat")
+				for _, n := range []int{27182, 8, 1828, 45904} {
+					msg := lpm(0, strings.Repeat("p", n))
+					c.send(msg)
+					assert.Equal(t, msg, c.read(len(msg)))
+				}
+				require.NoError(t, c.str.Close())
+				body, err := c.rest()
+				require.NoError(t, err)
+				assert.Empty(t, body)
+				code, _ := c.status()
+				assert.Equal(t, "0", code)
+			})
+		}},
+		{name: "Fail before Open answers trailers-only", run: func(t *testing.T) {
+			b := newGRPCBench(t, echoOrigin(t), func(c *GRPCCtx) error { return c.Fail(CodeUnknown, specialStatusMessage) })
+			c := b.h3Call(t, b.h3Client(t), "/pkg.Svc/Method")
+			_, _ = c.str.Write(lpm(0, "x"))
+			_ = c.str.Close()
+			resp := c.response()
+			body, err := c.rest()
+			require.NoError(t, err)
+			assert.Empty(t, body)
+			assert.Equal(t, http.StatusOK, resp.StatusCode)
+			assert.Equal(t, "application/grpc", resp.Header.Get("Content-Type"))
+			assert.Equal(t, "2", resp.Header.Get("Grpc-Status"))
+			assert.Equal(t, "%09%0Atest with whitespace%0D%0Aand Unicode BMP %E2%98%BA and non-BMP %F0%9F%98%88%09%0A", resp.Header.Get("Grpc-Message"))
+			assert.Empty(t, resp.Trailer)
+			b.origin.noCall(t)
+		}},
+		{name: "Fail after Open ends the call on its status in the trailers", run: func(t *testing.T) {
+			release := make(chan struct{})
+			b := newGRPCBench(t, streamOrigin(t), func(c *GRPCCtx) error {
+				if err := c.Open(); err != nil {
+					return err
+				}
+				m, err := c.Outbound().ReadMessage()
+				if err != nil {
+					return err
+				}
+				if err := m.Forward(); err != nil {
+					return err
+				}
+				m, err = c.Inbound().ReadMessage()
+				if err != nil {
+					return err
+				}
+				if err := m.Forward(); err != nil {
+					return err
+				}
+				ferr := c.Fail(CodeResourceExhausted, "quota")
+				select {
+				case <-release:
+				case <-time.After(5 * time.Second):
+				}
+				return ferr
+			})
+			c := b.h3Call(t, b.h3Client(t), "/pkg.Svc/Chat")
+			c.send(lpm(0, "one"))
+			assert.Equal(t, lpm(0, "one"), c.read(len(lpm(0, "one"))))
+			assert.Error(t, b.origin.call(t).readErr, "Fail did not cancel the origin")
+			close(release)
+			body, err := c.rest()
+			require.NoError(t, err)
+			assert.Empty(t, body)
+			code, msg := c.status()
+			assert.Equal(t, "8", code)
+			assert.Equal(t, "quota", msg)
+			assert.Empty(t, c.response().Header.Get("Grpc-Status"))
+		}},
+		{name: "the client cancels the call", run: func(t *testing.T) {
+			eachMode(t, func(t *testing.T, h GRPC) {
+				b := newGRPCBench(t, streamOrigin(t), h)
+				c := b.h3Call(t, b.h3Client(t), "/pkg.Svc/Chat")
+				c.send(lpm(0, "one"))
+				c.read(len(lpm(0, "one")))
+				c.str.CancelRead(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+				c.str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+				assert.Error(t, b.origin.call(t).readErr, "the origin read a request stream the client never ended")
+			})
+		}},
+		{name: "the client resets its request stream and keeps reading", run: func(t *testing.T) {
+			eachMode(t, func(t *testing.T, h GRPC) {
+				b := newGRPCBench(t, streamOrigin(t), h)
+				c := b.h3Call(t, b.h3Client(t), "/pkg.Svc/Chat")
+				c.send(lpm(0, "one"))
+				c.read(len(lpm(0, "one")))
+				c.str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+				assert.Error(t, b.origin.call(t).readErr, "the origin read a request stream the client never ended")
+				if _, err := c.rest(); err != nil {
+					var h3err *http3.Error
+					assert.ErrorAs(t, err, &h3err, "the response did not end on a reset")
+					return
+				}
+				code, _ := c.status()
+				assert.NotContains(t, []string{"", "0"}, code, "the cut call ended as complete")
+			})
+		}},
+		{name: "the origin resets the stream after one message", run: func(t *testing.T) {
+			eachMode(t, func(t *testing.T, h GRPC) {
+				o := newGRPCOrigin(t, func(o *grpcOrigin, w http.ResponseWriter, r *http.Request) {
+					o.record(r)
+					w.Header().Set("Content-Type", "application/grpc")
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write(lpm(0, "one"))
+					_ = http.NewResponseController(w).Flush()
+					panic(http.ErrAbortHandler)
+				})
+				b := newGRPCBench(t, o, h)
+				c := b.h3Call(t, b.h3Client(t), "/pkg.Svc/Watch")
+				c.send(lpm(0, "x"))
+				require.NoError(t, c.str.Close())
+				_, err := c.str.ReadResponse()
+				if err == nil {
+					_, err = io.ReadAll(c.str)
+				}
+				var h3err *http3.Error
+				require.ErrorAs(t, err, &h3err)
+				assert.True(t, h3err.Remote)
+				assert.Equal(t, http3.ErrCodeRequestCanceled, h3err.ErrorCode)
+			})
+		}},
+		{name: "a message over the bound ends on RESOURCE_EXHAUSTED", run: func(t *testing.T) {
+			b := newGRPCBench(t, echoOrigin(t), func(c *GRPCCtx) error {
+				if err := c.Open(); err != nil {
+					return err
+				}
+				_, err := c.Outbound().ReadMessage()
+				return err
+			}, WithMaxMessageBytes(8))
+			c := b.h3Call(t, b.h3Client(t), "/pkg.Svc/Method")
+			_, _ = c.str.Write(lpm(0, "123456789"))
+			_ = c.str.Close()
+			body, err := c.rest()
+			require.NoError(t, err)
+			assert.Empty(t, body)
+			code, _ := c.status()
+			assert.Equal(t, "8", code)
+		}},
+		{name: "the entry deleted mid-call refuses the next message", run: func(t *testing.T) {
+			eachMode(t, func(t *testing.T, h GRPC) {
+				b := newGRPCBench(t, streamOrigin(t), h)
+				c := b.h3Call(t, b.h3Client(t), "/pkg.Svc/Chat")
+				c.send(lpm(0, "one"))
+				assert.Equal(t, lpm(0, "one"), c.read(len(lpm(0, "one"))))
+				_, err := b.p.Delete[GRPC](b.host + "/*{method}")
+				require.NoError(t, err)
+				_, _ = c.str.Write(lpm(0, "two"))
+				_ = c.str.Close()
+				body, err := c.rest()
+				require.NoError(t, err)
+				assert.Empty(t, body)
+				code, msg := c.status()
+				assert.Equal(t, "14", code)
+				assert.Equal(t, "Unavailable", msg)
+			})
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, tc.run)
+	}
+}
+
+func TestKindGRPC_HTTP3CallInterceptedOnUDPIsForwarded(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	seen := new(recorder)
+	origin := httptest.NewUnstartedServer(grpcEchoHandler(seen))
+	origin.EnableHTTP2 = true
+	origin.TLS = &tls.Config{Certificates: []tls.Certificate{selfSignedFor(t, ca, "origin.test")}}
+	origin.StartTLS()
+	t.Cleanup(origin.Close)
+
+	tr := DefaultTransport()
+	tr.DialContext = pinnedDialer(origin.Listener.Addr().String())
+	tr.RootCAs = poolOf(ca)
+	resolver := &fakeResolver{addrs: map[string][]netip.Addr{"origin.test": {netip.MustParseAddr("127.0.0.1")}}}
+	destination := netip.MustParseAddrPort("127.0.0.1:443")
+
+	fronts := []struct {
+		dial func(t *testing.T, p *Proxy) http.RoundTripper
+		name string
+	}{
+		{name: "transparent", dial: func(t *testing.T, p *Proxy) http.RoundTripper {
+			h3 := dialQUICTo(startQUICRedirected(t, p, destination), poolOf(ca))
+			t.Cleanup(func() { _ = h3.Close() })
+			return h3
+		}},
+		{name: "CONNECT-UDP", dial: func(t *testing.T, p *Proxy) http.RoundTripper {
+			front, _ := startQUICFront(t, p, ca)
+			pconn, _, err := openTunnel(t, masqueClient(t, front, ca), front, "origin.test:443", nil)
+			require.NoError(t, err)
+			inner, _ := innerH3(t, pconn, destination, "origin.test", ca)
+			return inner
+		}},
+	}
+	for _, f := range fronts {
+		t.Run(f.name, func(t *testing.T) {
+			p := testProxyWithCA(t, ca, WithTransport(tr), WithNameResolver(resolver))
+			p.MustAdd("origin.test/pkg.Svc/Method", forwardCall)
+			client := &http.Client{Timeout: 10 * time.Second, Transport: f.dial(t, p)}
+			before := len(seen.all())
+			resp := grpcDo(t, client, "https://origin.test/pkg.Svc/Method", grpcPayload("hello"))
+			body, err := io.ReadAll(resp.Body)
+			require.NoError(t, err)
+			_ = resp.Body.Close()
+
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			assert.Equal(t, "HTTP/3.0", resp.Proto)
+			assert.Equal(t, grpcPayload("hello"), body)
+			assert.Equal(t, "0", resp.Trailer.Get("Grpc-Status"))
+			assert.Equal(t, []string{"HTTP/2.0"}, seen.all()[before:])
+		})
+	}
+}
+
 func TestKindGRPC_CallToAPlaintextOriginThroughAnUpstreamProxyIsTunneled(t *testing.T) {
 	seen := new(recorder)
 	origin := h2cOnlyOrigin(t, grpcEchoHandler(seen))
@@ -1355,6 +1644,7 @@ type grpcBench struct {
 	p         *Proxy
 	origin    *grpcOrigin
 	pool      *x509.CertPool
+	ca        *CA
 	proxyAddr string
 	host      string
 	authority string
@@ -1370,7 +1660,7 @@ func newGRPCBench(t *testing.T, origin *grpcOrigin, h GRPC, opts ...ProxyOption)
 	tr.RootCAs = originPool(t, origin.srv)
 	p, err := New(append([]ProxyOption{WithCA(ca), WithTransport(tr)}, opts...)...)
 	require.NoError(t, err)
-	b := &grpcBench{p: p, origin: origin, pool: ca.CertPool(), host: originHost(u), authority: u.Host}
+	b := &grpcBench{p: p, origin: origin, pool: ca.CertPool(), ca: ca, host: originHost(u), authority: u.Host}
 	if h != nil {
 		p.MustAdd(b.host+"/*{method}", h)
 	}
@@ -1551,6 +1841,71 @@ func (c *grpcClient) awaitData(id uint32, r *grpcResult, n int) {
 		c.step(id, r)
 	}
 	require.Len(c.t, r.data, n)
+}
+
+func (b *grpcBench) h3Client(t *testing.T) *http3.ClientConn {
+	t.Helper()
+	front, _ := startQUICFront(t, b.p, b.ca)
+	tr := &http3.Transport{DisableCompression: true}
+	t.Cleanup(func() { _ = tr.Close() })
+	return tr.NewClientConn(dialQUICFront(t, front, b.ca))
+}
+
+// h3Call drives a request stream directly. A round trip cannot reset one direction of a call.
+type h3Call struct {
+	t    *testing.T
+	str  *http3.RequestStream
+	resp *http.Response
+}
+
+func (b *grpcBench) h3Call(t *testing.T, cc *http3.ClientConn, path string) *h3Call {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	str, err := cc.OpenRequestStream(ctx)
+	require.NoError(t, err)
+	require.NoError(t, str.SetDeadline(time.Now().Add(10*time.Second)))
+	req, err := http.NewRequest(http.MethodPost, "https://"+b.authority+path, http.NoBody)
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/grpc")
+	req.Header.Set("Te", "trailers")
+	require.NoError(t, str.SendRequestHeader(req))
+	return &h3Call{t: t, str: str}
+}
+
+func (c *h3Call) send(b []byte) {
+	c.t.Helper()
+	_, err := c.str.Write(b)
+	require.NoError(c.t, err)
+}
+
+func (c *h3Call) response() *http.Response {
+	c.t.Helper()
+	if c.resp == nil {
+		resp, err := c.str.ReadResponse()
+		require.NoError(c.t, err)
+		c.resp = resp
+	}
+	return c.resp
+}
+
+func (c *h3Call) read(n int) []byte {
+	c.t.Helper()
+	c.response()
+	b := make([]byte, n)
+	_, err := io.ReadFull(c.str, b)
+	require.NoError(c.t, err)
+	return b
+}
+
+func (c *h3Call) rest() ([]byte, error) {
+	c.t.Helper()
+	c.response()
+	return io.ReadAll(c.str)
+}
+
+func (c *h3Call) status() (code, msg string) {
+	return grpcStatus(c.response())
 }
 
 func forwardCall(c *GRPCCtx) error { return c.Forward() }
