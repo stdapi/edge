@@ -622,6 +622,10 @@ func TestSOCKS5_AssociationBoundsWhatWaitsOnAName(t *testing.T) {
 		for range maxPendingDatagrams + 1 {
 			_, err := client.WriteTo([]byte(host), name)
 			require.NoError(t, err)
+			// The relay reads in order, so the datagram ahead of the probe is read before the
+			// next datagram is written.
+			body, _ := echoThroughSOCKS(t, client, net.UDPAddrFromAddrPort(echo), "probe")
+			require.Equal(t, "probe", body)
 		}
 	}
 	for range socks5NameResolving {
@@ -631,10 +635,6 @@ func TestSOCKS5_AssociationBoundsWhatWaitsOnAName(t *testing.T) {
 			t.Fatal("a name was not looked up")
 		}
 	}
-	// The relay reads in order, so once the probe is answered every datagram above is queued
-	// or dropped.
-	body, _ := echoThroughSOCKS(t, client, net.UDPAddrFromAddrPort(echo), "probe")
-	require.Equal(t, "probe", body)
 	close(resolver.release)
 	got := make(map[string]int)
 	for range socks5NameResolving * maxPendingDatagrams {

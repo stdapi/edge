@@ -1553,9 +1553,10 @@ func readDatagram(t *testing.T, conn *net.UDPConn, timeout time.Duration) (strin
 	return string(buf[:n]), nil
 }
 
-// blockingUDPProxy serves origin with a handler that parks the outbound datagrams of blocked
-// until release is closed, and forwards everything else.
-func blockingUDPProxy(t *testing.T, origin, blocked netip.AddrPort) (p *Proxy, proxyAddr netip.AddrPort, entered <-chan struct{}, release func()) {
+// blockingUDPProxy serves origin with a handler that parks every outbound datagram of blocked
+// and forwards everything else. A send on gate lets one datagram through, and release lets
+// all of them through.
+func blockingUDPProxy(t *testing.T, origin, blocked netip.AddrPort) (p *Proxy, proxyAddr netip.AddrPort, entered <-chan struct{}, gate chan<- struct{}, release func()) {
 	t.Helper()
 	p, err := New()
 	require.NoError(t, err)
@@ -1575,7 +1576,21 @@ func blockingUDPProxy(t *testing.T, origin, blocked netip.AddrPort) (p *Proxy, p
 	// Registered after the serve helper's Close, so the handler is released before Close waits.
 	once := sync.OnceFunc(func() { close(rel) })
 	t.Cleanup(once)
-	return p, addr, in, once
+	return p, addr, in, rel, once
+}
+
+func waitReceived(t *testing.T, received func() []string, want string) {
+	t.Helper()
+	require.Eventually(t, func() bool { return slices.Contains(received(), want) }, 5*time.Second, time.Millisecond, "%q never reached the sink", want)
+}
+
+func letThrough(t *testing.T, gate chan<- struct{}) {
+	t.Helper()
+	select {
+	case gate <- struct{}{}:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no datagram is parked")
+	}
 }
 
 func waitEntered(t *testing.T, entered <-chan struct{}) {
@@ -1597,7 +1612,7 @@ func TestTransparentUDP_ParkedHandlerDoesNotDelayAnotherClient(t *testing.T) {
 	origin := udpEchoOrigin(t)
 	slow, slowAddr := udpClient(t)
 	fast, _ := udpClient(t)
-	_, proxyAddr, entered, release := blockingUDPProxy(t, origin, slowAddr)
+	_, proxyAddr, entered, _, release := blockingUDPProxy(t, origin, slowAddr)
 
 	sendTo(t, slow, proxyAddr, "slow")
 	waitEntered(t, entered)
@@ -1617,7 +1632,7 @@ func TestTransparentUDP_FullQueueDropsForThatClientOnly(t *testing.T) {
 	origin, received := udpSinkOrigin(t)
 	slow, slowAddr := udpClient(t)
 	other, _ := udpClient(t)
-	_, proxyAddr, entered, release := blockingUDPProxy(t, origin, slowAddr)
+	_, proxyAddr, entered, _, release := blockingUDPProxy(t, origin, slowAddr)
 
 	sendTo(t, slow, proxyAddr, "slow-0")
 	waitEntered(t, entered)
@@ -1660,7 +1675,8 @@ func TestTransparentUDP_FullQueueDropsForThatClientOnly(t *testing.T) {
 func TestTransparentUDP_QueueIsBoundedInBytes(t *testing.T) {
 	origin, received := udpSinkOrigin(t)
 	slow, slowAddr := udpClient(t)
-	_, proxyAddr, entered, release := blockingUDPProxy(t, origin, slowAddr)
+	other, _ := udpClient(t)
+	_, proxyAddr, entered, gate, _ := blockingUDPProxy(t, origin, slowAddr)
 
 	const size = 8000
 	fits := udpQueueBytes / size
@@ -1674,13 +1690,28 @@ func TestTransparentUDP_QueueIsBoundedInBytes(t *testing.T) {
 	waitEntered(t, entered)
 	for i := 1; i <= fits+8; i++ {
 		sendTo(t, slow, proxyAddr, payload(i))
+		// The proxy reads its socket in order, so the datagram ahead of the probe is queued or
+		// dropped before the next datagram is written.
+		probe := fmt.Sprintf("probe-%d", i)
+		sendTo(t, other, proxyAddr, probe)
+		waitReceived(t, received, probe)
 	}
-	time.Sleep(300 * time.Millisecond)
-	release()
+	for i := range 1 + fits {
+		letThrough(t, gate)
+		waitReceived(t, received, payload(i))
+	}
+	// The flow serves its queue in order, so the tail is the next datagram let through when
+	// nothing was queued past the bound.
+	sendTo(t, slow, proxyAddr, "tail")
+	letThrough(t, gate)
+	waitReceived(t, received, "tail")
 
-	require.Eventually(t, func() bool { return len(received()) >= 1+fits }, 3*time.Second, 10*time.Millisecond)
-	time.Sleep(100 * time.Millisecond)
-	got := received()
+	var got []string
+	for _, s := range received() {
+		if strings.HasPrefix(s, "big-") {
+			got = append(got, s)
+		}
+	}
 	assert.Len(t, got, 1+fits)
 	for i, s := range got {
 		assert.Len(t, s, size)
@@ -1876,7 +1907,7 @@ func onlyUDPFlow(t *testing.T, p *Proxy) *udpFlow {
 func TestTransparentUDP_ArrivalKeepsTheFlowInUse(t *testing.T) {
 	origin := udpEchoOrigin(t)
 	slow, slowAddr := udpClient(t)
-	p, proxyAddr, entered, _ := blockingUDPProxy(t, origin, slowAddr)
+	p, proxyAddr, entered, _, _ := blockingUDPProxy(t, origin, slowAddr)
 
 	sendTo(t, slow, proxyAddr, "0")
 	waitEntered(t, entered)
