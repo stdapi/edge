@@ -27,6 +27,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1695,15 +1696,25 @@ func TestTransparentUDP_FlowKeepsOrder(t *testing.T) {
 	_, proxyAddr := startTProxyQUIC(t, p, origin)
 	client, _ := udpClient(t)
 
-	const count = 200
+	// More than the queue bounds, so a handler behind the sender drops a run and what
+	// arrives is in order. The first udpQueue datagrams are never dropped.
+	const count = 3 * udpQueue
 	for i := range count {
 		sendTo(t, client, proxyAddr, fmt.Sprintf("%03d", i))
 		time.Sleep(100 * time.Microsecond)
 	}
-	for i := range count {
+	last := -1
+	for received := 0; received < count; received++ {
 		got, err := readDatagram(t, client, 3*time.Second)
+		if err != nil {
+			require.True(t, isTimeout(err), "%v", err)
+			require.GreaterOrEqual(t, received, udpQueue, "the proxy dropped among the first %d datagrams", udpQueue)
+			break
+		}
+		n, err := strconv.Atoi(got)
 		require.NoError(t, err)
-		require.Equal(t, fmt.Sprintf("%03d", i), got)
+		require.Greater(t, n, last, "datagram %s arrived after %03d", got, last)
+		last = n
 	}
 }
 
