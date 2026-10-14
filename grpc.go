@@ -657,9 +657,10 @@ func (b *refusedBody) Close() error { return b.gate.Close() }
 // returns, and so is what remains of [GRPCCtx.Outbound] when it returns nil without
 // [GRPCCtx.Fail] or [GRPCCtx.CloseSend]. The call ends on the trailers of the origin when the
 // handler returns after Inbound ended, and otherwise on a status the proxy sets, the one given
-// to [GRPCCtx.Fail], the one the returned error maps to, or [CodeInternal]. A response whose
-// status is not 200 or whose content type is not gRPC is relayed unchanged with no status
-// set, and Inbound ends once it is relayed.
+// to [GRPCCtx.Fail], the one the returned error maps to, or [CodeInternal]. A status the proxy
+// sets resets what remains of Outbound toward the origin. A response with a status other than
+// 200 or a content type other than gRPC is relayed unchanged with no status set, and Inbound
+// ends once it is relayed.
 //
 // Call Open before any goroutine reads. [GRPCCtx.Respond] fails after Open.
 func (c *GRPCCtx) Open() error {

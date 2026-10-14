@@ -687,6 +687,41 @@ func TestKindGRPC_ReturnFromAMergeWithAReadPendingEndsOnInternal(t *testing.T) {
 	assert.Error(t, b.origin.call(t).readErr, "the origin read a request stream the client never ended")
 }
 
+func TestKindGRPC_StatusOfTheProxyResetsTheRequestStream(t *testing.T) {
+	ends := []struct {
+		end  func(c *GRPCCtx) error
+		name string
+		code string
+	}{
+		{func(c *GRPCCtx) error { return c.Fail(CodeResourceExhausted, "quota") }, "Fail", "8"},
+		{func(c *GRPCCtx) error { return errors.New("handler failed") }, "error", "2"},
+	}
+	for _, tc := range ends {
+		t.Run(tc.name, func(t *testing.T) {
+			b := newGRPCBench(t, streamOrigin(t), func(c *GRPCCtx) error {
+				if err := c.Open(); err != nil {
+					return err
+				}
+				m, err := c.Outbound().ReadMessage()
+				if err != nil {
+					return err
+				}
+				if err := m.Forward(); err != nil {
+					return err
+				}
+				return tc.end(c)
+			})
+			c := b.client(t)
+			id := c.call("/pkg.Svc/Method")
+			c.data(id, false, lpm(0, "one"))
+			r := c.await(id)
+
+			assert.Equal(t, tc.code, grpcStatusOf(r))
+			assert.Error(t, b.origin.call(t).readErr, "the origin read a request stream the client never ended")
+		})
+	}
+}
+
 func TestKindGRPC_ErrorAfterOpenReachesTheClient(t *testing.T) {
 	release := make(chan struct{})
 	defer close(release)
