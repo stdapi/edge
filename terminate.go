@@ -316,7 +316,7 @@ func (p *Proxy) serveTerminatedStream(ctx context.Context, conn net.Conn, sess *
 	if !p.srv.admitSession(sess) {
 		return ErrConnectionRejected
 	}
-	defer p.srv.trackSession(sess, false)
+	defer p.srv.untrackSession(sess)
 
 	c := &TCPCtx{
 		ctx:      ctx,
@@ -416,7 +416,7 @@ func (p *Proxy) serveTerminatedHTTP(conn net.Conn, sess *Session, state *tls.Con
 	if !p.srv.admitSession(sess) {
 		return ErrConnectionRejected
 	}
-	defer p.srv.trackSession(sess, false)
+	defer p.srv.untrackSession(sess)
 
 	ln := newSingleConnListener(conn, sess, state)
 	err := p.srv.term.Serve(ln)

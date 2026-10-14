@@ -504,6 +504,7 @@ func TestSOCKS5_AssociateTerminatesTheInnerHTTP3(t *testing.T) {
 	assert.Equal(t, origin, conn.Upstream())
 
 	require.NoError(t, assoc.Close())
+	assertSessionEnded(t, p, assoc)
 	waitForSessions(t, p, 0)
 	requireEnded(t, qconn, "the inner connection is closed through the association")
 	_, err = io.ReadAll(client.ctrl)

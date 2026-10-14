@@ -1017,6 +1017,7 @@ func TestKindUDP_SessionCloseClosesTheAlternates(t *testing.T) {
 	for s := range p.Sessions() {
 		if s.Kind() == KindUDP {
 			require.NoError(t, s.Close())
+			assertSessionEnded(t, p, s)
 			closed++
 		}
 	}

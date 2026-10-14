@@ -329,6 +329,7 @@ func TestConnectUDP_TerminatesTheInnerHTTP3(t *testing.T) {
 
 	// Closing the tunnel ends what it carries, and the client sees its stream end.
 	require.NoError(t, tunnel.Close())
+	assertSessionEnded(t, p, tunnel)
 	require.NoError(t, tunnel.Close(), "closing twice is a no-op")
 	waitForSessions(t, p, 0)
 	requireEnded(t, againConn, "the inner connection is closed through the tunnel")
@@ -1149,6 +1150,7 @@ func TestConnectUDP_Capsules_TerminatesTheInnerHTTP3(t *testing.T) {
 
 			// Closing the tunnel ends what it carries, and the client sees its stream end.
 			require.NoError(t, tunnel.Close())
+			assertSessionEnded(t, p, tunnel)
 			waitForSessions(t, p, 0)
 			require.NoError(t, pconn.SetReadDeadline(time.Now().Add(5*time.Second)))
 			_, _, err = pconn.ReadFrom(make([]byte, 64))
@@ -1363,6 +1365,55 @@ func TestConnectUDP_Capsules_CloseEndsAStalledClient(t *testing.T) {
 				3*time.Second, 20*time.Millisecond, "the tunnel outlived its close")
 		})
 	}
+}
+
+func TestConnectUDP_CloseEndsAnH2TunnelBehindAClientThatStoppedReadingItsConnection(t *testing.T) {
+	if !extendedConnectEnabled() {
+		t.Skip("needs GODEBUG=http2xconnect=1")
+	}
+	fx := newUDPFixture(t)
+	flood := udpFlood(t, 20000, 1200)
+	front := fx.frontAddr(t, viaH2)
+	tc := dialFront(t, netip.MustParseAddrPort(front), fx.ca, "h2")
+	t.Cleanup(func() { _ = tc.Close() })
+	_, err := tc.Write([]byte(http2.ClientPreface))
+	require.NoError(t, err)
+	fr := http2.NewFramer(tc, tc)
+	require.NoError(t, fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1<<31 - 1}))
+	require.NoError(t, fr.WriteWindowUpdate(0, 1<<31-1-65535))
+	var buf bytes.Buffer
+	enc := hpack.NewEncoder(&buf)
+	for _, f := range []hpack.HeaderField{
+		{Name: ":method", Value: http.MethodConnect},
+		{Name: ":protocol", Value: connectUDPUpgrade},
+		{Name: ":scheme", Value: "https"},
+		{Name: ":authority", Value: front},
+		{Name: ":path", Value: templatePath(flood.String())},
+		{Name: "capsule-protocol", Value: "?1"},
+	} {
+		require.NoError(t, enc.WriteField(f))
+	}
+	require.NoError(t, fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: buf.Bytes(), EndHeaders: true}))
+	require.NoError(t, fr.WriteData(1, false, capsuleOf(0, append([]byte{0}, "go"...))))
+	// Nothing reads the connection, the flood fills the socket.
+	time.Sleep(1500 * time.Millisecond)
+
+	var tunnel *Session
+	for s := range fx.p.Sessions() {
+		if s.Tunnel() {
+			tunnel = s
+		}
+	}
+	require.NotNil(t, tunnel)
+	closed := make(chan error, 1)
+	go func() { closed <- tunnel.Close() }()
+	select {
+	case err := <-closed:
+		require.NoError(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("Session.Close waited for the client to read its connection")
+	}
+	assertSessionEnded(t, fx.p, tunnel)
 }
 
 func TestConformanceConnectUDP(t *testing.T) {

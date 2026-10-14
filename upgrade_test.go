@@ -368,6 +368,7 @@ func TestUpgrade_SessionCloseEndsAStalledClient(t *testing.T) {
 	start := time.Now()
 	_ = sess.Close()
 	assert.Less(t, time.Since(start), alertWriteTimeout, "Close blocked on the client")
+	assertSessionEnded(t, p, sess)
 	assert.Eventually(t, func() bool { return len(slices.Collect(p.Sessions())) == 0 },
 		alertWriteTimeout, 10*time.Millisecond, "the pipe outlived its close")
 }

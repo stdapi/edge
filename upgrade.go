@@ -69,11 +69,13 @@ func (p *Proxy) spliceWebSocket(c *routeCtx, w http.ResponseWriter, r *http.Requ
 	}
 	defer func() { _ = client.Close() }()
 
+	sctx, scancel := p.webSocketContext(r)
+	defer scancel()
 	// After the hijack http.Server neither closes nor waits for the connection, so tracking
 	// it here is what lets a shutdown and a route change reach it. A refusal means the proxy
 	// is stopping, and the 101 has not been written yet, so the client sees the upgrade fail.
 	pipe := &upgradedPipe{client: client, backend: backend}
-	sess := p.pipeSession(c, r, KindWebSocket, c.entry, pipe)
+	sess := p.pipeSession(c, r, KindWebSocket, c.entry, pipe, sctx, scancel)
 	// The handler owns the request it is handed, so the copy is what a later decision reads.
 	sess.upgrade = r.Clone(r.Context())
 
@@ -88,7 +90,7 @@ func (p *Proxy) spliceWebSocket(c *routeCtx, w http.ResponseWriter, r *http.Requ
 		p.logf(r.Context(), slog.LevelDebug, "upgrade refused, the entries changed while it was admitted", sess, nil)
 		return writeRawStatus(brw, http.StatusForbidden)
 	}
-	defer p.srv.trackSession(sess, false)
+	defer p.srv.untrackSession(sess)
 
 	// Response.Write copies the body after the headers, and here the body is the connection
 	// itself. Leaving it in place would block forever draining a stream that only ends when
@@ -101,7 +103,7 @@ func (p *Proxy) spliceWebSocket(c *routeCtx, w http.ResponseWriter, r *http.Requ
 		return fmt.Errorf("flush upgrade response: %w", err)
 	}
 
-	ctx, cancel := p.webSocketContext(r)
+	ctx, cancel := context.WithCancelCause(sctx)
 	defer cancel(nil)
 	wc := &WebSocketCtx{
 		ctx:      ctx,
@@ -122,23 +124,15 @@ func (p *Proxy) spliceWebSocket(c *routeCtx, w http.ResponseWriter, r *http.Requ
 	return runKindHandler(p, sess, func() error { return handler(wc) })
 }
 
-// webSocketContext returns the context of a WebSocket handler, with the values of the
+// webSocketContext returns the context of a WebSocket session, with the values of the
 // connection's context and an end of its own. Edge closes the client connection while the
 // closing handshake goes on toward the origin.
-func (p *Proxy) webSocketContext(r *http.Request) (context.Context, context.CancelCauseFunc) {
+func (p *Proxy) webSocketContext(r *http.Request) (context.Context, context.CancelFunc) {
 	base := r.Context()
 	if s := sessionFromRequest(r); s != nil {
 		base = s.Context()
 	}
-	ctx, cancel := context.WithCancelCause(context.WithoutCancel(base))
-	go func() {
-		select {
-		case <-p.srv.ctx.Done():
-			cancel(nil)
-		case <-ctx.Done():
-		}
-	}()
-	return ctx, cancel
+	return p.untilShutdown(context.WithoutCancel(base))
 }
 
 // serveUpgradedStream serves what an upgrade left behind as the byte stream it now is. HTTP
@@ -176,8 +170,10 @@ func (p *Proxy) serveUpgradedStream(c *routeCtx, w http.ResponseWriter, r *http.
 	}
 	defer func() { _ = client.Close() }()
 
+	ctx, cancel := p.hijackedContext(r)
+	defer cancel()
 	pipe := &upgradedPipe{client: client, backend: backend}
-	upSess := p.pipeSession(c, r, KindTCP, e, pipe)
+	upSess := p.pipeSession(c, r, KindTCP, e, pipe, ctx, cancel)
 
 	if !p.srv.tryTrack(pipe) {
 		return nil
@@ -188,7 +184,7 @@ func (p *Proxy) serveUpgradedStream(c *routeCtx, w http.ResponseWriter, r *http.
 		p.logf(r.Context(), slog.LevelDebug, "upgrade refused, the entries changed while it was admitted", upSess, nil)
 		return writeRawStatus(brw, http.StatusForbidden)
 	}
-	defer p.srv.trackSession(upSess, false)
+	defer p.srv.untrackSession(upSess)
 
 	resp.Body = nil
 	if err := resp.Write(brw); err != nil {
@@ -198,8 +194,6 @@ func (p *Proxy) serveUpgradedStream(c *routeCtx, w http.ResponseWriter, r *http.
 		return fmt.Errorf("flush upgrade response: %w", err)
 	}
 
-	ctx, cancel := p.hijackedContext(r)
-	defer cancel()
 	sc := &TCPCtx{
 		ctx:      ctx,
 		p:        p,
@@ -282,14 +276,17 @@ func (u *upgradedPipe) Close() error {
 	return errors.Join(cerr, berr)
 }
 
-// pipeSession describes the connection an upgrade leaves behind, served by e.
+// pipeSession describes the connection an upgrade leaves behind, served by e, living under ctx.
 //
 // It gets a session of its own because a request routes on its Host header, which can differ
 // from the CONNECT authority. Reusing the connection's would report an authority the pipe does
 // not talk to, and a sweep would keep the wrong one.
-func (p *Proxy) pipeSession(c *routeCtx, r *http.Request, kind Kind, e *entry, pipe io.Closer) *Session {
+func (p *Proxy) pipeSession(c *routeCtx, r *http.Request, kind Kind, e *entry, pipe io.Closer,
+	ctx context.Context, cancel context.CancelFunc,
+) *Session {
 	target := Target{Scheme: c.scheme, Host: c.host, Port: c.port}
-	sess := newSession(p, r.Context(), nil, target, kind, protoOfRequest(r))
+	sess := newSession(p, ctx, nil, target, kind, protoOfRequest(r))
+	sess.cancel = cancel
 	sess.closer = pipe
 	sess.entry.Store(e)
 	// An upgrade outlives the request that established it, so a revocation can only reach it

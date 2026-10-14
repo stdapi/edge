@@ -130,6 +130,7 @@ func (p *Proxy) serveSOCKS5(conn net.Conn) error {
 	}
 
 	sess := newSession(p, ctx, conn, target, 0, 0)
+	sess.cancel = cancel
 	sess.identity = identity
 	sess.setDestination(target)
 
@@ -228,6 +229,7 @@ func (p *Proxy) serveSOCKS5Associate(ctx context.Context, conn net.Conn, from so
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	sess := newSession(p, ctx, conn, Target{}, 0, 0)
+	sess.cancel = cancel
 	sess.identity = identity
 	sess.tunnel = true
 
@@ -249,7 +251,7 @@ func (p *Proxy) serveSOCKS5Associate(ctx context.Context, conn net.Conn, from so
 		_ = relay.Close()
 		return errors.New("the entries changed while the association was admitted")
 	}
-	defer p.srv.trackSession(sess, false)
+	defer p.srv.untrackSession(sess)
 
 	relayAddr := addrPort(relay.LocalAddr())
 	if err := socks5.WriteReply(conn, socks5.Succeeded, socks5.Addr{IP: relayAddr.Addr(), Port: relayAddr.Port()}); err != nil {

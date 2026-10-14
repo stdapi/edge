@@ -126,15 +126,15 @@ func (p *Proxy) ServeConn(conn net.Conn) error {
 	}
 
 	if head[0] == tlsHandshakeRecord {
-		return p.serveTransparentTLS(ctx, peeked, origin)
+		return p.serveTransparentTLS(ctx, cancel, peeked, origin)
 	}
-	return p.serveTransparentPlain(ctx, peeked, origin)
+	return p.serveTransparentPlain(ctx, cancel, peeked, origin)
 }
 
 // serveTransparentTLS serves a redirected TLS connection. The destination is the authority
 // it starts from, and the server name in the ClientHello replaces it before the handshake, see
 // [Proxy.placeTLS].
-func (p *Proxy) serveTransparentTLS(ctx context.Context, conn *peekConn, origin netip.AddrPort) error {
+func (p *Proxy) serveTransparentTLS(ctx context.Context, cancel context.CancelFunc, conn *peekConn, origin netip.AddrPort) error {
 	target := Target{Scheme: "https", Port: "443"}
 	if origin.IsValid() {
 		target.Port = fmt.Sprint(origin.Port())
@@ -142,13 +142,14 @@ func (p *Proxy) serveTransparentTLS(ctx context.Context, conn *peekConn, origin 
 	}
 
 	sess := newSession(p, ctx, conn, target, 0, 0)
+	sess.cancel = cancel
 	sess.transparent = true
 	sess.setUpstream(origin)
 	return p.terminate(ctx, conn, sess)
 }
 
 // serveTransparentPlain serves a redirected connection that is not TLS.
-func (p *Proxy) serveTransparentPlain(ctx context.Context, conn *peekConn, origin netip.AddrPort) error {
+func (p *Proxy) serveTransparentPlain(ctx context.Context, cancel context.CancelFunc, conn *peekConn, origin netip.AddrPort) error {
 	target := Target{Scheme: "http", Port: "80"}
 	if origin.IsValid() {
 		target = Target{
@@ -159,6 +160,7 @@ func (p *Proxy) serveTransparentPlain(ctx context.Context, conn *peekConn, origi
 	}
 
 	sess := newSession(p, ctx, conn, target, 0, 0)
+	sess.cancel = cancel
 	sess.transparent = true
 	sess.setUpstream(origin)
 	return p.servePlain(ctx, conn, sess)

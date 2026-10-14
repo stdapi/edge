@@ -67,6 +67,7 @@ func (p *Proxy) connectHijack(w http.ResponseWriter, r *http.Request, target Tar
 	// fills in the TLS state.
 	front := sessionFromRequest(r)
 	sess := newSession(p, ctx, nil, target, 0, 0)
+	sess.cancel = cancel
 	sess.remoteAddr, sess.localAddr = front.remoteAddr, front.localAddr
 	sess.identity = identity
 	sess.setDestination(target)
@@ -124,7 +125,10 @@ func (p *Proxy) connectStream(w http.ResponseWriter, r *http.Request, target Tar
 
 	stream := newH2Stream(w, r, local, remote)
 	cut := streamCut{stream}
-	sess := newSession(p, r.Context(), nil, target, 0, 0)
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	sess := newSession(p, ctx, nil, target, 0, 0)
+	sess.cancel = cancel
 	sess.localAddr, sess.remoteAddr = local, remote
 	sess.identity = identity
 	sess.setDestination(target)
@@ -148,8 +152,8 @@ func (p *Proxy) connectStream(w http.ResponseWriter, r *http.Request, target Tar
 	stream.writeHeader(http.StatusOK)
 
 	pc := newPeekConn(stream, nil, clientHelloPeekSize)
-	if err := p.terminate(r.Context(), pc, sess); err != nil {
-		p.logf(r.Context(), slog.LevelDebug, "stream closed", sess, err)
+	if err := p.terminate(ctx, pc, sess); err != nil {
+		p.logf(ctx, slog.LevelDebug, "stream closed", sess, err)
 	}
 }
 

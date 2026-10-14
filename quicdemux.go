@@ -1449,6 +1449,7 @@ func (d *quicDemux) openUDPFlow(client net.Addr, from flowKey, origin netip.Addr
 
 	ctx, cancel := context.WithCancel(d.ctx)
 	sess := newSession(d.p, ctx, nil, target, KindUDP, 0)
+	sess.cancel = cancel
 	d.fillSession(sess, client)
 	sess.setUpstream(origin)
 	u := &udpFlow{
@@ -2147,6 +2148,7 @@ func (d *quicDemux) beginTermination(from flowKey, client net.Addr, conn *quicCo
 
 	ctx, cancel := context.WithCancel(context.Background())
 	sess := newSession(d.p, ctx, nil, target, kind, 0)
+	sess.cancel = cancel
 	d.fillSession(sess, client)
 	sess.setUpstream(conn.origin)
 	sess.clientHello.Store(hello)

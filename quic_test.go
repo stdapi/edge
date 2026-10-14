@@ -200,6 +200,7 @@ func TestQUIC_CloseCarriesTheProtocolsNoErrorCode(t *testing.T) {
 			require.Equal(t, KindQUIC, sess.Kind())
 			assert.Equal(t, tc.servableAs, sess.ServableAs())
 			require.NoError(t, sess.Close())
+			assertSessionEnded(t, p, sess)
 
 			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
 			defer cancel()
@@ -210,6 +211,36 @@ func TestQUIC_CloseCarriesTheProtocolsNoErrorCode(t *testing.T) {
 			assert.Equal(t, tc.code, appErr.ErrorCode)
 		})
 	}
+}
+
+func TestQUIC_ProxyCloseEndsTheSession(t *testing.T) {
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(proxyCA))
+	require.NoError(t, err)
+	started, release := make(chan struct{}), make(chan struct{})
+	p.MustAdd[QUIC](h3Authority, func(*QUICCtx) error {
+		close(started)
+		<-release
+		return nil
+	})
+	proxyAddr := startQUIC(t, p)
+	t.Cleanup(func() { close(release) })
+
+	pc, err := loopbackUDP()
+	require.NoError(t, err)
+	defer func() { _ = pc.Close() }()
+	conn, err := quic.Dial(t.Context(), pc, net.UDPAddrFromAddrPort(proxyAddr),
+		&tls.Config{ServerName: h3Authority, RootCAs: poolOf(proxyCA), NextProtos: []string{"doq"}, MinVersion: tls.VersionTLS13},
+		&quic.Config{MaxIdleTimeout: 10 * time.Second, HandshakeIdleTimeout: 3 * time.Second},
+	)
+	require.NoError(t, err)
+	defer func() { _ = conn.CloseWithError(0, "") }()
+	<-started
+
+	sess := waitForSessions(t, p, 1)[0]
+	require.NoError(t, p.Close())
+	assertSessionEnded(t, p, sess)
 }
 
 func TestQUIC_SessionALPNDuringHandshake(t *testing.T) {

@@ -402,7 +402,7 @@ func tcpStalledH2Connect(t *testing.T) *Session {
 	return sess
 }
 
-func TestConnect_CloseReturnsBehindAClientThatStoppedReadingItsConnection(t *testing.T) {
+func TestConnect_CloseEndsTheSessionBehindAClientThatStoppedReadingItsConnection(t *testing.T) {
 	sess := tcpStalledH2Connect(t)
 	closed := make(chan error, 1)
 	go func() { closed <- sess.Close() }()
@@ -412,17 +412,80 @@ func TestConnect_CloseReturnsBehindAClientThatStoppedReadingItsConnection(t *tes
 	case <-time.After(3 * time.Second):
 		t.Fatal("Session.Close waited for the client to read its connection")
 	}
+	assertSessionEnded(t, sess.p, sess)
+}
+
+func TestConnect_TLSInsideAnH2StreamHalfClosesAndEndsCleanly(t *testing.T) {
+	const head, rest = "head", "the rest of the upload"
+	originCA, err := GenerateCA()
+	require.NoError(t, err)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	received := make(chan string, 1)
+	go func() {
+		conn, aerr := ln.Accept()
+		if aerr != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		tc := tls.Server(conn, &tls.Config{
+			Certificates: []tls.Certificate{selfSignedFor(t, originCA, "127.0.0.1")},
+			MinVersion:   tls.VersionTLS12,
+		})
+		first := make([]byte, len(head))
+		if _, rerr := io.ReadFull(tc, first); rerr != nil {
+			received <- "read: " + rerr.Error()
+			return
+		}
+		_ = tc.CloseWrite()
+		tail, _ := io.ReadAll(tc)
+		received <- string(first) + string(tail)
+	}()
+
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	tr := DefaultTransport()
+	tr.RootCAs = poolOf(originCA)
+	p, err := New(WithCA(ca), WithTransport(tr))
+	require.NoError(t, err)
+	p.MustAdd[TCP](ln.Addr().String(), relayStream)
+	w, r := h2cConnect(t, startProxy(t, p), ln.Addr().String())
+	client := tls.Client(&tunnelConn{r: io.NopCloser(r), w: w.(io.WriteCloser)}, clientTLSConfig(ca, "127.0.0.1"))
+	require.NoError(t, client.Handshake())
+
+	_, err = client.Write([]byte(head))
+	require.NoError(t, err)
+	_, err = io.ReadAll(client)
+	require.NoError(t, err, "the origin's half-close reaches the client as a close_notify")
+	_, err = client.Write([]byte(rest))
+	require.NoError(t, err)
+	require.NoError(t, client.CloseWrite())
+
+	select {
+	case got := <-received:
+		assert.Equal(t, head+rest, got)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the origin never saw the end of the upload")
+	}
+	_, err = io.Copy(io.Discard, r)
+	assert.NoError(t, err, "the stream ends with END_STREAM")
 }
 
 // openH3Connect opens a CONNECT over HTTP/3 to origin and returns once its response header
 // arrived, with nothing sent on it.
 func openH3Connect(t *testing.T, origin net.Listener) (*Proxy, *http3.RequestStream) {
 	t.Helper()
+	return openH3ConnectTo(t, origin, relayStream)
+}
+
+func openH3ConnectTo(t *testing.T, origin net.Listener, h TCP) (*Proxy, *http3.RequestStream) {
+	t.Helper()
 	ca, err := GenerateCA()
 	require.NoError(t, err)
 	p, err := New(WithCA(ca))
 	require.NoError(t, err)
-	p.MustAdd[TCP](origin.Addr().String(), relayStream)
+	p.MustAdd[TCP](origin.Addr().String(), h)
 	front, _ := startQUICFront(t, p, ca)
 
 	tr := &http3.Transport{}

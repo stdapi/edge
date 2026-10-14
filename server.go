@@ -92,6 +92,8 @@ type server struct {
 
 	mu      sync.Mutex
 	closing atomic.Bool
+	// cut is set once closeActive has ended the sessions, guarded by mu.
+	cut bool
 }
 
 func newServer(p *Proxy) (*server, error) {
@@ -455,7 +457,8 @@ func (p *Proxy) Shutdown(ctx context.Context) error {
 }
 
 // Close stops the proxy at once, dropping every connection including the traffic in flight.
-// It does not wait for a handler still running.
+// It does not wait for a handler still running, and ends every session as [Session.Close]
+// does.
 func (p *Proxy) Close() error {
 	p.srv.beginClose()
 	defer p.srv.endClose()
@@ -739,16 +742,19 @@ func (s *server) untrackDemux(d *quicDemux) {
 	s.wg.Done()
 }
 
-// trackSession adds or removes a session. The goroutine serving the connection makes both
-// calls, so membership stays single-writer.
-func (s *server) trackSession(sess *Session, add bool) {
+// untrackSession removes a session once the goroutine serving it is done with it.
+func (s *server) untrackSession(sess *Session) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if add {
-		s.sessions[sess] = struct{}{}
-		return
-	}
 	delete(s.sessions, sess)
+	s.mu.Unlock()
+}
+
+// endSession removes a session for good, before the goroutines serving it have returned.
+func (s *server) endSession(sess *Session) {
+	s.mu.Lock()
+	sess.ended = true
+	delete(s.sessions, sess)
+	s.mu.Unlock()
 }
 
 // admitSession registers a session and reports whether the tree still decides it the way it
@@ -765,12 +771,23 @@ func (s *server) admitSession(sess *Session) bool {
 	if sess.perRequest {
 		return true
 	}
+	if sess.cancel == nil {
+		panic("edge: a session is registered with no context Close can end")
+	}
 
-	s.trackSession(sess, true)
+	s.mu.Lock()
+	ended := sess.ended || s.cut
+	if !ended {
+		s.sessions[sess] = struct{}{}
+	}
+	s.mu.Unlock()
+	if ended {
+		return false
+	}
 	if !sess.Stale() {
 		return true
 	}
-	s.trackSession(sess, false)
+	s.untrackSession(sess)
 	return false
 }
 
@@ -795,10 +812,16 @@ func (s *server) closeListeners() error {
 
 func (s *server) closeActive() {
 	s.mu.Lock()
-	conns := make([]io.Closer, 0, len(s.active))
+	conns := make([]io.Closer, 0, len(s.active)+len(s.sessions))
 	for c := range s.active {
 		conns = append(conns, c)
 	}
+	// A cut ends the sessions too, so a handler that ignores its I/O cannot keep one listed,
+	// and admitSession refuses the ones decided after it.
+	for sess := range s.sessions {
+		conns = append(conns, sess)
+	}
+	s.cut = true
 	s.mu.Unlock()
 
 	// Concurrently: a closer that blocks, a QUIC demux waiting out a handler that will not

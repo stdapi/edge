@@ -230,6 +230,26 @@ func TestSession_StaleWebSocket(t *testing.T) {
 	assert.True(t, sess.Stale(), "nothing admits it any more")
 }
 
+func TestSession_WebSocketEndsAtCloseWithoutWaitingForItsHandler(t *testing.T) {
+	origin, originURL := wsOrigin(t, nil)
+	p := testProxy(t)
+	handlerCtx, release := make(chan context.Context, 1), make(chan struct{})
+	p.MustAdd(originHost(originURL)+"/ws", func(c *WebSocketCtx) error {
+		handlerCtx <- c.Context()
+		<-release
+		return nil
+	})
+	resp := wsUpgrade(t, startProxy(t, p), origin, "")
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+	t.Cleanup(func() { close(release) })
+	ctx := <-handlerCtx
+
+	sess := waitForSessions(t, p, 1)[0]
+	require.NoError(t, sess.Close())
+	assertSessionEnded(t, p, sess)
+	assert.Error(t, ctx.Err(), "the context of the handler is live")
+}
+
 func TestSession_FrontIsNeverStale(t *testing.T) {
 	p := testProxy(t)
 	stale := make(chan bool, 1)
@@ -475,7 +495,9 @@ func TestSession_AdmitAfterChange(t *testing.T) {
 			decide := func() *Session {
 				kind, e, _ := p.firstAdmittedWith(target, []Kind{KindHTTP, KindTCP})
 				require.Equal(t, KindTCP, kind)
-				sess := newSession(p, context.Background(), nil, target, kind, 0)
+				ctx, cancel := context.WithCancel(t.Context())
+				sess := newSession(p, ctx, nil, target, kind, 0)
+				sess.cancel = cancel
 				sess.servableAs = []Kind{KindHTTP, KindTCP}
 				sess.entry.Store(e)
 				return sess
@@ -484,7 +506,7 @@ func TestSession_AdmitAfterChange(t *testing.T) {
 			admitted := decide()
 			require.True(t, p.srv.admitSession(admitted))
 			require.Len(t, slices.Collect(p.Sessions()), 1)
-			p.srv.trackSession(admitted, false)
+			p.srv.untrackSession(admitted)
 
 			late := decide()
 			tc.change(t, p)
@@ -784,4 +806,123 @@ func TestSession_StaleWebSocketLeavesTheNoEntryHandler(t *testing.T) {
 
 	p.MustAdd(originHost(originURL)+"/ws", func(c *WebSocketCtx) error { return c.Relay() })
 	assert.True(t, sess.Stale())
+}
+
+// assertSessionEnded checks that sess is over as soon as the call that ended it returns,
+// whatever its handler is still doing.
+func assertSessionEnded(t *testing.T, p *Proxy, sess *Session) {
+	t.Helper()
+	assert.Error(t, sess.Context().Err(), "the context of the ended session is live")
+	assert.False(t, slices.Contains(slices.Collect(p.Sessions()), sess), "the ended session is listed")
+}
+
+// parkedStream is a TCP handler that ignores its context and its connections until release
+// closes.
+func parkedStream(started chan<- struct{}, release <-chan struct{}) TCP {
+	return func(*TCPCtx) error {
+		close(started)
+		<-release
+		return nil
+	}
+}
+
+func TestSession_AdmissionRefusedOnceEnded(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		end  func(p *Proxy, sess *Session)
+	}{
+		{"SessionClose", func(_ *Proxy, sess *Session) { _ = sess.Close() }},
+		{"ProxyClose", func(p *Proxy, _ *Session) { _ = p.Close() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := testProxy(t)
+			p.MustAdd[TCP]("example.test", relayStream)
+			ctx, cancel := context.WithCancel(t.Context())
+			sess := newSession(p, ctx, nil, Target{Scheme: "https", Host: "example.test", Port: "443"}, KindTCP, 0)
+			sess.cancel = cancel
+			sess.closer = io.NopCloser(nil)
+
+			tc.end(p, sess)
+			assert.False(t, p.srv.admitSession(sess), "a session decided before the end is registered after it")
+			assert.Empty(t, slices.Collect(p.Sessions()))
+		})
+	}
+}
+
+func TestSession_EndsAtTheCutWithoutWaitingForItsHandler(t *testing.T) {
+	fronts := []struct {
+		name string
+		open func(t *testing.T, h TCP) *Proxy
+	}{
+		{"h1", func(t *testing.T, h TCP) *Proxy {
+			origin := sinkOrigin(t)
+			p := testProxy(t)
+			p.MustAdd[TCP](origin.Addr().String(), h)
+			conn, err := net.Dial("tcp", startProxy(t, p))
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = conn.Close() })
+			_, err = fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %[1]s\r\n\r\nx", origin.Addr())
+			require.NoError(t, err)
+			return p
+		}},
+		{"h2", func(t *testing.T, h TCP) *Proxy {
+			p, _, _ := openH2ConnectTo(t, sinkOrigin(t), h)
+			return p
+		}},
+		{"h3", func(t *testing.T, h TCP) *Proxy {
+			p, rstr := openH3ConnectTo(t, sinkOrigin(t), h)
+			_, err := rstr.Write([]byte("x"))
+			require.NoError(t, err)
+			return p
+		}},
+		{"transparent", func(t *testing.T, h TCP) *Proxy {
+			origin := netip.MustParseAddrPort(sinkOrigin(t).Addr().String())
+			p := testProxy(t)
+			p.MustAdd[TCP](origin.String(), h)
+			addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) { return origin, nil })
+			conn, err := net.Dial("tcp", addr)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = conn.Close() })
+			_, err = conn.Write([]byte("x"))
+			require.NoError(t, err)
+			return p
+		}},
+		{"socks5", func(t *testing.T, h TCP) *Proxy {
+			origin := netip.MustParseAddrPort(sinkOrigin(t).Addr().String())
+			p := testProxy(t)
+			p.MustAdd[TCP](origin.String(), h)
+			w := socksConnect(t, startSOCKS5(t, p), socksAddrBytes(origin))
+			w.readReply()
+			w.write([]byte("x"))
+			return p
+		}},
+	}
+	cuts := []struct {
+		name string
+		cut  func(p *Proxy, sess *Session) error
+	}{
+		{"SessionClose", func(_ *Proxy, sess *Session) error { return sess.Close() }},
+		{"ProxyClose", func(p *Proxy, _ *Session) error { return p.Close() }},
+	}
+	for _, front := range fronts {
+		for _, cut := range cuts {
+			t.Run(front.name+"/"+cut.name, func(t *testing.T) {
+				started, release := make(chan struct{}), make(chan struct{})
+				p := front.open(t, parkedStream(started, release))
+				t.Cleanup(func() { close(release) })
+				<-started
+				sess := waitForSessions(t, p, 1)[0]
+
+				done := make(chan error, 1)
+				go func() { done <- cut.cut(p, sess) }()
+				select {
+				case err := <-done:
+					require.NoError(t, err)
+				case <-time.After(3 * time.Second):
+					t.Fatal("the cut waited for the handler")
+				}
+				assertSessionEnded(t, p, sess)
+			})
+		}
+	}
 }

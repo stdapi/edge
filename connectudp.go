@@ -89,6 +89,7 @@ func (p *Proxy) serveConnectUDP(w http.ResponseWriter, r *http.Request, identity
 	ctx, cancel := p.tunnelContext(r)
 	defer cancel()
 	sess := newSession(p, ctx, nil, target, kind, protoOfRequest(r))
+	sess.cancel = cancel
 	sess.servableAs = candidates
 	sess.setUpstream(upstream)
 	sess.identity = identity
@@ -120,7 +121,7 @@ func (p *Proxy) serveConnectUDP(w http.ResponseWriter, r *http.Request, identity
 		p.writeStatus(w, r, http.StatusForbidden, "the entries changed while the tunnel was admitted")
 		return
 	}
-	defer p.srv.trackSession(sess, false)
+	defer p.srv.untrackSession(sess)
 
 	pipe := p.openTunnel(ctx, w, r, tun)
 	if pipe == nil {

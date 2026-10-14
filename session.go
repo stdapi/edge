@@ -131,6 +131,9 @@ type Session struct {
 	// after.
 	closer   io.Closer
 	closeErr error
+	// cancel ends ctx. Every session [Proxy.Sessions] reports has one, so Close ends the
+	// session without waiting for the goroutines serving it.
+	cancel context.CancelFunc
 	// tlsState is atomic because the QUIC path fills it in once the handshake reaches the
 	// server, by which point [Proxy.Sessions] already reports the session.
 	tlsState atomic.Pointer[tls.ConnectionState]
@@ -179,6 +182,8 @@ type Session struct {
 	transparent bool
 	// tunnel marks a CONNECT-UDP tunnel, a session that serves nothing itself.
 	tunnel bool
+	// ended is set by Close under the server lock, so a registration racing it is refused.
+	ended bool
 	// hasSchemeField marks a front connection whose HTTP/2 requests have their :scheme in
 	// schemeHeader.
 	hasSchemeField bool
@@ -372,18 +377,26 @@ func (s *Session) ALPN() string {
 }
 
 // Close ends the session at once, without draining, and the requests or streams in flight
-// fail. It ends this session and nothing else. The client sees the end in its own protocol, a
-// FIN, a CONNECTION_CLOSE or a stream reset, and is free to come back, to be authenticated and
-// admitted again on the entries as they stand then. A datagram flow has no such signal and
-// the client sees its replies stop. Closing a session that already ended is a no-op.
-// Revoking an identity uses the same call, see [Session.Identity].
+// fail. Once it returns, [Proxy.Sessions] no longer reports the session and its context is
+// done, even while a handler serving it has yet to return. It ends this session and nothing
+// else. The client sees the end in its own protocol, a FIN, a CONNECTION_CLOSE or a stream
+// reset, and is free to come back, to be authenticated and admitted again on the entries as
+// they stand then. A datagram flow has no such signal and the client sees its replies stop.
+// Closing a session that already ended is a no-op. Revoking an identity uses the same call,
+// see [Session.Identity].
 func (s *Session) Close() error {
 	if s.closer == nil {
 		return nil
 	}
 	s.closeOnce.Do(func() {
+		s.p.srv.endSession(s)
+		// The closer comes first, so a handler returning on its context cannot end the stream
+		// cleanly before the cut resets it.
 		if err := s.closer.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			s.closeErr = err
+		}
+		if s.cancel != nil {
+			s.cancel()
 		}
 	})
 	return s.closeErr
