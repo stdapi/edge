@@ -42,6 +42,14 @@ func requireCurl(t *testing.T) string {
 	return path
 }
 
+func requireCurlHTTP3(t *testing.T) {
+	t.Helper()
+	out, err := exec.Command(requireCurl(t), "--version").Output()
+	if err != nil || !slices.Contains(strings.Fields(string(out)), "HTTP3") {
+		skipWithoutTool(t, "the curl on PATH has no HTTP/3")
+	}
+}
+
 // writeCAFile writes the CA certificate where curl can read it.
 func writeCAFile(t *testing.T, ca *CA) string {
 	t.Helper()
@@ -603,7 +611,7 @@ func TestCurl_ThroughSOCKS5(t *testing.T) {
 }
 
 func TestCurl_InterceptHTTP3(t *testing.T) {
-	requireCurl(t)
+	requireCurlHTTP3(t)
 
 	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
 	require.NoError(t, err)
@@ -643,7 +651,7 @@ func TestCurl_InterceptHTTP3(t *testing.T) {
 }
 
 func TestCurl_HTTP3HandlerCanShortCircuit(t *testing.T) {
-	requireCurl(t)
+	requireCurlHTTP3(t)
 
 	proxyCA, err := GenerateCA()
 	require.NoError(t, err)
@@ -671,7 +679,7 @@ func TestCurl_HTTP3HandlerCanShortCircuit(t *testing.T) {
 }
 
 func TestCurl_GRPCOverHTTP3(t *testing.T) {
-	requireCurl(t)
+	requireCurlHTTP3(t)
 
 	ca, err := GenerateCA()
 	require.NoError(t, err)
