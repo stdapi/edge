@@ -3757,3 +3757,159 @@ func BenchmarkTunnelOutbound(b *testing.B) {
 		putTunnelBuf(out)
 	}
 }
+
+// blackHoleRelay forwards datagrams between one client and front, and drops every one past
+// the moment cut is set.
+func blackHoleRelay(t *testing.T, front netip.AddrPort, cut *atomic.Bool) netip.AddrPort {
+	t.Helper()
+	in, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	require.NoError(t, err)
+	out, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = in.Close()
+		_ = out.Close()
+	})
+	var client atomic.Pointer[net.Addr]
+	go func() {
+		buf := make([]byte, 65536)
+		for {
+			n, addr, rerr := in.ReadFrom(buf)
+			if rerr != nil {
+				return
+			}
+			client.Store(&addr)
+			if !cut.Load() {
+				_, _ = out.WriteTo(buf[:n], net.UDPAddrFromAddrPort(front))
+			}
+		}
+	}()
+	go func() {
+		buf := make([]byte, 65536)
+		for {
+			n, _, rerr := out.ReadFrom(buf)
+			if rerr != nil {
+				return
+			}
+			if c := client.Load(); c != nil && !cut.Load() {
+				_, _ = in.WriteTo(buf[:n], *c)
+			}
+		}
+	}()
+	return netip.MustParseAddrPort(in.LocalAddr().String())
+}
+
+func TestConnectUDP_CloseEndsATunnelBehindAClientThatStoppedAcknowledging(t *testing.T) {
+	flood := udpFlood(t, 20000, 1200)
+	p, ca, front, _ := masqueProxy(t, WithIdleTimeout(10*time.Second))
+	p.MustAdd[UDP]("127.0.0.1", forwardDatagram)
+	var cut atomic.Bool
+	relay := blackHoleRelay(t, front, &cut)
+	cc := masqueClient(t, relay, ca)
+	mc, _, err := openTunnel(t, cc, relay, flood.String(), nil)
+	require.NoError(t, err)
+	_, err = mc.WriteTo([]byte("go"), nil)
+	require.NoError(t, err)
+	time.Sleep(100 * time.Millisecond)
+	cut.Store(true)
+	time.Sleep(500 * time.Millisecond)
+
+	var tunnel *Session
+	for _, s := range waitForSessions(t, p, 2) {
+		if s.Tunnel() {
+			tunnel = s
+		}
+	}
+	require.NotNil(t, tunnel)
+	require.NoError(t, tunnel.Close())
+	assert.Eventually(t, func() bool { return !slices.Contains(slices.Collect(p.Sessions()), tunnel) },
+		2*time.Second, 20*time.Millisecond, "the tunnel outlived its close")
+}
+
+func TestConnectUDP_HalfCloseOverHTTP2WhileTheSenderIsBlocked(t *testing.T) {
+	if !extendedConnectEnabled() {
+		t.Skip("needs GODEBUG=http2xconnect=1")
+	}
+	fx := newUDPFixture(t)
+	flood := udpFlood(t, 2000, 1200)
+	front := fx.frontAddr(t, viaH2)
+	tc := dialFront(t, netip.MustParseAddrPort(front), fx.ca, "h2")
+	t.Cleanup(func() { _ = tc.Close() })
+	_, err := tc.Write([]byte(http2.ClientPreface))
+	require.NoError(t, err)
+	fr := http2.NewFramer(tc, tc)
+	fr.ReadMetaHeaders = hpack.NewDecoder(4096, nil)
+	// A stream window of 64 bytes leaves the sender blocked in its first write.
+	require.NoError(t, fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 64}))
+	head := make(chan *http2.MetaHeadersFrame, 1)
+	ended := make(chan http2.Frame, 4)
+	writes := make(chan func(), 16)
+	go func() {
+		for {
+			f, rerr := fr.ReadFrame()
+			if rerr != nil {
+				return
+			}
+			switch f := f.(type) {
+			case *http2.SettingsFrame:
+				if !f.IsAck() {
+					writes <- func() { _ = fr.WriteSettingsAck() }
+				}
+			case *http2.PingFrame:
+				if !f.IsAck() {
+					data := f.Data
+					writes <- func() { _ = fr.WritePing(true, data) }
+				}
+			case *http2.MetaHeadersFrame:
+				head <- f
+			case *http2.RSTStreamFrame:
+				ended <- f
+			case *http2.DataFrame:
+				if f.StreamEnded() {
+					ended <- f
+				}
+			}
+		}
+	}()
+	write := func(fn func()) {
+		done := make(chan struct{})
+		writes <- func() {
+			fn()
+			close(done)
+		}
+		<-done
+	}
+	var buf bytes.Buffer
+	enc := hpack.NewEncoder(&buf)
+	for _, f := range []hpack.HeaderField{
+		{Name: ":method", Value: http.MethodConnect},
+		{Name: ":protocol", Value: connectUDPUpgrade},
+		{Name: ":scheme", Value: "https"},
+		{Name: ":authority", Value: front},
+		{Name: ":path", Value: templatePath(flood.String())},
+		{Name: "capsule-protocol", Value: "?1"},
+	} {
+		require.NoError(t, enc.WriteField(f))
+	}
+	require.NoError(t, fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: buf.Bytes(), EndHeaders: true}))
+	go func() {
+		for fn := range writes {
+			fn()
+		}
+	}()
+	select {
+	case h := <-head:
+		require.Equal(t, "200", h.PseudoValue("status"))
+	case <-time.After(5 * time.Second):
+		t.Fatal("the tunnel was not answered")
+	}
+	write(func() { _ = fr.WriteData(1, false, capsuleOf(0, append([]byte{0}, "go"...))) })
+	time.Sleep(300 * time.Millisecond)
+	write(func() { _ = fr.WriteData(1, true, nil) })
+	select {
+	case <-ended:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the stream never ended")
+	}
+	time.Sleep(500 * time.Millisecond)
+}

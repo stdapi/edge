@@ -406,7 +406,21 @@ func (t *connectUDPTunnel) serve(ctx context.Context, pipe tunnelPipe) {
 		t.d.dispatch(t.addr, payload, true)
 	}
 	t.close()
-	<-t.sent
+	// The deadline close armed bounds the drain of every pipe but QUIC datagrams while the client
+	// reads its connection. A QUIC datagram waits for room in the connection's queue, so that
+	// stream is ended here after tunnelDrainTimeout, and a send still waiting returns once the
+	// queue has room or the connection ends.
+	if dp, isDatagrams := pipe.(*datagramPipe); !isDatagrams || dp.capsules {
+		<-t.sent
+		return
+	}
+	drained := time.NewTimer(tunnelDrainTimeout)
+	defer drained.Stop()
+	select {
+	case <-t.sent:
+	case <-drained.C:
+		_ = pipe.close()
+	}
 }
 
 // send queues b, from origin, for the client and drops it when the queue is full.
@@ -433,8 +447,8 @@ func putTunnelBuf(b []byte) {
 }
 
 // sender is the one goroutine writing the pipe. Once the tunnel is done it drains the queue,
-// the CONNECTION_CLOSE of every inner connection among it, then ends the pipe. The deadline
-// close armed bounds the drain, and a send to a client that stopped reading with it.
+// the CONNECTION_CLOSE of every inner connection among it, then ends the pipe, unless serve
+// ended it first.
 func (t *connectUDPTunnel) sender(pipe tunnelPipe) {
 	defer close(t.sent)
 	for {

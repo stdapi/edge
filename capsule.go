@@ -300,10 +300,14 @@ func (p *datagramPipe) abort() {
 	p.str.CancelRead(quic.StreamErrorCode(http3.ErrCodeMessageError))
 }
 
+// close ends the stream once, and a later close does nothing.
 func (p *datagramPipe) close() error {
-	p.closeOnce.Do(func() { close(p.done) })
-	err := p.str.Close()
-	p.str.CancelRead(p.code)
+	var err error
+	p.closeOnce.Do(func() {
+		close(p.done)
+		err = p.str.Close()
+		p.str.CancelRead(p.code)
+	})
 	return err
 }
 
