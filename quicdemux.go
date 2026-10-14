@@ -130,8 +130,10 @@ func (p *Proxy) ListenAndServeTransparentUDP(addr string) error {
 // datagrams belonging to a QUIC connection are never served that way: a connection the proxy
 // cannot read is one it refuses rather than one it passes on.
 //
-// A [UDP] handler serves the datagrams of a flow one at a time, in the order they arrived.
-// While it blocks, up to 64 datagrams or 256 KiB of that flow wait and the rest are dropped.
+// A [UDP] handler serves the datagrams a client sends on a flow one at a time, in the order they
+// arrived, and the replies of each origin the same way. The two directions are served
+// concurrently. While it blocks, up to 64 datagrams or 256 KiB the client sent on that flow
+// wait and the rest are dropped.
 //
 // Under Encrypted Client Hello the decision sees the outer server name only, unless
 // [WithRejectECH] refuses such connections. A QUIC version other than v1 and v2 is served by the
@@ -534,14 +536,16 @@ func (c *quicConnCloser) Close() error {
 		return nil
 	}
 	qc := conn.qc
-	c.d.removeConnLocked(flow, conn)
+	it := c.d.detachConnLocked(flow, conn)
 	c.d.mu.Unlock()
 
-	if qc == nil {
-		return nil
+	var err error
+	if qc != nil {
+		// Outside the lock, quic-go writes a CONNECTION_CLOSE from here.
+		err = closeNoError(qc)
 	}
-	// Outside the lock, quic-go writes a CONNECTION_CLOSE from here.
-	return closeNoError(qc)
+	c.d.releaseIntercept(it)
+	return err
 }
 
 // udpFlowCloser ends one datagram flow. The flow is the whole of what its session covers, so
@@ -639,6 +643,7 @@ func newQUICDemux(p *Proxy, pc net.PacketConn) (*quicDemux, error) {
 type quicCarrier struct {
 	client net.Addr
 	sess   *Session
+	conn   *quicConn // guarded by d.mu
 	odcid  string
 }
 
@@ -772,7 +777,7 @@ func (d *quicDemux) interceptForLocked(client net.Addr, origin netip.AddrPort) (
 		// destination connection ID, pre-Retry even when a Retry happened.
 		if carrier, ok := ctx.Value(quicCarrierKey{}).(*quicCarrier); ok {
 			carrier.odcid = string(odcid.Bytes())
-			d.adopt(ctx, carrier.client, carrier.odcid)
+			d.adopt(ctx, carrier)
 		}
 		return nil
 	}
@@ -932,27 +937,34 @@ func (d *quicDemux) evictableLocked() *quicIntercept {
 
 // adopt ties the removal of a terminated connection to its context, which ends with the
 // connection however that happens, a failed handshake included.
-func (d *quicDemux) adopt(ctx context.Context, client net.Addr, odcid string) {
-	from := flowKeyOf(client)
+func (d *quicDemux) adopt(ctx context.Context, carrier *quicCarrier) {
+	from := flowKeyOf(carrier.client)
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	flow := d.flows[from]
 	if flow == nil {
 		return
 	}
-	if conn := flow.conns[odcid]; conn != nil && conn.state == connTerminated {
-		context.AfterFunc(ctx, func() { d.endTerminated(from, odcid) })
+	conn := flow.conns[carrier.odcid]
+	if conn == nil {
+		return
+	}
+	carrier.conn = conn
+	if conn.state == connTerminated {
+		context.AfterFunc(ctx, func() { d.endTerminated(from, conn) })
 	}
 }
 
-func (d *quicDemux) endTerminated(from flowKey, odcid string) {
+// endTerminated removes conn once its connection has ended, when its ODCID still maps to it. A
+// later connection of the same client may reuse the ODCID.
+func (d *quicDemux) endTerminated(from flowKey, conn *quicConn) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	flow := d.flows[from]
 	if flow == nil {
 		return
 	}
-	if conn := flow.conns[odcid]; conn != nil && conn.state == connTerminated {
+	if flow.conns[conn.odcid] == conn && conn.state == connTerminated {
 		d.removeConnLocked(flow, conn)
 	}
 }
@@ -970,15 +982,19 @@ func (d *quicDemux) accept(c *quic.Conn) *Session {
 	from := flowKeyOf(carrier.client)
 	d.mu.Lock()
 	var conn *quicConn
+	var doomed *quicIntercept
 	if flow := d.flows[from]; flow != nil {
-		conn = flow.conns[carrier.odcid]
+		if conn = flow.conns[carrier.odcid]; conn != carrier.conn {
+			conn = nil
+		}
 		if conn != nil && conn.doomed {
-			d.removeConnLocked(flow, conn)
+			doomed = d.detachConnLocked(flow, conn)
 		}
 	}
 	if conn == nil || conn.doomed || conn.state != connTerminated {
 		d.mu.Unlock()
 		_ = closeNoError(c)
+		d.releaseIntercept(doomed)
 		return nil
 	}
 	conn.qc = c
@@ -1045,7 +1061,7 @@ func (d *quicDemux) placedSession(ctx context.Context) *Session {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if flow := d.flows[flowKeyOf(carrier.client)]; flow != nil {
-		if conn := flow.conns[carrier.odcid]; conn != nil {
+		if conn := flow.conns[carrier.odcid]; conn != nil && conn == carrier.conn {
 			return conn.sess
 		}
 	}
@@ -1754,12 +1770,11 @@ func (u *udpFlow) alternateLocked(addr string) (*udpAlt, error) {
 func (d *quicDemux) runUDPAlternate(u *udpFlow, addr string, alt *udpAlt) {
 	buf := make([]byte, maxUDPPayload)
 	for {
-		_ = alt.conn.SetReadDeadline(u.idleDeadline())
 		n, err := alt.conn.Read(buf)
 		if n > 0 || err == nil {
 			d.serveDatagramOn(u, &alt.in, buf[:n])
 		}
-		if err == nil || isTimeout(err) {
+		if err == nil {
 			continue
 		}
 		d.mu.Lock()
@@ -1919,6 +1934,26 @@ func (d *quicDemux) releaseInterceptLocked(conn *quicConn) {
 		conn.stack.lastSeen = time.Now()
 		conn.stack = nil
 	}
+}
+
+// detachConnLocked removes conn and returns its stack, still counting the connection until
+// releaseIntercept, so the stack is not evicted before the CONNECTION_CLOSE is sent. d.mu must
+// be held.
+func (d *quicDemux) detachConnLocked(flow *quicFlow, conn *quicConn) *quicIntercept {
+	it := conn.stack
+	conn.stack = nil
+	d.removeConnLocked(flow, conn)
+	return it
+}
+
+func (d *quicDemux) releaseIntercept(it *quicIntercept) {
+	if it == nil {
+		return
+	}
+	d.mu.Lock()
+	it.conns--
+	it.lastSeen = time.Now()
+	d.mu.Unlock()
 }
 
 // sniff feeds a datagram to the reassembler and starts placing the connection once its

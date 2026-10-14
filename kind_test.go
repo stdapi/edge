@@ -6,6 +6,7 @@ package edge
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1162,4 +1164,108 @@ func TestKindUDP_StaleOnTheKindAlone(t *testing.T) {
 	_, err = p.Delete[UDP]("[0.0.0.0/0]:" + port)
 	require.NoError(t, err)
 	assert.True(t, sess.Stale(), "nothing admits the flow any more")
+}
+
+// timeoutOnceConn counts its reads, and its next read fails with a timeout once expire is set.
+type timeoutOnceConn struct {
+	net.Conn
+	reads  *atomic.Int64
+	expire *atomic.Bool
+}
+
+func (c timeoutOnceConn) Read(b []byte) (int, error) {
+	c.reads.Add(1)
+	if c.expire.Swap(false) {
+		return 0, os.ErrDeadlineExceeded
+	}
+	return c.Conn.Read(b)
+}
+
+func TestKindUDP_AlternateReaderDoesNotLoopOnATimeout(t *testing.T) {
+	origin := udpEchoOrigin(t)
+	other := udpEchoOrigin(t)
+	var reads atomic.Int64
+	var expire atomic.Bool
+	tr := DefaultTransport()
+	tr.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		c, err := (&net.Dialer{}).DialContext(ctx, network, addr)
+		if err != nil || addr != other.String() {
+			return c, err
+		}
+		return timeoutOnceConn{Conn: c, reads: &reads, expire: &expire}, nil
+	}
+	p, err := New(WithTransport(tr))
+	require.NoError(t, err)
+	release, blocked := make(chan struct{}), make(chan struct{})
+	p.MustAdd("[0.0.0.0/0]:"+fmt.Sprint(origin.Port()), func(d *DatagramCtx) error {
+		switch {
+		case !d.Inbound():
+			_ = d.SendTo(other.String(), d.Bytes())
+			return d.Forward()
+		case d.Origin() == origin:
+			close(blocked)
+			<-release
+			return nil
+		}
+		err := d.Forward()
+		// The reply of the origin moves the flow's last use, so it comes first.
+		<-blocked
+		// The flow falls idle, and the alternate reader times out at its next read.
+		p.srv.mu.Lock()
+		for dm := range p.srv.quics {
+			dm.mu.Lock()
+			for _, flow := range dm.flows {
+				for _, u := range flow.udp {
+					u.touch(time.Now().Add(-2 * udpFlowIdle))
+				}
+			}
+			dm.mu.Unlock()
+		}
+		p.srv.mu.Unlock()
+		expire.Store(true)
+		return err
+	})
+	_, proxyAddr := startTProxyQUIC(t, p, origin)
+	t.Cleanup(func() { close(release) })
+
+	client, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = client.Close() })
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
+	_, err = client.WriteTo([]byte("x"), net.UDPAddrFromAddrPort(proxyAddr))
+	require.NoError(t, err)
+	_, _, err = client.ReadFrom(make([]byte, 64))
+	require.NoError(t, err)
+
+	time.Sleep(200 * time.Millisecond)
+	before := reads.Load()
+	time.Sleep(300 * time.Millisecond)
+	assert.Less(t, reads.Load()-before, int64(10), "the alternate reader loops on an expired deadline")
+}
+
+func TestKindUDP_DirectionsAreServedConcurrently(t *testing.T) {
+	origin := udpEchoOrigin(t)
+	release := make(chan struct{})
+	p, err := New()
+	require.NoError(t, err)
+	p.MustAdd("[0.0.0.0/0]:"+fmt.Sprint(origin.Port()), func(d *DatagramCtx) error {
+		err := d.Forward()
+		if !d.Inbound() {
+			<-release
+		}
+		return err
+	})
+	_, proxyAddr := startTProxyQUIC(t, p, origin)
+	t.Cleanup(func() { close(release) })
+
+	client, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = client.Close() })
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
+	_, err = client.WriteTo([]byte("hello"), net.UDPAddrFromAddrPort(proxyAddr))
+	require.NoError(t, err)
+	buf := make([]byte, 64)
+	n, _, err := client.ReadFrom(buf)
+	require.NoError(t, err, "the reply waited for the handler serving the outbound datagram")
+	assert.Equal(t, "hello", string(buf[:n]))
 }

@@ -898,10 +898,11 @@ func TestQUICDemux_HandshakeRefusesAChangedClientHello(t *testing.T) {
 	client := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 40000}
 	sess := newSession(p, t.Context(), nil, Target{Host: "allowed.test", Port: "443"}, KindQUIC, 0)
 	sess.clientHello.Store(&ClientHello{ServerName: "allowed.test", ALPN: []string{"raw"}})
+	conn := &quicConn{sess: sess}
 	d := &quicDemux{p: p, flows: map[flowKey]*quicFlow{
-		flowKeyOf(client): {client: client, conns: map[string]*quicConn{"odcid": {sess: sess}}},
+		flowKeyOf(client): {client: client, conns: map[string]*quicConn{"odcid": conn}},
 	}}
-	ctx := context.WithValue(t.Context(), quicCarrierKey{}, &quicCarrier{client: client, odcid: "odcid"})
+	ctx := context.WithValue(t.Context(), quicCarrierKey{}, &quicCarrier{client: client, odcid: "odcid", conn: conn})
 
 	handshake := func(name string, protos ...string) error {
 		c, s := net.Pipe()

@@ -1721,3 +1721,67 @@ func TestQUICDemux_InitialFromItsOwnSocketIsRefused(t *testing.T) {
 		t.Fatal("the refusal was not logged")
 	}
 }
+
+func idleDemux(t *testing.T) *quicDemux {
+	t.Helper()
+	p, err := New()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = p.Close() })
+	pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = pc.Close() })
+	d, err := newQUICDemux(p, pc)
+	require.NoError(t, err)
+	return d
+}
+
+func TestQUIC_EndOfAConnectionLeavesALaterOneWithTheSameODCID(t *testing.T) {
+	d := idleDemux(t)
+	client := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5555}
+	key := flowKeyOf(client)
+	it := &quicIntercept{conns: 1}
+	odcid := "ABCDEFGH"
+	first := &quicConn{odcid: odcid, state: connTerminated, stack: it}
+	flow := &quicFlow{client: client, conns: map[string]*quicConn{odcid: first}}
+	d.mu.Lock()
+	d.flows[key] = flow
+	d.mu.Unlock()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	d.adopt(ctx, &quicCarrier{client: client, odcid: odcid})
+
+	d.mu.Lock()
+	d.removeConnLocked(flow, first)
+	later := &quicConn{odcid: odcid, state: connTerminated, stack: it}
+	flow.conns[odcid] = later
+	it.conns++
+	d.mu.Unlock()
+
+	cancel()
+	time.Sleep(50 * time.Millisecond)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	assert.Same(t, later, flow.conns[odcid], "the end of the first connection removed the later one")
+	assert.Equal(t, 1, it.conns)
+}
+
+func TestQUIC_DetachedConnectionKeepsItsStackUntilReleased(t *testing.T) {
+	d := idleDemux(t)
+	client := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5555}
+	it := &quicIntercept{key: interceptKey{}, conns: 1}
+	conn := &quicConn{odcid: "ABCDEFGH", state: connTerminated, stack: it}
+	flow := &quicFlow{client: client, conns: map[string]*quicConn{conn.odcid: conn}}
+
+	d.mu.Lock()
+	d.flows[flowKeyOf(client)] = flow
+	d.intercepts[it.key] = it
+	detached := d.detachConnLocked(flow, conn)
+	assert.Empty(t, flow.conns)
+	assert.Nil(t, d.evictableLocked(), "the stack of a connection not yet closed is evictable")
+	d.mu.Unlock()
+
+	d.releaseIntercept(detached)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	assert.Same(t, it, d.evictableLocked())
+}
