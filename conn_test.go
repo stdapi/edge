@@ -5,6 +5,7 @@
 package edge
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -22,6 +23,8 @@ import (
 	"github.com/quic-go/quic-go/http3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
 )
 
 func readErrWithin(t *testing.T, c net.Conn, d time.Duration) error {
@@ -339,6 +342,122 @@ func TestH2Stream_FinishWaitsForTheWriteInFlight(t *testing.T) {
 	s.Abort()
 	s.finish()
 	assert.True(t, w.returned.Load(), "finish returned with a write in flight")
+}
+
+// deadlineWriter counts the write deadlines that reach the response writer, each of which
+// net/http turns into a reset of the stream once it expires.
+type deadlineWriter struct {
+	http.ResponseWriter
+	set atomic.Int32
+}
+
+func (w *deadlineWriter) SetWriteDeadline(time.Time) error {
+	w.set.Add(1)
+	return nil
+}
+
+func TestH2Stream_AnExpiredWriteDeadlineLeavesAnIdleStream(t *testing.T) {
+	pr, pw := io.Pipe()
+	defer func() { _ = pw.Close() }()
+	w := &deadlineWriter{ResponseWriter: httptest.NewRecorder()}
+	s := newH2Stream(w, httptest.NewRequest(http.MethodConnect, "/", pr), nil, nil)
+
+	require.NoError(t, s.SetWriteDeadline(time.Now()))
+	_, err := s.Write([]byte("late"))
+	assert.ErrorIs(t, err, os.ErrDeadlineExceeded)
+	require.NoError(t, s.SetWriteDeadline(time.Time{}))
+	_, err = s.Write([]byte("on time"))
+	assert.NoError(t, err)
+
+	require.NoError(t, s.SetWriteDeadline(time.Now().Add(20*time.Millisecond)))
+	time.Sleep(60 * time.Millisecond)
+	_, err = s.Write([]byte("late"))
+	assert.ErrorIs(t, err, os.ErrDeadlineExceeded)
+	assert.Zero(t, w.set.Load(), "a deadline reached the writer with no write in flight")
+}
+
+func TestH2Stream_FinishStopsTheWriteDeadline(t *testing.T) {
+	pr, pw := io.Pipe()
+	defer func() { _ = pw.Close() }()
+	s := newH2Stream(&deadlineWriter{ResponseWriter: httptest.NewRecorder()}, httptest.NewRequest(http.MethodConnect, "/", pr), nil, nil)
+	require.NoError(t, s.SetWriteDeadline(time.Now().Add(time.Hour)))
+	s.finish()
+	assert.False(t, s.wtimer.Stop(), "the timer outlives the stream")
+}
+
+func TestH2Stream_SmallWriteCutByItsDeadlineFails(t *testing.T) {
+	type result struct {
+		err  error
+		took time.Duration
+	}
+	written := make(chan result, 1)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	var protos http.Protocols
+	protos.SetUnencryptedHTTP2(true)
+	srv := &http.Server{Protocols: &protos, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s := newH2Stream(w, r, nil, nil)
+		defer s.finish()
+		s.writeHeader(http.StatusOK)
+		start := time.Now()
+		_ = s.SetWriteDeadline(start.Add(100 * time.Millisecond))
+		_, werr := s.Write([]byte("small"))
+		written <- result{werr, time.Since(start)}
+	})}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+
+	// A client that grants no window, so the write waits for credit that never comes.
+	raw, err := net.Dial("tcp", ln.Addr().String())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = raw.Close() })
+	_, err = raw.Write([]byte(http2.ClientPreface))
+	require.NoError(t, err)
+	fr := http2.NewFramer(raw, raw)
+	require.NoError(t, fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 0}))
+	var buf bytes.Buffer
+	enc := hpack.NewEncoder(&buf)
+	require.NoError(t, enc.WriteField(hpack.HeaderField{Name: ":method", Value: http.MethodConnect}))
+	require.NoError(t, enc.WriteField(hpack.HeaderField{Name: ":authority", Value: "example.test:443"}))
+	require.NoError(t, fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: buf.Bytes(), EndHeaders: true}))
+	go func() {
+		for {
+			if _, rerr := fr.ReadFrame(); rerr != nil {
+				return
+			}
+		}
+	}()
+
+	select {
+	case r := <-written:
+		assert.Error(t, r.err, "a write the reset discarded reports success")
+		assert.GreaterOrEqual(t, r.took, 100*time.Millisecond)
+	case <-time.After(3 * time.Second):
+		t.Fatal("the write stayed blocked past its deadline")
+	}
+}
+
+func TestH2Stream_WriteBlockedPastItsDeadlineReturns(t *testing.T) {
+	pr, pw := io.Pipe()
+	defer func() { _ = pw.Close() }()
+	w := &blockedWriter{ResponseWriter: httptest.NewRecorder(), reset: make(chan struct{}), writing: make(chan struct{})}
+	s := newH2Stream(w, httptest.NewRequest(http.MethodConnect, "/", pr), nil, nil)
+
+	const d = 50 * time.Millisecond
+	start := time.Now()
+	require.NoError(t, s.SetWriteDeadline(start.Add(d)))
+	written := make(chan error, 1)
+	go func() {
+		_, err := s.Write([]byte("x"))
+		written <- err
+	}()
+	select {
+	case err := <-written:
+		assert.ErrorIs(t, err, os.ErrDeadlineExceeded)
+		assert.GreaterOrEqual(t, time.Since(start), d, "the write was cut before its deadline")
+	case <-time.After(2 * time.Second):
+		t.Fatal("the write stayed blocked past its deadline")
+	}
 }
 
 func TestTLSConn_NoCloseNotifyAfterAFailedWrite(t *testing.T) {

@@ -350,27 +350,50 @@ func (t *idleTracker) stop() {
 // does not wait for: without the guard, one of those could reach the writer after the
 // CONNECT handler returned.
 type h2Stream struct {
-	r       *deadlineReader
-	body    io.ReadCloser
-	w       http.ResponseWriter
-	flusher http.Flusher
-	local   net.Addr
-	remote  net.Addr
+	r        *deadlineReader
+	body     io.ReadCloser
+	w        http.ResponseWriter
+	flushErr flushErrorer
+	flusher  http.Flusher
+	local    net.Addr
+	remote   net.Addr
+
+	// wdeadline is the HTTP/2 write deadline. net/http resets the stream when its own deadline
+	// passes, a write in flight or not.
+	wdeadline time.Time   // guarded by dmu
+	wtimer    *time.Timer // guarded by dmu
 
 	cmu      sync.Mutex
 	wmu      sync.Mutex
+	dmu      sync.Mutex
 	closed   atomic.Bool
 	aborted  atomic.Bool
+	expired  atomic.Bool
 	sent     bool // guarded by wmu
 	finished bool // guarded by cmu
 }
 
 func newH2Stream(w http.ResponseWriter, r *http.Request, local, remote net.Addr) *h2Stream {
 	s := &h2Stream{r: newDeadlineReader(r.Body), body: r.Body, w: w, local: local, remote: remote}
-	if f, ok := w.(http.Flusher); ok {
+	if f, ok := w.(flushErrorer); ok {
+		s.flushErr = f
+	} else if f, ok := w.(http.Flusher); ok {
 		s.flusher = f
 	}
 	return s
+}
+
+// flushErrorer is the flush with an error that http.ResponseController looks for first.
+type flushErrorer interface{ FlushError() error }
+
+func (s *h2Stream) flush() error {
+	if s.flushErr != nil {
+		return s.flushErr.FlushError()
+	}
+	if s.flusher != nil {
+		s.flusher.Flush()
+	}
+	return nil
 }
 
 func (s *h2Stream) Read(b []byte) (int, error) {
@@ -398,9 +421,7 @@ func (s *h2Stream) writeHeader(code int) {
 		return
 	}
 	s.w.WriteHeader(code)
-	if s.flusher != nil {
-		s.flusher.Flush()
-	}
+	_ = s.flush()
 }
 
 func (s *h2Stream) Write(b []byte) (int, error) {
@@ -409,12 +430,16 @@ func (s *h2Stream) Write(b []byte) (int, error) {
 	if s.closed.Load() || s.sent {
 		return 0, net.ErrClosed
 	}
+	if s.expired.Load() {
+		return 0, os.ErrDeadlineExceeded
+	}
 
 	n, err := s.w.Write(b)
 	// A CONNECT stream is a byte pipe with no framing of its own: without an explicit
-	// flush the data sits in the response buffer until enough of it accumulates.
-	if s.flusher != nil {
-		s.flusher.Flush()
+	// flush the data sits in the response buffer until enough of it accumulates. Bytes a
+	// failed flush left in the buffer were not sent.
+	if ferr := s.flush(); err == nil && ferr != nil {
+		return 0, ferr
 	}
 	return n, err
 }
@@ -504,6 +529,12 @@ func (s *h2Stream) finish() {
 		_ = s.body.Close()
 	}
 	s.cmu.Unlock()
+	// A timer still armed would keep the stream reachable until its deadline.
+	s.dmu.Lock()
+	if s.wtimer != nil {
+		s.wtimer.Stop()
+	}
+	s.dmu.Unlock()
 	s.idle()
 }
 
@@ -540,15 +571,66 @@ func (s *h2Stream) SetReadDeadline(t time.Time) error {
 	return nil
 }
 
-// SetWriteDeadline bounds the writes that follow. Past it the server resets the stream and a
-// blocked write returns.
+// SetWriteDeadline bounds the writes that follow, as on a socket. On HTTP/2 a write still
+// blocked when the deadline passes resets the stream, the only way it returns.
 func (s *h2Stream) SetWriteDeadline(t time.Time) error {
-	s.cmu.Lock()
-	defer s.cmu.Unlock()
+	if _, ok := s.w.(http3.HTTPStreamer); ok {
+		s.cmu.Lock()
+		defer s.cmu.Unlock()
+		if s.closed.Load() {
+			return net.ErrClosed
+		}
+		return http.NewResponseController(s.w).SetWriteDeadline(t)
+	}
+	s.dmu.Lock()
+	defer s.dmu.Unlock()
 	if s.closed.Load() {
 		return net.ErrClosed
 	}
-	return http.NewResponseController(s.w).SetWriteDeadline(t)
+	s.wdeadline = t
+	s.expired.Store(false)
+	if s.wtimer != nil {
+		s.wtimer.Stop()
+	}
+	if t.IsZero() {
+		return nil
+	}
+	if d := time.Until(t); d > 0 {
+		if s.wtimer == nil {
+			s.wtimer = time.AfterFunc(d, s.expire)
+		} else {
+			s.wtimer.Reset(d)
+		}
+		return nil
+	}
+	s.expireLocked()
+	return nil
+}
+
+// expire runs when the write deadline passes, and does nothing when the deadline moved after
+// the timer was armed.
+func (s *h2Stream) expire() {
+	s.dmu.Lock()
+	defer s.dmu.Unlock()
+	if s.wdeadline.IsZero() || time.Now().Before(s.wdeadline) {
+		return
+	}
+	s.expireLocked()
+}
+
+// expireLocked fails the writes that follow and resets the stream under the one in flight. dmu
+// must be held.
+func (s *h2Stream) expireLocked() {
+	s.expired.Store(true)
+	if s.wmu.TryLock() {
+		s.wmu.Unlock()
+		return
+	}
+	s.cmu.Lock()
+	defer s.cmu.Unlock()
+	if !s.closed.Load() {
+		_ = http.NewResponseController(s.w).SetWriteDeadline(time.Now())
+	}
 }
 
 // deadlineReader gives a reader that has no deadline of its own one, by keeping at most one

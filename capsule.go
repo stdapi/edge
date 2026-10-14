@@ -336,6 +336,8 @@ func newCapsulePipe(conn net.Conn, br *bufio.Reader) *capsulePipe {
 func (p *capsulePipe) recv(context.Context) ([]byte, error) {
 	b, err := p.next()
 	if errors.Is(err, errTunnelMalformed) {
+		// RFC 9297 section 3.3 calls for PROTOCOL_ERROR on HTTP/2, which Go's server cannot send,
+		// so an HTTP/2 stream is reset with INTERNAL_ERROR.
 		abort(p.conn)
 	}
 	return b, err
