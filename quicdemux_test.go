@@ -1732,6 +1732,7 @@ func idleDemux(t *testing.T) *quicDemux {
 	t.Cleanup(func() { _ = pc.Close() })
 	d, err := newQUICDemux(p, pc)
 	require.NoError(t, err)
+	t.Cleanup(d.close)
 	return d
 }
 
@@ -1769,6 +1770,12 @@ func TestQUIC_DetachedConnectionKeepsItsStackUntilReleased(t *testing.T) {
 	d := idleDemux(t)
 	client := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5555}
 	it := &quicIntercept{key: interceptKey{}, conns: 1}
+	// The stack has no listener, so it must leave the map before a sweep or close ends it.
+	t.Cleanup(func() {
+		d.mu.Lock()
+		delete(d.intercepts, it.key)
+		d.mu.Unlock()
+	})
 	conn := &quicConn{odcid: "ABCDEFGH", state: connTerminated, stack: it}
 	flow := &quicFlow{client: client, conns: map[string]*quicConn{conn.odcid: conn}}
 
