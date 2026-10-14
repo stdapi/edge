@@ -110,6 +110,8 @@ func (c *HTTPCtx) Protocol() Protocol {
 	return protoOfRequest(c.r.req)
 }
 
+func (c *HTTPCtx) sealed() {}
+
 // Identity returns what the configured [ProxyAuthenticator] reported for this request, or an
 // empty string when none did. A request read off a terminated connection was never
 // challenged, so it reports the identity of whatever established the connection.

@@ -101,6 +101,8 @@ func newEntryNotFoundError(ic *entry) error {
 	return fmt.Errorf("%w: %s", ErrEntryNotFound, sb.String())
 }
 
+// PatternError represents an error that occurred during pattern parsing.
+// It contains the pattern, and the position of the offending segment.
 type PatternError struct {
 	err     error  // wrapped error
 	Pattern string // provided pattern

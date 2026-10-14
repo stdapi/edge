@@ -52,6 +52,8 @@ type RequestContext interface {
 	RemoteAddr() netip.AddrPort
 	// Protocol returns the protocol the request was received over.
 	Protocol() Protocol
+
+	sealed()
 }
 
 // routeCtx is the state of one routing lookup, what the tree walks with, what it captures and
@@ -236,4 +238,9 @@ func (o onlyRequestContext) Protocol() Protocol {
 	return protoOfRequest(o.c.req)
 }
 
-var _ RequestContext = onlyRequestContext{}
+func (o onlyRequestContext) sealed() {}
+
+var (
+	_ RequestContext = onlyRequestContext{}
+	_ RequestContext = (*HTTPCtx)(nil)
+)
