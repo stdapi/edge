@@ -2412,7 +2412,11 @@ func TestChain_ClosedOwnSocketLeavesItsPortToAClient(t *testing.T) {
 		_, _ = io.WriteString(w, "ok")
 	}))
 	t.Cleanup(origin.Close)
-	p := testProxy(t)
+	// A port bound before the connect is shared with no socket in TIME_WAIT, which would keep
+	// it from the client below.
+	tr := DefaultTransport()
+	tr.DialContext = (&net.Dialer{LocalAddr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1)}}).DialContext
+	p := testProxy(t, WithTransport(tr))
 	p.MustAdd("127.0.0.1/*{any}", forwardHandler)
 	addr := startProxy(t, p)
 
