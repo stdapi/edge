@@ -450,7 +450,7 @@ func takeScheme(r *http.Request) string {
 	if r.ProtoMajor < 2 {
 		return ""
 	}
-	if sess := sessionFromRequest(r); sess != nil && sess.hasSchemeField {
+	if sessionFromRequest(r).hasSchemeField {
 		vs := r.Header[schemeHeader]
 		delete(r.Header, schemeHeader)
 		if len(vs) != 1 {
@@ -464,8 +464,8 @@ func takeScheme(r *http.Request) string {
 		}
 		return ""
 	}
-	// quic-go does not expose :scheme either, nor does the server edge is mounted on, so the
-	// scheme is the connection's. A client sending "http" over TLS is forwarded as "https".
+	// quic-go does not expose :scheme either, so the scheme is the connection's. A client
+	// sending "http" over TLS is forwarded as "https".
 	if r.TLS != nil {
 		return "https"
 	}

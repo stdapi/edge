@@ -34,15 +34,6 @@ func (c *closeRecorder) Close() error {
 	return nil
 }
 
-func TestH3Body_CloseWithoutAReadDeadlineClosesTheBody(t *testing.T) {
-	rc := &closeRecorder{r: strings.NewReader("abc")}
-	b := &h3Body{ReadCloser: rc, w: httptest.NewRecorder()}
-	require.NoError(t, b.Close())
-	assert.True(t, rc.closed)
-	_, err := b.Read(make([]byte, 1))
-	assert.ErrorIs(t, err, http.ErrBodyReadAfterClose)
-}
-
 type deadlineRecorder struct {
 	http.ResponseWriter
 	calls int

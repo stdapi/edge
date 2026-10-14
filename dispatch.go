@@ -379,18 +379,17 @@ func (b *h3Body) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// Close ends a read in progress with a read deadline, and with the Close of quic-go when the
-// writer sets none. That Close sends STOP_SENDING with H3_REQUEST_CANCELLED, which gRPC maps to
-// CANCELLED, where quic-go sends STOP_SENDING with H3_NO_ERROR when the handler returns, and
-// past that return the stream is the server's.
+// Close ends a read in progress with a read deadline. The Close of quic-go sends STOP_SENDING
+// with H3_REQUEST_CANCELLED, which gRPC maps to CANCELLED, where quic-go sends STOP_SENDING with
+// H3_NO_ERROR when the handler returns, and past that return the stream is the server's.
 func (b *h3Body) Close() error {
 	if b.closed.Swap(true) {
 		return nil
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.returned || http.NewResponseController(b.w).SetReadDeadline(time.Unix(1, 0)) == nil {
+	if b.returned {
 		return nil
 	}
-	return b.ReadCloser.Close()
+	return http.NewResponseController(b.w).SetReadDeadline(time.Unix(1, 0))
 }

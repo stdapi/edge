@@ -10,7 +10,6 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"net"
 	"net/http"
 	"strconv"
 
@@ -66,15 +65,11 @@ func (p *Proxy) connectHijack(w http.ResponseWriter, r *http.Request, target Tar
 	// The hijacked connection is the front one, so its handshake describes the proxy and not
 	// the tunnel. The session takes the addresses alone and the tunnel's own termination
 	// fills in the TLS state.
+	front := sessionFromRequest(r)
 	sess := newSession(p, ctx, nil, target, 0, 0)
-	sess.remoteAddr = client.RemoteAddr()
-	sess.localAddr = client.LocalAddr()
+	sess.remoteAddr, sess.localAddr = front.remoteAddr, front.localAddr
 	sess.identity = identity
 	sess.setDestination(target)
-	if s := sessionFromRequest(r); s != nil {
-		sess.remoteAddr = s.remoteAddr
-		sess.localAddr = s.localAddr
-	}
 
 	// A hijacked connection is invisible to http.Server, so only the registry can end it.
 	if !p.srv.tryTrack(conn) {
@@ -107,8 +102,8 @@ func (p *Proxy) hijackedContext(r *http.Request) (context.Context, context.Cance
 	return p.untilShutdown(base)
 }
 
-// untilShutdown returns a child of base that also ends with the proxy. Mounted in a server of
-// its own the proxy has no ConnContext, so a shutdown is watched for explicitly.
+// untilShutdown returns a child of base that also ends once the proxy begins to close.
+// http.Server cancels no context of a hijacked connection when a shutdown begins.
 func (p *Proxy) untilShutdown(base context.Context) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(base)
 	go func() {
@@ -125,10 +120,7 @@ func (p *Proxy) untilShutdown(base context.Context) (context.Context, context.Ca
 // itself is the connection rather than the whole transport.
 func (p *Proxy) connectStream(w http.ResponseWriter, r *http.Request, target Target, identity string) {
 	front := sessionFromRequest(r)
-	var local, remote net.Addr
-	if front != nil {
-		local, remote = front.localAddr, front.remoteAddr
-	}
+	local, remote := front.localAddr, front.remoteAddr
 
 	stream := newH2Stream(w, r, local, remote)
 	cut := streamCut{stream}

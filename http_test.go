@@ -400,30 +400,6 @@ func TestHTTP_ResetOfTheRequestStreamResetsTheResponseOverHTTP3(t *testing.T) {
 	assert.Equal(t, "RST_STREAM CANCEL", b.origin.nextNote(t))
 }
 
-func TestHTTP_ForwardThroughAWriterWithoutAReadDeadlineCompletesOverHTTP3(t *testing.T) {
-	o := newGRPCOrigin(t, func(_ *grpcOrigin, w http.ResponseWriter, _ *http.Request) {
-		_, _ = io.WriteString(w, "ok")
-	})
-	b := newGRPCBench(t, o, nil)
-	b.p.MustAdd(b.host+"/*{p}", forwardHandler)
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel()
-	str, err := b.h3Mounted(t).OpenRequestStream(ctx)
-	require.NoError(t, err)
-	require.NoError(t, str.SetDeadline(time.Now().Add(10*time.Second)))
-	req, err := http.NewRequest(http.MethodPost, "https://"+b.authority+"/upload", http.NoBody)
-	require.NoError(t, err)
-	require.NoError(t, str.SendRequestHeader(req))
-	_, err = str.Write([]byte("a"))
-	require.NoError(t, err)
-	resp, err := str.ReadResponse()
-	require.NoError(t, err)
-	body, err := io.ReadAll(str)
-	require.NoError(t, err)
-	assert.Equal(t, http.StatusOK, resp.StatusCode)
-	assert.Equal(t, "ok", string(body))
-}
-
 func TestHTTP_HTTP3TrailerSectionRefusedByQUICGoIsMalformed(t *testing.T) {
 	for _, tc := range []struct {
 		name  string

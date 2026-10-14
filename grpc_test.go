@@ -1590,21 +1590,6 @@ func TestKindGRPC_CallOnTheHTTP3FrontIsForwarded(t *testing.T) {
 			require.True(t, ok, "the response ended with %v", err)
 			assert.Equal(t, http3.ErrCodeRequestCanceled, code)
 		}},
-		{name: "a call through a writer without a read deadline completes", run: func(t *testing.T) {
-			eachMode(t, func(t *testing.T, h GRPC) {
-				o := newGRPCOrigin(t, func(_ *grpcOrigin, w http.ResponseWriter, _ *http.Request) {
-					answerOK(w, lpm(0, "r"))
-				})
-				b := newGRPCBench(t, o, h)
-				c := b.h3Call(t, b.h3Mounted(t), "/pkg.Svc/Chat")
-				c.send(lpm(0, "one"))
-				body, err := c.rest()
-				require.NoError(t, err)
-				assert.Equal(t, lpm(0, "r"), body)
-				code, _ := c.status()
-				assert.Equal(t, "0", code)
-			})
-		}},
 		{name: "Fail after a trailers-only answer ends the call on its status alone", run: func(t *testing.T) {
 			b := newGRPCBench(t, trailersOnlyOrigin(t, "12"), func(c *GRPCCtx) error {
 				if err := c.Open(); err != nil {
@@ -2320,30 +2305,6 @@ func (b *grpcBench) h3Client(t *testing.T) *http3.ClientConn {
 	tr := &http3.Transport{DisableCompression: true}
 	t.Cleanup(func() { _ = tr.Close() })
 	return tr.NewClientConn(dialQUICFront(t, front, b.ca))
-}
-
-// h3Mounted serves the proxy through ServeHTTP on an http3.Server of the test, behind a
-// writer without a read deadline.
-func (b *grpcBench) h3Mounted(t *testing.T) *http3.ClientConn {
-	t.Helper()
-	cert, err := b.ca.Leaf("127.0.0.1")
-	require.NoError(t, err)
-	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
-	require.NoError(t, err)
-	srv := &http3.Server{
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			b.p.ServeHTTP(plainWriter{w}, r)
-		}),
-		TLSConfig: http3.ConfigureTLSConfig(&tls.Config{Certificates: []tls.Certificate{*cert}, MinVersion: tls.VersionTLS13}),
-	}
-	go func() { _ = srv.Serve(pc) }()
-	t.Cleanup(func() {
-		_ = srv.Close()
-		_ = pc.Close()
-	})
-	tr := &http3.Transport{DisableCompression: true}
-	t.Cleanup(func() { _ = tr.Close() })
-	return tr.NewClientConn(dialQUICFront(t, netip.MustParseAddrPort(pc.LocalAddr().String()), b.ca))
 }
 
 // h3Call drives a request stream directly. A round trip cannot reset one direction of a call.

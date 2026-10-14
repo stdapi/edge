@@ -339,14 +339,6 @@ func skipWithoutTool(t *testing.T, format string, args ...any) {
 	t.Skipf(format, args...)
 }
 
-// plainWriter hides every optional interface of the writer it wraps, as a middleware without
-// Unwrap does.
-type plainWriter struct{ w http.ResponseWriter }
-
-func (p plainWriter) Header() http.Header         { return p.w.Header() }
-func (p plainWriter) Write(b []byte) (int, error) { return p.w.Write(b) }
-func (p plainWriter) WriteHeader(code int)        { p.w.WriteHeader(code) }
-
 func selfSignedFor(t *testing.T, ca *CA, host string) tls.Certificate {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)

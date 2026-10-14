@@ -504,18 +504,6 @@ func (p *Proxy) Sessions() iter.Seq[*Session] {
 	return slices.Values(out)
 }
 
-// ServeHTTP serves one request with explicit forward proxy semantics: a CONNECT opens a
-// connection, anything else is a plain HTTP request carrying an absolute target.
-//
-// It makes a Proxy an [http.Handler], so it can be mounted in a server you already own
-// rather than given a listener of its own. The server must leave hijacking available, which
-// authorities out anything that wraps the response writer without forwarding [http.Hijacker].
-func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	p.serveProxyRequest(w, r)
-}
-
-var _ http.Handler = (*Proxy)(nil)
-
 // serveProxyRequest is the explicit forward proxy entry point: a CONNECT opens a connection,
 // anything else is a plain HTTP request carrying an absolute target.
 func (p *Proxy) serveProxyRequest(w http.ResponseWriter, r *http.Request) {
@@ -529,10 +517,9 @@ func (p *Proxy) serveProxyRequest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if sess := sessionFromRequest(r); sess != nil {
-		// ConnContext builds the session before ALPN or the h2c preface has set the protocol.
-		sess.setProtocol(protoOfRequest(r))
-	}
+	// ConnContext builds the session before ALPN or the h2c preface has set the protocol.
+	sess := sessionFromRequest(r)
+	sess.setProtocol(protoOfRequest(r))
 
 	if r.Method == http.MethodConnect {
 		switch extendedConnectProtocol(r) {
@@ -559,11 +546,6 @@ func (p *Proxy) serveProxyRequest(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		p.writeStatus(w, r, http.StatusBadRequest, err.Error())
 		return
-	}
-
-	sess := sessionFromRequest(r)
-	if sess == nil {
-		sess = newSession(p, r.Context(), nil, target, KindHTTP, protoOfRequest(r))
 	}
 
 	p.dispatchRequest(w, r, sess, target, identity)

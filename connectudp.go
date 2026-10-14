@@ -94,13 +94,11 @@ func (p *Proxy) serveConnectUDP(w http.ResponseWriter, r *http.Request, identity
 	sess.identity = identity
 	sess.tunnel = true
 	front := sessionFromRequest(r)
-	if front != nil {
-		sess.remoteAddr, sess.localAddr = front.remoteAddr, front.localAddr
-		if state := front.tlsState.Load(); state != nil {
-			sess.tlsState.Store(state)
-		} else {
-			sess.tlsConn = front.tlsConn
-		}
+	sess.remoteAddr, sess.localAddr = front.remoteAddr, front.localAddr
+	if state := front.tlsState.Load(); state != nil {
+		sess.tlsState.Store(state)
+	} else {
+		sess.tlsConn = front.tlsConn
 	}
 
 	tun := newConnectUDPTunnel(d, sess, &contextFraming{target: target, upstream: upstream}, cancel)
