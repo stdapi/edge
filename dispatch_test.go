@@ -5,7 +5,9 @@
 package edge
 
 import (
+	"context"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -71,4 +73,18 @@ func TestH3Body_EndReachedAsTheBodyClosesIsTheEnd(t *testing.T) {
 	rc.onRead = func() { _ = b.Close() }
 	_, err := b.Read(make([]byte, 1))
 	assert.ErrorIs(t, err, io.EOF)
+}
+
+func TestRunKindHandler_LogsAPanicWithTheSessionContext(t *testing.T) {
+	type key struct{}
+	logs := &ctxHandler{}
+	p := testProxy(t, WithLogger(slog.New(logs)))
+	sess := newSession(p, context.WithValue(t.Context(), key{}, "session"), nil, Target{Host: "a.test", Port: "443"}, KindTCP, 0)
+
+	err := runKindHandler(p, sess, func() error { panic("boom") })
+	require.ErrorAs(t, err, new(*PanicError))
+
+	ctxs := logs.contexts()
+	require.Len(t, ctxs, 1)
+	assert.Equal(t, "session", ctxs[0].Value(key{}))
 }

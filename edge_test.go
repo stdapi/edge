@@ -758,3 +758,47 @@ func connectStream(t *testing.T, proxyAddr, authority string) net.Conn {
 type noEnd struct{}
 
 func (noEnd) endBy(cause, time.Time) error { return nil }
+
+type ctxHandler struct {
+	mu   sync.Mutex
+	ctxs []context.Context
+}
+
+func (h *ctxHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *ctxHandler) Handle(ctx context.Context, _ slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.ctxs = append(h.ctxs, ctx)
+	return nil
+}
+
+func (h *ctxHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+
+func (h *ctxHandler) WithGroup(string) slog.Handler { return h }
+
+func (h *ctxHandler) contexts() []context.Context {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return slices.Clone(h.ctxs)
+}
+
+func TestDefaultErrorHandler_LogsWithTheRequestContext(t *testing.T) {
+	type key struct{}
+	logs := &ctxHandler{}
+	p := testProxy(t, WithLogger(slog.New(logs)))
+	tree := p.getTree()
+	c := tree.pool.Get().(*routeCtx)
+	defer tree.pool.Put(c)
+	req := httptest.NewRequestWithContext(context.WithValue(t.Context(), key{}, "request"), http.MethodGet, "/", nil)
+	c.reset(nil, req, "https", "a.test", "443")
+
+	DefaultErrorHandler(&c.http, &PanicError{Value: "boom"})
+	DefaultErrorHandler(&c.http, io.ErrUnexpectedEOF)
+
+	ctxs := logs.contexts()
+	require.Len(t, ctxs, 2)
+	for _, ctx := range ctxs {
+		assert.Equal(t, "request", ctx.Value(key{}))
+	}
+}

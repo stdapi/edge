@@ -218,7 +218,7 @@ func runKindHandler(p *Proxy, sess *Session, fn func() error) (err error) {
 			return
 		}
 		err = &PanicError{Value: rec, Stack: stacktrace(panicStackSkip)}
-		p.cfg.logger.Error("edge: handler panic",
+		p.cfg.logger.ErrorContext(sess.Context(), "edge: handler panic",
 			slog.String("target", sess.target.String()),
 			slog.Any("panic", rec))
 	}()

@@ -6,6 +6,7 @@ package edge
 
 import (
 	"cmp"
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -491,14 +492,18 @@ func DefaultErrorHandler(c *HTTPCtx, err error) *http.Response {
 	}
 	if c != nil && c.r != nil && c.r.p != nil {
 		logger := c.r.p.cfg.logger
+		ctx := context.Background()
+		if req := c.Request(); req != nil {
+			ctx = req.Context()
+		}
 		if panicked {
-			logger.Error("edge: handler panic",
+			logger.ErrorContext(ctx, "edge: handler panic",
 				slog.String("pattern", c.Pattern()),
 				slog.Any("panic", pe.Value),
 				slog.String("stack", pe.Stack),
 			)
 		} else {
-			logger.Debug("edge: handler error",
+			logger.DebugContext(ctx, "edge: handler error",
 				slog.String("pattern", c.Pattern()),
 				slog.String("error", err.Error()),
 			)
