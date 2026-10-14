@@ -3451,3 +3451,1293 @@ func TestKindGRPC_MessagesAreGatedAfterForwardReturns(t *testing.T) {
 	r := b.client(t).unary("/pkg.Svc/Method", bytes.Repeat(lpm(0, ""), 10000))
 	assert.Equal(t, "0", grpcStatusOf(r))
 }
+
+func TestKindGRPC_OpenCallEnds(t *testing.T) {
+	m1, m2, big := lpm(0, "m1"), lpm(0, "m2"), lpm(0, strings.Repeat("b", 2*endMaxMessage))
+	both := slices.Concat(m1, m2)
+	answers := func(r *endRun, data []byte) []byte {
+		if r.echoes() {
+			return data
+		}
+		return []byte{}
+	}
+
+	natural := []endRow{
+		{
+			name:   "the client half-closes",
+			origin: originEcho,
+			script: func(t *testing.T, r *endRun) (endResult, bool) {
+				r.call.send(m1)
+				r.waitGot(t, "m1")
+				if r.echoes() {
+					r.call.read(t, len(m1))
+				}
+				r.call.send(m2)
+				r.call.closeSend()
+				return r.call.result(t), true
+			},
+			want: func(*endRun) endWant {
+				return endWant{data: both, code: "0", origin: []string{"m1", "m2"}, originEnd: originEOF}
+			},
+		},
+		{
+			name:   "the client resets the call",
+			origin: originEcho,
+			script: func(t *testing.T, r *endRun) (endResult, bool) {
+				r.call.send(m1)
+				r.waitGot(t, "m1")
+				if r.echoes() {
+					r.call.read(t, len(m1))
+				}
+				r.call.reset()
+				if r.fx.cell.client != HTTP3 {
+					return endResult{}, false
+				}
+				return r.call.result(t), true
+			},
+			want: func(r *endRun) endWant {
+				if r.shape == "OpenOnly" && r.fx.cell.origin != HTTP2 {
+					return endWant{data: m1, code: "2", origin: []string{"m1"}, originEnd: originCut, defect: defectRelayCut}
+				}
+				return endWant{data: answers(r, m1), code: "1", anyForm: !r.echoes(), origin: []string{"m1"}, originEnd: originCut}
+			},
+		},
+		{
+			name:   "the origin answers with trailers only",
+			origin: originTrailersOnly,
+			script: func(t *testing.T, r *endRun) (endResult, bool) {
+				r.call.send(m1)
+				if !r.duplex() {
+					r.call.closeSend()
+				}
+				return r.call.result(t), true
+			},
+			want: func(*endRun) endWant {
+				return endWant{data: []byte{}, code: "12", trailersOnly: true}
+			},
+		},
+		{
+			name:   "the origin ends while the request stream is open",
+			origin: originAnswerFirst,
+			script: func(t *testing.T, r *endRun) (endResult, bool) {
+				r.call.send(m1)
+				// Only an origin reached over HTTP/2 ends a read of Outbound before Inbound is asked
+				// for, as the godoc of GRPCCtx.Outbound documents.
+				if !r.duplex() || r.shape == "OutboundOnly" && r.fx.cell.origin != HTTP2 {
+					r.waitGot(t, "m1")
+					r.call.closeSend()
+				}
+				return r.call.result(t), true
+			},
+			want: func(r *endRun) endWant {
+				w := endWant{data: lpm(0, "r"), code: "0", origin: []string{"m1"}}
+				if r.duplex() && r.shape == "OutboundOnly" && r.fx.cell.origin == HTTP2 {
+					w.returned = errOriginStopped
+				}
+				return w
+			},
+		},
+		{
+			name:   "the origin resets the call",
+			origin: originReset,
+			script: func(t *testing.T, r *endRun) (endResult, bool) {
+				r.call.send(m1)
+				if r.echoes() {
+					r.call.read(t, len(m1))
+				}
+				close(r.release)
+				r.call.closeSend()
+				return r.call.result(t), true
+			},
+			want: func(r *endRun) endWant {
+				w := endWant{reset: true, origin: []string{"m1"}}
+				if r.echoes() {
+					w.data = m1
+				} else if r.fx.cell.origin == HTTP3 {
+					// The RESET_STREAM of the origin may discard its response before the proxy reads it.
+					w.alt = &endWant{data: []byte{}, code: "14", trailersOnly: true}
+				}
+				return w
+			},
+		},
+		{
+			name:   "the tree refuses the call",
+			origin: originEcho,
+			script: func(t *testing.T, r *endRun) (endResult, bool) {
+				r.call.send(m1)
+				r.waitGot(t, "m1")
+				if r.echoes() {
+					r.call.read(t, len(m1))
+				}
+				_, err := r.fx.p.Delete[GRPC](r.pattern)
+				require.NoError(t, err)
+				r.call.send(m2)
+				if !r.duplex() {
+					r.call.closeSend()
+				}
+				return r.call.result(t), true
+			},
+			want: func(r *endRun) endWant {
+				return endWant{data: answers(r, m1), code: "14", trailersOnly: !r.duplex(), anyForm: r.duplex() && !r.echoes(), origin: []string{"m1"}, originEnd: originCut}
+			},
+		},
+		{
+			name:   "a request message over the bound",
+			origin: originEcho,
+			script: func(t *testing.T, r *endRun) (endResult, bool) {
+				r.call.send(m1)
+				r.waitGot(t, "m1")
+				if r.echoes() {
+					r.call.read(t, len(m1))
+				}
+				r.call.send(big)
+				if !r.duplex() || r.shape == "Forward" {
+					r.call.closeSend()
+				}
+				return r.call.result(t), true
+			},
+			want: func(r *endRun) endWant {
+				if r.shape == "Forward" {
+					return endWant{data: slices.Concat(m1, big), code: "0", origin: []string{"m1", string(big[5:])}, originEnd: originEOF}
+				}
+				if r.shape == "OpenOnly" && r.duplex() && r.fx.cell.origin != HTTP2 {
+					return endWant{data: m1, code: "2", origin: []string{"m1"}, originEnd: originCut, defect: defectRelayCut}
+				}
+				return endWant{data: answers(r, m1), code: "8", trailersOnly: !r.duplex(), anyForm: r.duplex() && !r.echoes(), origin: []string{"m1"}, originEnd: originCut}
+			},
+		},
+		{
+			name:   "a response message over the bound",
+			origin: originBig,
+			script: func(t *testing.T, r *endRun) (endResult, bool) {
+				r.call.send(m1)
+				r.call.closeSend()
+				return r.call.result(t), true
+			},
+			want: func(r *endRun) endWant {
+				switch {
+				case (r.shape == "Merge" || r.shape == "TwoGoroutines") && !r.duplex():
+					return endWant{data: []byte{}, origin: []string{"m1"}, originEnd: originEOF, defect: defectH1Status}
+				case r.shape == "Merge" || r.shape == "TwoGoroutines":
+					return endWant{data: []byte{}, code: "8", origin: []string{"m1"}, originEnd: originEOF}
+				}
+				return endWant{data: big, code: "0", origin: []string{"m1"}, originEnd: originEOF}
+			},
+		},
+		{
+			name:   "the origin answers with a response that is not gRPC",
+			origin: originNotGRPC,
+			script: func(t *testing.T, r *endRun) (endResult, bool) {
+				r.call.send(m1)
+				if !r.duplex() {
+					r.call.closeSend()
+				}
+				return r.call.result(t), true
+			},
+			want: func(*endRun) endWant {
+				return endWant{data: []byte("nope"), status: http.StatusNotFound}
+			},
+		},
+		{
+			name:   "the proxy closes",
+			own:    true,
+			origin: originEcho,
+			script: func(t *testing.T, r *endRun) (endResult, bool) {
+				r.call.send(m1)
+				r.waitGot(t, "m1")
+				if r.echoes() {
+					r.call.read(t, len(m1))
+				}
+				require.NoError(t, r.fx.p.Close())
+				if !r.duplex() {
+					// The HTTP/1.1 client returns once its request body ends.
+					r.call.closeSend()
+				}
+				return r.call.result(t), true
+			},
+			want: func(*endRun) endWant {
+				return endWant{reset: true, origin: []string{"m1"}, originEnd: originCut}
+			},
+		},
+		{
+			name:   "the proxy shuts down",
+			own:    true,
+			origin: originEcho,
+			script: func(t *testing.T, r *endRun) (endResult, bool) {
+				r.call.send(m1)
+				r.waitGot(t, "m1")
+				if r.echoes() {
+					r.call.read(t, len(m1))
+				}
+				shut := make(chan error, 1)
+				go func() {
+					ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					shut <- r.fx.p.Shutdown(ctx)
+				}()
+				r.call.send(m2)
+				r.call.closeSend()
+				res := r.call.result(t)
+				select {
+				case err := <-shut:
+					assert.NoError(t, err)
+				case <-time.After(10 * time.Second):
+					t.Error("Shutdown did not return")
+				}
+				return res, true
+			},
+			want: func(*endRun) endWant {
+				return endWant{data: both, code: "0", origin: []string{"m1", "m2"}, originEnd: originEOF}
+			},
+		},
+		{
+			name:   "the proxy shuts down past its deadline",
+			own:    true,
+			origin: originEcho,
+			script: func(t *testing.T, r *endRun) (endResult, bool) {
+				r.call.send(m1)
+				r.waitGot(t, "m1")
+				if r.echoes() {
+					r.call.read(t, len(m1))
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+				defer cancel()
+				assert.ErrorIs(t, r.fx.p.Shutdown(ctx), context.DeadlineExceeded)
+				if !r.duplex() {
+					// The HTTP/1.1 client returns once its request body ends.
+					r.call.closeSend()
+				}
+				return r.call.result(t), true
+			},
+			want: func(*endRun) endWant {
+				return endWant{reset: true, origin: []string{"m1"}, originEnd: originCut}
+			},
+		},
+	}
+
+	sendAndEnd := func(t *testing.T, r *endRun) (endResult, bool) {
+		r.call.send(m1)
+		r.call.closeSend()
+		return r.call.result(t), true
+	}
+	sendThenResult := func(t *testing.T, r *endRun) (endResult, bool) {
+		r.call.send(m1)
+		if !r.duplex() {
+			r.call.closeSend()
+		}
+		return r.call.result(t), true
+	}
+	single := []endRow{
+		{
+			name:   "Fail after the origin answered",
+			origin: originHold(true),
+			handler: func(r *endRun) GRPC {
+				return func(c *GRPCCtx) error {
+					if err := c.Open(); err != nil {
+						return err
+					}
+					m, err := c.Outbound().ReadMessage()
+					if err != nil {
+						return err
+					}
+					if err := m.Forward(); err != nil {
+						return err
+					}
+					in, err := c.Inbound().ReadMessage()
+					if err != nil {
+						return err
+					}
+					if err := in.Forward(); err != nil {
+						return err
+					}
+					_ = c.Fail(CodeResourceExhausted, "quota")
+					if err := m.Forward(); err == nil {
+						r.problem("a message forwarded toward the origin after Fail was accepted")
+					}
+					return nil
+				}
+			},
+			script: sendThenResult,
+			want: func(*endRun) endWant {
+				return endWant{data: m1, code: "8", msg: "quota", origin: []string{"m1"}, originEnd: originCanceled}
+			},
+		},
+		{
+			name:   "Fail before the origin answered",
+			origin: originHold(false),
+			handler: func(r *endRun) GRPC {
+				return func(c *GRPCCtx) error {
+					if err := c.Open(); err != nil {
+						return err
+					}
+					m, err := c.Outbound().ReadMessage()
+					if err != nil {
+						return err
+					}
+					if err := m.Forward(); err != nil {
+						return err
+					}
+					select {
+					case <-r.got:
+					case <-time.After(5 * time.Second):
+						r.problem("the origin did not read m1")
+					}
+					return c.Fail(CodePermissionDenied, "policy")
+				}
+			},
+			script: sendThenResult,
+			want: func(*endRun) endWant {
+				return endWant{data: []byte{}, code: "7", msg: "policy", trailersOnly: true, origin: []string{"m1"}, originEnd: originCanceled}
+			},
+		},
+		{
+			name:   "Fail after Inbound ended replaces the status of the origin",
+			origin: originEcho,
+			handler: func(*endRun) GRPC {
+				return func(c *GRPCCtx) error {
+					if err := openCall(c); err != nil {
+						return err
+					}
+					return c.Fail(CodeNotFound, "hidden")
+				}
+			},
+			script: sendAndEnd,
+			want: func(*endRun) endWant {
+				return endWant{data: m1, code: "5", msg: "hidden", origin: []string{"m1"}, originEnd: originEOF}
+			},
+		},
+		{
+			name:   "the handler returns an error after Open",
+			origin: originHold(true),
+			handler: func(*endRun) GRPC {
+				return func(c *GRPCCtx) error {
+					if err := c.Open(); err != nil {
+						return err
+					}
+					m, err := c.Outbound().ReadMessage()
+					if err != nil {
+						return err
+					}
+					if err := m.Forward(); err != nil {
+						return err
+					}
+					if _, err := c.Response(); err != nil {
+						return err
+					}
+					return errors.New("edge test: handler failure")
+				}
+			},
+			script: sendThenResult,
+			want: func(r *endRun) endWant {
+				if !r.duplex() {
+					return endWant{data: []byte{}, origin: []string{"m1"}, originEnd: originCanceled, defect: defectH1Status}
+				}
+				return endWant{data: []byte{}, code: "2", origin: []string{"m1"}, originEnd: originCanceled}
+			},
+		},
+		{
+			name:   "the handler returns nil with Inbound pending",
+			origin: originHold(true),
+			handler: func(*endRun) GRPC {
+				return func(c *GRPCCtx) error {
+					if err := c.Open(); err != nil {
+						return err
+					}
+					m, err := c.Outbound().ReadMessage()
+					if err != nil {
+						return err
+					}
+					if err := m.Forward(); err != nil {
+						return err
+					}
+					if err := c.CloseSend(); err != nil {
+						return err
+					}
+					in, err := c.Inbound().ReadMessage()
+					if err != nil {
+						return err
+					}
+					return in.Forward()
+				}
+			},
+			script: sendThenResult,
+			want: func(*endRun) endWant {
+				return endWant{data: m1, code: "13", origin: []string{"m1"}, originEnd: originCanceled}
+			},
+		},
+		{
+			name:   "a reply toward the client before the origin answered fails",
+			origin: originRelease,
+			handler: func(r *endRun) GRPC {
+				return func(c *GRPCCtx) error {
+					if err := c.Open(); err != nil {
+						return err
+					}
+					m, err := c.Outbound().ReadMessage()
+					if err != nil {
+						return err
+					}
+					if err := m.Reply([]byte("early")); err == nil {
+						r.problem("a reply before the origin answered was accepted")
+					}
+					if err := m.Forward(); err != nil {
+						return err
+					}
+					close(r.release)
+					return nil
+				}
+			},
+			script: sendAndEnd,
+			want: func(*endRun) endWant {
+				return endWant{data: m1, code: "0", origin: []string{"m1"}, originEnd: originEOF}
+			},
+		},
+		{
+			name:   "Outbound read to its end before Open is half-closed at the return",
+			origin: originEcho,
+			handler: func(*endRun) GRPC {
+				return func(c *GRPCCtx) error {
+					out := c.Outbound()
+					for {
+						if _, err := out.ReadMessage(); errors.Is(err, io.EOF) {
+							break
+						} else if err != nil {
+							return err
+						}
+					}
+					return c.Open()
+				}
+			},
+			script: sendAndEnd,
+			want: func(*endRun) endWant {
+				return endWant{data: []byte{}, code: "0", origin: []string{}, originEnd: originEOF}
+			},
+		},
+	}
+
+	for _, cell := range endCells {
+		t.Run(cell.String(), func(t *testing.T) {
+			t.Parallel()
+			fx := newEndFixture(t, cell)
+			for _, row := range natural {
+				for _, s := range endShapes {
+					t.Run(row.name+"/"+s.name, func(t *testing.T) {
+						f := fx
+						if row.own {
+							f = newEndFixture(t, cell)
+						}
+						f.run(t, &row, s.name, func(*endRun) GRPC { return s.h })
+					})
+				}
+			}
+			for _, row := range single {
+				t.Run(row.name, func(t *testing.T) {
+					fx.run(t, &row, "", row.handler)
+				})
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			assert.NoError(t, fx.p.Shutdown(ctx), "a call of the cell did not end")
+		})
+	}
+}
+
+const endMaxMessage = 1 << 10
+
+type endCell struct{ client, origin Protocol }
+
+var endCells = []endCell{
+	{HTTP11, HTTP11}, {HTTP2, HTTP11}, {HTTP2, HTTP2}, {HTTP3, HTTP11}, {HTTP3, HTTP2}, {HTTP3, HTTP3},
+}
+
+func (c endCell) String() string {
+	short := map[Protocol]string{HTTP11: "h1", HTTP2: "h2", HTTP3: "h3"}
+	return "client " + short[c.client] + " origin " + short[c.origin]
+}
+
+type endShape struct {
+	h    GRPC
+	name string
+}
+
+var endShapes = []endShape{
+	{forwardCall, "Forward"},
+	{func(c *GRPCCtx) error { return c.Open() }, "OpenOnly"},
+	{forwardOutbound, "OutboundOnly"},
+	{openCall, "Merge"},
+	{forwardApart, "TwoGoroutines"},
+}
+
+func forwardMessages(r *MessageReader) error {
+	for {
+		m, err := r.ReadMessage()
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if err := m.Forward(); err != nil {
+			return err
+		}
+	}
+}
+
+func forwardOutbound(c *GRPCCtx) error {
+	if err := c.Open(); err != nil {
+		return err
+	}
+	return forwardMessages(c.Outbound())
+}
+
+func forwardApart(c *GRPCCtx) error {
+	if err := c.Open(); err != nil {
+		return err
+	}
+	ended := make(chan error, 2)
+	go func() { ended <- forwardMessages(c.Outbound()) }()
+	go func() { ended <- forwardMessages(c.Inbound()) }()
+	err := <-ended
+	if next := <-ended; err == nil {
+		err = next
+	}
+	return err
+}
+
+type endRow struct {
+	origin  func(r *endRun, w http.ResponseWriter, req *http.Request)
+	handler func(r *endRun) GRPC
+	script  func(t *testing.T, r *endRun) (endResult, bool)
+	want    func(r *endRun) endWant
+	name    string
+	own     bool
+}
+
+type originEnd uint8
+
+const (
+	originUnchecked originEnd = iota
+	originEOF
+	originCut
+	originCanceled
+)
+
+// Defects of the current code. A row with a defect asserts the current behavior.
+const (
+	defectRelayCut = "with OpenOnly over an HTTP/1.1 or HTTP/3 origin, a request stream cut after the return ends on Unknown, where the other shapes end on Canceled or ResourceExhausted"
+	defectH1Status = "on an HTTP/1.1 client, the status the proxy sets is lost when no message reached the client and the origin announced no trailer"
+)
+
+type endWant struct {
+	alt          *endWant
+	returned     error
+	defect       string
+	data         []byte
+	origin       []string
+	code         string
+	msg          string
+	status       int
+	originEnd    originEnd
+	trailersOnly bool
+	// anyForm leaves the form of the status unchecked, for a call cut while the response of the
+	// origin may still be on its way.
+	anyForm bool
+	reset   bool
+}
+
+type endResult struct {
+	data         []byte
+	code, msg    string
+	status       int
+	trailersOnly bool
+	reset        bool
+}
+
+type endObs struct {
+	err      error
+	msgs     []string
+	canceled bool
+}
+
+type endRun struct {
+	fx       *endFixture
+	row      *endRow
+	call     endCall
+	got      chan string
+	obs      chan endObs
+	proto    chan string
+	returned chan error
+	release  chan struct{}
+	shape    string
+	pattern  string
+	problems []string
+	mu       sync.Mutex
+}
+
+func (r *endRun) duplex() bool { return r.fx.cell.client != HTTP11 }
+
+// echoes reports whether a response message reaches the client before the request stream ends.
+func (r *endRun) echoes() bool { return r.duplex() && r.shape != "OutboundOnly" }
+
+func (r *endRun) problem(s string) {
+	r.mu.Lock()
+	r.problems = append(r.problems, s)
+	r.mu.Unlock()
+}
+
+func (r *endRun) waitGot(t *testing.T, want string) {
+	t.Helper()
+	select {
+	case m := <-r.got:
+		assert.Equal(t, want, m)
+	case <-time.After(5 * time.Second):
+		t.Errorf("the origin did not read %s", want)
+	}
+}
+
+func (r *endRun) readRequest(req *http.Request, each func(m []byte)) endObs {
+	src := &msgSource{r: req.Body, max: 1 << 20}
+	var obs endObs
+	obs.msgs = []string{}
+	for {
+		payload, flag, err := src.next()
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				obs.err = err
+			}
+			return obs
+		}
+		obs.msgs = append(obs.msgs, string(payload))
+		r.got <- string(payload)
+		if each != nil {
+			each(lpm(flag, string(payload)))
+		}
+	}
+}
+
+type endFixture struct {
+	p    *Proxy
+	ca   *CA
+	addr string
+	h3   netip.AddrPort
+	runs sync.Map
+	next atomic.Int64
+	cell endCell
+}
+
+func newEndFixture(t *testing.T, cell endCell) *endFixture {
+	t.Helper()
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	cert := selfSignedFor(t, ca, "origin.test")
+	fx := &endFixture{ca: ca, cell: cell}
+	h := http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		v, ok := fx.runs.Load(req.URL.Path)
+		if !ok {
+			http.NotFound(w, req)
+			return
+		}
+		r := v.(*endRun)
+		r.proto <- req.Proto
+		_ = http.NewResponseController(w).EnableFullDuplex()
+		r.row.origin(r, w, req)
+	})
+	var addr string
+	if cell.origin == HTTP3 {
+		pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+		require.NoError(t, err)
+		srv := &http3.Server{
+			Handler:   h,
+			TLSConfig: http3.ConfigureTLSConfig(&tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: tls.VersionTLS13}),
+		}
+		go func() { _ = srv.Serve(pc) }()
+		t.Cleanup(func() {
+			_ = srv.Close()
+			_ = pc.Close()
+		})
+		addr = pc.LocalAddr().String()
+	} else {
+		srv := httptest.NewUnstartedServer(h)
+		srv.EnableHTTP2 = cell.origin == HTTP2
+		srv.TLS = &tls.Config{Certificates: []tls.Certificate{cert}}
+		srv.StartTLS()
+		t.Cleanup(srv.Close)
+		addr = srv.Listener.Addr().String()
+	}
+	tr := DefaultTransport()
+	tr.AllowHTTP3 = cell.origin == HTTP3
+	tr.DialContext = pinnedDialer(addr)
+	tr.RootCAs = poolOf(ca)
+	fx.p = testProxyWithCA(t, ca, WithTransport(tr), WithMaxMessageBytes(endMaxMessage))
+	if cell.client == HTTP3 {
+		fx.h3, _ = startQUICFront(t, fx.p, ca)
+	} else {
+		fx.addr = startProxy(t, fx.p)
+	}
+	return fx
+}
+
+func (fx *endFixture) run(t *testing.T, row *endRow, shape string, handler func(*endRun) GRPC) {
+	path := "/end.Svc/R" + strconv.FormatInt(fx.next.Add(1), 10)
+	r := &endRun{
+		fx: fx, row: row, shape: shape, pattern: "origin.test" + path,
+		got: make(chan string, 16), obs: make(chan endObs, 1), proto: make(chan string, 1),
+		returned: make(chan error, 1), release: make(chan struct{}),
+	}
+	fx.runs.Store(path, r)
+	defer fx.runs.Delete(path)
+	h := handler(r)
+	fx.p.MustAdd(r.pattern, func(c *GRPCCtx) error {
+		err := h(c)
+		r.returned <- err
+		return err
+	})
+	defer func() { _, _ = fx.p.Delete[GRPC](r.pattern) }()
+
+	switch fx.cell.client {
+	case HTTP11:
+		r.call = fx.h1Call(t, path)
+	case HTTP2:
+		r.call = fx.h2Call(t, path)
+	default:
+		r.call = fx.h3Call(t, path)
+	}
+	res, read := row.script(t, r)
+	want := row.want(r)
+	if want.defect != "" {
+		t.Logf("known defect: %s", want.defect)
+	}
+	if want.alt != nil && res.reset != want.reset {
+		want.data, want.code, want.trailersOnly, want.reset = want.alt.data, want.alt.code, want.alt.trailersOnly, want.alt.reset
+	}
+
+	if read {
+		if want.data != nil {
+			assert.Equal(t, want.data, res.data, "response messages")
+		}
+		assert.Equal(t, want.reset, res.reset, "reset of the response")
+		if !want.reset {
+			status := want.status
+			if status == 0 {
+				status = http.StatusOK
+			}
+			assert.Equal(t, status, res.status, "HTTP status")
+			assert.Equal(t, want.code, res.code, "grpc-status")
+			if want.msg != "" {
+				assert.Equal(t, want.msg, res.msg, "grpc-message")
+			}
+			if !want.anyForm {
+				assert.Equal(t, want.trailersOnly, res.trailersOnly, "trailers-only")
+			}
+		}
+	}
+
+	select {
+	case proto := <-r.proto:
+		assert.Equal(t, map[Protocol]string{HTTP11: "HTTP/1.1", HTTP2: "HTTP/2.0", HTTP3: "HTTP/3.0"}[fx.cell.origin], proto, "protocol at the origin")
+	case <-time.After(5 * time.Second):
+		t.Error("the origin received no call")
+	}
+	if want.origin != nil || want.originEnd != originUnchecked {
+		select {
+		case obs := <-r.obs:
+			if want.origin != nil {
+				assert.Equal(t, want.origin, obs.msgs, "messages the origin read")
+			}
+			switch want.originEnd {
+			case originEOF:
+				assert.NoError(t, obs.err, "the read of the request stream at the origin")
+				assert.False(t, obs.canceled, "the origin was canceled")
+			case originCut:
+				assert.Error(t, obs.err, "the read of the request stream at the origin")
+			case originCanceled:
+				assert.True(t, obs.canceled, "the origin was canceled")
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("the origin did not end its read of the request stream")
+		}
+	}
+	var returned error
+	select {
+	case returned = <-r.returned:
+		if want.returned != nil {
+			assert.ErrorIs(t, returned, want.returned, "the error the handler returned")
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("the handler did not return")
+	}
+	r.mu.Lock()
+	assert.Empty(t, r.problems)
+	r.mu.Unlock()
+	if t.Failed() {
+		t.Logf("response %+v, handler returned %v", res, returned)
+	}
+}
+
+func originEcho(r *endRun, w http.ResponseWriter, req *http.Request) {
+	w.Header().Set("Content-Type", "application/grpc")
+	w.Header().Set("Trailer", "Grpc-Status")
+	rc := http.NewResponseController(w)
+	var held []byte
+	obs := r.readRequest(req, func(m []byte) {
+		if !r.duplex() {
+			held = append(held, m...)
+			return
+		}
+		_, _ = w.Write(m)
+		_ = rc.Flush()
+	})
+	r.obs <- obs
+	if obs.err != nil {
+		panic(http.ErrAbortHandler)
+	}
+	_, _ = w.Write(held)
+	w.Header().Set(http.TrailerPrefix+"Grpc-Status", "0")
+}
+
+func originTrailersOnly(_ *endRun, w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/grpc")
+	w.Header().Set("Grpc-Status", "12")
+	w.WriteHeader(http.StatusOK)
+}
+
+func originAnswerFirst(r *endRun, w http.ResponseWriter, req *http.Request) {
+	src := &msgSource{r: req.Body, max: 1 << 20}
+	payload, _, err := src.next()
+	if err != nil {
+		r.obs <- endObs{err: err}
+		panic(http.ErrAbortHandler)
+	}
+	r.got <- string(payload)
+	r.obs <- endObs{msgs: []string{string(payload)}}
+	answerOK(w, lpm(0, "r"))
+}
+
+func originReset(r *endRun, w http.ResponseWriter, req *http.Request) {
+	src := &msgSource{r: req.Body, max: 1 << 20}
+	payload, flag, err := src.next()
+	if err != nil {
+		r.obs <- endObs{err: err}
+		panic(http.ErrAbortHandler)
+	}
+	r.got <- string(payload)
+	r.obs <- endObs{msgs: []string{string(payload)}}
+	w.Header().Set("Content-Type", "application/grpc")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(lpm(flag, string(payload)))
+	_ = http.NewResponseController(w).Flush()
+	select {
+	case <-r.release:
+	case <-time.After(5 * time.Second):
+	}
+	panic(http.ErrAbortHandler)
+}
+
+func originBig(r *endRun, w http.ResponseWriter, req *http.Request) {
+	obs := r.readRequest(req, nil)
+	r.obs <- obs
+	if obs.err != nil {
+		panic(http.ErrAbortHandler)
+	}
+	answerOK(w, lpm(0, strings.Repeat("b", 2*endMaxMessage)))
+}
+
+func originNotGRPC(_ *endRun, w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/plain")
+	w.WriteHeader(http.StatusNotFound)
+	_, _ = io.WriteString(w, "nope")
+}
+
+// originHold reads the first message, echoes it when answer is set, reads the rest of the
+// request and waits for the proxy to cancel it.
+func originHold(answer bool) func(r *endRun, w http.ResponseWriter, req *http.Request) {
+	return func(r *endRun, w http.ResponseWriter, req *http.Request) {
+		src := &msgSource{r: req.Body, max: 1 << 20}
+		payload, flag, err := src.next()
+		if err != nil {
+			r.obs <- endObs{err: err}
+			panic(http.ErrAbortHandler)
+		}
+		r.got <- string(payload)
+		if answer {
+			w.Header().Set("Content-Type", "application/grpc")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(lpm(flag, string(payload)))
+			_ = http.NewResponseController(w).Flush()
+		}
+		obs := endObs{msgs: []string{string(payload)}}
+		for err == nil {
+			_, _, err = src.next()
+		}
+		if !errors.Is(err, io.EOF) {
+			obs.err = err
+		}
+		select {
+		case <-req.Context().Done():
+			obs.canceled = true
+		case <-time.After(5 * time.Second):
+		}
+		r.obs <- obs
+	}
+}
+
+func originRelease(r *endRun, w http.ResponseWriter, req *http.Request) {
+	src := &msgSource{r: req.Body, max: 1 << 20}
+	payload, flag, err := src.next()
+	if err != nil {
+		r.obs <- endObs{err: err}
+		panic(http.ErrAbortHandler)
+	}
+	r.got <- string(payload)
+	select {
+	case <-r.release:
+	case <-time.After(5 * time.Second):
+	}
+	obs := endObs{msgs: []string{string(payload)}}
+	for err == nil {
+		_, _, err = src.next()
+	}
+	if !errors.Is(err, io.EOF) {
+		obs.err = err
+	}
+	r.obs <- obs
+	answerOK(w, lpm(flag, string(payload)))
+}
+
+type endCall interface {
+	send(b []byte)
+	closeSend()
+	reset()
+	read(t *testing.T, n int)
+	result(t *testing.T) endResult
+}
+
+type endH1 struct {
+	pw     *io.PipeWriter
+	cancel context.CancelFunc
+	resp   chan *http.Response
+	err    error
+	r      *http.Response
+	data   []byte
+}
+
+func (fx *endFixture) h1Call(t *testing.T, path string) endCall {
+	t.Helper()
+	pr, pw := io.Pipe()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://origin.test"+path, pr)
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/grpc")
+	req.Header.Set("Te", "trailers")
+	tr := &http.Transport{
+		Proxy:           http.ProxyURL(&url.URL{Scheme: "http", Host: fx.addr}),
+		TLSClientConfig: &tls.Config{RootCAs: fx.ca.CertPool(), MinVersion: tls.VersionTLS12},
+	}
+	t.Cleanup(tr.CloseIdleConnections)
+	c := &endH1{pw: pw, cancel: cancel, resp: make(chan *http.Response, 1)}
+	go func() {
+		resp, err := tr.RoundTrip(req)
+		if err != nil {
+			c.err = err
+		}
+		c.resp <- resp
+	}()
+	return c
+}
+
+func (c *endH1) send(b []byte) { _, _ = c.pw.Write(b) }
+
+func (c *endH1) closeSend() { _ = c.pw.Close() }
+
+func (c *endH1) reset() {
+	c.cancel()
+	_ = c.pw.CloseWithError(errors.New("edge test: client reset"))
+}
+
+func (c *endH1) response(t *testing.T) *http.Response {
+	t.Helper()
+	if c.r == nil {
+		select {
+		case c.r = <-c.resp:
+		case <-time.After(10 * time.Second):
+			t.Fatal("no response")
+		}
+	}
+	return c.r
+}
+
+func (c *endH1) read(t *testing.T, n int) {
+	t.Helper()
+	resp := c.response(t)
+	require.NotNil(t, resp, "%v", c.err)
+	b := make([]byte, n)
+	_, err := io.ReadFull(resp.Body, b)
+	require.NoError(t, err)
+	c.data = append(c.data, b...)
+}
+
+func (c *endH1) result(t *testing.T) endResult {
+	t.Helper()
+	resp := c.response(t)
+	if resp == nil {
+		return endResult{data: c.data, reset: true}
+	}
+	b, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	res := endResult{data: append(c.data, b...), status: resp.StatusCode, reset: err != nil}
+	if res.data == nil {
+		res.data = []byte{}
+	}
+	res.code, res.msg = grpcStatus(resp)
+	res.trailersOnly = resp.Trailer.Get("Grpc-Status") == "" && resp.Header.Get("Grpc-Status") != ""
+	return res
+}
+
+type endH2 struct {
+	c       *grpcClient
+	conn    net.Conn
+	connErr error
+	res     grpcResult
+	id      uint32
+}
+
+func (fx *endFixture) h2Call(t *testing.T, path string) endCall {
+	t.Helper()
+	raw := connectRaw(t, fx.addr, "origin.test:443")
+	tc := tls.Client(raw, &tls.Config{ServerName: "origin.test", RootCAs: fx.ca.CertPool(), NextProtos: []string{"h2"}, MinVersion: tls.VersionTLS12})
+	require.NoError(t, tc.Handshake())
+	require.Equal(t, "h2", tc.ConnectionState().NegotiatedProtocol)
+	require.NoError(t, tc.SetDeadline(time.Now().Add(10*time.Second)))
+	_, err := io.WriteString(tc, http2.ClientPreface)
+	require.NoError(t, err)
+	c := &grpcClient{t: t, fr: http2.NewFramer(tc, tc), authority: "origin.test:443", next: 1}
+	c.enc = hpack.NewEncoder(&c.buf)
+	c.fr.ReadMetaHeaders = hpack.NewDecoder(65536, nil)
+	c.fr.MaxHeaderListSize = 1 << 20
+	require.NoError(t, c.fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1 << 30}))
+	require.NoError(t, c.fr.WriteWindowUpdate(0, 1<<30))
+	return &endH2{c: c, conn: tc, id: c.call(path)}
+}
+
+func (c *endH2) send(b []byte) { _ = c.c.fr.WriteData(c.id, false, b) }
+
+func (c *endH2) closeSend() { _ = c.c.fr.WriteData(c.id, true, nil) }
+
+func (c *endH2) reset() { _ = c.c.fr.WriteRSTStream(c.id, http2.ErrCodeCancel) }
+
+func (c *endH2) step() bool {
+	f, err := c.c.fr.ReadFrame()
+	if err != nil {
+		c.connErr = err
+		return false
+	}
+	switch f := f.(type) {
+	case *http2.SettingsFrame:
+		if !f.IsAck() {
+			_ = c.c.fr.WriteSettingsAck()
+		}
+	case *http2.PingFrame:
+		if !f.IsAck() {
+			_ = c.c.fr.WritePing(true, f.Data)
+		}
+	case *http2.MetaHeadersFrame:
+		if f.StreamID == c.id {
+			c.res.blocks = append(c.res.blocks, f.Fields)
+			if f.StreamEnded() {
+				c.res.ended, c.res.endOnBlock = true, true
+			}
+		}
+	case *http2.DataFrame:
+		if f.StreamID == c.id {
+			c.res.data = append(c.res.data, f.Data()...)
+			c.res.ended = f.StreamEnded()
+		}
+	case *http2.RSTStreamFrame:
+		if f.StreamID == c.id {
+			c.res.reset, c.res.rst = true, f.ErrCode
+		}
+	}
+	return true
+}
+
+func (c *endH2) read(t *testing.T, n int) {
+	t.Helper()
+	for len(c.res.data) < n && !c.res.done() && c.step() {
+	}
+	require.Len(t, c.res.data, n, "%v", c.connErr)
+}
+
+func (c *endH2) result(*testing.T) endResult {
+	for !c.res.done() && c.step() {
+	}
+	_ = c.conn.Close()
+	res := endResult{data: c.res.data, reset: c.res.reset || c.connErr != nil}
+	if res.data == nil {
+		res.data = []byte{}
+	}
+	res.status, _ = strconv.Atoi(c.res.header(":status"))
+	res.trailersOnly = len(c.res.blocks) == 1 && c.res.endOnBlock
+	res.code = grpcStatusOf(c.res)
+	if res.trailersOnly {
+		res.msg = c.res.header("grpc-message")
+	} else {
+		res.msg = c.res.trailer("grpc-message")
+	}
+	return res
+}
+
+type endH3 struct {
+	str  *http3.RequestStream
+	resp *http.Response
+	err  error
+	data []byte
+}
+
+func (fx *endFixture) h3Call(t *testing.T, path string) endCall {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	tr := &http3.Transport{DisableCompression: true}
+	t.Cleanup(func() { _ = tr.Close() })
+	str, err := tr.NewClientConn(dialQUICFront(t, fx.h3, fx.ca)).OpenRequestStream(ctx)
+	require.NoError(t, err)
+	require.NoError(t, str.SetDeadline(time.Now().Add(10*time.Second)))
+	req, err := http.NewRequest(http.MethodPost, "https://origin.test"+path, http.NoBody)
+	require.NoError(t, err)
+	req.Header.Set("Content-Type", "application/grpc")
+	req.Header.Set("Te", "trailers")
+	require.NoError(t, str.SendRequestHeader(req))
+	return &endH3{str: str}
+}
+
+func (c *endH3) send(b []byte) { _, _ = c.str.Write(b) }
+
+func (c *endH3) closeSend() { _ = c.str.Close() }
+
+func (c *endH3) reset() { c.str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeRequestCanceled)) }
+
+func (c *endH3) response() *http.Response {
+	if c.resp == nil && c.err == nil {
+		c.resp, c.err = c.str.ReadResponse()
+	}
+	return c.resp
+}
+
+func (c *endH3) read(t *testing.T, n int) {
+	t.Helper()
+	require.NotNil(t, c.response(), "%v", c.err)
+	b := make([]byte, n)
+	_, err := io.ReadFull(c.str, b)
+	require.NoError(t, err)
+	c.data = append(c.data, b...)
+}
+
+func (c *endH3) result(*testing.T) endResult {
+	resp := c.response()
+	if resp == nil {
+		return endResult{data: c.data, reset: true}
+	}
+	b, err := io.ReadAll(c.str)
+	res := endResult{data: append(c.data, b...), status: resp.StatusCode, reset: err != nil}
+	if res.data == nil {
+		res.data = []byte{}
+	}
+	res.code, res.msg = grpcStatus(resp)
+	res.trailersOnly = resp.Trailer.Get("Grpc-Status") == "" && resp.Header.Get("Grpc-Status") != ""
+	return res
+}
+
+var grpcCallShapes = []struct {
+	h    GRPC
+	name string
+}{
+	{forwardCall, "Forward"},
+	{func(c *GRPCCtx) error { return c.Open() }, "OpenOnly"},
+	{openCall, "Merge"},
+}
+
+func grpcCaller(tb testing.TB, h GRPC) func(body []byte) error {
+	tb.Helper()
+	ca, err := GenerateCA()
+	require.NoError(tb, err)
+	leaf, err := ca.Leaf("origin.test")
+	require.NoError(tb, err)
+	origin := httptest.NewUnstartedServer(grpcEchoHandler(nil))
+	origin.EnableHTTP2 = true
+	origin.TLS = &tls.Config{Certificates: []tls.Certificate{*leaf}}
+	origin.StartTLS()
+	tb.Cleanup(origin.Close)
+	tr := DefaultTransport()
+	tr.DialContext = pinnedDialer(origin.Listener.Addr().String())
+	tr.RootCAs = poolOf(ca)
+	p, err := New(WithCA(ca), WithTransport(tr))
+	require.NoError(tb, err)
+	p.MustAdd("origin.test/pkg.Svc/Chat", h)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(tb, err)
+	go func() { _ = p.Serve(ln) }()
+	tb.Cleanup(func() { _ = p.Close() })
+	client := h2Client(ln.Addr().String(), ca.CertPool())
+	tb.Cleanup(client.CloseIdleConnections)
+	rd := new(bytes.Reader)
+	return func(body []byte) error {
+		rd.Reset(body)
+		req, err := http.NewRequest(http.MethodPost, "https://origin.test/pkg.Svc/Chat", rd)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/grpc")
+		resp, err := client.Do(req)
+		if err != nil {
+			return err
+		}
+		n, err := io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		switch {
+		case err != nil:
+			return err
+		case n != int64(len(body)):
+			return fmt.Errorf("echoed %d bytes of %d", n, len(body))
+		case resp.Trailer.Get("Grpc-Status") != "0":
+			return fmt.Errorf("grpc-status %q", resp.Trailer.Get("Grpc-Status"))
+		}
+		return nil
+	}
+}
+
+func BenchmarkKindGRPC_Call(b *testing.B) {
+	for _, s := range grpcCallShapes {
+		for _, n := range []int{1, 100} {
+			b.Run(s.name+"/"+strconv.Itoa(n), func(b *testing.B) {
+				call := grpcCaller(b, s.h)
+				var body []byte
+				for range n {
+					body = append(body, lpm(0, "hello")...)
+				}
+				b.ReportAllocs()
+				for b.Loop() {
+					if err := call(body); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestKindGRPC_CallAllocs(t *testing.T) {
+	ceilings := map[string]float64{"Forward": 250, "OpenOnly": 270, "Merge": 283}
+	body := lpm(0, "hello")
+	for _, s := range grpcCallShapes {
+		t.Run(s.name, func(t *testing.T) {
+			call := grpcCaller(t, s.h)
+			allocs := testing.AllocsPerRun(200, func() {
+				if err := call(body); err != nil {
+					t.Fatal(err)
+				}
+			})
+			assert.LessOrEqual(t, allocs, ceilings[s.name])
+		})
+	}
+}
