@@ -151,6 +151,61 @@ func TestTerminate_StreamRefusedPastTheHandshakeSendsCloseNotify(t *testing.T) {
 	assert.Equal(t, byte(tlsAlert), rec.lastRecord())
 }
 
+func TestTerminate_SessionCloseEndsAStalledClient(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		tlsFront, inner bool
+	}{
+		{"tls front", true, false},
+		{"tls tunnel", false, true},
+		{"tls front and tunnel", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ca, err := GenerateCA()
+			require.NoError(t, err)
+			p, err := New(WithCA(ca))
+			require.NoError(t, err)
+			full := make(chan struct{})
+			p.MustAdd[TCP](tlsDB, func(c *TCPCtx) error {
+				writeUntilFull(c.Client())
+				close(full)
+				<-c.Context().Done()
+				return nil
+			})
+
+			var raw net.Conn
+			if tc.tlsFront {
+				raw, err = tls.Dial("tcp", startTLSFront(t, p, ca, "http/1.1").String(), &tls.Config{RootCAs: ca.CertPool()})
+			} else {
+				raw, err = net.Dial("tcp", startProxy(t, p))
+			}
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = raw.Close() })
+			_, err = fmt.Fprintf(raw, "CONNECT %s:443 HTTP/1.1\r\nHost: %s:443\r\n\r\n", tlsDB, tlsDB)
+			require.NoError(t, err)
+			resp, err := http.ReadResponse(bufio.NewReader(raw), &http.Request{Method: http.MethodConnect})
+			require.NoError(t, err)
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			var client io.Writer = raw
+			if tc.inner {
+				inner := tls.Client(raw, &tls.Config{ServerName: tlsDB, RootCAs: ca.CertPool()})
+				require.NoError(t, inner.Handshake())
+				client = inner
+			}
+			_, err = client.Write([]byte{0})
+			require.NoError(t, err)
+			sess := waitForSessions(t, p, 1)[0]
+			<-full
+
+			start := time.Now()
+			_ = sess.Close()
+			assert.Less(t, time.Since(start), alertWriteTimeout, "Close blocked on the client")
+			assert.Eventually(t, func() bool { return len(slices.Collect(p.Sessions())) == 0 },
+				alertWriteTimeout, 10*time.Millisecond, "the session outlived its close")
+		})
+	}
+}
+
 func TestTerminate_InterceptHTTP2(t *testing.T) {
 	origin := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "origin proto %s", r.Proto)

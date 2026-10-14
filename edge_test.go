@@ -695,3 +695,14 @@ func h2cConnect(t *testing.T, addr, authority string) (io.Writer, *bufio.Reader)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	return pw, bufio.NewReader(resp.Body)
 }
+
+// writeUntilFull writes to c a byte at a time until a write blocks for 100 ms and fails, which
+// leaves the socket buffers full when the peer does not read.
+func writeUntilFull(c net.Conn) {
+	for {
+		_ = c.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+		if _, err := c.Write([]byte{0}); err != nil {
+			return
+		}
+	}
+}

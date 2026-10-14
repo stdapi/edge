@@ -962,7 +962,7 @@ func startTLSFront(t *testing.T, p *Proxy, ca *CA, protos ...string) netip.AddrP
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	cfg := &tls.Config{Certificates: []tls.Certificate{*cert}, MinVersion: tls.VersionTLS12, NextProtos: protos}
-	go func() { _ = p.serveFront(tls.NewListener(cancelListener{ln}, cfg)) }()
+	go func() { _ = p.serveFront(tlsListener{Listener: cancelListener{ln}, cfg: cfg}) }()
 	t.Cleanup(func() { _ = p.Close() })
 	return netip.MustParseAddrPort(ln.Addr().String())
 }
@@ -1324,24 +1324,6 @@ func udpFlood(t *testing.T, bursts, size int) netip.AddrPort {
 		}
 	}()
 	return netip.MustParseAddrPort(pc.LocalAddr().String())
-}
-
-func TestConnectUDP_Capsules_CloseDoesNotWaitOnTheCloseNotify(t *testing.T) {
-	ca, err := GenerateCA()
-	require.NoError(t, err)
-	leaf, err := ca.Leaf("tunnel.test")
-	require.NoError(t, err)
-	clientSide, serverSide := net.Pipe()
-	t.Cleanup(func() { _ = clientSide.Close() })
-	server := tls.Server(serverSide, &tls.Config{Certificates: []tls.Certificate{*leaf}, MinVersion: tls.VersionTLS13})
-	client := tls.Client(clientSide, &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS13})
-	go func() { _ = client.Handshake() }()
-	require.NoError(t, server.Handshake())
-
-	pipe := newCapsulePipe(server, bufio.NewReader(server))
-	start := time.Now()
-	_ = pipe.close()
-	assert.Less(t, time.Since(start), time.Second, "the close waited on a client that does not read")
 }
 
 func TestConnectUDP_Capsules_CloseEndsAStalledClient(t *testing.T) {

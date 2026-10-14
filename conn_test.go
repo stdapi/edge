@@ -6,6 +6,7 @@ package edge
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"io"
 	"net"
@@ -171,6 +172,47 @@ func TestH2Stream_ReadDeadlineReachesABlockedRead(t *testing.T) {
 	}
 }
 
+func tlsPipe(t *testing.T) (server, client *tlsConn) {
+	t.Helper()
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	leaf, err := ca.Leaf("pipe.test")
+	require.NoError(t, err)
+	a, b := net.Pipe()
+	t.Cleanup(func() {
+		_ = a.Close()
+		_ = b.Close()
+	})
+	server = tlsServer(a, &tls.Config{Certificates: []tls.Certificate{*leaf}})
+	client = tlsClient(b, &tls.Config{ServerName: "pipe.test", RootCAs: ca.CertPool()})
+	handshake := make(chan error, 1)
+	go func() { handshake <- client.Handshake() }()
+	require.NoError(t, server.Handshake())
+	require.NoError(t, <-handshake)
+	return server, client
+}
+
+func TestTLSConn_CloseNotifyIsBounded(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		close func(server, client *tlsConn) error
+	}{
+		{"server close", func(server, _ *tlsConn) error { return server.Close() }},
+		{"server close write", func(server, _ *tlsConn) error { return server.CloseWrite() }},
+		{"client close", func(_, client *tlsConn) error { return client.Close() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			server, client := tlsPipe(t)
+			start := time.Now()
+			err := tc.close(server, client)
+			elapsed := time.Since(start)
+			assert.ErrorIs(t, err, os.ErrDeadlineExceeded)
+			assert.GreaterOrEqual(t, elapsed, alertWriteTimeout/2, "the close_notify was not attempted")
+			assert.Less(t, elapsed, 2*alertWriteTimeout)
+		})
+	}
+}
+
 func TestH2Stream_ReadDeadlineSetTwiceUnderABlockedRead(t *testing.T) {
 	pr, pw := io.Pipe()
 	defer func() { _ = pw.Close() }()
@@ -297,4 +339,89 @@ func TestH2Stream_FinishWaitsForTheWriteInFlight(t *testing.T) {
 	s.Abort()
 	s.finish()
 	assert.True(t, w.returned.Load(), "finish returned with a write in flight")
+}
+
+func TestTLSConn_NoCloseNotifyAfterAFailedWrite(t *testing.T) {
+	server, client := tlsPipe(t)
+	require.NoError(t, server.SetWriteDeadline(time.Now().Add(50*time.Millisecond)))
+	_, err := server.Write([]byte("lost"))
+	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+
+	raw := make(chan []byte, 1)
+	go func() {
+		b, _ := io.ReadAll(client.socket.Conn)
+		raw <- b
+	}()
+	start := time.Now()
+	_ = server.Close()
+	assert.Less(t, time.Since(start), alertWriteTimeout/2)
+	assert.Empty(t, <-raw, "a close_notify followed a failed write")
+}
+
+type writeEntered struct {
+	net.Conn
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (c *writeEntered) Write(b []byte) (int, error) {
+	c.once.Do(func() { close(c.entered) })
+	return c.Conn.Write(b)
+}
+
+func TestTLSConn_CloseBoundsAnAlertOfTheReader(t *testing.T) {
+	server, client := tlsPipe(t)
+	alert := &writeEntered{Conn: server.socket.Conn, entered: make(chan struct{})}
+	server.socket.Conn = alert
+	read := make(chan error, 1)
+	go func() {
+		_, err := server.Read(make([]byte, 1))
+		read <- err
+	}()
+	// A record that does not decrypt, answered with bad_record_mac to a client that does not read.
+	_, err := client.socket.Conn.Write(append([]byte{0x17, 0x03, 0x03, 0x00, 0x20}, make([]byte, 32)...))
+	require.NoError(t, err)
+	<-alert.entered
+
+	closed := make(chan struct{})
+	start := time.Now()
+	go func() {
+		_ = server.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+	case <-time.After(5 * alertWriteTimeout):
+		t.Fatal("Close blocked behind the alert of the reader")
+	}
+	assert.Less(t, time.Since(start), 2*alertWriteTimeout)
+	assert.Error(t, <-read)
+}
+
+func TestTLSConn_SetDeadlineKeepsTheBound(t *testing.T) {
+	server, _ := tlsPipe(t)
+	closed := make(chan time.Duration, 1)
+	start := time.Now()
+	go func() {
+		_ = server.Close()
+		closed <- time.Since(start)
+	}()
+	time.Sleep(200 * time.Millisecond)
+	_ = server.SetDeadline(time.Now().Add(4 * alertWriteTimeout))
+	assert.Less(t, <-closed, 2*alertWriteTimeout)
+}
+
+func TestTLSConn_LaterCloseKeepsTheBound(t *testing.T) {
+	server, _ := tlsPipe(t)
+	closed := make(chan time.Duration, 1)
+	start := time.Now()
+	go func() {
+		_ = server.Close()
+		closed <- time.Since(start)
+	}()
+	for range 2 {
+		time.Sleep(400 * time.Millisecond)
+		assert.ErrorIs(t, server.Close(), net.ErrClosed)
+	}
+	assert.Less(t, <-closed, alertWriteTimeout*3/2)
 }

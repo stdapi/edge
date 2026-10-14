@@ -38,8 +38,8 @@ const (
 )
 
 const (
-	// alertWriteTimeout bounds the write of an alert, so a client that stopped reading cannot
-	// keep a refused connection open.
+	// alertWriteTimeout bounds the write of an alert, so a peer that stopped reading cannot
+	// keep a connection open.
 	alertWriteTimeout = time.Second
 	// alertDrainTimeout and alertDrainLimit bound what is read and discarded after an alert. A
 	// close with bytes left unread sends a reset, which can destroy the alert before the client
@@ -101,32 +101,32 @@ func (p *Proxy) terminate(ctx context.Context, conn *peekConn, sess *Session) er
 		return err
 	}
 
-	tlsConn := tls.Server(conn, p.serverTLSConfig(sess, false))
-	if err := tlsConn.HandshakeContext(ctx); err != nil {
+	tc := tlsServer(conn, p.serverTLSConfig(sess, false))
+	if err := tc.HandshakeContext(ctx); err != nil {
 		return fmt.Errorf("tls handshake with client for %s: %w", sess.target.Authority(), err)
 	}
 
-	state := tlsConn.ConnectionState()
+	state := tc.ConnectionState()
 	sess.tlsState.Store(&state)
 
 	candidates := candidatesForALPN(state.NegotiatedProtocol, KindTCP)
 	if candidates == nil {
 		// The client offered no ALPN, so nothing has said what this is. Past the handshake
 		// the payload is in the clear, which is exactly what the sniff reads.
-		peeked := newPeekConn(tlsConn, nil, defaultPeekSize)
+		peeked := newPeekConn(tc, nil, defaultPeekSize)
 		candidates = sniffStreamCandidates(peeked, p.cfg.server.sniffTimeout)
 		served := p.serveCandidates(ctx, peeked, sess, candidates, &state)
-		closeRefused(tlsConn, served)
+		closeRefused(tc, served)
 		return served
 	}
-	served := p.serveCandidates(ctx, tlsConn, sess, candidates, &state)
-	closeRefused(tlsConn, served)
+	served := p.serveCandidates(ctx, tc, sess, candidates, &state)
+	closeRefused(tc, served)
 	return served
 }
 
-func closeRefused(tlsConn *tls.Conn, err error) {
+func closeRefused(tc *tlsConn, err error) {
 	if errors.Is(err, ErrConnectionRejected) {
-		_ = tlsConn.Close()
+		_ = tc.Close()
 	}
 }
 

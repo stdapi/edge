@@ -2553,3 +2553,11 @@ func BenchmarkOwnSockets(b *testing.B) {
 		}
 	})
 }
+
+func TestChain_CapsuleExitCloseReturnsAtOnce(t *testing.T) {
+	_, client := tlsPipe(t)
+	c := &connectUDPConn{pipe: newCapsulePipe(client, bufio.NewReader(client))}
+	start := time.Now()
+	require.NoError(t, c.Close())
+	assert.Less(t, time.Since(start), alertWriteTimeout/2, "Close blocked on a proxy that stopped reading")
+}

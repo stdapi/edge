@@ -98,7 +98,7 @@ func (p *Proxy) serveConnectUDP(w http.ResponseWriter, r *http.Request, identity
 	if state := front.tlsState.Load(); state != nil {
 		sess.tlsState.Store(state)
 	} else {
-		sess.tlsConn = front.tlsConn
+		sess.pendingTLS = front.pendingTLS
 	}
 
 	tun := newConnectUDPTunnel(d, sess, &contextFraming{target: target, upstream: upstream}, cancel)

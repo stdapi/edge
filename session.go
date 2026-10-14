@@ -137,9 +137,9 @@ type Session struct {
 	// entry is the one serving a connection whose handler owns it, TCP, QUIC or WebSocket,
 	// and nil where each unit is routed on its own. Atomic for the same reason as tlsState.
 	entry atomic.Pointer[entry]
-	// tlsConn is set instead of tlsState when the session is created before the handshake,
+	// pendingTLS is set instead of tlsState when the session is created before the handshake,
 	// so TLS() can read the state once it exists.
-	tlsConn     *tls.Conn
+	pendingTLS  connectionStater
 	clientHello atomic.Pointer[ClientHello]
 	// leaf is the certificate the proxy presented on a terminated connection.
 	leaf atomic.Pointer[x509.Certificate]
@@ -201,14 +201,14 @@ func newSession(p *Proxy, ctx context.Context, c net.Conn, target Target, kind K
 			s.hasSchemeField = true
 			c = sc.Conn
 		}
-		if tc, ok := c.(*tls.Conn); ok {
+		if tc, ok := c.(connectionStater); ok {
 			if state := tc.ConnectionState(); state.HandshakeComplete {
 				s.tlsState.Store(&state)
 			} else {
 				// http.Server calls ConnContext before it performs the handshake, so the
 				// state read here would be the zero one. Keeping the connection lets it be
 				// read once it exists, which is any time a request is being served.
-				s.tlsConn = tc
+				s.pendingTLS = tc
 			}
 		}
 	}
@@ -259,10 +259,10 @@ func (s *Session) TLS() *tls.ConnectionState {
 	if state := s.tlsState.Load(); state != nil {
 		return state
 	}
-	if s.tlsConn != nil {
+	if s.pendingTLS != nil {
 		// The handshake had not run when the session was created. tls.Conn guards its own
 		// state, so reading it now is safe from any of the goroutines serving the connection.
-		if state := s.tlsConn.ConnectionState(); state.HandshakeComplete {
+		if state := s.pendingTLS.ConnectionState(); state.HandshakeComplete {
 			return &state
 		}
 	}
@@ -363,8 +363,8 @@ func (s *Session) ALPN() string {
 	if state := s.tlsState.Load(); state != nil {
 		return state.NegotiatedProtocol
 	}
-	if s.tlsConn != nil {
-		if state := s.tlsConn.ConnectionState(); state.HandshakeComplete {
+	if s.pendingTLS != nil {
+		if state := s.pendingTLS.ConnectionState(); state.HandshakeComplete {
 			return state.NegotiatedProtocol
 		}
 	}

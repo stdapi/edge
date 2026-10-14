@@ -447,9 +447,4 @@ func (p *capsulePipe) send(b []byte) error {
 func (p *capsulePipe) setReadDeadline(t time.Time) error  { return p.conn.SetReadDeadline(t) }
 func (p *capsulePipe) setWriteDeadline(t time.Time) error { return p.conn.SetWriteDeadline(t) }
 
-// close ends the tunnel without waiting. The close_notify a TLS connection sends from Close
-// waits up to five seconds on a client that stopped reading, so the close runs apart.
-func (p *capsulePipe) close() error {
-	go func() { _ = p.conn.Close() }()
-	return nil
-}
+func (p *capsulePipe) close() error { return p.conn.Close() }

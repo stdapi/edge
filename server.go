@@ -250,7 +250,7 @@ func (p *Proxy) ServeTLS(ln net.Listener, cert tls.Certificate) error {
 	}
 	// The cancel wrapper sits under the TLS listener, where it cannot hide the handshake
 	// from net/http.
-	return p.serveFront(tls.NewListener(cancelListener{ln}, cfg))
+	return p.serveFront(tlsListener{Listener: cancelListener{ln}, cfg: cfg})
 }
 
 // ListenAndServeQUIC listens for UDP on addr and serves as an explicit forward proxy reached

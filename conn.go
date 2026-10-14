@@ -769,6 +769,100 @@ func abort(c net.Conn) {
 	}
 }
 
+// tlsConn wraps the TLS connections the proxy serves and dials itself. crypto/tls gives its
+// close_notify a write deadline of five seconds, and a peer that stopped reading makes a close
+// last that long.
+type tlsConn struct {
+	*tls.Conn
+	socket tlsSocket
+}
+
+func tlsServer(c net.Conn, cfg *tls.Config) *tlsConn {
+	tc := &tlsConn{socket: tlsSocket{Conn: c}}
+	tc.Conn = tls.Server(&tc.socket, cfg)
+	return tc
+}
+
+func tlsClient(c net.Conn, cfg *tls.Config) *tlsConn {
+	tc := &tlsConn{socket: tlsSocket{Conn: c}}
+	tc.Conn = tls.Client(&tc.socket, cfg)
+	return tc
+}
+
+// The first Close or CloseWrite also bounds a write already blocked, such as an alert of the
+// reader, which crypto/tls sends under the lock the close_notify waits for.
+func (c *tlsConn) Close() error {
+	if !c.socket.closing.Swap(true) {
+		_ = c.socket.SetWriteDeadline(time.Time{})
+	}
+	return c.Conn.Close()
+}
+
+func (c *tlsConn) CloseWrite() error {
+	if !c.socket.closing.Swap(true) {
+		_ = c.socket.SetWriteDeadline(time.Time{})
+	}
+	return c.Conn.CloseWrite()
+}
+
+func (c *tlsConn) Abort() { abort(c.socket.Conn) }
+
+func (c *tlsConn) NetConn() net.Conn { return c.socket.Conn }
+
+type tlsSocket struct {
+	net.Conn
+	closing atomic.Bool
+	failed  atomic.Bool
+}
+
+func (s *tlsSocket) Write(b []byte) (int, error) {
+	n, err := s.Conn.Write(b)
+	if err != nil {
+		s.failed.Store(true)
+	}
+	return n, err
+}
+
+// SetWriteDeadline caps every write deadline at alertWriteTimeout once a close has begun. After
+// a failed write the deadline expires at once, as the peer could not decrypt a later record.
+func (s *tlsSocket) SetWriteDeadline(t time.Time) error {
+	if s.closing.Load() {
+		now := time.Now()
+		switch {
+		case s.failed.Load():
+			t = now
+		case t.IsZero() || t.After(now.Add(alertWriteTimeout)):
+			t = now.Add(alertWriteTimeout)
+		}
+	}
+	return s.Conn.SetWriteDeadline(t)
+}
+
+// SetDeadline keeps the write deadline under the cap of SetWriteDeadline.
+func (s *tlsSocket) SetDeadline(t time.Time) error {
+	if !s.closing.Load() {
+		return s.Conn.SetDeadline(t)
+	}
+	if err := s.SetReadDeadline(t); err != nil {
+		return err
+	}
+	return s.SetWriteDeadline(t)
+}
+
+// tlsListener is [tls.NewListener] for a [tlsConn].
+type tlsListener struct {
+	net.Listener
+	cfg *tls.Config
+}
+
+func (l tlsListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return tlsServer(c, l.cfg), nil
+}
+
 func lingerZero(c net.Conn) {
 	if tc, ok := c.(*net.TCPConn); ok {
 		_ = tc.SetLinger(0)

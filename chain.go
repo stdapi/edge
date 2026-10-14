@@ -512,7 +512,7 @@ func overTCP[T any](ctx context.Context, u *upstreamDialer, proxy *url.URL, d tc
 		if d.h2 {
 			cfg.NextProtos = []string{"h2", "http/1.1"}
 		}
-		tc := tls.Client(nc, cfg)
+		tc := tlsClient(nc, cfg)
 		hctx := ctx
 		if u.t.TLSHandshakeTimeout > 0 {
 			var cancel context.CancelFunc
@@ -1306,8 +1306,10 @@ func (c *connectUDPConn) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
+// Close returns at once. The demultiplexer closes a flow on its read loop, and a pipe over
+// TLS closes within alertWriteTimeout.
 func (c *connectUDPConn) Close() error {
-	c.closeOnce.Do(func() { _ = c.pipe.close() })
+	c.closeOnce.Do(func() { go func() { _ = c.pipe.close() }() })
 	return nil
 }
 

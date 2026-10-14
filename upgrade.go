@@ -310,7 +310,7 @@ func (p *Proxy) pipeSession(c *routeCtx, r *http.Request, kind Kind, e *entry, p
 	} else {
 		// The explicit proxy reached over TLS builds its session before the handshake, so
 		// the state only exists behind the connection.
-		sess.tlsConn = front.tlsConn
+		sess.pendingTLS = front.pendingTLS
 	}
 	return sess
 }

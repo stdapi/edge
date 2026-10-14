@@ -335,6 +335,43 @@ func TestUpgrade_CloseEndsAPipeOnAFrontConnection(t *testing.T) {
 	assert.Error(t, err, "Close must reach a pipe http.Server no longer owns")
 }
 
+func TestUpgrade_SessionCloseEndsAStalledClient(t *testing.T) {
+	origin := upgradeOrigin(t)
+	originURL, _ := url.Parse(origin.URL)
+
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	tr := DefaultTransport()
+	tr.RootCAs = originPool(t, origin)
+	p, err := New(WithCA(ca), WithTransport(tr))
+	require.NoError(t, err)
+	full := make(chan struct{})
+	p.MustAdd[TCP](originHost(originURL), func(c *TCPCtx) error {
+		writeUntilFull(c.Client())
+		close(full)
+		<-c.Context().Done()
+		return nil
+	})
+	p.MustAdd(originHost(originURL)+"/ws", forwardHandler, WithMethods[HTTP](http.MethodGet))
+
+	raw, err := dialThroughProxy(t, startProxy(t, p), originURL.Host, ca)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = raw.Close() })
+	_, err = fmt.Fprintf(raw, upgradeRequest, "/ws", originURL.Host)
+	require.NoError(t, err)
+	resp, err := http.ReadResponse(bufio.NewReader(raw), nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+	<-full
+	sess := tcpSession(t, p)
+
+	start := time.Now()
+	_ = sess.Close()
+	assert.Less(t, time.Since(start), alertWriteTimeout, "Close blocked on the client")
+	assert.Eventually(t, func() bool { return len(slices.Collect(p.Sessions())) == 0 },
+		alertWriteTimeout, 10*time.Millisecond, "the pipe outlived its close")
+}
+
 func TestUpgrade_ReachesTheNoEntryTCPHandler(t *testing.T) {
 	origin, _ := wsOrigin(t, nil)
 	p := testProxy(t, WithNoEntry(forwardHandler), WithNoEntry(relayStream))

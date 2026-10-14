@@ -236,6 +236,70 @@ func TestTCP_StartTLS_HandlerReturnSendsCloseNotify(t *testing.T) {
 	assert.Equal(t, byte(tlsAlert), rec.lastRecord())
 }
 
+func TestTCP_StartTLS_HandlerReturnEndsAStalledClient(t *testing.T) {
+	p, ca := newTLSProxy(t)
+	returned := make(chan struct{})
+	p.MustAdd[TCP](tlsDB, func(c *TCPCtx) error {
+		if err := startTLSLine(c); err != nil {
+			return err
+		}
+		writeUntilFull(c.Client())
+		close(returned)
+		return nil
+	})
+	conn := connectRaw(t, startProxy(t, p), tlsDB+":5432")
+	_, err := io.WriteString(conn, "STARTTLS\n")
+	require.NoError(t, err)
+	_, err = io.ReadFull(conn, make([]byte, len("OK\n")))
+	require.NoError(t, err)
+	require.NoError(t, tls.Client(conn, clientTLSConfig(ca, tlsDB)).Handshake())
+	tcpSession(t, p)
+
+	<-returned
+	assert.Eventually(t, func() bool { return len(slices.Collect(p.Sessions())) == 0 },
+		alertWriteTimeout, 10*time.Millisecond, "the session outlived its handler")
+}
+
+func TestTCP_StartTLS_HandlerReturnEndsAStalledOrigin(t *testing.T) {
+	originCA, err := GenerateCA()
+	require.NoError(t, err)
+	cert := selfSignedFor(t, originCA, tlsDB)
+	stop := make(chan struct{})
+	t.Cleanup(func() { close(stop) })
+	addr, _ := tlsOrigin(t, &cert, nil, func(*tls.Conn) { <-stop })
+	tr := DefaultTransport()
+	tr.RootCAs = poolOf(originCA)
+	tr.DialContext = pinnedDialer(addr)
+	p, ca := newTLSProxy(t, WithTransport(tr))
+
+	returned := make(chan struct{})
+	p.MustAdd[TCP](tlsDB, func(c *TCPCtx) error {
+		if err := startTLSLine(c); err != nil {
+			return err
+		}
+		up, err := c.Dial()
+		if err != nil {
+			return err
+		}
+		writeUntilFull(up)
+		close(returned)
+		return nil
+	})
+	conn := connectRaw(t, startProxy(t, p), tlsDB+":5432")
+	_, err = io.WriteString(conn, "STARTTLS\n")
+	require.NoError(t, err)
+	_, err = io.ReadFull(conn, make([]byte, len("OK\n")))
+	require.NoError(t, err)
+	client := tls.Client(conn, clientTLSConfig(ca, tlsDB))
+	require.NoError(t, client.Handshake())
+	go func() { _, _ = io.Copy(io.Discard, client) }()
+	tcpSession(t, p)
+
+	<-returned
+	assert.Eventually(t, func() bool { return len(slices.Collect(p.Sessions())) == 0 },
+		alertWriteTimeout, 10*time.Millisecond, "the session outlived its handler")
+}
+
 func TestTransparent_StartTLS_TerminatesAnInBandUpgrade(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
@@ -303,7 +367,7 @@ func TestTCP_StartTLS_DialToSpeaksTLSAfterwards(t *testing.T) {
 		}
 		conn, err := c.DialTo(context.Background(), other.Addr().String())
 		if err == nil {
-			if _, ok := conn.(*tls.Conn); !ok {
+			if _, ok := conn.(*tlsConn); !ok {
 				err = fmt.Errorf("DialTo returned %T, want a TLS connection", conn)
 			}
 		}

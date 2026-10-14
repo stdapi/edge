@@ -183,7 +183,7 @@ func (c *TCPCtx) upgradeTLS(ctx context.Context, conn net.Conn, addr, serverName
 		ctx, cancel = context.WithTimeout(ctx, timeout)
 		defer cancel()
 	}
-	tc := tls.Client(conn, cfg)
+	tc := tlsClient(conn, cfg)
 	if err := tc.HandshakeContext(ctx); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("tls handshake with %s: %w", addr, err)
@@ -242,13 +242,13 @@ func (c *TCPCtx) StartTLS() error {
 		}
 	}
 
-	tlsConn := tls.Server(conn, p.serverTLSConfig(c.sess, true))
-	if err := tlsConn.HandshakeContext(c.ctx); err != nil {
+	tc := tlsServer(conn, p.serverTLSConfig(c.sess, true))
+	if err := tc.HandshakeContext(c.ctx); err != nil {
 		return fmt.Errorf("tls handshake with client for %s: %w", c.target.Authority(), err)
 	}
-	state := tlsConn.ConnectionState()
+	state := tc.ConnectionState()
 	c.tlsState = &state
-	c.client.Conn = tlsConn
+	c.client.Conn = tc
 	c.sess.tlsState.Store(&state)
 
 	if c.up.Conn != nil {
