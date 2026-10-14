@@ -5,6 +5,7 @@
 package edge
 
 import (
+	"bufio"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -12,6 +13,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"io"
 	"log/slog"
 	"math/big"
 	"net"
@@ -27,6 +29,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/net/http2"
 )
 
 func FuzzRoundTripRegistration(f *testing.F) {
@@ -673,3 +676,22 @@ func (h *recordHandler) Handle(_ context.Context, r slog.Record) error {
 func (h *recordHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
 
 func (h *recordHandler) WithGroup(string) slog.Handler { return h }
+
+// h2cConnect opens a CONNECT to authority over unencrypted HTTP/2 and returns the two ends of
+// its stream.
+func h2cConnect(t *testing.T, addr, authority string) (io.Writer, *bufio.Reader) {
+	t.Helper()
+	raw, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = raw.Close() })
+	cc, err := (&http2.Transport{AllowHTTP: true}).NewClientConn(raw)
+	require.NoError(t, err)
+	pr, pw := io.Pipe()
+	t.Cleanup(func() { _ = pw.Close() })
+	req, err := http.NewRequest(http.MethodConnect, "https://"+authority, pr)
+	require.NoError(t, err)
+	resp, err := cc.RoundTrip(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	return pw, bufio.NewReader(resp.Body)
+}

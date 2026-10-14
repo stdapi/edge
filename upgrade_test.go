@@ -1659,3 +1659,31 @@ var wsConformance = []conformanceCase{
 		skip: "a rule on the compressor and the decompressor, and edge never decompresses a payload",
 	},
 }
+
+func TestUpgrade_InsideAnHTTP2Connect(t *testing.T) {
+	origin := plainUpgradeOrigin(t)
+	originURL, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+	tr := DefaultTransport()
+	tr.DialContext = pinnedDialer(originURL.Host)
+	p := testProxy(t, WithTransport(tr))
+	p.MustAdd[TCP]("allowed.test:80", relayStream)
+	p.MustAdd("allowed.test/ws", forwardHandler, WithMethods[HTTP](http.MethodGet))
+
+	w, br := h2cConnect(t, startProxy(t, p), "allowed.test:80")
+	_, err = fmt.Fprintf(w, upgradeRequest, "/ws", "allowed.test")
+	require.NoError(t, err)
+	got := make(chan *http.Response, 1)
+	go func() {
+		resp, rerr := http.ReadResponse(br, nil)
+		if rerr == nil {
+			got <- resp
+		}
+	}()
+	select {
+	case resp := <-got:
+		assert.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+	case <-time.After(2 * time.Second):
+		t.Fatal("the upgrade was not answered")
+	}
+}

@@ -1657,3 +1657,29 @@ func TestServe_H2CClientWithoutConnect(t *testing.T) {
 	assert.Equal(t, HTTP2, seenProto)
 	assert.Equal(t, HTTP2, seenSessProto)
 }
+
+func TestLifecycle_ShutdownDrainsAnIdleConnectionInsideAnHTTP2Connect(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}))
+	t.Cleanup(origin.Close)
+	originURL, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+	tr := DefaultTransport()
+	tr.DialContext = pinnedDialer(originURL.Host)
+	p := testProxy(t, WithTransport(tr))
+	p.MustAdd("allowed.test/*{rest}", forwardHandler)
+
+	w, br := h2cConnect(t, startProxy(t, p), "allowed.test:80")
+	_, err = io.WriteString(w, "GET /idle HTTP/1.1\r\nHost: allowed.test\r\n\r\n")
+	require.NoError(t, err)
+	resp, err := http.ReadResponse(br, nil)
+	require.NoError(t, err)
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	require.Equal(t, "ok", string(body))
+
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	assert.NoError(t, p.Shutdown(ctx), "the idle connection inside the tunnel was not drained")
+}

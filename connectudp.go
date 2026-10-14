@@ -128,9 +128,12 @@ func (p *Proxy) serveConnectUDP(w http.ResponseWriter, r *http.Request, identity
 	}
 	tun.serve(ctx, pipe)
 	if cp, isCapsules := pipe.(*capsulePipe); isCapsules {
-		if stream, isStream := cp.conn.(*h2Stream); isStream && stream.aborted.Load() {
-			// A return ends the stream cleanly.
-			panic(http.ErrAbortHandler)
+		if stream, isStream := cp.conn.(*h2Stream); isStream {
+			stream.finish()
+			if stream.aborted.Load() {
+				// A return ends the stream cleanly.
+				panic(http.ErrAbortHandler)
+			}
 		}
 	}
 }

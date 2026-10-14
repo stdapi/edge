@@ -136,7 +136,6 @@ func (p *Proxy) connectStream(w http.ResponseWriter, r *http.Request, target Tar
 		panic(http.ErrAbortHandler)
 	}
 	defer func() {
-		_ = stream.Close()
 		stream.finish()
 		p.srv.untrack(cut)
 		if stream.aborted.Load() {

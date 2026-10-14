@@ -6,6 +6,7 @@ package edge
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
@@ -28,6 +29,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
 )
 
 // namedOrigin starts a TLS origin holding a certificate for name, signed by ca, that answers
@@ -232,11 +234,16 @@ func stalledH2Connect(t *testing.T) (*Proxy, *Session, *http.Response) {
 // relay serving it is reported.
 func openH2Connect(t *testing.T, origin net.Listener) (*Proxy, *Session, *http.Response) {
 	t.Helper()
+	return openH2ConnectTo(t, origin, relayStream)
+}
+
+func openH2ConnectTo(t *testing.T, origin net.Listener, h TCP) (*Proxy, *Session, *http.Response) {
+	t.Helper()
 	ca, err := GenerateCA()
 	require.NoError(t, err)
 	p, err := New(WithCA(ca))
 	require.NoError(t, err)
-	p.MustAdd[TCP](origin.Addr().String(), relayStream)
+	p.MustAdd[TCP](origin.Addr().String(), h)
 	addr := startProxy(t, p)
 
 	raw, err := net.Dial("tcp", addr)
@@ -259,8 +266,8 @@ func openH2Connect(t *testing.T, origin net.Listener) (*Proxy, *Session, *http.R
 }
 
 // assertStreamReset checks that the client sees its CONNECT stream reset, how a cut reaches
-// it over HTTP/2.
-func assertStreamReset(t *testing.T, resp *http.Response) {
+// it over HTTP/2, and returns the error of its read.
+func assertStreamReset(t *testing.T, resp *http.Response) error {
 	t.Helper()
 	ended := make(chan error, 1)
 	go func() {
@@ -270,9 +277,18 @@ func assertStreamReset(t *testing.T, resp *http.Response) {
 	select {
 	case err := <-ended:
 		require.Error(t, err, "the stream is reset for the client")
+		return err
 	case <-time.After(5 * time.Second):
 		t.Fatal("the client never saw the stream end")
+		return nil
 	}
+}
+
+func assertResetCode(t *testing.T, err error, code http2.ErrCode) {
+	t.Helper()
+	se, ok := errors.AsType[http2.StreamError](err)
+	require.True(t, ok, "the stream ended with %v", err)
+	assert.Equal(t, code, se.Code)
 }
 
 func TestConnect_CloseOnAStalledH2StreamReturns(t *testing.T) {
@@ -313,6 +329,89 @@ func TestConnect_ShutdownDeadlineCutsAnIdleH2Stream(t *testing.T) {
 	err := p.Shutdown(ctx)
 	assert.True(t, errors.Is(err, context.DeadlineExceeded), "%v", err)
 	assertStreamReset(t, resp)
+}
+
+// idleH2Connect opens a CONNECT over HTTP/2 served by a handler that does no I/O on the stream
+// and returns once its context ends.
+func idleH2Connect(t *testing.T) (*Proxy, *Session, *http.Response, <-chan struct{}) {
+	t.Helper()
+	started, ended := make(chan struct{}), make(chan struct{})
+	p, sess, resp := openH2ConnectTo(t, sinkOrigin(t), func(c *TCPCtx) error {
+		close(started)
+		<-c.Context().Done()
+		close(ended)
+		return nil
+	})
+	<-started
+	return p, sess, resp, ended
+}
+
+func TestConnect_CloseResetsAnH2StreamOutsideItsHandlerIO(t *testing.T) {
+	_, sess, resp, ended := idleH2Connect(t)
+	require.NoError(t, sess.Close())
+	assertResetCode(t, assertStreamReset(t, resp), http2.ErrCodeInternal)
+	select {
+	case <-ended:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the handler context did not end")
+	}
+}
+
+func TestConnect_ShutdownDeadlineCutsAnH2StreamOutsideItsHandlerIO(t *testing.T) {
+	p, _, resp, ended := idleH2Connect(t)
+	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+	defer cancel()
+	err := p.Shutdown(ctx)
+	assert.True(t, errors.Is(err, context.DeadlineExceeded), "%v", err)
+	assertResetCode(t, assertStreamReset(t, resp), http2.ErrCodeInternal)
+	select {
+	case <-ended:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the handler context did not end")
+	}
+}
+
+// tcpStalledH2Connect opens a CONNECT over HTTP/2 to an origin that floods, with windows wide
+// enough that the relay fills the socket, and a client that never reads its connection.
+func tcpStalledH2Connect(t *testing.T) *Session {
+	t.Helper()
+	origin := floodingOrigin(t)
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+	p.MustAdd[TCP](origin.Addr().String(), relayStream)
+	addr := startProxy(t, p)
+
+	raw, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = raw.Close() })
+	_, err = raw.Write([]byte(http2.ClientPreface))
+	require.NoError(t, err)
+	fr := http2.NewFramer(raw, raw)
+	require.NoError(t, fr.WriteSettings(http2.Setting{ID: http2.SettingInitialWindowSize, Val: 1<<31 - 1}))
+	require.NoError(t, fr.WriteWindowUpdate(0, 1<<31-1-65535))
+	var buf bytes.Buffer
+	enc := hpack.NewEncoder(&buf)
+	require.NoError(t, enc.WriteField(hpack.HeaderField{Name: ":method", Value: http.MethodConnect}))
+	require.NoError(t, enc.WriteField(hpack.HeaderField{Name: ":authority", Value: origin.Addr().String()}))
+	require.NoError(t, fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: buf.Bytes(), EndHeaders: true}))
+	require.NoError(t, fr.WriteData(1, false, []byte("x")))
+	sess := waitForSessions(t, p, 1)[0]
+	time.Sleep(time.Second)
+	return sess
+}
+
+func TestConnect_CloseReturnsBehindAClientThatStoppedReadingItsConnection(t *testing.T) {
+	sess := tcpStalledH2Connect(t)
+	closed := make(chan error, 1)
+	go func() { closed <- sess.Close() }()
+	select {
+	case err := <-closed:
+		require.NoError(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("Session.Close waited for the client to read its connection")
+	}
 }
 
 // openH3Connect opens a CONNECT over HTTP/3 to origin and returns once its response header

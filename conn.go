@@ -422,38 +422,50 @@ func (s *h2Stream) Write(b []byte) (int, error) {
 func (s *h2Stream) Close() error {
 	s.cmu.Lock()
 	defer s.cmu.Unlock()
-	if !s.stop() {
+	if !s.stop(false) {
 		return nil
 	}
 	return s.body.Close()
 }
 
-// stop refuses every later write and waits out the one in flight, and reports whether the
-// stream was open. The caller holds cmu.
-func (s *h2Stream) stop() bool {
+// stop refuses every later write and reports whether the stream was open. With reset, or when a
+// write is in flight, it resets an HTTP/2 stream. The caller holds cmu.
+func (s *h2Stream) stop(reset bool) bool {
 	if s.closed.Swap(true) {
 		return false
 	}
-	// A write in flight returns once the stream is reset, which a deadline in the past does
-	// at once. The barrier then leaves the response writer idle for the caller.
-	if !s.wmu.TryLock() {
+	// A deadline in the past resets the stream at once. The write in flight returns only once
+	// the reset is written to the connection, which a client that stopped reading delays.
+	if reset || !s.wmu.TryLock() {
 		_ = http.NewResponseController(s.w).SetWriteDeadline(time.Now())
-		s.wmu.Lock()
+		return true
 	}
 	s.wmu.Unlock()
 	return true
 }
 
-// Abort closes the stream and resets it. An HTTP/3 stream is reset at once with
-// H3_CONNECT_ERROR, and an HTTP/2 stream by the handler serving it once it returns.
+// idle returns once no write is in flight.
+func (s *h2Stream) idle() {
+	s.wmu.Lock()
+	s.wmu.Unlock() //nolint:staticcheck // an empty section is the barrier
+}
+
+// Abort closes the stream and resets it, an HTTP/3 stream with H3_CONNECT_ERROR and an HTTP/2
+// stream with INTERNAL_ERROR.
 func (s *h2Stream) Abort() {
 	hs, ok := s.w.(http3.HTTPStreamer)
-	if !ok {
-		s.aborted.Store(true)
-		_ = s.Close()
+	if ok {
+		s.reset(hs, http3.ErrCodeConnectError)
 		return
 	}
-	s.reset(hs, http3.ErrCodeConnectError)
+	// A stream already closed is reset by its handler on return.
+	s.aborted.Store(true)
+	s.cmu.Lock()
+	defer s.cmu.Unlock()
+	if s.finished || !s.stop(true) {
+		return
+	}
+	_ = s.body.Close()
 }
 
 // streamCut ends a CONNECT stream with a reset when [Session.Close] or a shutdown cut closes it.
@@ -473,7 +485,8 @@ func (s *h2Stream) reset(hs http3.HTTPStreamer, code http3.ErrCode) {
 	}
 	// HTTPStream flushes the response writer, so stop first ends any write in flight. Closing
 	// the body cancels the read with a code of its own, so it comes last.
-	open := s.stop()
+	open := s.stop(false)
+	s.idle()
 	str := hs.HTTPStream()
 	str.CancelWrite(quic.StreamErrorCode(code))
 	str.CancelRead(quic.StreamErrorCode(code))
@@ -482,11 +495,16 @@ func (s *h2Stream) reset(hs http3.HTTPStreamer, code http3.ErrCode) {
 	}
 }
 
-// finish keeps reset off the response writer, which is invalid once the handler returns.
+// finish closes the stream before its handler returns. The response writer is invalid past that
+// return, and every later call on the stream leaves it alone.
 func (s *h2Stream) finish() {
 	s.cmu.Lock()
-	defer s.cmu.Unlock()
 	s.finished = true
+	if s.stop(false) {
+		_ = s.body.Close()
+	}
+	s.cmu.Unlock()
+	s.idle()
 }
 
 // CloseWrite ends the proxy-to-client direction of an HTTP/3 stream, which goes on receiving. An
@@ -541,7 +559,9 @@ type deadlineReader struct {
 	r        io.Reader
 	err      error
 	res      chan readResult
-	deadline atomic.Pointer[time.Time]
+	deadline time.Time
+	// changed is closed when the deadline moves under a blocked read.
+	changed chan struct{}
 	// buf is the one buffer the reading goroutine fills. It is handed out again only once
 	// that goroutine has delivered and rest is drained, so a read never writes into bytes a
 	// caller is still holding.
@@ -550,6 +570,7 @@ type deadlineReader struct {
 	mu   sync.Mutex
 	// pending is set while a read goroutine is still running for this reader.
 	pending bool
+	waiting int
 }
 
 type readResult struct {
@@ -561,48 +582,89 @@ func newDeadlineReader(r io.Reader) *deadlineReader {
 	return &deadlineReader{r: r, res: make(chan readResult, 1)}
 }
 
-func (d *deadlineReader) setDeadline(t time.Time) { d.deadline.Store(&t) }
+func (d *deadlineReader) setDeadline(t time.Time) {
+	d.mu.Lock()
+	d.deadline = t
+	d.wakeLocked()
+	d.mu.Unlock()
+}
+
+// wakeLocked wakes the blocked reads, which look again at the deadline, the bytes left and the
+// error. d.mu must be held.
+func (d *deadlineReader) wakeLocked() {
+	if d.waiting > 0 && d.changed != nil {
+		close(d.changed)
+		d.changed = nil
+	}
+}
 
 func (d *deadlineReader) Read(b []byte) (int, error) {
 	d.mu.Lock()
-	if len(d.rest) > 0 {
-		n := copy(b, d.rest)
-		d.rest = d.rest[n:]
-		d.mu.Unlock()
-		return n, nil
-	}
-	if d.err != nil {
-		err := d.err
-		d.mu.Unlock()
-		return 0, err
-	}
-	if !d.pending {
-		d.pending = true
-		if cap(d.buf) < len(b) {
-			d.buf = make([]byte, max(len(b), copyBufSize))
+	for {
+		if len(d.rest) > 0 {
+			n := copy(b, d.rest)
+			d.rest = d.rest[n:]
+			d.mu.Unlock()
+			return n, nil
 		}
-		buf := d.buf[:cap(d.buf)]
-		go func() {
-			n, err := d.r.Read(buf)
-			d.res <- readResult{b: buf[:n], err: err}
-		}()
-	}
-	d.mu.Unlock()
+		if d.err != nil {
+			err := d.err
+			d.mu.Unlock()
+			return 0, err
+		}
+		if !d.pending {
+			d.pending = true
+			if cap(d.buf) < len(b) {
+				d.buf = make([]byte, max(len(b), copyBufSize))
+			}
+			buf := d.buf[:cap(d.buf)]
+			go func() {
+				n, err := d.r.Read(buf)
+				d.res <- readResult{b: buf[:n], err: err}
+			}()
+		}
 
-	var timeout <-chan time.Time
-	if dl := d.deadline.Load(); dl != nil && !dl.IsZero() {
-		timer := time.NewTimer(time.Until(*dl))
-		defer timer.Stop()
-		timeout = timer.C
-	}
+		deadline := d.deadline
+		if d.changed == nil {
+			d.changed = make(chan struct{})
+		}
+		changed := d.changed
+		d.waiting++
+		d.mu.Unlock()
 
-	select {
-	case res := <-d.res:
+		var timer *time.Timer
+		var timeout <-chan time.Time
+		if !deadline.IsZero() {
+			timer = time.NewTimer(time.Until(deadline))
+			timeout = timer.C
+		}
+
+		var res readResult
+		got := false
+		select {
+		case res = <-d.res:
+			got = true
+		case <-timeout:
+		case <-changed:
+		}
+		if timer != nil {
+			timer.Stop()
+		}
 		d.mu.Lock()
+		d.waiting--
+		if !got {
+			if changed != d.changed {
+				continue
+			}
+			d.mu.Unlock()
+			return 0, os.ErrDeadlineExceeded
+		}
+
 		d.pending = false
 		d.err = res.err
 		n := copy(b, res.b)
 		d.rest = res.b[n:]
+		d.wakeLocked()
 		err := d.err
 		if n > 0 {
 			// The bytes come first; the error is reported on the read that finds nothing
@@ -611,8 +673,6 @@ func (d *deadlineReader) Read(b []byte) (int, error) {
 		}
 		d.mu.Unlock()
 		return n, err
-	case <-timeout:
-		return 0, os.ErrDeadlineExceeded
 	}
 }
 
