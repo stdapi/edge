@@ -780,24 +780,29 @@ func splitAuthority(authority string) (host, port string, ok bool) {
 		if rest := authority[len(host)+2:]; rest != "" && (rest[0] != ':' || rest[1:] != port) {
 			return "", "", false
 		}
-	} else {
-		for i := 0; i < len(host); i++ {
-			switch {
-			case host[i] == '%':
-				if i+2 >= len(host) {
-					return "", "", false
-				}
-				if _, hex := stringsutil.DecodeHexPair(host[i+1], host[i+2]); !hex {
-					return "", "", false
-				}
-				i += 2
-			case notInHost[host[i]]:
-				return "", "", false
-			}
-		}
+	} else if !isRegName(host) {
+		return "", "", false
 	}
 	port, ok = canonicalPort(port)
 	return host, port, ok
+}
+
+func isRegName(host string) bool {
+	for i := 0; i < len(host); i++ {
+		switch {
+		case host[i] == '%':
+			if i+2 >= len(host) {
+				return false
+			}
+			if _, hex := stringsutil.DecodeHexPair(host[i+1], host[i+2]); !hex {
+				return false
+			}
+			i += 2
+		case notInHost[host[i]]:
+			return false
+		}
+	}
+	return true
 }
 
 // notInHost marks every byte other than the unreserved characters and the sub-delims of RFC 3986,

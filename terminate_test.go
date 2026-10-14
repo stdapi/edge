@@ -343,6 +343,7 @@ func TestTerminate_RefusedClientHelloAlert(t *testing.T) {
 	withSNI := captureClientHello(t, &tls.Config{ServerName: tlsName, InsecureSkipVerify: true, MinVersion: tls.VersionTLS12})
 	withoutSNI := captureClientHello(t, &tls.Config{InsecureSkipVerify: true, MinVersion: tls.VersionTLS12})
 	unknown := captureClientHello(t, &tls.Config{ServerName: "unknown.test", InsecureSkipVerify: true, MinVersion: tls.VersionTLS12})
+	slashed := captureClientHello(t, &tls.Config{ServerName: "a/b." + tlsName, InsecureSkipVerify: true, MinVersion: tls.VersionTLS12})
 	// The extensions block claims one byte more than it has, inside a well framed message.
 	malformed := func() []byte {
 		msg := handshakeFromRecords(withSNI)
@@ -408,6 +409,16 @@ func TestTerminate_RefusedClientHelloAlert(t *testing.T) {
 			p, _ := newTLSProxy(t)
 			return connectRaw(t, startProxy(t, p), tlsName+":443")
 		}},
+		{name: "a server name that is not a hostname", hello: slashed, alert: alertIllegalParameter, open: func(t *testing.T) net.Conn {
+			p, _ := newTLSProxy(t)
+			p.MustAdd[TCP]("{sub}."+tlsName, relayStream)
+			return connectRaw(t, startProxy(t, p), tlsName+":443")
+		}},
+		{name: "a server name that is not a hostname, without a destination", hello: slashed, alert: alertIllegalParameter, open: func(t *testing.T) net.Conn {
+			p, _ := newTLSProxy(t)
+			p.MustAdd[TCP]("{sub}."+tlsName, relayStream)
+			return dial(t, startTransparent(t, p))
+		}},
 		{name: "a server name no entry admits through a CONNECT over HTTP/2", hello: unknown, alert: alertUnrecognizedName, open: func(t *testing.T) net.Conn {
 			p, ca := newTLSProxy(t)
 			return h2Connect(t, startTLSFront(t, p, ca, "h2"), ca, tlsName+":443")
@@ -432,6 +443,11 @@ func TestTerminate_RefusedClientHelloAlert(t *testing.T) {
 		{name: "StartTLS without a certificate authority", hello: withSNI, alert: alertInternalError, open: func(t *testing.T) net.Conn {
 			p, err := New()
 			require.NoError(t, err)
+			p.MustAdd[TCP](tlsDB, startTLSLine)
+			return starttls(t, connectRaw(t, startProxy(t, p), tlsDB+":5432"))
+		}},
+		{name: "StartTLS with a server name that is not a hostname", hello: slashed, alert: alertIllegalParameter, open: func(t *testing.T) net.Conn {
+			p, _ := newTLSProxy(t)
 			p.MustAdd[TCP](tlsDB, startTLSLine)
 			return starttls(t, connectRaw(t, startProxy(t, p), tlsDB+":5432"))
 		}},

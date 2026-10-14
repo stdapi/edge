@@ -35,6 +35,7 @@ const (
 	tlsAlertRecord        = 0x15
 	alertLevelFatal       = 2
 	alertHandshakeFailure = 40
+	alertIllegalParameter = 47
 	alertDecodeError      = 50
 	alertInternalError    = 80
 	alertMissingExtension = 109
@@ -251,11 +252,14 @@ func (p *Proxy) placeTLS(ctx context.Context, conn *peekConn, sess *Session) err
 // errHelloCutShort refuses a ClientHello its stream ended inside, a malformed message.
 var errHelloCutShort = errors.New("edge: a ClientHello cut short by the end of its stream")
 
+var errServerNameInvalid = fmt.Errorf("%w, the server name is not a hostname", ErrConnectionRejected)
+
 // peekClientHello reads the ClientHello waiting on conn without consuming it, nil when there
 // is none it can read, with the alert of clientHelloFromRecords. An error with an alert is a
-// refusal, of a ClientHello its stream ended inside or of one offering Encrypted Client Hello
-// the proxy rejects. An error with none is that of a read, which timed out, which the peer
-// failed, or which ended before a TLS record began.
+// refusal, of a ClientHello its stream ended inside, of one offering Encrypted Client Hello the
+// proxy rejects, or of one with a server name that is not a reg-name of RFC 3986. An error with
+// none is that of a read, which timed out, which the peer failed, or which ended before a TLS
+// record began.
 func (p *Proxy) peekClientHello(conn *peekConn) (*ClientHello, byte, error) {
 	raw, err := peekHandshakeRecords(conn)
 	if isTimeout(err) {
@@ -285,6 +289,9 @@ func (p *Proxy) peekClientHello(conn *peekConn) (*ClientHello, byte, error) {
 		return nil, 0, nil
 	}
 	hello, alert := clientHelloFromRecords(raw)
+	if hello != nil && !isRegName(hello.ServerName) {
+		return nil, alertIllegalParameter, errServerNameInvalid
+	}
 	return hello, alert, nil
 }
 

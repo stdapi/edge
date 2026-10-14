@@ -572,6 +572,7 @@ const alertNoApplicationProtocol = 120
 // The QUIC codes of the TLS alerts a refusal sends, 0x100 plus the alert, RFC 9001 section 4.8.
 const (
 	quicHandshakeFailure      = quic.TransportErrorCode(0x100 + alertHandshakeFailure)
+	quicIllegalParameter      = quic.TransportErrorCode(0x100 + alertIllegalParameter)
 	quicDecodeError           = quic.TransportErrorCode(0x100 + alertDecodeError)
 	quicInternalError         = quic.TransportErrorCode(0x100 + alertInternalError)
 	quicMissingExtension      = quic.TransportErrorCode(0x100 + alertMissingExtension)
@@ -2321,6 +2322,10 @@ func (d *quicDemux) place(from flowKey, client net.Addr, conn *quicConn, hello [
 			code = quic.TransportErrorCode(0x100 + uint64(alert))
 		}
 		d.refuseConn(from, conn, code, "the ClientHello cannot be parsed")
+		return
+	}
+	if !isRegName(ch.ServerName) {
+		d.refuseConn(from, conn, quicIllegalParameter, "the server name is not a hostname")
 		return
 	}
 	target := d.targetFor(ch, conn)

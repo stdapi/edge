@@ -536,6 +536,7 @@ func TestQUIC_RefusalCodes(t *testing.T) {
 		code   uint64
 	}{
 		{"no entry admits the server name", "refused.example.test", []string{"h3"}, 0x170},
+		{"a server name that is not a hostname", "a/b." + h3Authority, []string{"h3"}, 0x12f},
 		{"no server name and no destination", "", []string{"h3"}, 0x16d},
 		{"an offer without a protocol", h3Authority, nil, 0x178},
 		{"an offer without h3 to an authority admitted for HTTP", h3Authority, []string{"x-test"}, 0x178},
