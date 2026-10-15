@@ -147,7 +147,9 @@ func (m *MessageCtx) Forward() error {
 // Send sends b in place of the message, in its direction, with the compressed flag clear. A
 // send toward the origin fails once the request stream is half-closed or the origin stops
 // reading it, and is dropped once [GRPCCtx.Outbound] has ended on the end of the response. A
-// send toward the client fails until the origin has answered.
+// handler that returns the error of an origin that stopped reading ends the call as when it
+// returns nil, once the origin has answered. A send toward the client fails until the origin
+// has answered.
 func (m *MessageCtx) Send(b []byte) error { return m.call.writeMessage(m.inbound, 0, b) }
 
 // SendCompressed sends b in place of the message, in its direction, with the compressed flag
@@ -372,60 +374,238 @@ func (g *messageGate) Close() error { return g.r.Close() }
 // grpcCall is the state of a call the handler owns. It is allocated per call, since a pump
 // still blocked in a body read when the handler returns must find a dead call and never the
 // pooled context serving the next one.
+//
+// Once the call is open, run owns its state and takes every decision. The other goroutines do
+// the I/O of one resource each, post an event on each transition, and read only the facts run
+// publishes before it closes a pipe.
 type grpcCall struct {
 	ctx          context.Context
 	w            http.ResponseWriter
 	upErr        error
-	cut          error
-	req          *http.Request
+	cutErr       error
 	outBody      io.Reader
-	outPw        *io.PipeWriter
-	send         sendBody
-	inPw         *io.PipeWriter
-	inPr         *io.PipeReader
+	req          *http.Request
 	upResp       *http.Response
 	cancel       context.CancelFunc
-	respCh       chan struct{}
+	ev           chan callEvent
+	done         chan struct{}
+	answered     chan struct{}
+	ctl          chan callReply // the handler, its Fail, CloseSend and return
+	outReply     chan callReply // the reader of Outbound
+	inReply      chan callReply // the reader of Inbound
 	outR         *MessageReader
 	inR          *MessageReader
+	send         sendBody
 	route        grpcRoute
-	msg          string
+	fin          callFinal
 	trailerNames []string
 	outBuf       []byte
 	inBuf        []byte
-	wg           sync.WaitGroup
-	sendWg       sync.WaitGroup // the relay of the request messages the handler left
+	st           callState
+	toOrigin     callPipe
+	toClient     callPipe
 	max          int
-	mu           sync.Mutex // opened, outClosed, originDone, sendStopped, respCh and the readers
+	mu           sync.Mutex // the readers, outBody and opened against each other
+	ctlMu        sync.Mutex // one wait on ctl at a time
 	outMu        sync.Mutex // writes toward the origin
 	outSrcMu     sync.Mutex // reads of the request stream
 	inMu         sync.Mutex // writes toward the client
-	bodyMu       sync.Mutex // upstream body reads against the trailer read, filled inside the EOF read
-	code         Code
-	opened       bool
-	outClosed    bool
-	outEOF       bool
-	outCut       bool
-	outRead      bool
-	inDone       bool
-	ended        bool
+	opened       atomic.Bool
+	outRead      atomic.Bool
+	originDone   atomic.Bool
+	sendStopped  atomic.Bool
+	readStopped  atomic.Bool // the transport no longer reads the request stream
 	passthrough  bool
 	trailersOnly bool
-	originDone   bool
-	sendStopped  bool
+}
+
+// callState is owned by the handler until Open and by run after.
+type callState struct {
+	retErr       error
+	cut          error
+	cutCause     error // why the request stream toward the origin was reset
+	echo         error // the first failure of Inbound after that reset
+	msg          string
+	code         Code
+	send         sendState
+	ended        bool
+	outEOF       bool
+	inAsked      bool
+	inEnded      bool
+	answered     bool
+	returned     bool
+	relayIn      bool
+	relaying     bool
+	finWritten   bool
+	finalWaiting bool
+	finalized    bool
+	stoppedEarly bool
+	stopReturn   bool
+	handlerEnded bool
+	inWaiting    bool
+	rtDone       bool
+	rwDone       bool
+}
+
+// The first status set is what the client reads.
+func (s *callState) setStatus(code Code, msg string) {
+	if !s.ended {
+		s.code, s.msg, s.ended = code, msg, true
+	}
+}
+
+type sendState uint8
+
+const (
+	sendOpen sendState = iota
+	sendClosed
+	sendCut
+	sendStopped
+)
+
+// callFinal is what the response writer reads once the pipe toward the client has ended. run
+// writes it once, before it closes that pipe.
+type callFinal struct {
+	msg     string
+	code    Code
+	ended   bool
+	inEnded bool
+}
+
+type eventKind uint8
+
+const (
+	evAnswered      eventKind = iota // the round trip returned
+	evOriginStopped                  // the transport stopped reading the request stream
+	evOutEnd                         // a read of Outbound failed, answered with what it returns
+	evInbound                        // Inbound was asked for
+	evInEnd                          // a read of Inbound failed
+	evInWait                         // the Inbound reader waits for a relayed response to end
+	evCloseSend
+	evFail
+	evRWDone    // the response writer returned
+	evRelayDone // the relay of Outbound after the return ended
+	evReturn    // the handler returned, answered with what to relay
+	evFinalize  // answered once the end of the call is decided
+)
+
+type callEvent struct {
+	err   error
+	cause error
+	msg   string
+	code  Code
+	kind  eventKind
+	ended bool
+}
+
+type callReply struct {
+	err      error
+	relayOut bool
+	relayIn  bool
 }
 
 // sendBody is the request stream of an open call as the upstream transport reads it. The
 // transport closes it once it stops reading, the only sign of an origin that ended a response
 // the handler does not read.
-type sendBody struct {
-	*io.PipeReader
-	call *grpcCall
-}
+type sendBody struct{ call *grpcCall }
+
+func (b *sendBody) Read(p []byte) (int, error) { return b.call.toOrigin.Read(p) }
 
 func (b *sendBody) Close() error {
-	b.call.originStoppedReading()
-	return b.PipeReader.Close()
+	if !b.call.post(callEvent{kind: evOriginStopped}) {
+		b.call.toOrigin.closeRead(nil)
+	}
+	return nil
+}
+
+// callPipe is an io.Pipe embedded in the call it serves, which allocates nothing. A write
+// returns once every byte was read or the pipe closed.
+type callPipe struct {
+	rerr error
+	werr error
+	cond sync.Cond
+	buf  []byte
+	mu   sync.Mutex
+	wmu  sync.Mutex // one write at a time
+	done bool
+}
+
+func (p *callPipe) init() { p.cond.L = &p.mu }
+
+func (p *callPipe) Read(b []byte) (int, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for len(p.buf) == 0 && !p.done {
+		p.cond.Wait()
+	}
+	if p.done {
+		if p.rerr == nil && p.werr != nil {
+			return 0, p.werr
+		}
+		return 0, io.ErrClosedPipe
+	}
+	n := copy(b, p.buf)
+	p.buf = p.buf[n:]
+	if len(p.buf) == 0 {
+		p.cond.Broadcast()
+	}
+	return n, nil
+}
+
+func (p *callPipe) Write(b []byte) (int, error) {
+	p.wmu.Lock()
+	defer p.wmu.Unlock()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.done {
+		return 0, p.writeErr()
+	}
+	p.buf = b
+	p.cond.Broadcast()
+	for len(p.buf) > 0 && !p.done {
+		p.cond.Wait()
+	}
+	n := len(b) - len(p.buf)
+	p.buf = nil
+	if n == len(b) {
+		return n, nil
+	}
+	return n, p.writeErr()
+}
+
+func (p *callPipe) writeErr() error {
+	if p.werr == nil && p.rerr != nil {
+		return p.rerr
+	}
+	return io.ErrClosedPipe
+}
+
+// closeRead ends the pipe for the writer with err, or io.ErrClosedPipe when err is nil.
+func (p *callPipe) closeRead(err error) {
+	if err == nil {
+		err = io.ErrClosedPipe
+	}
+	p.mu.Lock()
+	if p.rerr == nil {
+		p.rerr = err
+	}
+	p.done = true
+	p.cond.Broadcast()
+	p.mu.Unlock()
+}
+
+// closeWrite ends the pipe for the reader with err, or io.EOF when err is nil.
+func (p *callPipe) closeWrite(err error) {
+	if err == nil {
+		err = io.EOF
+	}
+	p.mu.Lock()
+	if p.werr == nil {
+		p.werr = err
+	}
+	p.done = true
+	p.cond.Broadcast()
+	p.mu.Unlock()
 }
 
 func (c *GRPCCtx) routeOf() grpcRoute {
@@ -657,7 +837,8 @@ func (b *refusedBody) Close() error { return b.gate.Close() }
 // returns, and so is what remains of [GRPCCtx.Outbound] when it returns nil without
 // [GRPCCtx.Fail] or [GRPCCtx.CloseSend]. The call ends on the trailers of the origin when the
 // handler returns after Inbound ended, and otherwise on a status the proxy sets, the one given
-// to [GRPCCtx.Fail], the one the returned error maps to, or [CodeInternal]. A status the proxy
+// to [GRPCCtx.Fail], the one the returned error maps to, or [CodeInternal]. An error of
+// Inbound that follows a reset of Outbound maps as the error that reset it. A status the proxy
 // sets resets what remains of Outbound toward the origin. A response with a status other than
 // 200 or a content type other than gRPC is relayed unchanged with no status set, and Inbound
 // ends once it is relayed.
@@ -714,110 +895,298 @@ func (c *GRPCCtx) finishOpenCall(err error) (opened bool, cut error) {
 	return true, c.call.finish(err)
 }
 
-func (k *grpcCall) isOpen() bool {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	return k.opened
-}
+func (k *grpcCall) isOpen() bool { return k.opened.Load() }
 
-func (k *grpcCall) outboundRead() bool {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	return k.outRead
+func (k *grpcCall) outboundRead() bool { return k.outRead.Load() }
+
+func requestBody(req *http.Request) io.Reader {
+	if req.Body != nil {
+		return req.Body
+	}
+	return http.NoBody
 }
 
 func (k *grpcCall) open(h *HTTPCtx, req *http.Request, w http.ResponseWriter) error {
-	k.mu.Lock()
-	if k.opened {
-		k.mu.Unlock()
+	if k.opened.Load() {
 		return nil
 	}
-	outPr, outPw := io.Pipe()
-	inPr, inPw := io.Pipe()
 	ctx, cancel := context.WithCancel(req.Context())
-	k.w, k.req = w, req
-	k.outPw, k.inPw, k.inPr = outPw, inPw, inPr
-	k.cancel = cancel
-	k.respCh = make(chan struct{})
-	k.opened = true
+	k.w, k.req, k.cancel = w, req, cancel
+	k.toOrigin.init()
+	k.toClient.init()
+	k.ev = make(chan callEvent)
+	k.done = make(chan struct{})
+	k.answered = make(chan struct{})
+	k.ctl = make(chan callReply)
+	k.outReply = make(chan callReply)
+	k.inReply = make(chan callReply)
+	k.mu.Lock()
+	if k.outBody == nil {
+		k.outBody = requestBody(req)
+	}
+	k.st.inAsked = k.inR != nil
+	k.opened.Store(true)
 	k.mu.Unlock()
 
 	out := req.WithContext(ctx)
-	k.send = sendBody{PipeReader: outPr, call: k}
+	k.send.call = k
 	out.Body = &k.send
 	// The handler decides which messages go up, so the declared length no longer holds.
 	out.ContentLength = -1
 
-	// finish joins both goroutines before the context returns to its pool, so the round trip
-	// may read the pooled state.
-	k.wg.Go(func() {
-		resp, err := h.ForwardRequest(out)
-		if err != nil {
-			k.upErr = upstreamError{err}
-			h.r.p.logf(ctx, slog.LevelDebug, "grpc call failed", h.r.sess, err)
-			// Nothing else ends a write into the pipe once the transport gave up on it.
-			_ = outPr.CloseWithError(k.upErr)
-		} else {
-			k.upResp = resp
-			k.passthrough = resp.StatusCode != http.StatusOK || !isGRPCContentType(resp.Header.Get("Content-Type"))
-			_, status := resp.Header["Grpc-Status"]
-			k.trailersOnly = !k.passthrough && status
-			// The trailer names are known with the headers, and the values are written by
-			// the body read that returns EOF. The names are copied before that read can
-			// happen.
-			for name := range resp.Trailer {
-				k.trailerNames = append(k.trailerNames, name)
-			}
-		}
-		close(k.respCh)
-		if k.trailersOnly {
-			k.originEnded()
-		}
-	})
-	k.wg.Go(k.serveResponse)
+	go k.run()
+	go k.roundTrip(h, out)
+	go k.serveResponse()
 	return nil
 }
 
-func (k *grpcCall) closeSend() error {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	if !k.opened || k.outClosed {
-		return nil
+// post hands e to run, and reports false once run has exited.
+func (k *grpcCall) post(e callEvent) bool {
+	select {
+	case k.ev <- e:
+		return true
+	case <-k.done:
+		return false
 	}
-	k.outClosed = true
-	return k.outPw.Close()
+}
+
+// request posts e and waits for the answer of run on reply, which only one goroutine waits
+// on at a time.
+func (k *grpcCall) request(reply chan callReply, e callEvent) (callReply, bool) {
+	if !k.post(e) {
+		return callReply{}, false
+	}
+	return <-reply, true
+}
+
+// roundTrip sends the request headers and waits for the origin to answer. finish waits for
+// run, which outlives it, before the context returns to its pool, so it may read the pooled
+// state.
+func (k *grpcCall) roundTrip(h *HTTPCtx, out *http.Request) {
+	resp, err := h.ForwardRequest(out)
+	if err != nil {
+		k.upErr = upstreamError{err}
+		h.r.p.logf(out.Context(), slog.LevelDebug, "grpc call failed", h.r.sess, err)
+	} else {
+		k.upResp = resp
+		k.passthrough = resp.StatusCode != http.StatusOK || !isGRPCContentType(resp.Header.Get("Content-Type"))
+		_, status := resp.Header["Grpc-Status"]
+		k.trailersOnly = !k.passthrough && status
+		// The trailer names are known with the headers, and the values are written by the
+		// body read that returns EOF. The names are copied before that read can happen.
+		for name := range resp.Trailer {
+			k.trailerNames = append(k.trailerNames, name)
+		}
+	}
+	k.post(callEvent{kind: evAnswered})
+}
+
+// run decides every transition of an open call. It blocks on nothing but its events, so it
+// never closes the body of an HTTP/1.1 request, whose Close waits for a read in progress.
+func (k *grpcCall) run() {
+	st := &k.st
+	for {
+		e := <-k.ev
+		switch e.kind {
+		case evAnswered:
+			st.rtDone, st.answered = true, true
+			close(k.answered)
+			switch {
+			case k.upErr != nil:
+				// Nothing else ends a write into the pipe once the transport gave up on it.
+				k.toOrigin.closeRead(k.upErr)
+			case k.trailersOnly:
+				st.inEnded = true
+				k.originEnded()
+			}
+		case evOriginStopped:
+			// The origin may have ended its response or reset it, so the call ends on the
+			// response once the handler returns.
+			// A transport also closes the request stream once it has sent all of it.
+			if st.send == sendOpen {
+				k.readStopped.Store(true)
+				st.stoppedEarly = !st.answered
+				if !st.inAsked {
+					st.send = sendStopped
+					k.sendStopped.Store(true)
+					k.closeClientBody()
+				}
+			}
+			k.toOrigin.closeRead(nil)
+		case evOutEnd:
+			err := e.err
+			switch {
+			case k.originDone.Load():
+				err = io.EOF
+			case st.send == sendStopped:
+				err = errOriginStopped
+			}
+			st.outEOF = errors.Is(err, io.EOF)
+			if errors.Is(err, errCallRefused) {
+				st.setStatus(CodeUnavailable, CodeUnavailable.String())
+			}
+			k.endSend(err)
+			k.outReply <- callReply{err: err}
+		case evInbound:
+			st.inAsked = true
+		case evInEnd:
+			switch {
+			case errors.Is(e.err, io.EOF):
+				st.inEnded = true
+				k.originEnded()
+			case st.finalized:
+				// The read failed on the cancel of finalize.
+			default:
+				if st.send == sendCut && st.echo == nil {
+					st.echo = e.err
+				}
+				if errors.Is(e.err, errCallRefused) {
+					st.setStatus(CodeUnavailable, CodeUnavailable.String())
+				}
+				k.markCut(e.err)
+			}
+			k.inReply <- callReply{}
+		case evInWait:
+			if st.rwDone {
+				k.inReply <- callReply{}
+			} else {
+				st.inWaiting = true
+			}
+		case evCloseSend:
+			if st.send == sendOpen {
+				st.send = sendClosed
+				k.toOrigin.closeWrite(nil)
+			}
+			k.ctl <- callReply{}
+		case evFail:
+			st.setStatus(e.code, e.msg)
+			k.endSend(errSendCut)
+			k.cancel()
+			k.closeToClient()
+			k.ctl <- callReply{}
+		case evRWDone:
+			st.rwDone = true
+			if k.passthrough {
+				switch {
+				case errors.Is(e.err, errBodyCut):
+					st.cut = e.err
+				case e.err == nil:
+					k.originEnded()
+				}
+			}
+			if st.inWaiting {
+				st.inWaiting = false
+				k.inReply <- callReply{}
+			}
+		case evRelayDone:
+			st.relaying = false
+		case evReturn:
+			k.onReturn(e.err)
+		case evFinalize:
+			st.finalWaiting = true
+			if e.ended {
+				st.inEnded = true
+			}
+			if e.err != nil {
+				st.retErr = e.err
+			}
+			if e.cause != nil {
+				if st.send == sendCut && st.echo == nil {
+					st.echo = e.cause
+				}
+				k.markCut(e.cause)
+			}
+		}
+
+		// The relay of a response that is not gRPC runs to its end, as Forward does, before
+		// the origin is canceled. A handler that returned the error of an origin that stopped
+		// reading before it answered ends the call on that answer.
+		awaitAnswer := st.stoppedEarly && !st.answered && st.stopReturn && !st.ended
+		if st.finalWaiting && !st.finalized && !awaitAnswer && (!st.answered || !k.passthrough || st.rwDone) {
+			k.finalize()
+		}
+		if st.finalized && st.rtDone && st.rwDone && !st.relaying {
+			// A status set before the cut is what the client reads, except on a relayed
+			// response where no status can be written.
+			if st.cut != nil && (k.passthrough || !st.handlerEnded) {
+				k.cutErr = st.cut
+			}
+			close(k.done)
+			return
+		}
+	}
+}
+
+func (k *grpcCall) onReturn(err error) {
+	st := &k.st
+	st.returned = true
+	if errors.Is(err, errOriginStopped) {
+		err = nil
+		st.stopReturn = true
+	}
+	relayOut := err == nil && !st.ended && st.send == sendOpen
+	if !relayOut {
+		k.endSend(errSendCut)
+	}
+	st.retErr = err
+	st.relayIn = err == nil && !st.inAsked && !st.ended
+	st.relaying = relayOut
+	k.ctl <- callReply{relayOut: relayOut, relayIn: st.relayIn}
+}
+
+// finalize decides the status of the call once the handler returned and the relays it left
+// ended. A read of Inbound that ends after the cancel no longer counts.
+func (k *grpcCall) finalize() {
+	st := &k.st
+	st.finalized = true
+	st.handlerEnded = st.ended
+	k.cancel()
+	switch {
+	case st.stopReturn && st.answered && k.upErr != nil:
+		code := statusOf(k.upErr)
+		st.setStatus(code, code.String())
+	case st.retErr != nil:
+		err := st.retErr
+		// A failure of Inbound that follows a reset of the request stream is its echo, and
+		// which of the two reaches the handler first is a race.
+		if st.echo != nil && errors.Is(err, st.echo) {
+			err = st.cutCause
+		}
+		code := statusOf(err)
+		st.setStatus(code, code.String())
+	case !st.inEnded:
+		st.setStatus(CodeInternal, CodeInternal.String())
+	}
+	k.closeToClient()
+	if st.relaying {
+		k.endSend(errSendCut)
+	}
+	k.ctl <- callReply{}
+}
+
+func (k *grpcCall) closeToClient() {
+	st := &k.st
+	if !st.finWritten {
+		st.finWritten = true
+		k.fin = callFinal{code: st.code, msg: st.msg, ended: st.ended, inEnded: st.inEnded}
+	}
+	k.toClient.closeWrite(nil)
 }
 
 // originEnded ends the request stream once the origin has ended its response, as a forwarded
 // call does. A read of the client's request stream in progress returns.
 func (k *grpcCall) originEnded() {
-	k.mu.Lock()
-	if k.originDone {
-		k.mu.Unlock()
+	if k.originDone.Load() {
 		return
 	}
-	k.originDone = true
-	body := k.outBody
-	k.mu.Unlock()
-	// The HTTP/1.1 server does not end a read in progress on a Close, it waits for it.
-	if c, ok := body.(io.Closer); ok && k.req.ProtoMajor >= 2 {
-		_ = c.Close()
-	}
+	k.originDone.Store(true)
+	k.closeClientBody()
 }
 
-// originStoppedReading ends the request stream once the transport stops reading it, before
-// Inbound is asked for. The origin may have ended its response or reset it, so the call ends
-// on the response once the handler returns.
-func (k *grpcCall) originStoppedReading() {
-	k.mu.Lock()
-	if k.outClosed || k.inR != nil {
-		k.mu.Unlock()
-		return
-	}
-	k.outClosed, k.sendStopped = true, true
-	body := k.outBody
-	k.mu.Unlock()
-	if c, ok := body.(io.Closer); ok && k.req.ProtoMajor >= 2 {
+// closeClientBody ends a read of the request stream of the client in progress. The HTTP/1.1
+// server does not end one on a Close, it waits for it.
+func (k *grpcCall) closeClientBody() {
+	if c, ok := k.outBody.(io.Closer); ok && k.req.ProtoMajor >= 2 {
 		_ = c.Close()
 	}
 }
@@ -825,18 +1194,18 @@ func (k *grpcCall) originStoppedReading() {
 // endSend ends the request stream toward the origin, cleanly when the outbound source reached
 // its end on a message boundary and with err otherwise, which the transport sends as a reset.
 func (k *grpcCall) endSend(err error) {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	if !k.opened || k.outClosed {
+	st := &k.st
+	if st.send != sendOpen {
 		return
 	}
-	k.outClosed = true
-	if k.outEOF {
-		_ = k.outPw.Close()
+	if st.outEOF {
+		st.send = sendClosed
+		k.toOrigin.closeWrite(nil)
 		return
 	}
-	k.outCut = true
-	_ = k.outPw.CloseWithError(err)
+	st.send = sendCut
+	st.cutCause = err
+	k.toOrigin.closeWrite(err)
 }
 
 // markCut records a failure of the response body of the origin, which resets the client
@@ -848,11 +1217,29 @@ func (k *grpcCall) markCut(err error) {
 		errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return
 	}
-	k.mu.Lock()
-	if !k.outCut && k.cut == nil {
-		k.cut = fmt.Errorf("%w: %w", errBodyCut, err)
+	if k.st.send != sendCut && k.st.cut == nil {
+		k.st.cut = fmt.Errorf("%w: %w", errBodyCut, err)
 	}
-	k.mu.Unlock()
+}
+
+// control posts e for the handler and waits for the answer of run. Two goroutines of the
+// handler waiting on ctl at once would take each other's answer.
+func (k *grpcCall) control(e callEvent) callReply {
+	k.ctlMu.Lock()
+	defer k.ctlMu.Unlock()
+	r, _ := k.request(k.ctl, e)
+	return r
+}
+
+func (k *grpcCall) closeSend() error {
+	if k.opened.Load() {
+		k.control(callEvent{kind: evCloseSend})
+	}
+	return nil
+}
+
+func (k *grpcCall) fail(code Code, msg string) {
+	k.control(callEvent{kind: evFail, code: code, msg: msg})
 }
 
 func (k *grpcCall) outbound(body io.Reader) *MessageReader {
@@ -861,128 +1248,107 @@ func (k *grpcCall) outbound(body io.Reader) *MessageReader {
 	if k.outR != nil {
 		return k.outR
 	}
-
-	k.outBody = body
-	src := &msgSource{r: body, admit: k.route.admitted, max: k.max}
+	if k.outBody == nil {
+		k.outBody = body
+	}
+	src := &msgSource{r: k.outBody, admit: k.route.admitted, max: k.max}
 	mc := &MessageCtx{call: k, inbound: false}
 	k.outR = &MessageReader{ctx: k.ctx, read: func() (*MessageCtx, error) {
-		k.mu.Lock()
-		k.outRead = true
-		originDone, sendStopped := k.originDone, k.sendStopped
-		k.mu.Unlock()
-		if sendStopped && !originDone {
-			return nil, errOriginStopped
-		}
-		// A pump of MergeMessages may still be reading when the relay that follows the
-		// handler starts.
-		k.outSrcMu.Lock()
-		defer k.outSrcMu.Unlock()
-		var payload []byte
-		var flag byte
-		err := io.EOF
-		if !originDone {
-			payload, flag, err = src.next()
-		}
-		if err != nil {
-			k.mu.Lock()
-			switch {
-			case k.originDone:
-				err = io.EOF
-			case k.sendStopped:
-				err = errOriginStopped
-			}
-			k.outEOF = errors.Is(err, io.EOF)
-			k.mu.Unlock()
-			if errors.Is(err, errCallRefused) {
-				k.refuse()
-			}
-			k.endSend(err)
-			return nil, err
-		}
-		mc.payload, mc.flag = payload, flag
-		return mc, nil
+		return k.readOutbound(src, mc)
 	}}
 	return k.outR
 }
 
-func (k *grpcCall) inbound() *MessageReader {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	if k.inR != nil {
-		return k.inR
-	}
-
-	var src *msgSource
-	mc := &MessageCtx{call: k, inbound: true}
-	k.inR = &MessageReader{ctx: k.ctx, read: func() (*MessageCtx, error) {
-		if src == nil {
-			if err := k.waitResponse(); err != nil {
-				return nil, err
-			}
-			if k.passthrough {
-				// serveResponse relays the response, and its trailers are set once it is done.
-				k.wg.Wait()
-				return nil, io.EOF
-			}
-			src = &msgSource{r: k.upResp.Body, admit: k.route.admitted, max: k.max}
-		}
-		k.bodyMu.Lock()
+func (k *grpcCall) readOutbound(src *msgSource, mc *MessageCtx) (*MessageCtx, error) {
+	k.outRead.Store(true)
+	if !k.opened.Load() {
+		// Only the handler reads before Open, and run takes the state over at Open.
 		payload, flag, err := src.next()
-		if errors.Is(err, io.EOF) {
-			k.inDone = true
-		}
-		k.bodyMu.Unlock()
-		if errors.Is(err, io.EOF) {
-			k.originEnded()
-		}
 		if err != nil {
+			k.st.outEOF = errors.Is(err, io.EOF)
 			if errors.Is(err, errCallRefused) {
-				k.refuse()
+				k.st.setStatus(CodeUnavailable, CodeUnavailable.String())
 			}
-			k.markCut(err)
 			return nil, err
 		}
 		mc.payload, mc.flag = payload, flag
 		return mc, nil
-	}}
-	return k.inR
+	}
+	if k.sendStopped.Load() && !k.originDone.Load() {
+		return nil, errOriginStopped
+	}
+	// A pump of MergeMessages may still be reading when the relay that follows the handler
+	// starts, and both fill mc.
+	k.outSrcMu.Lock()
+	defer k.outSrcMu.Unlock()
+	var payload []byte
+	var flag byte
+	err := io.EOF
+	if !k.originDone.Load() {
+		payload, flag, err = src.next()
+	}
+	if err == nil {
+		mc.payload, mc.flag = payload, flag
+		return mc, nil
+	}
+	if r, ok := k.request(k.outReply, callEvent{kind: evOutEnd, err: err}); ok {
+		return nil, r.err
+	}
+	switch {
+	case k.originDone.Load():
+		err = io.EOF
+	case k.sendStopped.Load():
+		err = errOriginStopped
+	}
+	return nil, err
 }
 
-// The first status set is what the client reads.
-func (k *grpcCall) end(code Code, msg string) {
+func (k *grpcCall) inbound() *MessageReader {
 	k.mu.Lock()
-	if !k.ended {
-		k.code, k.msg, k.ended = code, msg, true
+	r := k.inR
+	asked := r == nil && k.opened.Load()
+	if r == nil {
+		var src *msgSource
+		mc := &MessageCtx{call: k, inbound: true}
+		r = &MessageReader{ctx: k.ctx, read: func() (*MessageCtx, error) {
+			if src == nil {
+				if err := k.waitResponse(); err != nil {
+					return nil, err
+				}
+				if k.passthrough {
+					// The response writer relays the response, and its trailers are set once
+					// it is done.
+					k.request(k.inReply, callEvent{kind: evInWait})
+					return nil, io.EOF
+				}
+				src = &msgSource{r: k.upResp.Body, admit: k.route.admitted, max: k.max}
+			}
+			payload, flag, err := src.next()
+			if err != nil {
+				// Outbound ends once Inbound has, so the end is decided before it is returned.
+				k.request(k.inReply, callEvent{kind: evInEnd, err: err})
+				return nil, err
+			}
+			mc.payload, mc.flag = payload, flag
+			return mc, nil
+		}}
+		k.inR = r
 	}
 	k.mu.Unlock()
-}
-
-func (k *grpcCall) status() (code Code, msg string, ended bool) {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	return k.code, k.msg, k.ended
-}
-
-func (k *grpcCall) refuse() { k.end(CodeUnavailable, CodeUnavailable.String()) }
-
-func (k *grpcCall) fail(code Code, msg string) {
-	k.end(code, msg)
-	k.endSend(errSendCut)
-	k.cancel()
-	_ = k.inPw.Close()
+	if asked {
+		k.post(callEvent{kind: evInbound})
+	}
+	return r
 }
 
 // waitResponse blocks until the origin answered the open call, and returns the error when it
 // did not.
 func (k *grpcCall) waitResponse() error {
-	k.mu.Lock()
-	ch := k.respCh
-	k.mu.Unlock()
-	if ch == nil {
+	if !k.opened.Load() {
 		return errNotOpened
 	}
 	select {
-	case <-ch:
+	case <-k.answered:
 	case <-k.ctx.Done():
 		return k.ctx.Err()
 	}
@@ -992,28 +1358,22 @@ func (k *grpcCall) waitResponse() error {
 // writeMessage frames b toward one side of the call in one write. The pipe delivers each
 // write as one read, and one read is one DATA frame.
 func (k *grpcCall) writeMessage(inbound bool, flag byte, b []byte) error {
-	k.mu.Lock()
-	opened, ch, maxBytes := k.opened, k.respCh, k.max
-	originDone, sendStopped := k.originDone, k.sendStopped
-	k.mu.Unlock()
-	if !opened {
+	if !k.opened.Load() {
 		return errNotOpened
 	}
 	switch {
 	case inbound:
-	case originDone:
+	case k.originDone.Load():
 		return nil
-	case sendStopped:
-		return errOriginStopped
 	}
-	if len(b) > maxBytes {
+	if len(b) > k.max {
 		return errMessageTooLarge
 	}
 
-	w, mu, buf := io.Writer(k.outPw), &k.outMu, &k.outBuf
+	w, mu, buf := io.Writer(&k.toOrigin), &k.outMu, &k.outBuf
 	if inbound {
 		select {
-		case <-ch:
+		case <-k.answered:
 		default:
 			return errors.New("edge: no response to write into before the origin answered")
 		}
@@ -1023,21 +1383,21 @@ func (k *grpcCall) writeMessage(inbound bool, flag byte, b []byte) error {
 		if k.passthrough {
 			return errNotGRPCResponse
 		}
-		w, mu, buf = k.inPw, &k.inMu, &k.inBuf
+		w, mu, buf = &k.toClient, &k.inMu, &k.inBuf
 	}
 
 	mu.Lock()
 	defer mu.Unlock()
 	*buf = appendGRPCFrame((*buf)[:0], flag, b)
 	_, err := w.Write(*buf)
+	// run publishes why it ends the request stream before it closes the pipe.
 	if err != nil && !inbound {
-		k.mu.Lock()
-		originDone, sendStopped = k.originDone, k.sendStopped
-		k.mu.Unlock()
+		_, upstream := errors.AsType[upstreamError](err)
 		switch {
-		case originDone:
+		case upstream:
+		case k.originDone.Load():
 			return nil
-		case sendStopped:
+		case k.readStopped.Load():
 			return errOriginStopped
 		}
 	}
@@ -1046,32 +1406,30 @@ func (k *grpcCall) writeMessage(inbound bool, flag byte, b []byte) error {
 
 // serveResponse writes the response of an open call while the handler runs, so a forwarded
 // response message reaches the client before the handler returns. Only this goroutine uses
-// the response writer.
+// the response writer, and run outlives it.
 func (k *grpcCall) serveResponse() {
-	<-k.respCh
+	err := k.respond()
+	k.post(callEvent{kind: evRWDone, err: err})
+}
+
+// respond returns the error of the relay of a response that is not gRPC.
+func (k *grpcCall) respond() error {
+	<-k.answered
 
 	if k.upErr != nil {
-		// The pipe ends when the handler has ended the call, and the status is read after.
-		_, _ = io.Copy(io.Discard, k.inPr)
-		code, msg, ended := k.status()
-		if !ended {
+		// The pipe ends when the call is decided, and the status is read after.
+		_, _ = io.Copy(io.Discard, &k.toClient)
+		code, msg := k.fin.code, k.fin.msg
+		if !k.fin.ended {
 			code = statusOf(k.upErr)
 			msg = code.String()
 		}
 		_ = writeResponse(k.w, k.req, grpcStatusResponse(code, msg))
-		return
+		return nil
 	}
 
 	if k.passthrough {
-		err := writeResponse(k.w, k.req, k.upResp)
-		if errors.Is(err, errBodyCut) {
-			k.mu.Lock()
-			k.cut = err
-			k.mu.Unlock()
-		} else if err == nil {
-			k.originEnded()
-		}
-		return
+		return writeResponse(k.w, k.req, k.upResp)
 	}
 
 	resp := k.upResp
@@ -1100,31 +1458,29 @@ func (k *grpcCall) serveResponse() {
 	}
 
 	buf := getCopyBuf()
-	_, cerr := io.CopyBuffer(w, k.inPr, buf)
+	_, cerr := io.CopyBuffer(w, &k.toClient, buf)
 	putCopyBuf(buf)
 	if cerr != nil {
 		// Nothing reads the pipe once the client is gone, and a handler still sending toward
 		// it must not block. The handler may still be running and writing the trailers.
-		_ = k.inPr.CloseWithError(cerr)
-		return
+		k.toClient.closeRead(cerr)
+		return nil
 	}
 
-	k.bodyMu.Lock()
-	defer k.bodyMu.Unlock()
 	prefix, statusKey, msgKey := http.TrailerPrefix, http.TrailerPrefix+"Grpc-Status", http.TrailerPrefix+"Grpc-Message"
 	if late != nil && !late.wrote {
 		prefix, statusKey, msgKey = "", "Grpc-Status", "Grpc-Message"
 		defer k.w.WriteHeader(resp.StatusCode)
 	}
-	if code, msg, ended := k.status(); ended {
+	if k.fin.ended {
 		// The origin's trailers never arrived or no longer apply, and the client reads this
 		// status instead.
-		dst.Set(statusKey, strconv.FormatUint(uint64(code), 10))
-		dst.Set(msgKey, grpcPercentEncode(msg))
-		return
+		dst.Set(statusKey, strconv.FormatUint(uint64(k.fin.code), 10))
+		dst.Set(msgKey, grpcPercentEncode(k.fin.msg))
+		return nil
 	}
-	if !k.inDone {
-		return
+	if !k.fin.inEnded {
+		return nil
 	}
 	trailer := resp.Trailer
 	if late != nil {
@@ -1138,6 +1494,7 @@ func (k *grpcCall) serveResponse() {
 			dst.Add(prefix+name, v)
 		}
 	}
+	return nil
 }
 
 func isGRPCStatusField(name string) bool {
@@ -1161,78 +1518,34 @@ func (l *lateHeader) Write(b []byte) (int, error) {
 	return flushWriter{w: l.w, rc: l.rc}.Write(b)
 }
 
-// finish tears the call down once the handler has returned with err. The goroutines are
-// joined before the context returns to its pool. It returns an error wrapping errBodyCut when
-// the client stream must be reset.
+// finish tears the call down once the handler has returned with err. It returns once run has
+// exited, so every goroutine of the call is joined before the context returns to its pool. It
+// returns an error wrapping errBodyCut when the client stream must be reset.
 func (k *grpcCall) finish(err error) error {
-	if errors.Is(err, errOriginStopped) {
-		err = nil
-	}
-	k.mu.Lock()
-	untouched := k.inR == nil && !k.ended
-	relay := err == nil && !k.ended && !k.outClosed
-	outR := k.outR
-	k.mu.Unlock()
-	if relay {
-		if outR == nil {
-			var body io.Reader = http.NoBody
-			if k.req.Body != nil {
-				body = k.req.Body
-			}
-			outR = k.outbound(body)
-		}
+	r := k.control(callEvent{kind: evReturn, err: err})
+	if r.relayOut {
 		// The response is relayed meanwhile, so a client still sending does not stall it.
-		k.sendWg.Go(func() { k.relayOutbound(outR) })
-	} else {
-		k.endSend(errSendCut)
+		go k.relayOutbound(k.outbound(k.outBody))
 	}
-	if err == nil && untouched {
-		err = k.relayInbound()
+	end := callEvent{kind: evFinalize}
+	if r.relayIn {
+		end = k.relayInbound()
 	}
-	if k.answered() && k.passthrough {
-		// The relay runs to its end, as Forward does, before the origin is canceled.
-		k.wg.Wait()
-	}
-	k.mu.Lock()
-	handlerEnded := k.ended
-	k.mu.Unlock()
-	// A pump of MergeMessages may be in a read of the response under bodyMu, and an HTTP/3
-	// upstream keeps the response open past a reset of the request stream.
-	k.cancel()
-	k.bodyMu.Lock()
-	done := k.inDone
-	k.bodyMu.Unlock()
-	switch {
-	case err != nil:
-		code := statusOf(err)
-		k.end(code, code.String())
-	case !done:
-		k.end(CodeInternal, CodeInternal.String())
-	}
-	_ = k.inPw.Close()
-	if relay {
+	k.control(end)
+	if r.relayOut {
 		// The response has ended, and the client may never end a request stream nothing
 		// reads any more.
 		k.closeOutBody()
-		k.endSend(errSendCut)
-		k.sendWg.Wait()
 	}
-	k.wg.Wait()
+	<-k.done
 	if k.upResp != nil && k.upResp.Body != nil {
 		_ = k.upResp.Body.Close()
 	}
-	k.mu.Lock()
-	cut := k.cut
-	k.mu.Unlock()
-	// A status set before the cut is what the client reads, except on a relayed response
-	// where no status can be written.
-	if cut != nil && (k.passthrough || !handlerEnded) {
-		return cut
-	}
-	return nil
+	return k.cutErr
 }
 
 func (k *grpcCall) relayOutbound(r *MessageReader) {
+	defer k.post(callEvent{kind: evRelayDone})
 	for {
 		m, err := r.read()
 		if err != nil {
@@ -1245,46 +1558,28 @@ func (k *grpcCall) relayOutbound(r *MessageReader) {
 }
 
 func (k *grpcCall) closeOutBody() {
-	k.mu.Lock()
-	body := k.outBody
-	k.mu.Unlock()
-	if c, ok := body.(io.Closer); ok {
+	if c, ok := k.outBody.(io.Closer); ok {
 		_ = c.Close()
 	}
 }
 
-func (k *grpcCall) answered() bool {
-	k.mu.Lock()
-	ch := k.respCh
-	k.mu.Unlock()
-	select {
-	case <-ch:
-		return true
-	default:
-		return false
-	}
-}
-
 // relayInbound relays the response unchanged, for a handler that never read the inbound
-// reader.
-func (k *grpcCall) relayInbound() error {
-	if err := k.waitResponse(); err != nil {
-		return err
+// reader, and returns the event that reports it.
+func (k *grpcCall) relayInbound() callEvent {
+	e := callEvent{kind: evFinalize}
+	if e.err = k.waitResponse(); e.err != nil || k.passthrough {
+		return e
 	}
-	if k.passthrough {
-		return nil
-	}
-	k.bodyMu.Lock()
-	defer k.bodyMu.Unlock()
-	_, err := copyStream(k.inPw, k.upResp.Body, nil)
+	_, err := copyStream(&k.toClient, k.upResp.Body, nil)
 	if err == nil {
-		k.inDone = true
-		return nil
+		e.ended = true
+		return e
 	}
-	if !errors.As(err, new(writeError)) {
-		k.markCut(err)
+	e.err = err
+	if _, ok := errors.AsType[writeError](err); !ok {
+		e.cause = err
 	}
-	return err
+	return e
 }
 
 // Fail ends the call with a status. Before [GRPCCtx.Open] it answers with a trailers-only

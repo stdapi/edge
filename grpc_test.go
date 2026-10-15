@@ -1565,7 +1565,7 @@ func TestKindGRPC_CallOnTheHTTP3FrontIsForwarded(t *testing.T) {
 			body, err := c.rest()
 			require.NoError(t, err)
 			assert.Empty(t, body)
-			assert.ErrorIs(t, <-forwarded, io.ErrClosedPipe)
+			assert.ErrorIs(t, <-forwarded, errOriginStopped)
 			code, msg := c.status()
 			assert.Equal(t, "0", code, msg)
 		}},
@@ -3496,9 +3496,6 @@ func TestKindGRPC_OpenCallEnds(t *testing.T) {
 				return r.call.result(t), true
 			},
 			want: func(r *endRun) endWant {
-				if r.shape == "OpenOnly" && r.fx.cell.origin != HTTP2 {
-					return endWant{data: m1, code: "2", origin: []string{"m1"}, originEnd: originCut, defect: defectRelayCut}
-				}
 				return endWant{data: answers(r, m1), code: "1", anyForm: !r.echoes(), origin: []string{"m1"}, originEnd: originCut}
 			},
 		},
@@ -3556,6 +3553,9 @@ func TestKindGRPC_OpenCallEnds(t *testing.T) {
 				} else if r.fx.cell.origin == HTTP3 {
 					// The RESET_STREAM of the origin may discard its response before the proxy reads it.
 					w.alt = &endWant{data: []byte{}, code: "14", trailersOnly: true}
+				} else if r.shape == "OpenOnly" {
+					w.alt = &endWant{code: "2"}
+					w.defect = defectH1Body
 				}
 				return w
 			},
@@ -3599,9 +3599,6 @@ func TestKindGRPC_OpenCallEnds(t *testing.T) {
 			want: func(r *endRun) endWant {
 				if r.shape == "Forward" {
 					return endWant{data: slices.Concat(m1, big), code: "0", origin: []string{"m1", string(big[5:])}, originEnd: originEOF}
-				}
-				if r.shape == "OpenOnly" && r.duplex() && r.fx.cell.origin != HTTP2 {
-					return endWant{data: m1, code: "2", origin: []string{"m1"}, originEnd: originCut, defect: defectRelayCut}
 				}
 				return endWant{data: answers(r, m1), code: "8", trailersOnly: !r.duplex(), anyForm: r.duplex() && !r.echoes(), origin: []string{"m1"}, originEnd: originCut}
 			},
@@ -3913,6 +3910,282 @@ func TestKindGRPC_OpenCallEnds(t *testing.T) {
 				return endWant{data: []byte{}, code: "0", origin: []string{}, originEnd: originEOF}
 			},
 		},
+		{
+			name:   "a read of Outbound after the end of Inbound ends",
+			origin: originAnswerFirst,
+			handler: func(r *endRun) GRPC {
+				return func(c *GRPCCtx) error {
+					if err := c.Open(); err != nil {
+						return err
+					}
+					out := c.Outbound()
+					m, err := out.ReadMessage()
+					if err != nil {
+						return err
+					}
+					if err := m.Forward(); err != nil {
+						return err
+					}
+					if err := forwardMessages(c.Inbound()); err != nil {
+						return err
+					}
+					if m, err := out.ReadMessage(); err == nil {
+						r.problem(fmt.Sprintf("the read of Outbound after the end of Inbound returned %q", m.Bytes()))
+					} else if !errors.Is(err, io.EOF) {
+						r.problem(fmt.Sprintf("the read of Outbound after the end of Inbound returned %v", err))
+					}
+					return nil
+				}
+			},
+			script: func(t *testing.T, r *endRun) (endResult, bool) {
+				r.call.send(both)
+				if !r.duplex() {
+					r.call.closeSend()
+				}
+				return r.call.result(t), true
+			},
+			want: func(*endRun) endWant {
+				return endWant{data: lpm(0, "r"), code: "0", origin: []string{"m1"}}
+			},
+		},
+		{
+			name:   "an error returned after CloseSend with a read of Inbound pending",
+			origin: originHeadersThenHold,
+			handler: func(*endRun) GRPC {
+				return func(c *GRPCCtx) error {
+					if err := c.Open(); err != nil {
+						return err
+					}
+					src := MergeMessages(c.Outbound(), c.Inbound())
+					m, err := src.ReadMessage()
+					if err != nil {
+						return err
+					}
+					if err := m.Forward(); err != nil {
+						return err
+					}
+					if _, err := c.Response(); err != nil {
+						return err
+					}
+					// The pump of Inbound reaches its read of the response body.
+					time.Sleep(20 * time.Millisecond)
+					if err := c.CloseSend(); err != nil {
+						return err
+					}
+					return errors.New("edge test: handler failure")
+				}
+			},
+			script: sendThenResult,
+			want: func(r *endRun) endWant {
+				if !r.duplex() {
+					return endWant{data: []byte{}, origin: []string{"m1"}, originEnd: originCanceled, defect: defectH1Status}
+				}
+				return endWant{data: []byte{}, code: "2", origin: []string{"m1"}, originEnd: originCanceled}
+			},
+		},
+		{
+			name:   "a send toward an origin that stopped reading fails and the call ends on its answer with no message",
+			only:   func(c endCell) bool { return c.origin == HTTP3 },
+			origin: originStopThenAnswer,
+			handler: func(r *endRun) GRPC {
+				return func(c *GRPCCtx) error {
+					defer close(r.release)
+					if err := c.Open(); err != nil {
+						return err
+					}
+					src := MergeMessages(c.Outbound(), c.Inbound())
+					for {
+						m, err := src.ReadMessage()
+						if err != nil {
+							return err
+						}
+						start := time.Now()
+						err = m.Forward()
+						if d := time.Since(start); d > time.Second {
+							r.problem(fmt.Sprintf("a send toward an origin that stopped reading took %v", d))
+						}
+						if err != nil {
+							return err
+						}
+					}
+				}
+			},
+			script: func(t *testing.T, r *endRun) (endResult, bool) {
+				r.call.send(m1)
+				r.waitGot(t, "m1")
+				// The transport learns that the origin stopped reading on a write that follows.
+				for range 250 {
+					select {
+					case <-r.release:
+						return r.call.result(t), true
+					case <-time.After(20 * time.Millisecond):
+						r.call.send(m2)
+					}
+				}
+				t.Error("the handler did not return")
+				return r.call.result(t), true
+			},
+			want: func(*endRun) endWant {
+				return endWant{data: []byte{}, code: "11", trailersOnly: true, origin: []string{"m1"}}
+			},
+		},
+		{
+			name:   "a send toward an origin that stopped reading fails and an answer with messages ends on Internal",
+			only:   func(c endCell) bool { return c.origin == HTTP3 },
+			origin: originStopThenAnswerMessage,
+			handler: func(r *endRun) GRPC {
+				return func(c *GRPCCtx) error {
+					defer close(r.release)
+					if err := c.Open(); err != nil {
+						return err
+					}
+					src := MergeMessages(c.Outbound(), c.Inbound())
+					for {
+						m, err := src.ReadMessage()
+						if err != nil {
+							return err
+						}
+						start := time.Now()
+						err = m.Forward()
+						if d := time.Since(start); d > time.Second {
+							r.problem(fmt.Sprintf("a send toward an origin that stopped reading took %v", d))
+						}
+						if err != nil {
+							return err
+						}
+					}
+				}
+			},
+			script: func(t *testing.T, r *endRun) (endResult, bool) {
+				r.call.send(m1)
+				r.waitGot(t, "m1")
+				// The transport learns that the origin stopped reading on a write that follows.
+				for range 250 {
+					select {
+					case <-r.release:
+						return r.call.result(t), true
+					case <-time.After(20 * time.Millisecond):
+						r.call.send(m2)
+					}
+				}
+				t.Error("the handler did not return")
+				return r.call.result(t), true
+			},
+			want: func(*endRun) endWant {
+				return endWant{code: "13", origin: []string{"m1"}}
+			},
+		},
+		{
+			name:   "a nil return after the half-close and before the answer ends at once",
+			origin: originHold(false),
+			handler: func(r *endRun) GRPC {
+				return func(c *GRPCCtx) error {
+					if err := c.Open(); err != nil {
+						return err
+					}
+					_ = c.Inbound()
+					if err := forwardMessages(c.Outbound()); err != nil {
+						return err
+					}
+					select {
+					case <-r.got:
+					case <-time.After(5 * time.Second):
+						r.problem("the origin did not read m1")
+					}
+					// The transport closes the request stream it has sent to its end.
+					time.Sleep(50 * time.Millisecond)
+					return nil
+				}
+			},
+			script: func(t *testing.T, r *endRun) (endResult, bool) {
+				r.call.send(m1)
+				r.call.closeSend()
+				start := time.Now()
+				res := r.call.result(t)
+				if d := time.Since(start); d > 2*time.Second {
+					t.Errorf("the client read the end of the call after %v", d)
+				}
+				return res, true
+			},
+			want: func(*endRun) endWant {
+				return endWant{data: []byte{}, code: "13", trailersOnly: true, origin: []string{"m1"}, originEnd: originCanceled}
+			},
+		},
+		{
+			name:   "a nil return after the origin stopped reading ends at once",
+			only:   func(c endCell) bool { return c.origin == HTTP3 },
+			origin: originStopThenHold,
+			handler: func(r *endRun) GRPC {
+				return func(c *GRPCCtx) error {
+					defer close(r.release)
+					if err := c.Open(); err != nil {
+						return err
+					}
+					_ = c.Inbound()
+					_ = forwardMessages(c.Outbound())
+					return nil
+				}
+			},
+			script: func(t *testing.T, r *endRun) (endResult, bool) {
+				r.call.send(m1)
+				r.waitGot(t, "m1")
+				for range 250 {
+					select {
+					case <-r.release:
+						start := time.Now()
+						res := r.call.result(t)
+						if d := time.Since(start); d > 2*time.Second {
+							t.Errorf("the client read the end of the call after %v", d)
+						}
+						return res, true
+					case <-time.After(20 * time.Millisecond):
+						r.call.send(m2)
+					}
+				}
+				t.Error("the handler did not return")
+				return r.call.result(t), true
+			},
+			want: func(*endRun) endWant {
+				return endWant{data: []byte{}, code: "13", trailersOnly: true, origin: []string{"m1"}, originEnd: originCanceled}
+			},
+		},
+		{
+			name:   "a read of Outbound pending at the return and its relay",
+			only:   func(c endCell) bool { return c.client != HTTP11 },
+			origin: originEcho,
+			handler: func(r *endRun) GRPC {
+				return func(c *GRPCCtx) error {
+					if err := c.Open(); err != nil {
+						return err
+					}
+					src := MergeMessages(c.Outbound(), c.Inbound())
+					for range 2 {
+						m, err := src.ReadMessage()
+						if err != nil {
+							return err
+						}
+						if err := m.Forward(); err != nil {
+							return err
+						}
+					}
+					<-r.release
+					// The pump of Outbound reads m2, and the relay that follows the return m3.
+					time.Sleep(10 * time.Millisecond)
+					return nil
+				}
+			},
+			script: func(t *testing.T, r *endRun) (endResult, bool) {
+				r.call.send(m1)
+				r.call.read(t, len(m1))
+				r.call.send(m2)
+				r.call.send(lpm(0, "m3"))
+				close(r.release)
+				return r.call.result(t), true
+			},
+			want: func(*endRun) endWant {
+				return endWant{code: "13"}
+			},
+		},
 	}
 
 	for _, cell := range endCells {
@@ -3931,6 +4204,9 @@ func TestKindGRPC_OpenCallEnds(t *testing.T) {
 				}
 			}
 			for _, row := range single {
+				if row.only != nil && !row.only(cell) {
+					continue
+				}
 				t.Run(row.name, func(t *testing.T) {
 					fx.run(t, &row, "", row.handler)
 				})
@@ -3940,6 +4216,64 @@ func TestKindGRPC_OpenCallEnds(t *testing.T) {
 			assert.NoError(t, fx.p.Shutdown(ctx), "a call of the cell did not end")
 		})
 	}
+}
+
+func TestKindGRPC_OpenCallToAnUnreachableOriginEndsOnUnavailable(t *testing.T) {
+	m1 := lpm(0, "m1")
+	afterAnswer := func(c *GRPCCtx) error {
+		if err := c.Open(); err != nil {
+			return err
+		}
+		_ = c.Inbound()
+		m, err := c.Outbound().ReadMessage()
+		if err != nil {
+			return err
+		}
+		_, _ = c.Response()
+		return m.Forward()
+	}
+	shapes := append(slices.Clip(endShapes), endShape{afterAnswer, "SendAfterTheAnswer"})
+	for _, client := range []Protocol{HTTP2, HTTP3} {
+		fx := newUnreachableEndFixture(t, client)
+		for _, s := range shapes {
+			t.Run(map[Protocol]string{HTTP2: "client h2", HTTP3: "client h3"}[client]+"/"+s.name, func(t *testing.T) {
+				for range 3 {
+					path := "/end.Svc/R" + strconv.FormatInt(fx.next.Add(1), 10)
+					fx.p.MustAdd("origin.test"+path, s.h)
+					var call endCall
+					if client == HTTP3 {
+						call = fx.h3Call(t, path)
+					} else {
+						call = fx.h2Call(t, path)
+					}
+					call.send(m1)
+					res := call.result(t)
+					assert.Equal(t, "14", res.code, "grpc-status")
+				}
+			})
+		}
+	}
+}
+
+func newUnreachableEndFixture(t *testing.T, client Protocol) *endFixture {
+	t.Helper()
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	dead := ln.Addr().String()
+	require.NoError(t, ln.Close())
+	fx := &endFixture{ca: ca, cell: endCell{client: client, origin: HTTP2}}
+	tr := DefaultTransport()
+	tr.DialContext = pinnedDialer(dead)
+	tr.RootCAs = poolOf(ca)
+	fx.p = testProxyWithCA(t, ca, WithTransport(tr), WithMaxMessageBytes(endMaxMessage))
+	if client == HTTP3 {
+		fx.h3, _ = startQUICFront(t, fx.p, ca)
+	} else {
+		fx.addr = startProxy(t, fx.p)
+	}
+	return fx
 }
 
 const endMaxMessage = 1 << 10
@@ -4009,6 +4343,7 @@ type endRow struct {
 	handler func(r *endRun) GRPC
 	script  func(t *testing.T, r *endRun) (endResult, bool)
 	want    func(r *endRun) endWant
+	only    func(c endCell) bool
 	name    string
 	own     bool
 }
@@ -4024,8 +4359,8 @@ const (
 
 // Defects of the current code. A row with a defect asserts the current behavior.
 const (
-	defectRelayCut = "with OpenOnly over an HTTP/1.1 or HTTP/3 origin, a request stream cut after the return ends on Unknown, where the other shapes end on Canceled or ResourceExhausted"
 	defectH1Status = "on an HTTP/1.1 client, the status the proxy sets is lost when no message reached the client and the origin announced no trailer"
+	defectH1Body   = "on an HTTP/1.1 client, the server closes the request body once the response starts, and the relay of Outbound that reads it then resets the request stream"
 )
 
 type endWant struct {
@@ -4381,6 +4716,80 @@ func originHold(answer bool) func(r *endRun, w http.ResponseWriter, req *http.Re
 	}
 }
 
+// originHeadersThenHold answers headers with no message, reads the request to its end and
+// waits for the proxy to cancel it.
+func originHeadersThenHold(r *endRun, w http.ResponseWriter, req *http.Request) {
+	w.Header().Set("Content-Type", "application/grpc")
+	w.WriteHeader(http.StatusOK)
+	_ = http.NewResponseController(w).Flush()
+	obs := r.readRequest(req, nil)
+	select {
+	case <-req.Context().Done():
+		obs.canceled = true
+	case <-time.After(5 * time.Second):
+	}
+	r.obs <- obs
+}
+
+// originStopThenHold reads the first message, stops reading the request and waits for the
+// proxy to cancel it.
+func originStopThenHold(r *endRun, w http.ResponseWriter, req *http.Request) {
+	src := &msgSource{r: req.Body, max: 1 << 20}
+	payload, _, err := src.next()
+	if err != nil {
+		r.obs <- endObs{err: err}
+		panic(http.ErrAbortHandler)
+	}
+	r.got <- string(payload)
+	_ = req.Body.Close()
+	obs := endObs{msgs: []string{string(payload)}}
+	select {
+	case <-req.Context().Done():
+		obs.canceled = true
+	case <-time.After(5 * time.Second):
+	}
+	r.obs <- obs
+}
+
+// originStopThenAnswer reads the first message, stops reading the request and answers with
+// a trailers-only response once the handler has returned.
+func originStopThenAnswer(r *endRun, w http.ResponseWriter, req *http.Request) {
+	src := &msgSource{r: req.Body, max: 1 << 20}
+	payload, _, err := src.next()
+	if err != nil {
+		r.obs <- endObs{err: err}
+		panic(http.ErrAbortHandler)
+	}
+	r.got <- string(payload)
+	_ = req.Body.Close()
+	select {
+	case <-r.release:
+	case <-time.After(5 * time.Second):
+	}
+	r.obs <- endObs{msgs: []string{string(payload)}}
+	w.Header().Set("Content-Type", "application/grpc")
+	w.Header().Set("Grpc-Status", "11")
+	w.WriteHeader(http.StatusOK)
+}
+
+// originStopThenAnswerMessage is originStopThenAnswer with a message before the status.
+func originStopThenAnswerMessage(r *endRun, w http.ResponseWriter, req *http.Request) {
+	src := &msgSource{r: req.Body, max: 1 << 20}
+	payload, _, err := src.next()
+	if err != nil {
+		r.obs <- endObs{err: err}
+		panic(http.ErrAbortHandler)
+	}
+	r.got <- string(payload)
+	_ = req.Body.Close()
+	select {
+	case <-r.release:
+	case <-time.After(5 * time.Second):
+	}
+	r.obs <- endObs{msgs: []string{string(payload)}}
+	answer(w, nil, []string{"Grpc-Status", "11"}, lpm(0, "r"))
+}
+
 func originRelease(r *endRun, w http.ResponseWriter, req *http.Request) {
 	src := &msgSource{r: req.Body, max: 1 << 20}
 	payload, flag, err := src.next()
@@ -4727,7 +5136,7 @@ func BenchmarkKindGRPC_Call(b *testing.B) {
 }
 
 func TestKindGRPC_CallAllocs(t *testing.T) {
-	ceilings := map[string]float64{"Forward": 250, "OpenOnly": 270, "Merge": 283}
+	ceilings := map[string]float64{"Forward": 250, "OpenOnly": 265, "Merge": 279}
 	body := lpm(0, "hello")
 	for _, s := range grpcCallShapes {
 		t.Run(s.name, func(t *testing.T) {
@@ -4738,6 +5147,81 @@ func TestKindGRPC_CallAllocs(t *testing.T) {
 				}
 			})
 			assert.LessOrEqual(t, allocs, ceilings[s.name])
+		})
+	}
+}
+
+func TestCallPipe_MatchesIOPipe(t *testing.T) {
+	type pipe struct {
+		r          io.Reader
+		w          io.Writer
+		closeRead  func(error)
+		closeWrite func(error)
+	}
+	errA, errB := errors.New("a"), errors.New("b")
+	obs := func(n int, err error) string { return fmt.Sprintf("%d %v", n, err) }
+	read := func(p pipe, n int) string {
+		b := make([]byte, n)
+		n, err := p.r.Read(b)
+		return fmt.Sprintf("%q %v", b[:n], err)
+	}
+	write := func(p pipe, s string) string { return obs(p.w.Write([]byte(s))) }
+	writing := func(p pipe, s string) <-chan string {
+		done := make(chan string, 1)
+		go func() { done <- write(p, s) }()
+		return done
+	}
+	cases := []struct {
+		script func(p pipe) []string
+		name   string
+	}{
+		{name: "a write is read in pieces", script: func(p pipe) []string {
+			done := writing(p, "hello")
+			return []string{read(p, 2), read(p, 2), read(p, 2), <-done}
+		}},
+		{name: "the reader closes during a write", script: func(p pipe) []string {
+			done := writing(p, "hello")
+			first := read(p, 1)
+			p.closeRead(nil)
+			return []string{first, <-done, read(p, 1), write(p, "x")}
+		}},
+		{name: "the reader closes with an error", script: func(p pipe) []string {
+			done := writing(p, "hello")
+			first := read(p, 1)
+			p.closeRead(errA)
+			return []string{first, <-done, read(p, 1), write(p, "x")}
+		}},
+		{name: "the writer closes", script: func(p pipe) []string {
+			p.closeWrite(nil)
+			return []string{read(p, 1), write(p, "x")}
+		}},
+		{name: "the writer closes with an error", script: func(p pipe) []string {
+			p.closeWrite(errA)
+			return []string{read(p, 1), write(p, "x")}
+		}},
+		{name: "both ends close", script: func(p pipe) []string {
+			p.closeWrite(errA)
+			p.closeRead(errB)
+			return []string{read(p, 1), write(p, "x")}
+		}},
+		{name: "the first error of an end is kept", script: func(p pipe) []string {
+			p.closeRead(errA)
+			p.closeRead(errB)
+			return []string{write(p, "x")}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pr, pw := io.Pipe()
+			want := tc.script(pipe{
+				r: pr, w: pw,
+				closeRead:  func(err error) { _ = pr.CloseWithError(err) },
+				closeWrite: func(err error) { _ = pw.CloseWithError(err) },
+			})
+			cp := new(callPipe)
+			cp.init()
+			got := tc.script(pipe{r: cp, w: cp, closeRead: cp.closeRead, closeWrite: cp.closeWrite})
+			assert.Equal(t, want, got)
 		})
 	}
 }
