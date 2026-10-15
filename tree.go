@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/stdapi/edge/internal/regprog"
 	"github.com/stdapi/edge/internal/simplelru"
 )
 
@@ -57,10 +58,11 @@ func (t *iTree) route(c *routeCtx, lazy bool) *entry {
 }
 
 // canonicalHost returns host without its root label, or an empty string for a host ending in
-// an empty label, which no entry can admit.
+// an empty label or containing a slash, which no entry can admit. A hostname walk would match
+// a slash against the path keys below the hostname.
 func canonicalHost(host string) string {
 	host = strings.TrimSuffix(host, ".")
-	if strings.HasSuffix(host, ".") {
+	if strings.HasSuffix(host, ".") || strings.IndexByte(host, slashDelim) >= 0 {
 		return ""
 	}
 	return host
@@ -76,6 +78,9 @@ func canonicalHost(host string) string {
 // With admit set the walks stop on the host and answer with the entry admitting that kind.
 func lookupTarget(patterns, addrs *node, host, path string, c *routeCtx, lazy bool, admit Kind) (int, *node) {
 	*c.skipStack = (*c.skipStack)[:0]
+	if c.lookup.dirty {
+		c.lookup.reset()
+	}
 	// The canonical form exists only inside the lookup, like the routing path of a request.
 	host = canonicalHost(host)
 	if maybeRoutingAddr(host) {
@@ -674,6 +679,19 @@ func (t *tXn) insertParam(n *node, tk token, remaining []token, ic *entry) (*nod
 	return nc, nil
 }
 
+// compileProg compiles the regexp of a wildcard for simulation, or returns nil without regexp.
+func compileProg(re *regexp.Regexp) *regprog.Regexp {
+	if re == nil {
+		return nil
+	}
+	r, err := regprog.Compile(re)
+	if err != nil {
+		// The expression already compiled with regexp.
+		panic(fmt.Sprintf("unreachable: %s: %v", re, err))
+	}
+	return r
+}
+
 func (t *tXn) insertWildcard(n *node, tk token, remaining []token, ic *entry) (*node, error) {
 	key := canonicalKey(tk)
 	idx, child := n.getWildcardEdge(key)
@@ -687,6 +705,8 @@ func (t *tXn) insertWildcard(n *node, tk token, remaining []token, ic *entry) (*
 			&node{
 				key:    key,
 				regexp: tk.regexp,
+				prog:   compileProg(tk.regexp),
+				nested: tk.nested,
 			},
 			remaining,
 			ic,
@@ -1012,7 +1032,9 @@ func (t *tXn) writeNode(n *node) *node {
 		label:  n.label,
 		key:    n.key,
 		regexp: n.regexp,
+		prog:   n.prog,
 		host:   n.host,
+		nested: n.nested,
 	}
 
 	if len(n.entries) != 0 {
@@ -1135,6 +1157,8 @@ type token struct {
 	value string
 	// The type of this token: static, param, or wildcard.
 	typ nodeType
+	// True if a wildcard precedes this wildcard in the same part of the pattern (hostname or path).
+	nested bool
 	// True if this token is part of the hostname portion of the interceptor.
 	// Nodes created from tokens with hsplit=true cannot be merged
 	// during deletion to preserve the hostname/path boundary for lookupByPath optimization.

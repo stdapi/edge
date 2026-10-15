@@ -33,6 +33,9 @@ type entry struct {
 	priority     uint
 	relaxedSlash bool
 	kind         Kind
+	// nested reports whether a wildcard follows another wildcard in the same part of the pattern
+	// (hostname or path), so a lookup can reach the entry several times.
+	nested bool
 	// implied marks the admission entry derived from per-message registrations rather than
 	// declared, and refs counts how many of them still need it.
 	implied bool
@@ -68,9 +71,17 @@ func (e *entry) matchSlow(c *routeCtx) bool {
 	if !e.kindAccepts(c) {
 		return false
 	}
+	// A matcher returns the same result for the same request and never reads the captured
+	// params, so a failure is final for the rest of the lookup.
+	if e.nested && c.lookup.matcherFailed(e) {
+		return false
+	}
 	sealed := onlyRequestContext{c}
 	for _, m := range e.matchers {
 		if !m.Match(sealed) {
+			if e.nested {
+				c.lookup.setMatcherFailed(e)
+			}
 			return false
 		}
 	}

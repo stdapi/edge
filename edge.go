@@ -386,6 +386,7 @@ func newEntry[H Handler](p *Proxy, pattern string, handler H, opts ...EntryOptio
 		if tk.typ != nodeStatic {
 			e.params = append(e.params, tk.value)
 		}
+		e.nested = e.nested || tk.nested
 	}
 
 	for _, opt := range opts {

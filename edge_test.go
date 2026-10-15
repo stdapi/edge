@@ -759,6 +759,21 @@ type noEnd struct{}
 
 func (noEnd) endBy(cause, time.Time) error { return nil }
 
+// countingMatcher fails every request and counts its calls.
+type countingMatcher struct {
+	calls *int
+}
+
+func (m countingMatcher) Match(RequestContext) bool {
+	*m.calls++
+	return false
+}
+
+func (m countingMatcher) Equal(o RequestMatcher) bool {
+	om, ok := o.(countingMatcher)
+	return ok && om.calls == m.calls
+}
+
 type ctxHandler struct {
 	mu   sync.Mutex
 	ctxs []context.Context

@@ -21,8 +21,10 @@ import (
 
 // RequestMatcher evaluates if an HTTP request satisfies specific conditions. Matchers are
 // evaluated after hostname, port and path matching succeeds. All matchers associated with an
-// entry must match for the entry to be selected. Implementations must be safe for concurrent
-// use by multiple goroutines and must not retain the [RequestContext].
+// entry must match for the entry to be selected. Match must return the same result for the same
+// request and must not have side effects the application depends on. A lookup may evaluate the
+// matchers of entries it does not select, more than once and in any order. Implementations must
+// be safe for concurrent use by multiple goroutines and must not retain the [RequestContext].
 type RequestMatcher interface {
 	// Match evaluates if the [RequestContext] satisfies this matcher.
 	Match(c RequestContext) bool

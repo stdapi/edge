@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -241,4 +242,20 @@ func TestEntry_MaxMatchers(t *testing.T) {
 	_, err = p.Update("api.test/v1", noopHandler, WithRequestMatchers[HTTP](a, b), WithMethods[HTTP](http.MethodGet), WithScheme[HTTP]("https"))
 	assert.ErrorIs(t, err, ErrTooManyMatchers)
 	assert.Equal(t, 1, p.Len())
+}
+
+func TestEntry_MatcherEvaluatedOncePerLookup(t *testing.T) {
+	var calls int
+	p := testProxy(t)
+	p.MustAdd("a.test/+{a}/x/+{b}", noopHandler, WithRequestMatchers[HTTP](countingMatcher{calls: &calls}))
+	path := strings.Repeat("/a/x", 100)
+	tree := p.getTree()
+	c := tree.allocateContext()
+	c.reset(nil, httptest.NewRequest(http.MethodGet, path, nil), "https", "a.test", "443")
+	_, n := tree.lookup("a.test", path, c, false)
+	assert.Nil(t, n)
+	assert.Equal(t, 1, calls)
+	_, n = tree.lookup("a.test", path, c, false)
+	assert.Nil(t, n)
+	assert.Equal(t, 2, calls)
 }

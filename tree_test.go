@@ -5,12 +5,15 @@
 package edge
 
 import (
+	"cmp"
 	"fmt"
 	"io"
+	"math"
 	"math/rand/v2"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -459,6 +462,14 @@ func TestRouting_Hostname(t *testing.T) {
 			path:     "/bar",
 			want:     "+{any:[A-Z.]+}.com/bar",
 			params:   []Param{{Key: "any", Value: "A.B"}},
+		},
+		{
+			name:     "infix wildcard favors the hostname with the longest static tail",
+			patterns: []string{"+{h}.x.com/foo", "+{h}.com/foo"},
+			host:     "a.x.com",
+			path:     "/foo",
+			want:     "+{h}.x.com/foo",
+			params:   []Param{{Key: "h", Value: "a"}},
 		},
 		{
 			name:     "simple infix wildcard",
@@ -1078,6 +1089,13 @@ func TestRouting_Overlapping(t *testing.T) {
 
 func TestRouting_InfixWildcard(t *testing.T) {
 	runLookup(t, false, onPathHost([]lookupCase{
+		{
+			name:     "infix wildcard favors the entry with the longest static tail",
+			patterns: []string{"/+{w}/x/y", "/+{w}/y"},
+			path:     "/a/x/y",
+			want:     "/+{w}/x/y",
+			params:   []Param{{Key: "w", Value: "a"}},
+		},
 		{
 			name:     "simple infix wildcard",
 			patterns: []string{"/foo/+{args}/bar"},
@@ -2975,6 +2993,516 @@ func TestRouting_LookupAllocs(t *testing.T) {
 	}
 }
 
+func TestRouting_InfixWildcardAllocs(t *testing.T) {
+	tok := must(MatchHeader("X-Tok", "a"))
+	p := testProxy(t, WithRegexpParam(true))
+	for _, pattern := range []string{
+		"a.test/+{a}/x/+{b}/y",
+		"a.test/+{a}/z",
+		"a.test/r/+{a}/x/+{b:(?:[ab]+/)*[ab]+}/y",
+		"a.test/v2/+{name:[a-z]+(?:/[a-z]+)*}/manifests/{reference}",
+		"a.test/v2/+{name:[a-z]+(?:/[a-z]+)*}/blobs/{digest}",
+		"+{a}.x.+{b}.y.com/foo",
+		"+{a}.z.com/foo",
+	} {
+		p.MustAdd(pattern, noopHandler)
+	}
+	p.MustAdd("a.test/m/+{a}/x/+{b}", noopHandler, WithRequestMatchers[HTTP](tok))
+	p.MustAdd("a.test/m/+{a}", noopHandler)
+
+	tree := p.getTree()
+	c := tree.pool.Get().(*routeCtx)
+	defer tree.pool.Put(c)
+	for _, tc := range []struct{ host, path string }{
+		{"a.test", "/q/x/w/z"},
+		{"a.test", "/r/a/x/c/x/b/y"},
+		{"a.test", "/v2/" + strings.Repeat("abc/", 200) + "img/manifests/latest"},
+		{"q.x.w.z.com", "/foo"},
+		{"a.test", "/m" + strings.Repeat("/a/x", 50)},
+	} {
+		c.reset(nil, httptest.NewRequest(http.MethodGet, "/", nil), "https", tc.host, "443")
+		allocs := testing.AllocsPerRun(100, func() {
+			*c.params = (*c.params)[:0]
+			if _, n := tree.lookup(tc.host, tc.path, c, false); n == nil {
+				t.Fatalf("no match for %s%s", tc.host, tc.path)
+			}
+		})
+		assert.Zero(t, allocs, "%s%s", tc.host, tc.path)
+	}
+}
+
+// onHost puts a path pattern on the host a.test, the host every pattern needs.
+func onHost(pattern string) string {
+	if strings.HasPrefix(pattern, "/") {
+		return "a.test" + pattern
+	}
+	return pattern
+}
+
+func freshLookup(p *Proxy, host, path string, lazy bool, admit Kind) (*routeCtx, *entry) {
+	tree := p.getTree()
+	c := tree.allocateContext()
+	if host == "" {
+		host = "a.test"
+	}
+	c.reset(nil, httptest.NewRequest(http.MethodGet, "/", nil), "https", host, "443")
+	idx, n := lookupTarget(tree.patterns, tree.addrs, host, path, c, lazy, admit)
+	if n == nil {
+		return c, nil
+	}
+	return c, n.entries[idx]
+}
+
+func lookupSteps(c *routeCtx) int {
+	steps := c.lookup.steps
+	for _, w := range c.lookup.regexps {
+		steps += w.ends.Steps()
+	}
+	return steps
+}
+
+func TestRouting_InfixWildcardLinear(t *testing.T) {
+	docker := `[a-z0-9]+(?:(?:\.|_|__|-+)[a-z0-9]+)*(?:/[a-z0-9]+(?:(?:\.|_|__|-+)[a-z0-9]+)*)*`
+	registry := []string{
+		"/v2/+{name:" + docker + "}/manifests/{reference}",
+		"/v2/+{name:" + docker + "}/blobs/{digest}",
+		"/v2/+{name:" + docker + "}/tags/list",
+	}
+	cases := []struct {
+		name      string
+		patterns  []string
+		relaxed   bool
+		lazy      bool
+		admit     Kind
+		request   func(n int) (host, path string)
+		wantMatch bool
+	}{
+		{
+			name:     "regexp infix followed by a param",
+			patterns: registry,
+			request: func(n int) (string, string) {
+				return "", "/v2/" + strings.Repeat("abcdefg/", n) + "img/manifests/latest"
+			},
+			wantMatch: true,
+		},
+		{
+			name:     "regexp infix followed by a param near miss",
+			patterns: registry,
+			request: func(n int) (string, string) {
+				return "", "/v2/" + strings.Repeat("abcdefg/", n) + "img/manifests/latest/x"
+			},
+		},
+		{
+			name:     "multi infix near miss",
+			patterns: []string{"/files/+{p}/thumb/+{q}/download"},
+			request:  func(n int) (string, string) { return "", "/files" + strings.Repeat("/thumb", n) },
+		},
+		{
+			name:     "regexp infix near miss",
+			patterns: []string{"/files/+{p:(?:x/)*x}/x"},
+			request:  func(n int) (string, string) { return "", "/files/" + strings.Repeat("x/", n) + "Z" },
+		},
+		{
+			name:      "regexp infix rejecting the shorter captures",
+			patterns:  []string{"/files/+{p:(?:x/)*y}/x"},
+			request:   func(n int) (string, string) { return "", "/files/" + strings.Repeat("x/", n) + "y/x" },
+			wantMatch: true,
+		},
+		{
+			name:     "regexp infix below an infix",
+			patterns: []string{"/+{a}/x/+{b:(?:[a-z]+/)*[a-z]+}/y"},
+			request:  func(n int) (string, string) { return "", strings.Repeat("/a/x", n) + "/z" },
+		},
+		{
+			name:     "regexp infix listed below its last capture below an infix",
+			patterns: []string{"/+{a}/x/+{b:z[a-z/]*}/y"},
+			request:  func(n int) (string, string) { return "", strings.Repeat("/a/x", n) + "/y/y" },
+		},
+		{
+			name:     "regexp infix scanned to the end after a listed scan below an infix",
+			patterns: []string{"/+{a}/x/+{b:z[a-z/]*}/y"},
+			request:  func(n int) (string, string) { return "", "/a/x/q/y/y" + strings.Repeat("/a/x", n) + "/Z" },
+		},
+		{
+			name:     "regexp infix with trailing slash listed below an infix",
+			patterns: []string{"/+{a}/x/+{b:z[a-z]*}/"},
+			relaxed:  true,
+			request:  func(n int) (string, string) { return "", strings.Repeat("/a/x", n) + "/Z" },
+		},
+		{
+			name:     "regexp infix with trailing slash below an infix",
+			patterns: []string{"/+{a}/x/+{b:(?:[a-z]+/)*[a-z]+}/"},
+			relaxed:  true,
+			request:  func(n int) (string, string) { return "", strings.Repeat("/a/x", n) + "/Z" },
+		},
+		{
+			name:     "regexp infix with a bounded repeat below an infix",
+			patterns: []string{"/+{a}/x/+{b:.{1,255}}/y"},
+			request:  func(n int) (string, string) { return "", strings.Repeat("/a/x", n) + "/Z" },
+		},
+		{
+			name:     "regexp infix with bounded segments below an infix",
+			patterns: []string{"/+{a}/x/+{b:(?:[a-z]+/){1,255}}/y"},
+			request:  func(n int) (string, string) { return "", strings.Repeat("/a/x", n) + "/Z" },
+		},
+		{
+			name:     "regexp infix with bounded repeated segments below an infix",
+			patterns: []string{"/+{a}/x/+{b:(?:(?:[a-z]+/)+){1,255}}/y"},
+			request:  func(n int) (string, string) { return "", strings.Repeat("/a/x", n) + "/Z" },
+		},
+		{
+			name:     "regexp infix below an infix in a non ascii path",
+			patterns: []string{"/+{a}/x/+{b:[^/]+}/y"},
+			request:  func(n int) (string, string) { return "", strings.Repeat("/é/x", n) + "/Z" },
+		},
+		{
+			name:     "regexp suffix below an infix",
+			patterns: []string{"/+{a}/x/+{b:[a-z/]+}"},
+			request:  func(n int) (string, string) { return "", strings.Repeat("/a/x", n) + "/Z" },
+		},
+		{
+			name:     "hostname infix followed by a path",
+			patterns: []string{"+{sub}.example.+{tld}/{a}/x"},
+			request: func(n int) (string, string) {
+				return strings.Repeat("a.example.", n) + "com", "/" + strings.Repeat("a", n) + "/y"
+			},
+		},
+		{
+			name:     "hostname regexp infix below an infix",
+			patterns: []string{"+{a}.x.+{b:(?:[a-z]+\\.)*[a-z]+}.com/"},
+			request:  func(n int) (string, string) { return strings.Repeat("a.x.", n) + "org", "/" },
+		},
+		{
+			name:     "hostname regexp suffix below an infix",
+			patterns: []string{"+{a}.x.+{b:[a-z.]+}/"},
+			request:  func(n int) (string, string) { return strings.Repeat("a.x.", n) + "9", "/" },
+		},
+		{
+			name:     "admission below an infix",
+			patterns: []string{"+{a}.x.+{b}.y"},
+			admit:    KindTCP,
+			request:  func(n int) (string, string) { return strings.Repeat("a.x.", n) + "Z", "" },
+		},
+		{
+			name:     "admission regexp infix below an infix",
+			patterns: []string{"+{a}.x.+{b:(?:[a-z]+\\.)*[a-z]+}.com"},
+			admit:    KindTCP,
+			request:  func(n int) (string, string) { return strings.Repeat("a.x.", n) + "org", "" },
+		},
+		{
+			name:     "admission regexp suffix below an infix",
+			patterns: []string{"+{a}.x.+{b:[a-z.]+}"},
+			admit:    KindTCP,
+			request:  func(n int) (string, string) { return strings.Repeat("a.x.", n) + "9", "" },
+		},
+		{
+			name:     "admission implied by a path entry below an infix",
+			patterns: []string{"+{a}.x.+{b:(?:[a-z]+\\.)*[a-z]+}.com/"},
+			admit:    KindHTTP,
+			request:  func(n int) (string, string) { return strings.Repeat("a.x.", n) + "org", "" },
+		},
+		{
+			name:     "lazy admission regexp infix below an infix",
+			patterns: []string{"+{a}.x.+{b:(?:[a-z]+\\.)*[a-z]+}.com"},
+			admit:    KindTCP,
+			lazy:     true,
+			request:  func(n int) (string, string) { return strings.Repeat("a.x.", n) + "org", "" },
+		},
+		{
+			name:     "regexp infix below an infix under an address range",
+			patterns: []string{"[10.0.0.0/8]/+{a}/x/+{b:[a-z/]+}/y"},
+			request:  func(n int) (string, string) { return "10.1.2.3", strings.Repeat("/a/x", n) + "/Z" },
+		},
+		{
+			name:     "regexp infix below an infix on entries with a port",
+			patterns: []string{"a.test:8443/+{a}/x/+{b:[a-z/]+}/y", "a.test:443/+{a}/x/+{b:[a-z/]+}/w", "/+{a}/x/+{b:[a-z/]+}/z"},
+			request:  func(n int) (string, string) { return "", strings.Repeat("/a/x", n) + "/y" },
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := testProxy(t, WithRegexpParam(true), WithRelaxedTrailingSlash[HTTP](tc.relaxed))
+			for _, pattern := range tc.patterns {
+				var err error
+				if tc.admit == KindTCP {
+					_, err = p.Add[TCP](pattern, noopStream)
+				} else {
+					_, err = p.Add(onHost(pattern), noopHandler)
+				}
+				require.NoError(t, err)
+			}
+			steps := func(n int) int {
+				host, path := tc.request(n)
+				c, e := freshLookup(p, host, path, tc.lazy, tc.admit)
+				assert.Equal(t, tc.wantMatch, e != nil)
+				return lookupSteps(c)
+			}
+			small := steps(500)
+			assert.Less(t, steps(2000), 6*small)
+		})
+	}
+}
+
+func TestRouting_InfixWildcardSingleSegment(t *testing.T) {
+	cases := []struct {
+		name    string
+		pattern string
+		path    string
+		steps   int
+	}{
+		{name: "rejected by the static key", pattern: "/+{v:[a-z]+}/x", path: strings.Repeat("/v", 1000), steps: 1},
+		{name: "empty first capture", pattern: "/+{v:a}/api", path: strings.Repeat("/", 1000) + "Z", steps: 1},
+		{name: "rejected by the regexp", pattern: "/+{v:[a-z]+}/x", path: "/1" + strings.Repeat("/x", 1000), steps: 2},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := routingProxy(t, false, onHost(tc.pattern))
+			c, e := freshLookup(p, "", tc.path, false, 0)
+			assert.Nil(t, e)
+			assert.Equal(t, tc.steps, c.lookup.steps)
+		})
+	}
+}
+
+func TestRouting_InfixWildcardDisjointScans(t *testing.T) {
+	cases := []struct {
+		name    string
+		pattern string
+		host    string
+		path    string
+		params  []string
+	}{
+		{
+			name:    "path",
+			pattern: "/+{site}/archive/+{date:[0-9]{4}/[0-9]{2}/[0-9]{2}}/{slug}",
+			path:    "/blog/archive/engineering/archive/2026/10/13/pike-vm",
+			params:  []string{"blog/archive/engineering", "2026/10/13", "pike-vm"},
+		},
+		{
+			name:    "path with a single segment regexp",
+			pattern: "/+{site}/archive/+{year:[0-9]+}/{slug}",
+			path:    "/blog/archive/engineering/archive/2026/pike-vm",
+			params:  []string{"blog/archive/engineering", "2026", "pike-vm"},
+		},
+		{
+			name:    "hostname",
+			pattern: "+{bucket}.s3.+{region:[a-z]{2}-[a-z]+-[0-9]}.amazonaws.com/+{key}",
+			host:    "logs.s3.backup.s3.eu-west-1.amazonaws.com",
+			path:    "/2026/app.log",
+			params:  []string{"logs.s3.backup", "eu-west-1", "2026/app.log"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := routingProxy(t, false, onHost(tc.pattern))
+			c, e := freshLookup(p, tc.host, tc.path, false, 0)
+			require.NotNil(t, e)
+			assert.Equal(t, onHost(tc.pattern), e.pattern.str)
+			assert.Equal(t, tc.params, *c.params)
+			assert.Nil(t, c.lookup.pathPikeVM)
+			assert.Nil(t, c.lookup.hostPikeVM)
+		})
+	}
+}
+
+func TestRouting_InfixWildcardMemoryAllocs(t *testing.T) {
+	path := func(n int) (string, string) { return "", strings.Repeat("/a/x", n) + "/Z" }
+	cases := []struct {
+		patterns []string
+		admit    Kind
+		request  func(n int) (host, path string)
+	}{
+		{patterns: []string{"/+{a}/x/+{b:[a-z/]+}/y"}, request: path},
+		{patterns: []string{"/+{a}/x/+{b:(?:[a-z]+/)*[a-z]+}/y"}, request: path},
+		{patterns: []string{"/+{a}/x/+{b:[a-z0-9-]{1,63}(?:/[a-z0-9-]{1,63})*}/y"}, request: path},
+		{patterns: []string{"/+{a}/x/+{b:.{1,255}}/y"}, request: path},
+		{patterns: []string{"/+{a}/x/+{b:(?:(?:[a-z]+/)+){1,255}}/y"}, request: path},
+		{patterns: []string{"/+{a}/x/+{b:(?:[a-z/]?){64}}/y"}, request: path},
+		{patterns: []string{"/+{a}/x/+{b:[a-z/]+}/y", "/+{a}/x/+{c:[0-9/]+}/z", "/+{a}/x/+{d:(?:[a-z]+/)*[a-z]+}/w"}, request: path},
+		{
+			patterns: []string{"/+{b:[a-z/]+}/y"},
+			request:  func(n int) (string, string) { return "", strings.Repeat("/y", 2*n) + "/Z" },
+		},
+		{
+			patterns: []string{"+{a}.x.+{b:(?:[a-z]+\\.)*[a-z]+}.com/"},
+			request:  func(n int) (string, string) { return strings.Repeat("a.x.", n) + "org", "/" },
+		},
+		{
+			patterns: []string{"+{a}.x.+{b:(?:[a-z]+\\.)*[a-z]+}.com"},
+			admit:    KindTCP,
+			request:  func(n int) (string, string) { return strings.Repeat("a.x.", n) + "org", "" },
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.patterns[0], func(t *testing.T) {
+			p := testProxy(t, WithRegexpParam(true))
+			for _, pattern := range tc.patterns {
+				var err error
+				if tc.admit == KindTCP {
+					_, err = p.Add[TCP](pattern, noopStream)
+				} else {
+					_, err = p.Add(onHost(pattern), noopHandler)
+				}
+				require.NoError(t, err)
+			}
+			tree := p.getTree()
+
+			fresh := func(n int) uint64 {
+				host, path := tc.request(n)
+				if host == "" {
+					host = "a.test"
+				}
+				least := uint64(math.MaxUint64)
+				for range 3 {
+					c := tree.allocateContext()
+					c.reset(nil, httptest.NewRequest(http.MethodGet, "/", nil), "https", host, "443")
+					var before, after runtime.MemStats
+					runtime.ReadMemStats(&before)
+					_, nd := lookupTarget(tree.patterns, tree.addrs, host, path, c, false, tc.admit)
+					runtime.ReadMemStats(&after)
+					assert.Nil(t, nd)
+					least = min(least, after.TotalAlloc-before.TotalAlloc)
+
+					allocs := testing.AllocsPerRun(3, func() {
+						*c.params = (*c.params)[:0]
+						lookupTarget(tree.patterns, tree.addrs, host, path, c, false, tc.admit)
+					})
+					assert.Zero(t, allocs)
+				}
+				return least
+			}
+			small := fresh(1 << 12)
+			assert.NotZero(t, small)
+			assert.Equal(t, small, fresh(1<<14))
+		})
+	}
+}
+
+func TestRouting_ReusedContext(t *testing.T) {
+	p := testProxy(t, WithRegexpParam(true), WithRelaxedTrailingSlash[HTTP](true))
+	for _, pattern := range []string{
+		"/+{w:a.*}/{p}/",
+		"/files/+{p:[a-z/]+}/{name}",
+		"/+{a}/x/+{b:(?:[a-z]+/)*[a-z]+}/y",
+		"/+{a}/x/+{f:[a-z/]+}",
+		"+{h:[a-z.]+}.x.+{i:(?:[a-z]+\\.)*[a-z]+}.com/",
+		"+{sub}.example.+{tld}/{a}/x",
+	} {
+		p.MustAdd(onHost(pattern), noopHandler)
+	}
+	p.MustAdd[TCP]("+{h}.y.+{i:(?:[a-z]+\\.)*[a-z]+}.com", noopStream)
+
+	requests := []struct {
+		host, path string
+		admit      Kind
+	}{
+		{"a.test", "/a/a/b//x/a.b", 0},
+		{"a.test", "/files/a/bb/ccc/dddd", 0},
+		{"a.test", "/files/x/y/zz", 0},
+		{"a.test", "/ab//b/x", 0},
+		{"a.test", "/a/x/a/x/b/c/y", 0},
+		{"a.test", "/a/x/a/x/b/C", 0},
+		{"a.test", "/a/x/b/c", 0},
+		{"a.x.b.c.com", "/", 0},
+		{"a.b.x.c.x.d.com", "/", 0},
+		{"a.example.b.example.com", "/b/x", 0},
+		{"a.example.b.example.com", "/b/y", 0},
+		{"a.y.b.y.c.com", "", KindTCP},
+		{"a.y.b.y.C.com", "", KindTCP},
+		{"a.test", "/a/a/b//x/a.b", 0},
+	}
+
+	tree := p.getTree()
+	reused := tree.allocateContext()
+	for _, req := range requests {
+		fresh, want := freshLookup(p, req.host, req.path, false, req.admit)
+		reused.reset(nil, httptest.NewRequest(http.MethodGet, "/", nil), "https", req.host, "443")
+		idx, n := lookupTarget(tree.patterns, tree.addrs, req.host, req.path, reused, false, req.admit)
+		var got *entry
+		if n != nil {
+			got = n.entries[idx]
+		}
+		assert.Equal(t, want, got, "%s%s", req.host, req.path)
+		assert.Equal(t, *fresh.params, *reused.params, "%s%s", req.host, req.path)
+	}
+}
+
+func TestRouting_HostWithASlash(t *testing.T) {
+	p := testProxy(t, WithNoEntry[HTTP](noopHandler), WithNoEntry[TCP](noopStream))
+	p.MustAdd("a.api/x", noopHandler)
+	p.MustAdd("a.api/x/y", noopHandler)
+	p.MustAdd("{sub}.example.test/x", noopHandler)
+	p.MustAdd[TCP]("{sub}.example.test", noopStream)
+
+	tree := p.getTree()
+	c := tree.pool.Get().(*routeCtx)
+	defer tree.pool.Put(c)
+	for _, tc := range []struct{ host, path string }{
+		{"a.api/x", "/y"},
+		{"a/b.example.test", "/x"},
+	} {
+		c.reset(nil, httptest.NewRequest(http.MethodGet, tc.path, nil), "https", tc.host, "443")
+		assert.Nil(t, tree.route(c, false), "%s%s", tc.host, tc.path)
+		for _, kind := range []Kind{KindHTTP, KindTCP} {
+			assert.False(t, p.Admits(Target{Scheme: "https", Host: tc.host, Port: "443"}, kind), "%s %s", tc.host, kind)
+		}
+	}
+}
+
+func TestTree_WildcardKeepsItsProgram(t *testing.T) {
+	p := testProxy(t, WithRegexpParam(true))
+	patterns := []string{
+		"a.test/+{a}/x/+{b:[a-z/]+}/y",
+		"a.test/+{a}/x/+{b:[a-z/]+}/z",
+		"a.test/+{a}/x/+{b:[a-z/]+}",
+		"a.test/+{a:[0-9]+}/x",
+		"a.test/+{a:[0-9]+}/xy",
+		"+{h}.x.+{i:[a-z.]+}.com/",
+		"+{h}.x.+{i:[a-z.]+}.co/",
+	}
+	for _, pattern := range patterns {
+		p.MustAdd(pattern, noopHandler)
+	}
+	_, err := p.Update(patterns[0], noopHandler)
+	require.NoError(t, err)
+	for _, pattern := range []string{patterns[1], patterns[4], patterns[6]} {
+		_, err := p.Delete[HTTP](pattern)
+		require.NoError(t, err)
+	}
+
+	var walk func(n *node, wildcard, seen, inPath bool)
+	walk = func(n *node, wildcard, seen, inPath bool) {
+		assert.Equal(t, wildcard && n.regexp != nil, n.prog != nil, "node %q", n.key)
+		if wildcard {
+			assert.Equal(t, seen, n.nested, "node %q", n.key)
+			seen = true
+		}
+		for _, child := range n.statics {
+			if !inPath && strings.Contains(child.key, "/") {
+				walk(child, false, false, true)
+				continue
+			}
+			walk(child, false, seen, inPath)
+		}
+		for _, child := range n.params {
+			walk(child, false, seen, inPath)
+		}
+		for _, child := range n.wildcards {
+			walk(child, true, seen, inPath)
+		}
+	}
+	walk(p.getTree().patterns, false, false, false)
+
+	c, e := freshLookup(p, "", "/a/x/a/x/b/y", false, 0)
+	require.NotNil(t, e)
+	assert.Equal(t, patterns[0], e.pattern.str)
+	assert.Equal(t, []string{"a", "a/x/b"}, *c.params)
+}
+
 func TestRouting_SchemeIsOptional(t *testing.T) {
 	p := testProxy(t)
 	p.MustAdd("api.stripe.com/v1/charges", noopHandler, WithMethods[HTTP](http.MethodGet))
@@ -4066,6 +4594,116 @@ func BenchmarkLookupUnnarrowed(b *testing.B) {
 					b.Fatal("no match")
 				}
 			}
+		})
+	}
+}
+
+func benchLookup(b *testing.B, p *Proxy, host, path string, match bool) {
+	b.Helper()
+	tree := p.getTree()
+	c := tree.pool.Get().(*routeCtx)
+	defer tree.pool.Put(c)
+	c.reset(nil, httptest.NewRequest(http.MethodGet, "/", nil), "https", host, "443")
+	if _, n := tree.lookup(host, path, c, false); (n != nil) != match {
+		b.Fatalf("match = %t", n != nil)
+	}
+	b.ReportAllocs()
+	for b.Loop() {
+		*c.params = (*c.params)[:0]
+		tree.lookup(host, path, c, false)
+	}
+}
+
+func BenchmarkLookupRegexp(b *testing.B) {
+	deep := strings.Repeat("abc/", 32) + "abc"
+	cases := []struct {
+		name    string
+		pattern string
+		host    string
+		path    string
+	}{
+		{name: "param", pattern: "a.test/users/{id:[0-9]+}", path: "/users/12345"},
+		{name: "suffix", pattern: "a.test/files/+{p:[a-z/]+}", path: "/files/abc/def/ghi"},
+		{name: "infix_short", pattern: "a.test/files/+{p:(?:[a-z]+/)*[a-z]+}/meta", path: "/files/abc/meta"},
+		{name: "infix_deep", pattern: "a.test/files/+{p:(?:[a-z]+/)*[a-z]+}/meta", path: "/files/" + deep + "/meta"},
+		{name: "infix_class_param_deep", pattern: "a.test/files/+{p:[a-z/]+}/{name}", path: "/files/" + deep + "/meta"},
+		{
+			name:    "infix_nested_fallback",
+			pattern: "a.test/+{site}/archive/+{date:[0-9]{4}/[0-9]{2}/[0-9]{2}}/{slug}",
+			path:    "/blog/archive/engineering/archive/2026/10/13/pike-vm-for-routers",
+		},
+		{
+			name:    "host_nested_fallback",
+			pattern: "+{bucket}.s3.+{region:[a-z]{2}-[a-z]+-[0-9]}.amazonaws.com/+{key}",
+			host:    "logs.s3.backup.s3.eu-west-1.amazonaws.com",
+			path:    "/2026/10/13/app.log.gz",
+		},
+	}
+
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			p := mustFuzzProxy(b)
+			p.MustAdd(tc.pattern, noopHandler)
+			benchLookup(b, p, cmp.Or(tc.host, "a.test"), tc.path, true)
+		})
+	}
+}
+
+func BenchmarkLookupInfixNearMiss(b *testing.B) {
+	path := strings.Repeat("/a/x", 1<<14) + "/Z"
+	cases := []struct {
+		name     string
+		patterns []string
+		host     string
+		path     string
+		re       string
+	}{
+		{name: "nested", patterns: []string{"a.test/+{a}/x/+{b}/y"}, path: path, re: `^/(.+)/x/(.+)/y$`},
+		{name: "nested_class", patterns: []string{"a.test/+{a}/x/+{b:[a-z/]+}/y"}, path: path, re: `^/(.+)/x/([a-z/]+)/y$`},
+		{
+			name:     "nested_bounded",
+			patterns: []string{"a.test/+{a}/x/+{b:[a-z0-9-]{1,63}(?:/[a-z0-9-]{1,63})*}/y"},
+			path:     path,
+			re:       `^/(.+)/x/([a-z0-9-]{1,63}(?:/[a-z0-9-]{1,63})*)/y$`,
+		},
+		{name: "nested_counted", patterns: []string{"a.test/+{a}/x/+{b:.{1,255}}/y"}, path: path, re: `^/(.+)/x/(.{1,255})/y$`},
+		{name: "nested_optional_chain", patterns: []string{"a.test/+{a}/x/+{b:(?:[a-z/]?){64}}/y"}, path: path, re: `^/(.+)/x/((?:[a-z/]?){64})/y$`},
+		{
+			name:     "nested_siblings",
+			patterns: []string{"a.test/+{a}/x/+{b:[a-z/]+}/y", "a.test/+{a}/x/+{c:[0-9/]+}/z", "a.test/+{a}/x/+{d:(?:[a-z]+/)*[a-z]+}/w"},
+			path:     path,
+			re:       `^/(.+)/x/(?:([a-z/]+)/y|([0-9/]+)/z|((?:[a-z]+/)*[a-z]+)/w)$`,
+		},
+		{name: "nested_suffix", patterns: []string{"a.test/+{a}/x/+{b:[a-z/]+}"}, path: path, re: `^/(.+)/x/([a-z/]+)$`},
+		{name: "nested_non_ascii", patterns: []string{"a.test/+{a}/x/+{b:[^/]+}/y"}, path: strings.Repeat("/é/x", 1<<14) + "/Z", re: `^/(.+)/x/([^/]+)/y$`},
+		{
+			name:     "host_nested",
+			patterns: []string{`+{a}.x.+{b:(?:[a-z]+\.)*[a-z]+}.com/`},
+			host:     strings.Repeat("a.x.", 1<<14) + "org",
+			path:     "/",
+			re:       `^(.+)\.x\.((?:[a-z]+\.)*[a-z]+)\.com$`,
+		},
+	}
+
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			b.Run("edge", func(b *testing.B) {
+				p := mustFuzzProxy(b)
+				for _, pattern := range tc.patterns {
+					p.MustAdd(pattern, noopHandler)
+				}
+				benchLookup(b, p, cmp.Or(tc.host, "a.test"), tc.path, false)
+			})
+
+			b.Run("go", func(b *testing.B) {
+				re := regexp.MustCompile(tc.re)
+				in := cmp.Or(tc.host, tc.path)
+				require.Nil(b, re.FindStringSubmatchIndex(in))
+				b.ReportAllocs()
+				for b.Loop() {
+					re.FindStringSubmatchIndex(in)
+				}
+			})
 		})
 	}
 }

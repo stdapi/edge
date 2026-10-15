@@ -99,6 +99,7 @@ type routeCtx struct {
 	host     string
 	port     string
 	identity string
+	lookup   lookupState
 	// expectContinue is set when net/http writes a 100 Continue from the first read of the
 	// request body.
 	expectContinue bool

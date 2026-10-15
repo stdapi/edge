@@ -507,6 +507,7 @@ func (p *Proxy) parseHostname(hostname string) ([]token, int, *PatternError) {
 	var (
 		paramCount      int
 		prevWild        bool
+		sawWild         bool
 		staticSinceWild int
 		partLen         int
 		totalLen        int
@@ -559,7 +560,8 @@ func (p *Proxy) parseHostname(hostname string) ([]token, int, *PatternError) {
 			} else {
 				prevWild = false
 			}
-			tokens = append(tokens, token{typ: kind, value: name, regexp: re})
+			tokens = append(tokens, token{typ: kind, value: name, regexp: re, nested: isWild && sawWild})
+			sawWild = sawWild || isWild
 			i += n
 			last = 0
 			nonNumeric = true
@@ -650,6 +652,7 @@ func (p *Proxy) parsePath(path string, paramCount int) ([]token, bool, int, *Pat
 	tokens := make([]token, 0, 5)
 	var (
 		prevWild        bool
+		sawWild         bool
 		staticSinceWild int
 		optCatchAll     bool
 	)
@@ -707,7 +710,8 @@ func (p *Proxy) parsePath(path string, paramCount int) ([]token, bool, int, *Pat
 			} else {
 				prevWild = false
 			}
-			tokens = append(tokens, token{typ: kind, value: name, regexp: re})
+			tokens = append(tokens, token{typ: kind, value: name, regexp: re, nested: isWild && sawWild})
+			sawWild = sawWild || isWild
 			i += n
 			if isOpt {
 				if i < len(path) {

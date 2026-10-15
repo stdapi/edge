@@ -153,6 +153,11 @@ func TestParser_Pattern(t *testing.T) {
 	}
 	paramToken := func(v, reg string) token { return constrained(nodeParam, v, reg, "") }
 	wildcardToken := func(v, reg string) token { return constrained(nodeWildcard, v, reg, "") }
+	nestedWildcardToken := func(v, reg string) token {
+		tk := wildcardToken(v, reg)
+		tk.nested = true
+		return tk
+	}
 	hostParamToken := func(v, reg string) token { return constrained(nodeParam, v, reg, "(?i)") }
 	hostWildcardToken := func(v, reg string) token { return constrained(nodeWildcard, v, reg, "(?i)") }
 
@@ -302,9 +307,9 @@ func TestParser_Pattern(t *testing.T) {
 				staticToken("/foo/bar/", false),
 				wildcardToken("bar", ""),
 				staticToken("/x", false),
-				wildcardToken("args", ""),
+				nestedWildcardToken("args", ""),
 				staticToken("/y/", false),
-				wildcardToken("z", ""),
+				nestedWildcardToken("z", ""),
 				staticToken("/", false),
 				paramToken("b", ""),
 			},
@@ -828,9 +833,9 @@ func TestParser_Pattern(t *testing.T) {
 				staticToken("/foo/bar/", false),
 				wildcardToken("bar", ""),
 				staticToken("/x", false),
-				wildcardToken("args", ""),
+				nestedWildcardToken("args", ""),
 				staticToken("/y/", false),
-				wildcardToken("z", ""),
+				nestedWildcardToken("z", ""),
 				staticToken("/", false),
 				paramToken("b", ""),
 			},
@@ -872,9 +877,9 @@ func TestParser_Pattern(t *testing.T) {
 				staticToken("/foo/bar/", false),
 				wildcardToken("bar", ""),
 				staticToken("/x", false),
-				wildcardToken("args", ""),
+				nestedWildcardToken("args", ""),
 				staticToken("/y/", false),
-				wildcardToken("z", ""),
+				nestedWildcardToken("z", ""),
 				staticToken("/", false),
 				paramToken("b", ""),
 			},
@@ -1123,7 +1128,7 @@ func TestParser_Pattern(t *testing.T) {
 				staticToken("/foo/", false),
 				wildcardToken("bar", "[A-z]+"),
 				staticToken("/a", false),
-				wildcardToken("baz", "[0-9]+"),
+				nestedWildcardToken("baz", "[0-9]+"),
 			},
 		},
 		{
