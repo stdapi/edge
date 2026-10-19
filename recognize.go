@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"slices"
+	"syscall"
 	"time"
 )
 
@@ -327,10 +328,14 @@ func splitHeader(line []byte) (name, value []byte, ok bool) {
 
 func isAlpha(b byte) bool { return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' }
 
-// isTimeout reports whether err is a deadline rather than a failure.
+// isTimeout reports whether err is the expiry of a timer, a deadline of the proxy or a timeout of
+// a library it runs, and not the ETIMEDOUT of a kernel that gave up on its peer.
 func isTimeout(err error) bool {
 	if errors.Is(err, os.ErrDeadlineExceeded) {
 		return true
+	}
+	if errors.Is(err, syscall.ETIMEDOUT) {
+		return false
 	}
 	ne, ok := errors.AsType[net.Error](err)
 	return ok && ne.Timeout()

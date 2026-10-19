@@ -60,13 +60,14 @@ type RequestContext interface {
 type routeCtx struct {
 	// w is the client writer a 1xx from the origin is relayed to, nil where none may be.
 	w    http.ResponseWriter
+	body io.ReadCloser
+
 	req  *http.Request
 	sess *Session
 	// client is the request as the server read it and body is its body, which a handler may
 	// replace on the request. Only dispatch sets them, since a gRPC call routes each message
 	// again from the transport while its handler swaps the body.
 	client *http.Request
-	body   io.ReadCloser
 
 	params    *[]string
 	skipStack *skipStack
@@ -81,6 +82,13 @@ type routeCtx struct {
 	http HTTPCtx
 
 	relay *infoRelay
+	// inflight is the trace of a round trip without a relay.
+	inflight *inflightTrace
+	// upgraded is the relay that recorded the connection of the last round trip, which a 101
+	// hands over.
+	upgraded *infoRelay
+	// rq is the request in the list of server.requests, until its session takes it over.
+	rq *request
 	// grpc borrows the same state through http, a call being a request underneath, so
 	// serving one allocates nothing either.
 	grpc GRPCCtx
@@ -107,6 +115,11 @@ func (c *routeCtx) reset(sess *Session, r *http.Request, scheme, host, port stri
 	c.identity = ""
 	c.w = nil
 	c.expectContinue = false
+	c.rq = nil
+	if c.upgraded != nil {
+		c.upgraded.forget()
+		c.upgraded = nil
+	}
 	c.grpc.reset()
 	*c.params = (*c.params)[:0]
 }

@@ -48,7 +48,13 @@ type forwarder struct {
 	up     *upstreamDialer
 	shared struct{ http, https *upstreamPool }
 	pools  *simplelru.LRU[poolKey, *upstreamPool]
-	mu     sync.Mutex
+	// retired keeps the last pools the LRU evicted, to which their connections in flight
+	// return, so the pool stage of the cut ends those as idle connections. Guarded by mu.
+	retired     [maxPools]*upstreamPool
+	retiredNext int
+	mu          sync.Mutex
+	// closed runs close once, and a later or concurrent call returns once it has ended.
+	closed sync.Once
 }
 
 // poolKey includes the proxy, as the key of net/http does, so a request through another
@@ -115,18 +121,87 @@ func newUpstreamPool(up *upstreamDialer, scheme, fixed string, proxy *url.URL) *
 // response.
 type gatedConn struct {
 	net.Conn
-	waiter  atomic.Pointer[chan struct{}]
-	reading atomic.Bool
-	closed  atomic.Bool
+	// inflight is the Done channel of the last HTTP/1.1 request on the connection.
+	inflight atomic.Value
+	waiter   atomic.Pointer[chan struct{}]
+	// exchange is the generation of that request, shifted by exBits, and its state. A close
+	// while it failed resets the connection, docs/lifecycle.md End forms, Upstream request.
+	// The generation keeps a late hook or body of an earlier request off the next one.
+	exchange atomic.Uint64
 	// alpn is the protocol a connection over TLS negotiated, alpnH1 or alpnH2, once a request
 	// reused it.
-	alpn atomic.Uint32
+	alpn    atomic.Uint32
+	reading atomic.Bool
+	closed  atomic.Bool
 }
 
 const (
 	alpnH1 = 1 + iota
 	alpnH2
 )
+
+// The states of the exchange on a gatedConn.
+const (
+	exIdle uint64 = iota
+	exOpen
+	exAbandoned
+
+	exBits  = 2
+	exState = 1<<exBits - 1
+)
+
+// begin records the request in flight, its context ending with done, and returns its
+// generation.
+func (c *gatedConn) begin(done <-chan struct{}) uint64 {
+	c.inflight.Store(done)
+	gen := c.exchange.Load()>>exBits + 1
+	c.exchange.Store(gen<<exBits | exOpen)
+	return gen
+}
+
+// settle moves the exchange of generation gen from the state from to the state to, and
+// reports whether it did.
+func (c *gatedConn) settle(gen, from, to uint64) bool {
+	return c.exchange.CompareAndSwap(gen<<exBits|from, gen<<exBits|to)
+}
+
+// idle ends the exchange of generation gen once the transport returned the connection to its
+// pool, the response read to its end by its handler, a relay or the drain of the transport.
+func (c *gatedConn) idle(gen uint64) {
+	if !c.settle(gen, exOpen, exIdle) {
+		c.settle(gen, exAbandoned, exIdle)
+	}
+}
+
+// live reports whether the exchange of generation gen has not ended, so a hook of its round
+// trip may still run.
+func (c *gatedConn) live(gen uint64) bool {
+	ex := c.exchange.Load()
+	return ex>>exBits == gen && ex&exState != exIdle
+}
+
+// release ends the exchange in flight once a session took the connection over.
+func (c *gatedConn) release() {
+	c.exchange.Store((c.exchange.Load()>>exBits + 1) << exBits)
+}
+
+// failed reports whether the request in flight ends with its failed end: its response was
+// abandoned before its end, or its context ended before the response was read to its end.
+func (c *gatedConn) failed() bool {
+	switch c.exchange.Load() & exState {
+	case exAbandoned:
+		return true
+	case exOpen:
+		if done, _ := c.inflight.Load().(<-chan struct{}); done != nil {
+			select {
+			case <-done:
+				return true
+			default:
+			}
+		}
+	}
+	return false
+}
 
 func (c *gatedConn) Read(b []byte) (int, error) {
 	c.reading.Store(true)
@@ -136,10 +211,72 @@ func (c *gatedConn) Read(b []byte) (int, error) {
 	return n, err
 }
 
+// Write fails once the request in flight is canceled, so no close_notify precedes the reset of
+// its connection.
+func (c *gatedConn) Write(b []byte) (int, error) {
+	if c.failed() {
+		return 0, net.ErrClosed
+	}
+	return c.Conn.Write(b)
+}
+
 func (c *gatedConn) Close() error {
 	c.closed.Store(true)
 	c.wake()
+	if c.failed() {
+		abort(c.Conn)
+		return nil
+	}
 	return c.Conn.Close()
+}
+
+// h1Body is the body of a response read off an HTTP/1.1 connection, which records whether its
+// exchange was read to its end.
+type h1Body struct {
+	io.ReadCloser
+	g   *gatedConn
+	gen uint64
+}
+
+func (b *h1Body) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if errors.Is(err, io.EOF) {
+		b.g.settle(b.gen, exOpen, exIdle)
+	}
+	return n, err
+}
+
+func (b *h1Body) Close() error {
+	// A body closed before its end abandons the response. The connection is reset unless the
+	// transport drains the rest and reuses it.
+	b.g.settle(b.gen, exOpen, exAbandoned)
+	return b.ReadCloser.Close()
+}
+
+// trackBody records on g whether body, the response of the exchange of generation gen, is read
+// to its end.
+func trackBody(body io.ReadCloser, g *gatedConn, gen uint64) io.ReadCloser {
+	if body == nil || body == http.NoBody {
+		g.settle(gen, exOpen, exIdle)
+		return body
+	}
+	return &h1Body{ReadCloser: body, g: g, gen: gen}
+}
+
+// h1GatedConn returns the gatedConn under the connection of an HTTP/1.1 round trip, nil for
+// any other.
+func h1GatedConn(c net.Conn) *gatedConn {
+	if tc, ok := c.(interface {
+		ConnectionState() tls.ConnectionState
+		NetConn() net.Conn
+	}); ok {
+		if tc.ConnectionState().NegotiatedProtocol == "h2" {
+			return nil
+		}
+		c = tc.NetConn()
+	}
+	g, _ := c.(*gatedConn)
+	return g
 }
 
 // ReadFrom keeps the splice of *net.TCPConn for a request body.
@@ -152,6 +289,18 @@ func (c *gatedConn) ReadFrom(r io.Reader) (int64, error) {
 
 // CloseWrite forwards the half-close, which the embedded net.Conn does not promote.
 func (c *gatedConn) CloseWrite() error { return closeWrite(c.Conn) }
+
+// SetWriteDeadline caps a deadline at alertWriteTimeout from now. Go's transport sets none on
+// its connections, crypto/tls gives its close_notify five seconds, and a connection a 101 hands
+// over is written through a body that sets none.
+func (c *gatedConn) SetWriteDeadline(t time.Time) error {
+	if !t.IsZero() {
+		if bound := time.Now().Add(alertWriteTimeout); t.After(bound) {
+			t = bound
+		}
+	}
+	return c.Conn.SetWriteDeadline(t)
+}
 
 func (c *gatedConn) wake() {
 	if w := c.waiter.Load(); w != nil && c.waiter.CompareAndSwap(w, nil) {
@@ -241,22 +390,46 @@ func newForwarder(p *Proxy) (*forwarder, error) {
 	f.shared.http = newUpstreamPool(up, "http", "", nil)
 	f.shared.https = newUpstreamPool(up, "https", "", nil)
 	var err error
-	if f.pools, err = simplelru.NewLRU(maxPools, func(_ poolKey, pool *upstreamPool) { pool.closeIdle() }); err != nil {
+	if f.pools, err = simplelru.NewLRU(maxPools, func(_ poolKey, pool *upstreamPool) {
+		// Off the lock of the forwarder, a close through a chained exit may wait.
+		go pool.closeIdle()
+		f.retired[f.retiredNext] = pool
+		f.retiredNext = (f.retiredNext + 1) % maxPools
+	}); err != nil {
 		return nil, err
 	}
 	return f, nil
 }
 
-func (f *forwarder) close() {
+func (f *forwarder) close() { f.closed.Do(f.closeOnce) }
+
+func (f *forwarder) closeOnce() {
+	// The pools and the chained connections under them share one T, I4.
+	deadline := time.Now().Add(alertWriteTimeout)
 	f.mu.Lock()
 	pools := f.pools.Values()
-	f.mu.Unlock()
-	f.shared.http.close()
-	f.shared.https.close()
-	for _, pool := range pools {
-		pool.close()
+	for _, pool := range f.retired {
+		if pool != nil {
+			pools = append(pools, pool)
+		}
 	}
-	f.up.close()
+	f.mu.Unlock()
+	// quic-go closes the pooled HTTP/3 connections itself, through exits it may block on, so
+	// the exits get the deadline first and the wait for the pools ends with it.
+	f.up.armExits(deadline)
+	var wg sync.WaitGroup
+	wg.Go(f.shared.http.close)
+	wg.Go(f.shared.https.close)
+	for _, pool := range pools {
+		wg.Go(pool.close)
+	}
+	closed := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(closed)
+	}()
+	waitUntil(closed, deadline)
+	f.up.close(deadline)
 }
 
 // poolFor returns the pool of req, through the proxy [Transport.Proxy] selects, called with

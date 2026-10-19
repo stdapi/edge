@@ -5,11 +5,15 @@
 package edge
 
 import (
+	"errors"
 	"io"
 	"net"
+	"os"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/stdapi/edge/internal/netutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -108,7 +112,7 @@ func TestRelayer_IdleTimeoutEndsASilentRelay(t *testing.T) {
 
 	select {
 	case err := <-done:
-		assert.NoError(t, err, "an idle close is the normal end of a relay, not a fault")
+		assert.ErrorIs(t, err, os.ErrDeadlineExceeded, "the idle timeout is a failed end of the relay")
 	case <-time.After(3 * time.Second):
 		t.Fatal("the idle timeout did not end the relay")
 	}
@@ -176,4 +180,116 @@ func TestShaped_KeepsHalfClose(t *testing.T) {
 	n, err := io.ReadFull(w, buf[:4])
 	require.NoError(t, err, "the read direction outlives the half-close")
 	assert.Equal(t, "back", string(buf[:n]))
+}
+
+func TestRelayer_IdleTimeoutResetsBothLegs(t *testing.T) {
+	a, aPeer := tcpPair(t)
+	b, bPeer := tcpPair(t)
+	go func() { _, _, _ = (&Relayer{IdleTimeout: 100 * time.Millisecond}).Relay(a, b) }()
+	assert.Equal(t, "RST", peerEnd(aPeer, 2*time.Second))
+	assert.Equal(t, "RST", peerEnd(bPeer, 2*time.Second))
+}
+
+func TestAbortAfterFlush_WaitsForTheSendQueueWithinItsBound(t *testing.T) {
+	for _, reading := range []bool{false, true} {
+		t.Run(map[bool]string{false: "stalled peer", true: "reading peer"}[reading], func(t *testing.T) {
+			b, bPeer := tcpPair(t)
+			if _, err := netutil.UnsentBytes(b); errors.Is(err, errors.ErrUnsupported) {
+				t.Skip("the platform does not report the send queue")
+			}
+			if !reading {
+				// A fixed receive buffer stops the stack from growing the window that drains the
+				// queue.
+				require.NoError(t, bPeer.SetReadBuffer(4<<10))
+			}
+			writeUntilFull(b)
+			if reading {
+				go func() { _, _ = io.Copy(io.Discard, bPeer) }()
+			}
+			start := time.Now()
+			abortAfterFlush(b)
+			took := time.Since(start)
+			if reading {
+				assert.Less(t, took, alertWriteTimeout*9/10, "the drained queue was waited on")
+			} else {
+				assert.GreaterOrEqual(t, took, alertWriteTimeout*9/10, "the queue was dropped while it held bytes")
+				assert.Less(t, took, alertWriteTimeout*3/2)
+			}
+		})
+	}
+}
+
+func TestRelay_WriteFailureFlushesTheOtherLegBeforeItsReset(t *testing.T) {
+	aPeer, a := tcpPair(t)
+	b, bPeer := tcpPair(t)
+	if _, err := netutil.UnsentBytes(b); errors.Is(err, errors.ErrUnsupported) {
+		t.Skip("the platform reports no send queue")
+	}
+	// A fixed receive buffer stops the stack from growing the window that drains the queue.
+	require.NoError(t, bPeer.SetReadBuffer(4<<10))
+	// Bytes for bPeer queue in b, bPeer not reading.
+	writeUntilFull(b)
+	_ = b.SetWriteDeadline(time.Time{})
+	go func() { _, _, _ = Relay(a, b) }()
+	// bPeer keeps writing toward the client, so the copy b->a writes to a.
+	stop := make(chan struct{})
+	resetAt := make(chan time.Time, 1)
+	failedAt := make(chan time.Time, 1)
+	go func() {
+		chunk := make([]byte, 1024)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			_ = bPeer.SetWriteDeadline(time.Now().Add(50 * time.Millisecond))
+			if _, err := bPeer.Write(chunk); err != nil && !errors.Is(err, os.ErrDeadlineExceeded) {
+				failedAt <- time.Now()
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+	time.Sleep(200 * time.Millisecond)
+	// The client resets.
+	_ = aPeer.SetLinger(0)
+	resetAt <- time.Now()
+	_ = aPeer.Close()
+	select {
+	case f := <-failedAt:
+		r := <-resetAt
+		assert.GreaterOrEqual(t, f.Sub(r), alertWriteTimeout*8/10, "b was reset with bytes still queued for bPeer")
+	case <-time.After(3 * time.Second):
+		t.Fatal("b never ended")
+	}
+	close(stop)
+}
+
+func TestRelay_LocalCloseOfOneLegResetsTheOther(t *testing.T) {
+	for _, how := range []string{"close", "deadline"} {
+		t.Run(how, func(t *testing.T) {
+			_, a := tcpPair(t)
+			peerB, b := tcpPair(t)
+			done := make(chan error, 1)
+			go func() {
+				_, _, err := Relay(a, b)
+				done <- err
+			}()
+			time.Sleep(50 * time.Millisecond)
+			if how == "close" {
+				abort(a)
+			} else {
+				require.NoError(t, a.SetReadDeadline(time.Now()))
+			}
+			require.NoError(t, peerB.SetReadDeadline(time.Now().Add(2*time.Second)))
+			_, err := peerB.Read(make([]byte, 1))
+			require.ErrorIs(t, err, syscall.ECONNRESET, "the other leg of a leg ended on this side got no reset")
+			want := net.ErrClosed
+			if how == "deadline" {
+				want = os.ErrDeadlineExceeded
+			}
+			require.ErrorIs(t, <-done, want, "Relay hid the end that reset its legs")
+		})
+	}
 }

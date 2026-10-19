@@ -63,69 +63,89 @@ func (p *Proxy) ListenAndServeSOCKS5(addr string) error {
 // ServeSOCKS5 accepts connections on ln and serves them as a SOCKS5 proxy, see
 // [Proxy.ListenAndServeSOCKS5]. It returns [ErrInvalidConfig] at once when the authenticator
 // [WithProxyAuth] sets is not a [PasswordAuthenticator].
+// It always returns a non-nil error and closes ln. After [Proxy.Shutdown] or [Proxy.Close] has
+// begun, the returned error is [ErrProxyClosed], once ln is closed.
 func (p *Proxy) ServeSOCKS5(ln net.Listener) error {
 	if p.cfg.proxyAuth != nil {
 		if _, ok := p.cfg.proxyAuth.(PasswordAuthenticator); !ok {
+			_ = ln.Close()
 			return fmt.Errorf("%w: the proxy authenticator authenticates HTTP requests only, a SOCKS5 client presents a username and a password", ErrInvalidConfig)
 		}
 	}
 	return p.acceptEach(ln, p.serveSOCKS5, "SOCKS5 connection closed")
 }
 
-// The codec reads exactly the bytes of each message, so nothing the client sends after the
-// reply is consumed before the connection is handed on.
+// serveSOCKS5 serves a connection acceptEach tracked, and untracks it. The codec reads exactly
+// the bytes of each message, so nothing the client sends after the reply is consumed before the
+// connection is handed on.
 func (p *Proxy) serveSOCKS5(conn net.Conn) error {
-	if !p.srv.tryTrack(conn) {
-		_ = conn.Close()
-		return ErrProxyClosed
-	}
 	defer func() {
 		_ = conn.Close()
 		p.srv.untrack(conn)
 	}()
 
-	ctx, cancel := context.WithCancel(p.srv.ctx)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	if d := p.cfg.server.readHeaderTimeout; d > 0 {
 		_ = conn.SetReadDeadline(time.Now().Add(d))
 	}
-	identity, err := p.negotiateSOCKS5(conn)
-	if err != nil {
+	// The proxy records a socket it opens before it writes on it, so a request loop is told
+	// apart once the first bytes arrived, and refused with the failed end before they are
+	// parsed, docs/lifecycle.md Refusals.
+	first := newPeekConn(conn, nil, 1)
+	if _, err := first.Peek(1); err != nil {
+		if isTimeout(err) {
+			// The read header timeout refuses the negotiation, docs/lifecycle.md Timers.
+			lingerRefused(conn, socks5.WriteMethod(conn, socks5.MethodNoAcceptable))
+		}
 		return err
 	}
 	if p.fromItself(conn.RemoteAddr(), conn.LocalAddr(), netip.AddrPort{}) {
 		abort(conn)
 		return nil
 	}
+	identity, err := p.negotiateSOCKS5(first)
+	if err != nil {
+		return err
+	}
 	bound := socks5Bound(conn.LocalAddr())
 	cmd, addr, err := socks5.ReadRequest(conn)
 	if err != nil {
-		switch {
-		case errors.Is(err, socks5.ErrAddressType):
-			refuseSOCKS5(conn, socks5.AddressTypeNotSupported, bound)
-		case errors.Is(err, socks5.ErrNameLength):
-			refuseSOCKS5(conn, socks5.GeneralFailure, bound)
+		rep := socks5.GeneralFailure
+		if errors.Is(err, socks5.ErrAddressType) {
+			rep = socks5.AddressTypeNotSupported
 		}
+		refuseSOCKS5(conn, rep, bound)
 		return err
 	}
 	_ = conn.SetReadDeadline(time.Time{})
+	if p.srv.closing.Load() {
+		// A request read after the start of a drain opens no session, and one read during a
+		// cut gets the failed end.
+		if p.srv.cutting() {
+			abort(conn)
+		} else {
+			refuseSOCKS5(conn, socks5.GeneralFailure, bound)
+		}
+		return ErrProxyClosed
+	}
 
 	switch cmd {
 	case socks5.CmdConnect:
 	case socks5.CmdAssociate:
 		return p.serveSOCKS5Associate(ctx, conn, addr, identity)
 	default:
-		_ = socks5.WriteReply(conn, socks5.CommandNotSupported, bound)
+		refuseSOCKS5(conn, socks5.CommandNotSupported, bound)
 		return fmt.Errorf("SOCKS5 command %d is not served", cmd)
 	}
 	target, err := targetFromSOCKS5(addr)
 	if err != nil {
-		_ = socks5.WriteReply(conn, socks5.GeneralFailure, bound)
+		refuseSOCKS5(conn, socks5.GeneralFailure, bound)
 		return err
 	}
 	if !p.admitsAny(target, KindHTTP, KindTCP) {
-		_ = socks5.WriteReply(conn, socks5.NotAllowed, bound)
+		refuseSOCKS5(conn, socks5.NotAllowed, bound)
 		return errors.New("no entry admits this authority")
 	}
 
@@ -133,22 +153,36 @@ func (p *Proxy) serveSOCKS5(conn net.Conn) error {
 	sess.cancel = cancel
 	sess.identity = identity
 	sess.setDestination(target)
+	peeked := newPeekConn(conn, nil, clientHelloPeekSize)
+	if !p.srv.registerSession(sess, (*pendingSocket)(peeked)) {
+		abort(conn)
+		return ErrProxyClosed
+	}
+	defer p.srv.untrackSession(sess)
 
 	// The client sends its ClientHello only once it has the reply, so the reply comes before
 	// termination, as the 200 of a CONNECT does.
 	if err := socks5.WriteReply(conn, socks5.Succeeded, bound); err != nil {
+		// The client did not get its acceptance, a failed end of its leg, I1.
+		_ = sess.endBy(causePeerFailed, time.Now().Add(alertWriteTimeout))
 		return err
 	}
-	if err := p.terminate(ctx, newPeekConn(conn, nil, clientHelloPeekSize), sess); err != nil {
+	if err := p.terminate(ctx, peeked, sess); err != nil {
 		p.logf(ctx, slog.LevelDebug, "connection closed", sess, err)
 	}
 	return nil
 }
 
-// refuseSOCKS5 answers a request it could not read to its end. A close with unread data
-// sends a reset, which can destroy the reply before the client reads it.
+// refuseSOCKS5 answers a request with the failure rep.
 func refuseSOCKS5(conn net.Conn, rep socks5.Reply, bound socks5.Addr) {
-	if socks5.WriteReply(conn, rep, bound) != nil {
+	lingerRefused(conn, socks5.WriteReply(conn, rep, bound))
+}
+
+// lingerRefused ends a connection after the write of a refusal returned werr, with the normal
+// end of TCP, the client given socks5RefuseLinger to close first. A close with unread data
+// sends a reset, which can destroy the refusal before the client reads it.
+func lingerRefused(conn net.Conn, werr error) {
+	if werr != nil {
 		return
 	}
 	_ = closeWrite(conn)
@@ -157,10 +191,11 @@ func refuseSOCKS5(conn net.Conn, rep socks5.Reply, bound socks5.Addr) {
 }
 
 // One method is offered, username/password when an authenticator is configured and none
-// otherwise.
-func (p *Proxy) negotiateSOCKS5(rw io.ReadWriter) (string, error) {
-	methods, err := socks5.ReadMethods(rw)
+// otherwise. A malformed or failed negotiation is refused here.
+func (p *Proxy) negotiateSOCKS5(conn net.Conn) (string, error) {
+	methods, err := socks5.ReadMethods(conn)
 	if err != nil {
+		lingerRefused(conn, socks5.WriteMethod(conn, socks5.MethodNoAcceptable))
 		return "", err
 	}
 	auth, _ := p.cfg.proxyAuth.(PasswordAuthenticator)
@@ -169,26 +204,28 @@ func (p *Proxy) negotiateSOCKS5(rw io.ReadWriter) (string, error) {
 		want = socks5.MethodPassword
 	}
 	if !slices.Contains(methods, want) || (want == socks5.MethodPassword && auth == nil) {
-		_ = socks5.WriteMethod(rw, socks5.MethodNoAcceptable)
+		lingerRefused(conn, socks5.WriteMethod(conn, socks5.MethodNoAcceptable))
 		return "", errors.New("the client offers no acceptable authentication method")
 	}
-	if werr := socks5.WriteMethod(rw, want); werr != nil {
+	if werr := socks5.WriteMethod(conn, want); werr != nil {
 		return "", werr
 	}
 	if auth == nil {
 		return "", nil
 	}
 
-	username, password, err := socks5.ReadCredentials(rw)
+	username, password, err := socks5.ReadCredentials(conn)
 	if err != nil {
+		lingerRefused(conn, socks5.WriteCredentialsStatus(conn, false))
 		return "", err
 	}
 	identity, ok := auth.AuthenticatePassword(username, password)
-	if err := socks5.WriteCredentialsStatus(rw, ok); err != nil {
-		return "", err
-	}
 	if !ok {
+		lingerRefused(conn, socks5.WriteCredentialsStatus(conn, false))
 		return "", errors.New("proxy authentication failed")
+	}
+	if err := socks5.WriteCredentialsStatus(conn, true); err != nil {
+		return "", err
 	}
 	return identity, nil
 }
@@ -214,15 +251,23 @@ func targetFromSOCKS5(addr socks5.Addr) (Target, error) {
 // that declares no destination.
 func (p *Proxy) serveSOCKS5Associate(ctx context.Context, conn net.Conn, from socks5.Addr, identity string) error {
 	bound := socks5Bound(conn.LocalAddr())
+	// A refusal during a cut is the failed end.
+	refuse := func() {
+		if p.srv.cutting() {
+			abort(conn)
+			return
+		}
+		refuseSOCKS5(conn, socks5.GeneralFailure, bound)
+	}
 	d, err := p.srv.tunnelDemux()
 	if err != nil {
-		_ = socks5.WriteReply(conn, socks5.GeneralFailure, bound)
+		refuse()
 		return err
 	}
 	local := addrPort(conn.LocalAddr())
 	relay, err := net.ListenUDP("udp", net.UDPAddrFromAddrPort(netip.AddrPortFrom(local.Addr(), 0)))
 	if err != nil {
-		_ = socks5.WriteReply(conn, socks5.GeneralFailure, bound)
+		refuse()
 		return err
 	}
 
@@ -235,37 +280,66 @@ func (p *Proxy) serveSOCKS5Associate(ctx context.Context, conn net.Conn, from so
 
 	assoc := newSOCKSAssociation(ctx, p, relay, from, addrPort(conn.RemoteAddr()).Addr())
 	tun := newConnectUDPTunnel(d, sess, assoc, cancel)
-	sess.closer = tun
+	defer tun.noSender()
+	sess.closer = &socksAssociationCloser{tun: tun, control: conn}
 	if !d.publishTunnel(tun) {
 		_ = relay.Close()
-		_ = socks5.WriteReply(conn, socks5.GeneralFailure, bound)
+		refuse()
 		return errors.New("the proxy is at capacity or shutting down")
 	}
 	defer tun.close()
-	if !p.srv.tryTrack(tun) {
+	if !p.srv.trackRegistered(tun) {
 		_ = relay.Close()
+		abort(conn)
 		return ErrProxyClosed
 	}
 	defer p.srv.untrack(tun)
-	if !p.srv.admitSession(sess) {
+	if err := p.srv.admitSession(sess, nil); err != nil {
 		_ = relay.Close()
+		if errors.Is(err, errSessionEnded) {
+			abort(conn)
+			return err
+		}
 		return errors.New("the entries changed while the association was admitted")
 	}
 	defer p.srv.untrackSession(sess)
 
 	relayAddr := addrPort(relay.LocalAddr())
+	tun.accept(assoc)
 	if err := socks5.WriteReply(conn, socks5.Succeeded, socks5.Addr{IP: relayAddr.Addr(), Port: relayAddr.Port()}); err != nil {
+		_ = sess.endBy(causePeerFailed, time.Now().Add(alertWriteTimeout))
 		_ = relay.Close()
 		return err
 	}
 	// RFC 1928 section 7 ends the association with the connection, so it is read until
 	// the client closes it.
 	go func() {
-		_, _ = io.Copy(io.Discard, conn)
-		cancel()
+		_, err := io.Copy(io.Discard, conn)
+		if err == nil {
+			err = io.EOF
+		}
+		tun.peerEnded(err)
 	}()
 	tun.serve(ctx, assoc)
 	assoc.wg.Wait()
+	closeNormally(conn)
+	return nil
+}
+
+// socksAssociationCloser ends an association with its control connection, the normal end of
+// both once the tunnel ended what it carries.
+type socksAssociationCloser struct {
+	tun     *connectUDPTunnel
+	control net.Conn
+}
+
+func (c *socksAssociationCloser) endBy(cs cause, deadline time.Time) error {
+	_ = c.tun.endBy(cs, deadline)
+	if formOf(framed, cs, false) == formFailed {
+		abortBy(c.control, deadline)
+		return nil
+	}
+	closeNormallyBy(c.control, deadline)
 	return nil
 }
 
@@ -487,3 +561,5 @@ func (a *socksAssociation) send(b []byte) error {
 func (a *socksAssociation) setReadDeadline(t time.Time) error  { return a.conn.SetReadDeadline(t) }
 func (a *socksAssociation) setWriteDeadline(t time.Time) error { return a.conn.SetWriteDeadline(t) }
 func (a *socksAssociation) close() error                       { return a.conn.Close() }
+func (a *socksAssociation) closeBy(time.Time) error            { return a.conn.Close() }
+func (a *socksAssociation) fail()                              { _ = a.conn.Close() }

@@ -22,7 +22,7 @@ import (
 // dispatchRequest routes one request and runs whatever serves it. The lookup runs on the tree
 // as it stands now, so an entry added or removed while the connection was open applies to
 // this request.
-func (p *Proxy) dispatchRequest(w http.ResponseWriter, r *http.Request, sess *Session, target Target, identity string) {
+func (p *Proxy) dispatchRequest(w http.ResponseWriter, r *http.Request, sess *Session, target Target, identity string, rq *request) {
 	tree := p.getTree()
 	c := tree.pool.Get().(*routeCtx)
 	defer tree.pool.Put(c)
@@ -46,6 +46,7 @@ func (p *Proxy) dispatchRequest(w http.ResponseWriter, r *http.Request, sess *Se
 	c.reset(sess, r, target.Scheme, target.Host, target.Port)
 	c.client, c.body = r, r.Body
 	c.identity = identity
+	c.rq = rq
 
 	c.entry = tree.route(c, false)
 	if c.entry == nil {
@@ -85,13 +86,13 @@ func (p *Proxy) serveHTTPEntry(c *routeCtx, w http.ResponseWriter, r *http.Reque
 	resp, err := runHTTPHandler(&c.http, handler)
 	if err != nil {
 		resp = p.onError(&c.http, err)
-		if _, ok := errors.AsType[requestReset](err); ok {
-			// HTTP has no status for a canceled request.
-			if resp != nil && resp.Body != nil {
-				_ = resp.Body.Close()
-			}
-			abortResponse(w)
+	}
+	if _, ok := errors.AsType[requestReset](err); ok {
+		// HTTP has no status for a canceled request.
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
 		}
+		abortWith(w, r, http3.ErrCodeRequestCanceled, false)
 	}
 	if resp == nil {
 		resp = Status(http.StatusBadGateway)
@@ -108,9 +109,10 @@ func (p *Proxy) serveHTTPEntry(c *routeCtx, w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	c.rq.markHeader()
 	if werr := writeResponse(w, r, resp); werr != nil {
 		p.logf(r.Context(), slog.LevelDebug, "write response", sess, werr)
-		abortIfCut(w, werr)
+		abortIfCut(w, r, werr)
 	}
 }
 
@@ -123,6 +125,30 @@ func (p *Proxy) serveGRPC(c *routeCtx, w http.ResponseWriter, r *http.Request, s
 		return
 	}
 
+	if r.ProtoMajor == 1 {
+		// The HTTP/1.1 server closes a request body still unread when the response starts,
+		// and the messages of a call keep arriving after its response has started. A body
+		// left unread then ends the connection, which the response header announces.
+		rc := http.NewResponseController(w)
+		_ = rc.EnableFullDuplex()
+		body := &h1CallBody{ReadCloser: r.Body}
+		r.Body, c.body = body, body
+		if c.rq != nil {
+			c.rq.callBody = body
+		}
+		// The server would otherwise wait for the rest of the body for as long as the client
+		// keeps its request open. The reader of a call never opened stops with it. A body read
+		// to its end keeps its connection, which the deadline would end with the context of
+		// every later request.
+		defer func() {
+			if !body.eof.Load() {
+				_ = rc.SetReadDeadline(time.Unix(1, 0))
+			}
+			if call := c.grpc.current(); call != nil && call.h1 {
+				call.h1r.abandon()
+			}
+		}()
+	}
 	gc := &c.grpc
 	gc.ctx = r.Context()
 	gc.w = w
@@ -134,16 +160,17 @@ func (p *Proxy) serveGRPC(c *routeCtx, w http.ResponseWriter, r *http.Request, s
 		}
 		if cut != nil {
 			p.logf(r.Context(), slog.LevelDebug, "grpc response", sess, cut)
-			abortIfCut(w, cut)
+			abortIfCut(w, r, cut)
 		}
 		return
 	}
 	if err == nil {
 		var resp *http.Response
 		if resp, err = gc.response(); err == nil {
+			c.rq.markHeader()
 			if werr := writeResponse(w, r, resp); werr != nil {
 				p.logf(r.Context(), slog.LevelDebug, "write gRPC response", sess, werr)
-				abortIfCut(w, werr)
+				abortIfCut(w, r, werr)
 			}
 			return
 		}
@@ -157,6 +184,7 @@ func (p *Proxy) serveGRPC(c *routeCtx, w http.ResponseWriter, r *http.Request, s
 	p.logf(r.Context(), slog.LevelDebug, "grpc call failed", sess, err)
 	code := statusOf(err)
 	resp := grpcStatusResponse(code, code.String())
+	c.rq.markHeader()
 	if werr := writeResponse(w, r, resp); werr != nil {
 		p.logf(r.Context(), slog.LevelDebug, "write gRPC status", sess, werr)
 	}
@@ -267,19 +295,33 @@ var errBodyCut = errors.New("response body cut short")
 
 // abortIfCut resets the response when err is errBodyCut. A return would end it cleanly and the
 // client would read a complete body.
-func abortIfCut(w http.ResponseWriter, err error) {
+func abortIfCut(w http.ResponseWriter, r *http.Request, err error) {
 	if errors.Is(err, errBodyCut) {
-		abortResponse(w)
+		abortWith(w, r, http3.ErrCodeRequestCanceled, true)
 	}
 }
 
-func abortResponse(w http.ResponseWriter) {
-	if hs, ok := w.(http3.HTTPStreamer); ok {
+// rejectRequest gives a request no handler processed its failed end.
+func rejectRequest(w http.ResponseWriter, r *http.Request) {
+	abortWith(w, r, http3.ErrCodeRequestRejected, false)
+}
+
+// abortWith gives the response to r its failed end: a reset stream, or the failed end of its
+// connection for a response delimited by the close. On HTTP/3 the reset has code once the
+// response header was written, and H3_INTERNAL_ERROR before, since quic-go writes a 200 first
+// for any other code, docs/lifecycle.md Limits.
+func abortWith(w http.ResponseWriter, r *http.Request, code http3.ErrCode, header bool) {
+	if !r.ProtoAtLeast(1, 1) {
+		if sess := sessionFromRequest(r); sess != nil && sess.httpConn != nil {
+			abort(sess.httpConn)
+		}
+	}
+	if hs, ok := w.(http3.HTTPStreamer); ok && header {
 		// RFC 9114 4.1.1 resets an abandoned response with H3_REQUEST_CANCELLED, where quic-go
 		// resets an aborted handler with H3_INTERNAL_ERROR.
 		str := hs.HTTPStream()
-		str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
-		str.CancelRead(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+		str.CancelWrite(quic.StreamErrorCode(code))
+		str.CancelRead(quic.StreamErrorCode(code))
 	}
 	panic(http.ErrAbortHandler)
 }
@@ -338,6 +380,21 @@ func isClientGone(err error) bool {
 		errors.Is(err, http.ErrHandlerTimeout) ||
 		errors.Is(err, io.ErrUnexpectedEOF) ||
 		errors.Is(err, io.EOF)
+}
+
+// h1CallBody is the body of a gRPC call over HTTP/1.1, which records that it was read to its
+// end.
+type h1CallBody struct {
+	io.ReadCloser
+	eof atomic.Bool
+}
+
+func (b *h1CallBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if errors.Is(err, io.EOF) {
+		b.eof.Store(true)
+	}
+	return n, err
 }
 
 // requestReset is a read of an HTTP/3 request body that failed on a RESET_STREAM of the client.

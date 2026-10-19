@@ -19,6 +19,7 @@ import (
 	"os"
 	"slices"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -677,7 +678,9 @@ func TestSOCKS5_IdleAssociationIsClosed(t *testing.T) {
 	assoc := waitForSessions(t, p, 1)[0]
 	require.True(t, assoc.Tunnel())
 
+	p.srv.mu.Lock()
 	d := p.srv.tunnels
+	p.srv.mu.Unlock()
 	require.NotNil(t, d)
 	d.mu.Lock()
 	for _, flow := range d.flows {
@@ -1120,6 +1123,7 @@ var socksConformance = []conformanceCase{
 		run: func(t *testing.T) {
 			w := dialSOCKSWire(t, startSOCKS5(t, testProxy(t)))
 			w.write([]byte{4, 1, 0x00})
+			w.want(5, 0xff)
 			w.wantClosed()
 		},
 	},
@@ -1129,6 +1133,7 @@ var socksConformance = []conformanceCase{
 		run: func(t *testing.T) {
 			w := dialSOCKSWire(t, startSOCKS5(t, testProxy(t)))
 			w.write([]byte{5, 0})
+			w.want(5, 0xff)
 			w.wantClosed()
 		},
 	},
@@ -1224,6 +1229,7 @@ var socksConformance = []conformanceCase{
 			w.write([]byte{5, 1, 0})
 			w.want(5, 0)
 			w.write([]byte{4, 1, 0}, socksAddrBytes(netip.MustParseAddrPort("127.0.0.1:443")))
+			assert.EqualValues(t, 0x01, w.readReply()[1])
 			w.wantClosed()
 		},
 	},
@@ -1816,6 +1822,7 @@ var socksConformance = []conformanceCase{
 			w.write([]byte{5, 1, 0x02})
 			w.want(5, 0x02)
 			w.write([]byte{5, 5}, []byte("alice"), []byte{6}, []byte("secret"))
+			w.want(1, 1)
 			w.wantClosed()
 		},
 	},
@@ -1896,4 +1903,141 @@ func TestSOCKS5_RelayIsNotBoundToASocketOfTheProxy(t *testing.T) {
 	a := newSOCKSAssociation(t.Context(), p, nil, socks5.Addr{}, netip.MustParseAddr("127.0.0.1"))
 	assert.False(t, a.accepts(addrPort(own.LocalAddr())))
 	assert.True(t, a.accepts(addrPort(client.LocalAddr())))
+}
+
+func TestSOCKS5_EveryRefusalIsReadBeforeTheEnd(t *testing.T) {
+	request := func(ver, cmd, atyp byte) []byte {
+		return []byte{ver, cmd, 0x00, atyp, 127, 0, 0, 1, 0, 9}
+	}
+	cases := []struct {
+		name  string
+		auth  bool
+		sends [][]byte
+		reply []byte
+	}{
+		{name: "greeting of another version", sends: [][]byte{{0x04, 0x01, 0x00}}, reply: []byte{0x05, 0xff}},
+		{name: "no acceptable method", sends: [][]byte{{0x05, 0x01, 0x02}}, reply: []byte{0x05, 0xff}},
+		{name: "malformed credentials", auth: true, sends: [][]byte{{0x05, 0x01, 0x02}, {0x01, 0x00, 0x00}}, reply: []byte{0x05, 0x02, 0x01, 0x01}},
+		{name: "failed authentication", auth: true, sends: [][]byte{{0x05, 0x01, 0x02}, append([]byte{0x01, 5}, "alice\x04nope"...)}, reply: []byte{0x05, 0x02, 0x01, 0x01}},
+		{name: "request of another version", sends: [][]byte{{0x05, 0x01, 0x00}, request(0x04, 0x01, 0x01)}, reply: []byte{0x05, 0x00, 0x05, 0x01}},
+		{name: "unknown command", sends: [][]byte{{0x05, 0x01, 0x00}, request(0x05, 0x02, 0x01)}, reply: []byte{0x05, 0x00, 0x05, 0x07}},
+		{name: "unknown address type", sends: [][]byte{{0x05, 0x01, 0x00}, request(0x05, 0x01, 0x05)}, reply: []byte{0x05, 0x00, 0x05, 0x08}},
+		{name: "no entry", sends: [][]byte{{0x05, 0x01, 0x00}, request(0x05, 0x01, 0x01)}, reply: []byte{0x05, 0x00, 0x05, 0x02}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var opts []ProxyOption
+			if tc.auth {
+				opts = append(opts, WithProxyAuth(testBasic()))
+			}
+			w := dialSOCKSWire(t, startSOCKS5(t, testProxy(t, opts...)))
+			// Bytes past the message the proxy refuses, which a close would answer with a reset.
+			for i, b := range tc.sends {
+				if i == len(tc.sends)-1 {
+					b = append(slices.Clone(b), "pipelined"...)
+				}
+				w.write(b)
+			}
+			got := w.read(len(tc.reply))
+			assert.Equal(t, tc.reply, got)
+			require.NoError(t, w.conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+			_, err := io.ReadAll(w.conn)
+			assert.NoError(t, err, "the refusal ended with a reset")
+		})
+	}
+}
+
+func TestSOCKS5_RequestReadDuringTheDrainIsRefused(t *testing.T) {
+	p := testProxy(t)
+	var ran atomic.Bool
+	p.MustAdd[TCP]("[127.0.0.0/8]", func(*TCPCtx) error {
+		ran.Store(true)
+		return nil
+	})
+	conn, err := net.Dial("tcp", startSOCKS5(t, p))
+	require.NoError(t, err)
+	defer conn.Close()
+	require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+	_, err = conn.Write([]byte{0x05, 0x01, 0x00})
+	require.NoError(t, err)
+	_, err = io.ReadFull(conn, make([]byte, 2))
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	go func() { _ = p.Shutdown(ctx) }()
+	time.Sleep(200 * time.Millisecond)
+	_, err = conn.Write([]byte{0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, 0, 9})
+	require.NoError(t, err)
+	reply := make([]byte, 10)
+	_, err = io.ReadFull(conn, reply)
+	require.NoError(t, err)
+	assert.EqualValues(t, 0x01, reply[1])
+	assert.False(t, ran.Load())
+}
+
+func TestSOCKS5_DrainKeepsAnAssociationAndItsNewFlows(t *testing.T) {
+	first, second := udpEcho(t), udpEcho(t)
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca), WithProxyAuth(testBasic()))
+	require.NoError(t, err)
+	p.MustAdd[UDP]("[127.0.0.0/8]", forwardDatagram)
+	client := associate(t, startSOCKS5(t, p), "alice", "secret")
+	body, _ := echoThroughSOCKS(t, client, net.UDPAddrFromAddrPort(first), "before")
+	require.Equal(t, "before", body)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	go func() { _ = p.Shutdown(ctx) }()
+	time.Sleep(200 * time.Millisecond)
+	body, _ = echoThroughSOCKS(t, client, net.UDPAddrFromAddrPort(second), "during")
+	assert.Equal(t, "during", body, "a new flow of an association admitted before the drain")
+}
+
+func TestSOCKS5_SilentClientIsRefusedAtTheReadHeaderTimeout(t *testing.T) {
+	p := testProxy(t, WithReadHeaderTimeout(200*time.Millisecond))
+	conn, err := net.Dial("tcp", startSOCKS5(t, p))
+	require.NoError(t, err)
+	defer conn.Close()
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(3*time.Second)))
+	b, err := io.ReadAll(conn)
+	require.NoError(t, err, "a client silent until the read header timeout got no refusal")
+	require.Equal(t, []byte{0x05, 0xFF}, b)
+}
+
+type failingAcceptListener struct {
+	net.Listener
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (l *failingAcceptListener) Accept() (net.Conn, error) {
+	return nil, errors.New("permanent accept failure")
+}
+
+func (l *failingAcceptListener) Close() error {
+	l.once.Do(func() { close(l.closed) })
+	return l.Listener.Close()
+}
+
+func TestSOCKS5_ServeClosesItsListenerOnAPermanentAcceptError(t *testing.T) {
+	for name, serve := range map[string]func(*Proxy, net.Listener) error{
+		"socks5":      (*Proxy).ServeSOCKS5,
+		"transparent": (*Proxy).ServeTransparent,
+	} {
+		t.Run(name, func(t *testing.T) {
+			p := testProxy(t)
+			t.Cleanup(func() { _ = p.Close() })
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			require.NoError(t, err)
+			fl := &failingAcceptListener{Listener: ln, closed: make(chan struct{})}
+			require.Error(t, serve(p, fl))
+			select {
+			case <-fl.closed:
+			default:
+				t.Fatal("a Serve method returned with its listener open")
+			}
+		})
+	}
 }

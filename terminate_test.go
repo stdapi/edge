@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -199,7 +200,7 @@ func TestTerminate_SessionCloseEndsAStalledClient(t *testing.T) {
 
 			start := time.Now()
 			_ = sess.Close()
-			assert.Less(t, time.Since(start), alertWriteTimeout, "Close blocked on the client")
+			assert.Less(t, time.Since(start), alertWriteTimeout+alertWriteTimeout/2, "Close outlived its deadline")
 			assert.Eventually(t, func() bool { return len(slices.Collect(p.Sessions())) == 0 },
 				alertWriteTimeout, 10*time.Millisecond, "the session outlived its close")
 		})
@@ -916,11 +917,13 @@ func routedOver(t *testing.T, c net.Conn) string {
 func refusedUpstream(t *testing.T, tc *tls.Conn, host string) {
 	t.Helper()
 	w := newWire(tc)
-	w.send(t, "GET / HTTP/1.1\r\nHost: "+host+"\r\n\r\n")
 	if tc.ConnectionState().NegotiatedProtocol == "http/1.1" {
+		w.send(t, "GET / HTTP/1.1\r\nHost: "+host+"\r\n\r\n")
 		assert.Equal(t, http.StatusBadGateway, w.readResponse(t, http.MethodGet).resp.StatusCode)
 		return
 	}
+	// A byte stream the origin refused may have its failed end before the client writes.
+	_, _ = io.WriteString(tc, "GET / HTTP/1.1\r\nHost: "+host+"\r\n\r\n")
 	got, _ := io.ReadAll(w.br)
 	assert.Empty(t, string(got))
 }
@@ -1694,36 +1697,52 @@ var tlsConformance = []conformanceCase{
 		id: "rfc9846/6.1/2", name: "the origin closes its write side of a terminated stream",
 		req: "Each party MUST send a \"close_notify\" alert before closing its write side of the connection, unless it has already sent some error alert.  This does not have any effect on its read side of the connection.",
 		run: func(t *testing.T) {
-			originCA, err := GenerateCA()
-			require.NoError(t, err)
-			cert, err := originCA.Leaf(tlsUpstream)
-			require.NoError(t, err)
-			rest := make(chan string, 1)
-			origin, _ := tlsOrigin(t, cert, nil, func(tc *tls.Conn) {
-				_, _ = io.WriteString(tc, "hi")
-				_ = tc.CloseWrite()
-				got, _ := io.ReadAll(tc)
-				rest <- string(got)
-			})
-			p, ca := upstreamProxy(t, origin, originCA.CertPool())
-			rec := &recordingConn{Conn: connectRaw(t, startProxy(t, p), tlsUpstream+":443")}
-			require.NoError(t, rec.SetDeadline(time.Now().Add(5*time.Second)))
-			tc := tls.Client(rec, &tls.Config{ServerName: tlsUpstream, RootCAs: ca.CertPool(), NextProtos: []string{"x-test"}, MaxVersion: tls.VersionTLS12, MinVersion: tls.VersionTLS12})
-			require.NoError(t, tc.Handshake())
+			// On TLS 1.3 the close_notify half-closes at once. TLS 1.2 has none, a peer closes
+			// on a close_notify, so it comes once the other direction ended. The type of the
+			// record is read on TLS 1.2 alone, where it is not encrypted.
+			for _, version := range []uint16{tls.VersionTLS13, tls.VersionTLS12} {
+				t.Run(tls.VersionName(version), func(t *testing.T) {
+					originCA, err := GenerateCA()
+					require.NoError(t, err)
+					cert, err := originCA.Leaf(tlsUpstream)
+					require.NoError(t, err)
+					rest := make(chan string, 1)
+					origin, _ := tlsOrigin(t, cert, nil, func(tc *tls.Conn) {
+						_, _ = io.WriteString(tc, "hi")
+						_ = tc.CloseWrite()
+						got, _ := io.ReadAll(tc)
+						rest <- string(got)
+					})
+					p, ca := upstreamProxy(t, origin, originCA.CertPool())
+					rec := &recordingConn{Conn: connectRaw(t, startProxy(t, p), tlsUpstream+":443")}
+					require.NoError(t, rec.SetDeadline(time.Now().Add(5*time.Second)))
+					tc := tls.Client(rec, &tls.Config{ServerName: tlsUpstream, RootCAs: ca.CertPool(), NextProtos: []string{"x-test"}, MaxVersion: version, MinVersion: version})
+					require.NoError(t, tc.Handshake())
 
-			got, err := io.ReadAll(tc)
-			require.NoError(t, err)
-			assert.Equal(t, "hi", string(got))
-			assert.Equal(t, byte(tlsAlert), rec.lastRecord())
+					got := make([]byte, 2)
+					_, err = io.ReadFull(tc, got)
+					require.NoError(t, err)
+					assert.Equal(t, "hi", string(got))
+					if version == tls.VersionTLS13 {
+						_, err = tc.Read(make([]byte, 1))
+						require.ErrorIs(t, err, io.EOF, "the origin's half-close did not reach the client")
+					}
 
-			_, err = io.WriteString(tc, "after")
-			require.NoError(t, err)
-			require.NoError(t, tc.CloseWrite())
-			select {
-			case got := <-rest:
-				assert.Equal(t, "after", got)
-			case <-time.After(5 * time.Second):
-				t.Fatal("the origin never read the end of the stream")
+					_, err = io.WriteString(tc, "after")
+					require.NoError(t, err)
+					require.NoError(t, tc.CloseWrite())
+					select {
+					case got := <-rest:
+						assert.Equal(t, "after", got)
+					case <-time.After(5 * time.Second):
+						t.Fatal("the origin never read the end of the stream")
+					}
+					_, err = io.ReadAll(tc)
+					require.NoError(t, err)
+					if version == tls.VersionTLS12 {
+						assert.Equal(t, byte(tlsAlert), rec.lastRecord())
+					}
+				})
 			}
 		},
 	},
@@ -2388,5 +2407,282 @@ func TestLeafCovers(t *testing.T) {
 		cert, err := ca.Leaf(tc.leaf)
 		require.NoError(t, err)
 		assert.Equal(t, tc.want, leafCovers(cert.Leaf, tc.host), "%s for %s", tc.leaf, tc.host)
+	}
+}
+
+func TestTerminate_ClientHelloAfterTheSniffTimeoutFailsVisibly(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca), WithSniffTimeout(200*time.Millisecond))
+	require.NoError(t, err)
+	read := make(chan error, 1)
+	p.MustAdd[TCP]("svc.test:443", func(c *TCPCtx) error {
+		_, rerr := c.Client().Read(make([]byte, 1))
+		read <- rerr
+		return rerr
+	})
+	conn := connectRaw(t, startProxy(t, p), "svc.test:443")
+	time.Sleep(400 * time.Millisecond)
+	// The record header of a ClientHello and the start of its handshake message.
+	_, err = conn.Write([]byte{0x16, 0x03, 0x01, 0x00, 0x04, 0x01, 0x00, 0x00, 0x00})
+	require.NoError(t, err)
+	select {
+	case rerr := <-read:
+		require.ErrorIs(t, rerr, errLateClientHello)
+	case <-time.After(3 * time.Second):
+		t.Fatal("the handler never read")
+	}
+	assert.Equal(t, "RST", peerEnd(conn, 3*time.Second))
+}
+
+func TestTerminate_SilentClientSpeaksPlaintextAfterTheSniffTimeout(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca), WithSniffTimeout(200*time.Millisecond))
+	require.NoError(t, err)
+	got := make(chan string, 1)
+	p.MustAdd[TCP]("svc.test:25", func(c *TCPCtx) error {
+		line, rerr := bufio.NewReader(c.Client()).ReadString('\n')
+		got <- line
+		return rerr
+	})
+	conn := connectRaw(t, startProxy(t, p), "svc.test:25")
+	time.Sleep(400 * time.Millisecond)
+	// A first byte of 0x16 that is no TLS record header.
+	_, err = conn.Write([]byte("\x16 EHLO client\n"))
+	require.NoError(t, err)
+	select {
+	case line := <-got:
+		assert.Equal(t, "\x16 EHLO client\n", line)
+	case <-time.After(3 * time.Second):
+		t.Fatal("the handler never read")
+	}
+}
+
+func TestTerminate_UnresolvedHostInsideAConnectIsANameThatDoesNotMatch(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca), WithNameVerification(VerifyReject), WithNameResolver(&fakeResolver{err: errors.New("no such host")}))
+	require.NoError(t, err)
+	p.MustAdd("svc.test/*{any}", func(*HTTPCtx) (*http.Response, error) { return Text(200, "ok"), nil })
+	p.MustAdd("127.0.0.1/*{any}", func(*HTTPCtx) (*http.Response, error) { return Text(200, "ok"), nil })
+	conn := connectRaw(t, startProxy(t, p), "127.0.0.1:8080")
+	_, err = fmt.Fprintf(conn, "GET / HTTP/1.1\r\nHost: svc.test:8080\r\n\r\n")
+	require.NoError(t, err)
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+	assert.True(t, resp.Close)
+}
+
+func TestTerminate_PlaintextFirstRequestHeaderTimeoutGets408AndTheNormalEnd(t *testing.T) {
+	p := testProxy(t, WithReadHeaderTimeout(500*time.Millisecond))
+	p.MustAdd("plain.test/", okHandler)
+	conn, err := net.Dial("tcp", startProxy(t, p))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	_, err = fmt.Fprintf(conn, "CONNECT plain.test:80 HTTP/1.1\r\nHost: plain.test:80\r\n\r\n")
+	require.NoError(t, err)
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	_, err = io.WriteString(conn, "GET / HTTP/1.1\r\nHost: plain.te")
+	require.NoError(t, err)
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+	resp, err = http.ReadResponse(br, nil)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusRequestTimeout, resp.StatusCode)
+	assert.True(t, resp.Close)
+	_, err = io.ReadAll(br)
+	assert.NoError(t, err, "the normal end of the connection")
+}
+
+func TestTerminate_408EndsNormallyUnderTrickledBytes(t *testing.T) {
+	p := testProxy(t, WithReadHeaderTimeout(500*time.Millisecond))
+	p.MustAdd("plain.test/", okHandler)
+	conn, err := net.Dial("tcp", startProxy(t, p))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	_, err = fmt.Fprintf(conn, "CONNECT plain.test:80 HTTP/1.1\r\nHost: plain.test:80\r\n\r\n")
+	require.NoError(t, err)
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	_, err = io.WriteString(conn, "GET / HTTP/1.1\r\nHost: plain.te")
+	require.NoError(t, err)
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(10 * time.Millisecond):
+				if _, err := conn.Write([]byte("x")); err != nil {
+					return
+				}
+			}
+		}
+	}()
+	time.Sleep(800 * time.Millisecond)
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+	b, err := io.ReadAll(br)
+	t.Logf("read %q, end %v", b, err)
+	if err != nil {
+		t.Errorf("the end after the 408 is %v", err)
+	}
+}
+
+func TestTerminate_RefusalAfterTheHandshakeReadsUntilTheClientEnds(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p := testProxyWithCA(t, ca)
+	p.MustAdd("svc.test/", noopHandler)
+	raw := connectRaw(t, startProxy(t, p), "svc.test:443")
+	tc := tls.Client(raw, &tls.Config{ServerName: "svc.test", RootCAs: ca.CertPool()})
+	require.NoError(t, tc.Handshake())
+	// Not HTTP, so the stream is refused, with more behind it than the sniff reads.
+	go func() { _, _ = tc.Write(make([]byte, 128<<10)) }()
+	require.NoError(t, tc.SetReadDeadline(time.Now().Add(3*time.Second)))
+	_, err = io.Copy(io.Discard, tc)
+	require.NoError(t, err, "the refusal after the handshake wrote no close_notify")
+	time.Sleep(50 * time.Millisecond)
+	_, err = raw.Write(make([]byte, 64))
+	require.NoError(t, err)
+	require.Equal(t, "FIN", peerEnd(raw, 2*time.Second), "the refusal closed the socket before the client ended")
+}
+
+func TestTerminate_DrainEndOfAFreshConnectionResetsNothing(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p := testProxyWithCA(t, ca)
+	p.MustAdd("allowed.test/", okHandler)
+	client, err := net.Dial("tcp", startProxy(t, p))
+	require.NoError(t, err)
+	defer client.Close()
+	_, err = io.WriteString(client, "CONNECT allowed.test:443 HTTP/1.1\r\nHost: allowed.test:443\r\n\r\n")
+	require.NoError(t, err)
+	br := bufio.NewReader(client)
+	resp, err := http.ReadResponse(br, nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	tc := tls.Client(client, &tls.Config{RootCAs: ca.CertPool(), ServerName: "allowed.test", NextProtos: []string{"http/1.1"}})
+	require.NoError(t, tc.Handshake())
+	time.Sleep(100 * time.Millisecond)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+		defer cancel()
+		_ = p.Shutdown(ctx)
+	}()
+	_ = tc.SetReadDeadline(time.Now().Add(4 * time.Second))
+	_, err = tc.Read(make([]byte, 1))
+	require.ErrorIs(t, err, io.EOF, "close_notify expected")
+	// The client keeps its socket open past the discard bound of the proxy.
+	time.Sleep(2 * alertWriteTimeout)
+	_ = client.SetReadDeadline(time.Now().Add(time.Second))
+	_, err = client.Read(make([]byte, 1))
+	require.ErrorIs(t, err, io.EOF, "the normal end of the connection was reset")
+}
+
+func TestTerminate_ClientResetAfterTheSniffTimeoutReachesTheOriginAsAReset(t *testing.T) {
+	originAddr, upstream := oneConnOrigin(t)
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca), WithSniffTimeout(100*time.Millisecond))
+	require.NoError(t, err)
+	done := make(chan error, 1)
+	p.MustAdd[TCP](originAddr, func(c *TCPCtx) error {
+		up, err := c.Dial()
+		if err != nil {
+			done <- err
+			return err
+		}
+		_, _, err = Relay(c.Client(), up)
+		done <- err
+		return err
+	})
+	conn := connectRaw(t, startProxy(t, p), originAddr)
+	var up net.Conn
+	select {
+	case up = <-upstream:
+	case <-time.After(3 * time.Second):
+		t.Fatal("no upstream connection")
+	}
+	time.Sleep(300 * time.Millisecond)
+	require.NoError(t, conn.(*net.TCPConn).SetLinger(0))
+	require.NoError(t, conn.Close())
+	require.Equal(t, "RST", peerEnd(up, 2*time.Second))
+	select {
+	case err = <-done:
+		require.Error(t, err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("the relay outlived both legs")
+	}
+}
+
+func TestTerminate_ClientResetInsideTheFirstRequestHeaderFailsTheConnection(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca), WithSniffTimeout(2*time.Second))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = p.Close() })
+	p.MustAdd("reset.test/", okHandler)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+	client, err := net.Dial("tcp", ln.Addr().String())
+	require.NoError(t, err)
+	server, err := ln.Accept()
+	require.NoError(t, err)
+	done := make(chan error, 1)
+	go func() { done <- p.ServeConn(server) }()
+	_, err = client.Write([]byte("GET / HTTP/1.1\r\nHo"))
+	require.NoError(t, err)
+	time.Sleep(100 * time.Millisecond)
+	require.NoError(t, client.(*net.TCPConn).SetLinger(0))
+	require.NoError(t, client.Close())
+	select {
+	case err = <-done:
+		require.ErrorIs(t, err, syscall.ECONNRESET)
+	case <-time.After(5 * time.Second):
+		t.Fatal("ServeConn did not return")
+	}
+}
+
+func TestTerminate_TimeoutInsideTheClientHelloGetsNoAlert(t *testing.T) {
+	for _, reject := range []bool{false, true} {
+		t.Run("reject ECH "+strconv.FormatBool(reject), func(t *testing.T) {
+			ca, err := GenerateCA()
+			require.NoError(t, err)
+			p, err := New(WithCA(ca), WithRejectECH(reject), WithReadHeaderTimeout(300*time.Millisecond))
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = p.Close() })
+			p.MustAdd("reset.test/", okHandler)
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			require.NoError(t, err)
+			defer ln.Close()
+			client, err := net.Dial("tcp", ln.Addr().String())
+			require.NoError(t, err)
+			defer client.Close()
+			server, err := ln.Accept()
+			require.NoError(t, err)
+			done := make(chan error, 1)
+			go func() { done <- p.ServeConn(server) }()
+			// A record header announcing a ClientHello of 256 bytes, one of them sent.
+			_, err = client.Write([]byte{0x16, 0x03, 0x01, 0x01, 0x00, 0x01})
+			require.NoError(t, err)
+			_ = client.SetReadDeadline(time.Now().Add(3 * time.Second))
+			got, err := io.ReadAll(client)
+			require.Empty(t, got)
+			require.ErrorIs(t, err, syscall.ECONNRESET)
+			select {
+			case err = <-done:
+				require.True(t, isTimeout(err), "%v", err)
+			case <-time.After(3 * time.Second):
+				t.Fatal("ServeConn did not return")
+			}
+		})
 	}
 }

@@ -6,11 +6,13 @@ package edge
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"iter"
 	"math"
+	"net"
 	"net/http"
 	"net/http/httptrace"
 	"net/netip"
@@ -18,6 +20,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"golang.org/x/net/http/httpguts"
@@ -177,7 +180,8 @@ func (c *HTTPCtx) Forward() (*http.Response, error) {
 }
 
 // ForwardRequest sends r upstream instead of the request the handler was given. Use it to
-// retry, to fan out, or to rewrite the target entirely.
+// retry, to fan out, or to rewrite the target entirely. [Session.Close] and [Proxy.Close] cancel
+// r only when its context derives from the context of the request the handler was given.
 //
 // A TRACE or OPTIONS request with a Max-Forwards of 0 is answered by the proxy without reaching
 // the upstream, OPTIONS with an empty 200 and TRACE with a 501. A greater value is sent
@@ -189,6 +193,10 @@ func (c *HTTPCtx) ForwardRequest(r *http.Request) (*http.Response, error) {
 	if c.r.p == nil || c.r.p.srv == nil || c.r.p.srv.fwd == nil {
 		return nil, errors.New("edge: proxy has no forwarder")
 	}
+	// A request the proxy ended opens nothing more upstream, whatever the context of r.
+	if c.r.p.srv.requests.isClosed(c.r.rq) {
+		return nil, net.ErrClosed
+	}
 
 	hops, limited := maxForwards(r)
 	if limited && hops == 0 {
@@ -199,11 +207,32 @@ func (c *HTTPCtx) ForwardRequest(r *http.Request) (*http.Response, error) {
 	}
 
 	ctx := r.Context()
+	if c.r.upgraded != nil {
+		// The connection an earlier round trip recorded is no longer this request's.
+		c.r.upgraded.forget()
+		c.r.upgraded = nil
+	}
 	relay := c.r.infoRelay(ctx)
-	if relay != nil {
+	upgrade := upgradeType(r.Header) != ""
+	var record *infoRelay
+	var inflight *inflightTrace
+	switch {
+	case relay != nil:
 		ctx = httptrace.WithClientTrace(ctx, &relay.trace)
-	} else {
-		ctx = withReuseGate(ctx)
+		record = relay
+	case upgrade:
+		// No 1xx reaches the client, but the connection of a 101 is recorded all the same. The
+		// record has no Got1xxResponse, which would wait on a handler that reads no 1xx.
+		record = newInfoRelay()
+		record.trace.Got1xxResponse = nil
+		ctx = httptrace.WithClientTrace(ctx, &record.trace)
+	default:
+		// An upstream of HTTP/2 over TLS may still answer in HTTP/1.1.
+		inflight = c.r.inflightTrace(ctx)
+		ctx = httptrace.WithClientTrace(ctx, &inflight.trace)
+	}
+	if upgrade {
+		c.r.upgraded = record
 	}
 	out, err := c.outboundRequest(ctx, r)
 	if err != nil {
@@ -241,6 +270,9 @@ func (c *HTTPCtx) ForwardRequest(r *http.Request) (*http.Response, error) {
 	}
 	var resp *http.Response
 	if relay == nil {
+		if record != nil {
+			record.out, record.proto = out, c.upstreamProtocol()
+		}
 		resp, err = c.r.p.srv.fwd.roundTrip(out, c.upstreamProtocol(), fixed)
 	} else {
 		var started chan struct{}
@@ -257,6 +289,19 @@ func (c *HTTPCtx) ForwardRequest(r *http.Request) (*http.Response, error) {
 		return nil, fmt.Errorf("forward %s %s: %w", out.Method, out.URL.Redacted(), err)
 	}
 
+	// The connection of an HTTP/1.1 round trip ends with its failed end unless the response
+	// is read to its end, docs/lifecycle.md I2.
+	var g *gatedConn
+	var gen uint64
+	switch {
+	case record != nil:
+		g, gen = record.conn.Load(), record.gen.Load()
+	case inflight != nil:
+		g, gen = inflight.g.Load(), inflight.gen.Load()
+	}
+	if g != nil && resp.StatusCode != http.StatusSwitchingProtocols {
+		resp.Body = trackBody(resp.Body, g, gen)
+	}
 	stripResponseHopByHop(resp)
 	return resp, nil
 }
@@ -296,6 +341,12 @@ func (c *HTTPCtx) outboundRequest(ctx context.Context, r *http.Request) (*http.R
 	upgrade := upgradeType(r.Header)
 	if !r.ProtoAtLeast(1, 1) {
 		// RFC 9110 7.8, HTTP/1.0 has no upgrade.
+		upgrade = ""
+	}
+	if upgrade != "" && c.r.entry != nil && c.r.entry.kind == KindHTTP &&
+		!c.r.p.admitsAny(Target{Scheme: c.r.scheme, Host: c.r.host, Port: c.r.port}, KindTCP) {
+		// Nothing would serve the stream past a 101, so the origin is not asked for one, RFC
+		// 9110 section 7.8 letting an intermediary drop the field.
 		upgrade = ""
 	}
 	trailers := headerListContains(r.Header, "Te", "trailers")
@@ -354,17 +405,24 @@ func maxForwards(r *http.Request) (uint64, bool) {
 // runs on a goroutine of its own and the handler goroutine writes each 1xx while it waits, so
 // the response writer is never written from a transport goroutine.
 type infoRelay struct {
-	trace  httptrace.ClientTrace
+	trace httptrace.ClientTrace
+	// top is the connection the transport writes to over conn, TLS included, guarded by topMu.
+	top    net.Conn
 	info   chan informational
 	result chan roundTripResult
 	// done is closed once the handler stops waiting on a round trip that failed, so a 1xx the
 	// transport still reads for it is dropped.
-	done    chan struct{}
-	run     func()
-	fwd     *forwarder
-	out     *http.Request
+	done chan struct{}
+	run  func()
+	fwd  *forwarder
+	out  *http.Request
+	// conn is the HTTP/1.1 connection of the last round trip, and gen the generation of its
+	// exchange there.
+	conn    atomic.Pointer[gatedConn]
 	fixed   string
 	pending []informational
+	gen     atomic.Uint64
+	topMu   sync.Mutex
 	proto   Protocol
 }
 
@@ -387,23 +445,117 @@ func newInfoRelay() *infoRelay {
 	}
 	i.trace.Got1xxResponse = i.got1xx
 	i.trace.GotConn = i.gotConn
+	i.trace.PutIdleConn = i.putIdleConn
 	i.run = i.roundTrip
 	return i
 }
 
-func (i *infoRelay) gotConn(info httptrace.GotConnInfo) { gateReuse(info, i.out.Context().Done()) }
+// forget drops the connection a round trip recorded.
+func (i *infoRelay) forget() {
+	i.conn.Store(nil)
+	i.topMu.Lock()
+	i.top = nil
+	i.topMu.Unlock()
+}
 
-// reuseGate is the trace of a request forwarded without an [infoRelay]. Shared, it cannot reach
-// the request and waits without a bound, which the transport keeps short by reading or closing the
-// connection right after it put it back in the pool.
-var reuseGate = &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) { gateReuse(info, nil) }}
+func (i *infoRelay) gotConn(info httptrace.GotConnInfo) {
+	done := i.out.Context().Done()
+	gateReuse(info, done)
+	g := h1GatedConn(info.Conn)
+	if g != nil {
+		i.gen.Store(g.begin(done))
+	}
+	i.conn.Store(g)
+	i.topMu.Lock()
+	i.top = info.Conn
+	i.topMu.Unlock()
+}
 
-func withReuseGate(ctx context.Context) context.Context {
+// takeUpstreamConn returns the HTTP/1.1 connection a 101 handed over, the socket and the
+// connection over it, nil when none was recorded. The connection leaves its request, the
+// session of the 101 deciding its end.
+func (c *routeCtx) takeUpstreamConn() (socket, top net.Conn) {
+	i := c.upgraded
+	if i == nil {
+		return nil, nil
+	}
+	g := i.conn.Swap(nil)
+	if g == nil {
+		return nil, nil
+	}
+	g.release()
+	i.topMu.Lock()
+	top = i.top
+	i.top = nil
+	i.topMu.Unlock()
+	if tc, ok := top.(*tls.Conn); ok {
+		// The half-close of the pipe is bounded as any TLS end of the proxy, I4.
+		top = &boundedTLSConn{Conn: tc, done: make(chan struct{})}
+	}
+	return g.Conn, top
+}
+
+// putIdleConn ends the exchange of a connection the transport returned to its pool after a
+// complete exchange.
+func (i *infoRelay) putIdleConn(err error) {
+	if g := i.conn.Load(); g != nil && err == nil {
+		g.idle(i.gen.Load())
+	}
+}
+
+// busy reports whether a hook of the last round trip may still run, so the relay cannot serve
+// another one.
+func (i *infoRelay) busy() bool {
+	g := i.conn.Load()
+	return g != nil && g.live(i.gen.Load())
+}
+
+// inflightTrace is the trace of a round trip without a relay, recording the exchange of its
+// HTTP/1.1 connection as the relay does.
+type inflightTrace struct {
+	trace httptrace.ClientTrace
+	done  <-chan struct{}
+	g     atomic.Pointer[gatedConn]
+	gen   atomic.Uint64
+}
+
+func newInflightTrace() *inflightTrace {
+	t := new(inflightTrace)
+	t.trace.GotConn = func(info httptrace.GotConnInfo) {
+		gateReuse(info, t.done)
+		g := h1GatedConn(info.Conn)
+		if g != nil {
+			t.gen.Store(g.begin(t.done))
+		}
+		t.g.Store(g)
+	}
+	t.trace.PutIdleConn = func(err error) {
+		if g := t.g.Load(); g != nil && err == nil {
+			g.idle(t.gen.Load())
+		}
+	}
+	return t
+}
+
+// inflightTrace returns the trace of the next round trip without a relay, its context being
+// ctx.
+func (c *routeCtx) inflightTrace(ctx context.Context) *inflightTrace {
+	t := c.inflight
 	if httptrace.ContextClientTrace(ctx) != nil {
 		// WithClientTrace composes the trace it is given with the one already there.
-		return httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{GotConn: reuseGate.GotConn})
+		t = newInflightTrace()
+	} else if t == nil || t.busy() {
+		t = newInflightTrace()
+		c.inflight = t
 	}
-	return httptrace.WithClientTrace(ctx, reuseGate)
+	t.done = ctx.Done()
+	t.g.Store(nil)
+	return t
+}
+
+func (t *inflightTrace) busy() bool {
+	g := t.g.Load()
+	return g != nil && g.live(t.gen.Load())
 }
 
 // infoRelay returns the relay of the next round trip, or nil when the client cannot be sent a
@@ -417,7 +569,7 @@ func (c *routeCtx) infoRelay(ctx context.Context) *infoRelay {
 		// pooled trace would keep the hooks of this request.
 		return newInfoRelay()
 	}
-	if c.relay == nil {
+	if c.relay == nil || c.relay.busy() {
 		c.relay = newInfoRelay()
 	}
 	return c.relay

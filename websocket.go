@@ -61,8 +61,9 @@ func (o Opcode) String() string {
 // 125 payload bytes and forbids fragmenting.
 func (o Opcode) Control() bool { return o&0x8 != 0 }
 
-// The RFC 6455 status codes edge sends when a frame breaks the protocol.
+// The RFC 6455 status codes edge sends.
 const (
+	closeNormal        = 1000
 	closeGoingAway     = 1001
 	closeProtocolError = 1002
 	closeTooBig        = 1009
@@ -180,8 +181,8 @@ type WebSocketCtx struct {
 	toClient wsHop
 	toOrigin wsHop
 	maxFrame int
-	mu       sync.Mutex
 	initOnce sync.Once
+	mu       sync.Mutex
 	done     bool
 }
 
@@ -253,11 +254,12 @@ func (c *WebSocketCtx) Inbound() *FrameReader {
 
 // setHops sets the two connections of c. The proxy is the server toward the client and the
 // client toward the origin, so the masking rule of RFC 6455 section 5.3 runs one way on each.
-func (c *WebSocketCtx) setHops(client net.Conn, clientR io.Reader, backend io.ReadWriteCloser) {
+func (c *WebSocketCtx) setHops(client net.Conn, clientR io.Reader, backend io.ReadWriteCloser, raw, top net.Conn) {
 	c.toClient.c, c.toClient.peer, c.toClient.server = c, &c.toOrigin, true
+	c.toClient.done, c.toOrigin.done = make(chan struct{}), make(chan struct{})
 	c.toClient.conn, c.toClient.r, c.toClient.w.w = client, clientR, client
 	c.toOrigin.c, c.toOrigin.peer = c, &c.toClient
-	c.toOrigin.conn, c.toOrigin.r, c.toOrigin.w.w, c.toOrigin.w.mask = pipeConn{ReadWriteCloser: backend}, backend, backend, true
+	c.toOrigin.conn, c.toOrigin.r, c.toOrigin.w.w, c.toOrigin.w.mask = pipeConn{ReadWriteCloser: backend, raw: raw, top: top}, backend, backend, true
 }
 
 func (c *WebSocketCtx) init() {
@@ -276,7 +278,7 @@ func (c *WebSocketCtx) newFrameReader(src *wsHop, inbound bool) *FrameReader {
 			return nil, src.readEnded(err)
 		}
 		if f.opcode == OpClose {
-			src.closeCrossed(&src.recvClose)
+			src.closeReceived(closeCodeOf(f.payload))
 		}
 		f.inbound = inbound
 		fc.Frame = f
@@ -345,11 +347,15 @@ const (
 // the origin with edge as its client, and where the closing handshake stands on it. The state
 // is guarded by the mutex of c.
 type wsHop struct {
-	conn      net.Conn
-	r         io.Reader
-	c         *WebSocketCtx
-	peer      *wsHop
-	w         wsWriter
+	conn net.Conn
+	r    io.Reader
+	c    *WebSocketCtx
+	peer *wsHop
+	// done is closed once the hop ended.
+	done chan struct{}
+	w    wsWriter
+	// recvCode is the status of the Close frame the peer sent, closeNormal when it had none.
+	recvCode  uint16
 	server    bool
 	recvClose bool
 	sentClose bool
@@ -368,6 +374,14 @@ func (h *wsHop) write(f Frame) error {
 		h.closeCrossed(&h.sentClose)
 	}
 	return nil
+}
+
+// closeReceived records the Close h received, with its status code.
+func (h *wsHop) closeReceived(code uint16) {
+	h.c.mu.Lock()
+	h.recvCode = code
+	h.c.mu.Unlock()
+	h.closeCrossed(&h.recvClose)
 }
 
 // closeCrossed records a Close received from h or sent to h, flag being one of the two.
@@ -407,6 +421,7 @@ func (h *wsHop) readEnded(err error) error {
 		// because edge leaves it.
 		c.mu.Lock()
 		toSelf, toPeer := !h.sentClose && !h.ended, !h.peer.sentClose && !h.peer.ended
+		peerCode := h.peer.closeCodeLocked(false)
 		h.sentClose, h.peer.sentClose = true, true
 		self, peer := h.endLocked(hopClose), h.peer.endLocked(hopClose)
 		c.cancelIfEndedLocked()
@@ -415,7 +430,7 @@ func (h *wsHop) readEnded(err error) error {
 			h.writeClose(fe.code)
 		}
 		if toPeer {
-			h.peer.writeClose(closeGoingAway)
+			h.peer.writeClose(peerCode)
 		}
 		h.finish(self)
 		h.peer.finish(peer)
@@ -435,8 +450,8 @@ func (h *wsHop) readEnded(err error) error {
 			self, peer = h.endLocked(hopClose), h.peer.endLocked(hopClose)
 		}
 	case errors.Is(err, net.ErrClosed):
-		// A connection closed on this side, by a Session Close, ends the other one cleanly.
-		self, peer = h.endLocked(hopClose), h.peer.endLocked(hopClose)
+		// The closer of the session closed the connection, and ends the other one too.
+		self, peer = h.endLocked(hopOpen), h.peer.endLocked(hopOpen)
 	default:
 		self, peer = h.endLocked(hopClose), h.peer.endLocked(hopAbort)
 	}
@@ -447,15 +462,89 @@ func (h *wsHop) readEnded(err error) error {
 	return err
 }
 
-// writeClose writes a Close of edge's own, bounded so a peer that stopped reading cannot keep
-// the reader of the other hop waiting. The connection toward the origin has no deadline, so
-// it is closed once the bound passes.
+// writeClose writes a Close of edge's own within alertWriteTimeout, so a peer that stopped
+// reading cannot keep the reader of the other hop waiting, and resets the connection past it.
+// None goes out inside a message toward the peer, which would read it as complete.
 func (h *wsHop) writeClose(code uint16) {
-	_ = h.conn.SetWriteDeadline(time.Now().Add(wsCloseTimeout))
-	t := time.AfterFunc(wsCloseTimeout, func() { _ = h.conn.Close() })
-	_ = h.w.write(closeFrame(code))
+	h.writeCloseBy(code, time.Now().Add(alertWriteTimeout), true)
+}
+
+// writeCloseBy writes a Close of edge's own before deadline, and reports whether it went out.
+// When idle is set, no Close goes out while a frame is being written or a message toward the
+// peer is unfinished, since the peer would read it as complete.
+func (h *wsHop) writeCloseBy(code uint16, deadline time.Time, idle bool) bool {
+	// A Close frame still pending at the deadline gives the transport its failed end.
+	_ = h.conn.SetWriteDeadline(deadline)
+	t := time.AfterFunc(time.Until(deadline), func() { abort(h.conn) })
+	err := h.w.writeClose(code, idle)
 	t.Stop()
 	_ = h.conn.SetWriteDeadline(time.Time{})
+	return err == nil
+}
+
+// end ends h once its handler returned nil or its session closed: a Close frame unless one
+// went toward the peer or a message toward it is unfinished, then the normal end of its
+// transport, both before deadline. The Close has code 1001 when goingAway is set, and the code
+// of the peer's own Close or 1000 otherwise.
+//
+// A handler may still be reading h when its session closes, so h then only half-closes and
+// leaves the read to its reader, closing once that reader saw the end or at the deadline.
+func (h *wsHop) end(goingAway bool, deadline time.Time) {
+	h.c.mu.Lock()
+	send := !h.sentClose && !h.ended
+	code := h.closeCodeLocked(goingAway)
+	h.c.mu.Unlock()
+	if send {
+		if h.writeCloseBy(code, deadline, true) {
+			h.closeCrossed(&h.sentClose)
+		}
+	}
+	if !goingAway {
+		closeNormallyBy(h.conn, deadline)
+		return
+	}
+	_ = closeWrite(h.conn)
+	waitUntil(h.done, deadline)
+	_ = h.conn.Close()
+}
+
+// closeCodeLocked is the code of a Close frame the proxy writes to the peer of h: the code of
+// that peer's own Close frame when it sent one, else 1001 when goingAway, else 1000.
+func (h *wsHop) closeCodeLocked(goingAway bool) uint16 {
+	switch {
+	case h.recvClose:
+		return h.recvCode
+	case goingAway:
+		return closeGoingAway
+	}
+	return closeNormal
+}
+
+// end ends both hops, see [wsHop.end].
+func (c *WebSocketCtx) end(goingAway bool) { c.endBy(goingAway, time.Now().Add(alertWriteTimeout)) }
+
+// endBy is end by deadline.
+func (c *WebSocketCtx) endBy(goingAway bool, deadline time.Time) {
+	var wg sync.WaitGroup
+	wg.Go(func() { c.toClient.end(goingAway, deadline) })
+	c.toOrigin.end(goingAway, deadline)
+	wg.Wait()
+}
+
+// abortHops gives both hops their failed end by deadline, with no Close frame.
+func (c *WebSocketCtx) abortHops(deadline time.Time) {
+	var wg sync.WaitGroup
+	wg.Go(func() { abortBy(c.toClient.conn, deadline) })
+	abortBy(c.toOrigin.conn, deadline)
+	wg.Wait()
+}
+
+// closeCodeOf returns the status of a Close frame payload, closeNormal when it has none.
+func closeCodeOf(payload []byte) uint16 {
+	if len(payload) < 2 {
+		return closeNormal
+	}
+	return binary.BigEndian.Uint16(payload)
 }
 
 func (h *wsHop) writeFailed() {
@@ -479,6 +568,7 @@ func (h *wsHop) endLocked(how hopEnd) hopEnd {
 		return hopOpen
 	}
 	h.ended = true
+	close(h.done)
 	return how
 }
 
@@ -493,7 +583,7 @@ func (h *wsHop) finish(how hopEnd) {
 	case hopClose:
 		_ = h.conn.Close()
 	case hopAbort:
-		abort(h.conn)
+		abortAfterFlush(h.conn)
 	}
 }
 
@@ -522,7 +612,10 @@ type frameError struct {
 
 func (e *frameError) Error() string { return e.msg }
 
-var errAfterClose = errors.New("edge: websocket frame written after a Close")
+var (
+	errAfterClose = errors.New("edge: websocket frame written after a Close")
+	errNotIdle    = errors.New("edge: websocket frame or message being written")
+)
 
 var (
 	errFrameTooBig  = &frameError{msg: "edge: websocket frame larger than the configured limit", code: closeTooBig}
@@ -616,17 +709,41 @@ type wsWriter struct {
 	hdr    [14]byte
 	mask   bool
 	closed bool
+	// partial is set from the first fragment of a message to its last.
+	partial bool
 }
 
 func (w *wsWriter) write(f Frame) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	return w.writeLocked(f)
+}
 
+// writeClose writes a Close frame with code. When idle is set it writes nothing and returns
+// errNotIdle while a frame is being written or a message is unfinished.
+func (w *wsWriter) writeClose(code uint16, idle bool) error {
+	if !idle {
+		return w.write(closeFrame(code))
+	}
+	if !w.mu.TryLock() {
+		return errNotIdle
+	}
+	defer w.mu.Unlock()
+	if w.partial {
+		return errNotIdle
+	}
+	return w.writeLocked(closeFrame(code))
+}
+
+func (w *wsWriter) writeLocked(f Frame) error {
 	// RFC 6455 section 5.5.1 allows no data frame after a Close, and edge sends nothing at all.
 	if w.closed {
 		return errAfterClose
 	}
 	w.closed = f.opcode == OpClose
+	if !f.opcode.Control() {
+		w.partial = !f.fin
+	}
 
 	n := 2
 	w.hdr[0] = byte(f.opcode) | (f.rsv << 4)

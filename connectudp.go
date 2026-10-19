@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -50,7 +51,13 @@ var (
 // serveConnectUDP handles a CONNECT-UDP request, RFC 9298, an extended CONNECT over HTTP/2
 // and HTTP/3 and a GET with an Upgrade over HTTP/1.1. The tunnel's datagrams are placed by
 // the demultiplexer like a redirected socket's, and the tunnel is a session of its own.
-func (p *Proxy) serveConnectUDP(w http.ResponseWriter, r *http.Request, identity string) {
+func (p *Proxy) serveConnectUDP(w http.ResponseWriter, r *http.Request, identity string, rq *request) {
+	if r.ProtoMajor >= 2 {
+		// The server ends the stream as this handler returns, so the cut waits for the return
+		// before it ends the connection under the stream, I3.
+		p.srv.serving.add()
+		defer p.srv.serving.done()
+	}
 	target, err := targetFromConnectUDP(r)
 	if err != nil {
 		p.writeStatus(w, r, http.StatusBadRequest, err.Error())
@@ -59,7 +66,6 @@ func (p *Proxy) serveConnectUDP(w http.ResponseWriter, r *http.Request, identity
 	if hasContentFields(r.Header, r.TransferEncoding) {
 		// net/http drains the body of a request it keeps the connection of before answering,
 		// and the body of a GET may never end.
-		w.Header().Set("Connection", "close")
 		p.writeStatus(w, r, http.StatusBadRequest, "CONNECT-UDP request with content fields")
 		return
 	}
@@ -95,6 +101,12 @@ func (p *Proxy) serveConnectUDP(w http.ResponseWriter, r *http.Request, identity
 	sess.identity = identity
 	sess.tunnel = true
 	front := sessionFromRequest(r)
+	if r.ProtoMajor >= 2 {
+		sess.carrier = front
+	} else {
+		// The socket rides what the connection that sent the upgrade rides, Handover.
+		sess.carrier = front.carrier
+	}
 	sess.remoteAddr, sess.localAddr = front.remoteAddr, front.localAddr
 	if state := front.tlsState.Load(); state != nil {
 		sess.tlsState.Store(state)
@@ -103,7 +115,13 @@ func (p *Proxy) serveConnectUDP(w http.ResponseWriter, r *http.Request, identity
 	}
 
 	tun := newConnectUDPTunnel(d, sess, &contextFraming{target: target, upstream: upstream}, cancel)
+	defer tun.noSender()
 	sess.closer = tun
+	if r.ProtoMajor >= 2 {
+		// A tunnel on a stream ends through its closer, which the end of its connection runs,
+		// I1, armed once the fields its end reads are set.
+		defer sess.endWith(parentOf(r, front))()
+	}
 	if !d.publishTunnel(tun) {
 		p.writeStatus(w, r, http.StatusServiceUnavailable, "the proxy is at capacity or shutting down")
 		return
@@ -112,16 +130,20 @@ func (p *Proxy) serveConnectUDP(w http.ResponseWriter, r *http.Request, identity
 
 	// A refused registration means the proxy is stopping. Returning would let the server
 	// answer 200 for a tunnel that is already gone, so the stream is reset instead.
-	if !p.srv.tryTrack(tun) {
+	if !p.srv.trackRegistered(tun) {
 		panic(http.ErrAbortHandler)
 	}
 	defer p.srv.untrack(tun)
 
-	if !p.srv.admitSession(sess) {
+	if err := p.srv.admitSession(sess, nil); err != nil {
+		if errors.Is(err, errSessionEnded) {
+			panic(http.ErrAbortHandler)
+		}
 		p.writeStatus(w, r, http.StatusForbidden, "the entries changed while the tunnel was admitted")
 		return
 	}
 	defer p.srv.untrackSession(sess)
+	p.srv.requests.release(rq)
 
 	pipe := p.openTunnel(ctx, w, r, tun)
 	if pipe == nil {
@@ -150,7 +172,7 @@ func hasContentFields(h http.Header, transferEncoding []string) bool {
 // hijacked HTTP/1.1 connection outlives the request that opened it, the way a CONNECT does.
 func (p *Proxy) tunnelContext(r *http.Request) (context.Context, context.CancelFunc) {
 	if r.ProtoMajor >= 2 {
-		return context.WithCancel(r.Context())
+		return context.WithCancel(context.WithoutCancel(r.Context()))
 	}
 	return p.hijackedContext(r)
 }
@@ -167,40 +189,67 @@ func (p *Proxy) openTunnel(ctx context.Context, w http.ResponseWriter, r *http.R
 			p.writeStatus(w, r, http.StatusInternalServerError, "the stream has no datagram support")
 			return nil
 		}
-		// A tunnel closed while the SETTINGS are awaited is answered, and serve ends it.
-		capsules := peerWithoutDatagrams(ctx, w)
-		if r.Context().Err() != nil {
+		// The close of the tunnel and the client leaving its request end the wait for the
+		// SETTINGS.
+		capsules := peerWithoutDatagrams(ctx, r.Context(), w)
+		if c := tun.sess.end.first(); r.Context().Err() != nil && c != causeClosed && c != causeCut {
+			// The client left, a failed end through the closer, I1. A tunnel that Session.Close
+			// or the cut ended is accepted first, docs/lifecycle.md End forms.
+			tun.noSender()
+			_ = tun.sess.endBy(causePeerFailed, time.Now().Add(alertWriteTimeout))
+			abortWith(w, r, http3.ErrCodeRequestCanceled, false)
 			return nil
 		}
+		// A tunnel closed meanwhile is accepted all the same, and serve ends it with its normal
+		// end.
+		// HTTPStream writes the header, so the pipe exists only once the tunnel is accepted.
 		w.Header().Set(http3.CapsuleProtocolHeader, "?1")
 		w.WriteHeader(http.StatusOK)
-		pipe := newDatagramPipe(streamer.HTTPStream(), quic.StreamErrorCode(http3.ErrCodeRequestCanceled), capsules)
-		pipe.run(tun.close)
+		pipe := newDatagramPipe(streamer.HTTPStream(), capsules)
+		tun.accept(pipe)
+		pipe.run(func(failed bool) {
+			if failed {
+				tun.peerEnded(errTunnelEnded)
+			} else {
+				tun.peerEnded(io.EOF)
+			}
+		})
 		return pipe
 	case 2:
+		stream := newH2Stream(w, r, tun.sess.localAddr, tun.sess.remoteAddr)
+		pipe := newCapsulePipe(stream, bufio.NewReader(stream))
+		tun.accept(pipe)
 		w.Header().Set(http3.CapsuleProtocolHeader, "?1")
 		w.WriteHeader(http.StatusOK)
 		_ = http.NewResponseController(w).Flush()
-		stream := newH2Stream(w, r, tun.sess.localAddr, tun.sess.remoteAddr)
-		return newCapsulePipe(stream, bufio.NewReader(stream))
+		return pipe
 	default:
 		client, brw, err := http.NewResponseController(w).Hijack()
 		if err != nil {
-			p.writeStatus(w, r, http.StatusInternalServerError, "cannot hijack the connection for CONNECT-UDP")
+			tun.noSender()
+			_ = tun.sess.endAfter(causeRefused, time.Now().Add(alertWriteTimeout), func() {
+				p.writeStatus(w, r, http.StatusInternalServerError, "cannot hijack the connection for CONNECT-UDP")
+			})
 			return nil
 		}
-		if err := writeConnectUDPUpgrade(brw); err != nil {
-			_ = client.Close()
-			return nil
-		}
+		sessionFromRequest(r).handOver()
 		// Anything the reader buffered past the request is already capsule data.
-		return newCapsulePipe(client, brw.Reader)
+		pipe := newSocketCapsulePipe(client, brw.Reader)
+		tun.accept(pipe)
+		if err := writeConnectUDPUpgrade(brw); err != nil {
+			// The client did not get its acceptance, a failed end of its socket, I1.
+			tun.noSender()
+			_ = tun.sess.endBy(causePeerFailed, time.Now().Add(alertWriteTimeout))
+			pipe.fail()
+			return nil
+		}
+		return pipe
 	}
 }
 
-// peerWithoutDatagrams waits for the SETTINGS of the client until ctx ends, and reports
+// peerWithoutDatagrams waits for the SETTINGS of the client until ctx or req ends, and reports
 // whether it did not send SETTINGS_H3_DATAGRAM, true when they did not arrive.
-func peerWithoutDatagrams(ctx context.Context, w http.ResponseWriter) bool {
+func peerWithoutDatagrams(ctx, req context.Context, w http.ResponseWriter) bool {
 	s, isSettingser := w.(http3.Settingser)
 	if !isSettingser {
 		return false
@@ -209,6 +258,8 @@ func peerWithoutDatagrams(ctx context.Context, w http.ResponseWriter) bool {
 	case <-s.ReceivedSettings():
 		return !s.Settings().EnableDatagrams
 	case <-ctx.Done():
+		return true
+	case <-req.Done():
 		return true
 	}
 }
@@ -336,32 +387,50 @@ func (*contextFraming) wrap(_ netip.AddrPort, b []byte) []byte {
 // being dispatched, written by the goroutine feeding the tunnel and read on the dispatch
 // path alone.
 type connectUDPTunnel struct {
-	key       flowKey
-	d         *quicDemux
-	sess      *Session
-	framing   tunnelFraming
-	pipe      atomic.Pointer[tunnelPipe]
-	addr      *tunnelAddr
-	cancel    context.CancelFunc
-	sendCh    chan []byte
-	done      chan struct{}
-	sent      chan struct{}
-	upstream  netip.AddrPort
-	closeOnce sync.Once
+	framing tunnelFraming
+	d       *quicDemux
+	sess    *Session
+	pipe    atomic.Pointer[tunnelPipe]
+	addr    *tunnelAddr
+	cancel  context.CancelFunc
+	sendCh  chan []byte
+	done    chan struct{}
+	sent    chan struct{}
+	// answered is closed once the handler stored the pipe or gave up.
+	answered chan struct{}
+	// readEnd is closed once serve read its stream to an error, readErr.
+	readEnd  chan struct{}
+	readErr  error
+	key      flowKey
+	upstream netip.AddrPort
+	// deadline is the deadline of the closer in nanoseconds since the epoch, zero before it ran,
+	// and ending is set once the sender began the end of the pipe.
+	deadline   atomic.Int64
+	closeOnce  sync.Once
+	sentOnce   sync.Once
+	answerOnce sync.Once
+	ending     atomic.Bool
 	// closed refuses datagrams that reach the demultiplexer after the tunnel ended, so a
 	// datagram in flight cannot recreate the flow the close removed.
 	closed atomic.Bool
+	// refusing refuses a new inner unit once the end of the tunnel began, I3, while the inner
+	// units already placed still receive their packets until they ended.
+	refusing atomic.Bool
+	// failed is set when the tunnel ends with its failed end, which the sender gives its stream.
+	failed atomic.Bool
 }
 
 func newConnectUDPTunnel(d *quicDemux, sess *Session, framing tunnelFraming, cancel context.CancelFunc) *connectUDPTunnel {
 	t := &connectUDPTunnel{
-		d:       d,
-		sess:    sess,
-		framing: framing,
-		cancel:  cancel,
-		sendCh:  make(chan []byte, tunnelSendQueue),
-		done:    make(chan struct{}),
-		sent:    make(chan struct{}),
+		d:        d,
+		sess:     sess,
+		framing:  framing,
+		cancel:   cancel,
+		sendCh:   make(chan []byte, tunnelSendQueue),
+		done:     make(chan struct{}),
+		sent:     make(chan struct{}),
+		answered: make(chan struct{}),
+		readEnd:  make(chan struct{}),
 	}
 	client := addrPort(sess.remoteAddr)
 	t.addr = &tunnelAddr{
@@ -385,18 +454,78 @@ type tunnelAddr struct {
 func (a *tunnelAddr) Network() string { return "connect-udp" }
 func (a *tunnelAddr) String() string  { return a.name }
 
+// accept stores pipe once the tunnel is answered, so a closer that runs meanwhile waits for the
+// end of the stream.
+func (t *connectUDPTunnel) accept(pipe tunnelPipe) {
+	t.pipe.Store(&pipe)
+	t.answer()
+}
+
+// streamFailed reports whether the peer reset the stream of the tunnel or broke its framing, on
+// HTTP/2 and HTTP/3, waiting until deadline for the read of the stream the end of its connection
+// ends. A read still running at deadline gives the failed end, I4.
+func (t *connectUDPTunnel) streamFailed(deadline time.Time) bool {
+	// The end of the tunnel began, so the read drains the stream without opening an inner unit,
+	// I3.
+	t.refusing.Store(true)
+	pipe := t.pipe.Load()
+	if pipe == nil {
+		return false
+	}
+	switch p := (*pipe).(type) {
+	case *datagramPipe:
+		return p.streamFailed(deadline)
+	case *capsulePipe:
+		if _, ok := p.conn.(*h2Stream); !ok {
+			return false
+		}
+		// net/http hands the bytes buffered before a reset out ahead of it, so the reader of the
+		// stream reads to its error first.
+		if !waitUntil(t.readEnd, deadline) {
+			return true
+		}
+		err := t.readErr
+		return err != nil && !errors.Is(err, io.EOF) && !isTimeout(err) && !endedWithConn(err)
+	}
+	return false
+}
+
+// peerEnded runs the closer of the tunnel once err ended the read of its stream.
+func (t *connectUDPTunnel) peerEnded(err error) {
+	c := causePeer
+	if !cleanEnd(err) {
+		c = causePeerFailed
+		if endedWithConn(err) {
+			if carried, ok := t.sess.carrierEnd(); ok {
+				// The stream ended with its connection, which gives its cause, I3.
+				c = carried
+			}
+		}
+	}
+	_ = t.sess.endBy(c, time.Now().Add(alertWriteTimeout))
+}
+
+// noSender stands for the sender of a tunnel once the handler returns, which no closer then
+// waits for.
+func (t *connectUDPTunnel) noSender() {
+	t.sentOnce.Do(func() { close(t.sent) })
+	t.answer()
+}
+
+func (t *connectUDPTunnel) answer() { t.answerOnce.Do(func() { close(t.answered) }) }
+
 // serve reads the datagrams off the pipe and places each, until the tunnel ends.
 func (t *connectUDPTunnel) serve(ctx context.Context, pipe tunnelPipe) {
 	t.pipe.Store(&pipe)
-	// A reset or the loss of the front connection cancels the context. A FIN alone does
-	// not, which the pipe reports as the end of its reads.
-	stop := context.AfterFunc(ctx, t.close)
-	defer stop()
 	go t.sender(pipe)
 
 	for {
 		b, err := pipe.recv(ctx)
 		if err != nil {
+			t.readErr = err
+			close(t.readEnd)
+			// A tunnel runs no handler, so a peer end of its stream runs its closer, I1.
+			t.peerEnded(err)
 			break
 		}
 		payload, upstream, ok := t.framing.unwrap(b)
@@ -406,7 +535,6 @@ func (t *connectUDPTunnel) serve(ctx context.Context, pipe tunnelPipe) {
 		t.upstream = upstream
 		t.d.dispatch(t.addr, payload, true)
 	}
-	t.close()
 	// The deadline close armed bounds the drain of every pipe but QUIC datagrams while the client
 	// reads its connection. A QUIC datagram waits for room in the connection's queue, so that
 	// stream is ended here after tunnelDrainTimeout, and a send still waiting returns once the
@@ -451,7 +579,7 @@ func putTunnelBuf(b []byte) {
 // the CONNECTION_CLOSE of every inner connection among it, then ends the pipe, unless serve
 // ended it first.
 func (t *connectUDPTunnel) sender(pipe tunnelPipe) {
-	defer close(t.sent)
+	defer t.sentOnce.Do(func() { close(t.sent) })
 	for {
 		select {
 		case b := <-t.sendCh:
@@ -470,7 +598,18 @@ func (t *connectUDPTunnel) sender(pipe tunnelPipe) {
 		}
 		break
 	}
-	_ = pipe.close()
+	// The end shares the deadline of a closer, so the closer does not reset a stream after
+	// its normal end has begun.
+	deadline := time.Now().Add(alertWriteTimeout)
+	if n := t.deadline.Load(); n != 0 {
+		deadline = time.Unix(0, n)
+	}
+	t.ending.Store(true)
+	if t.failed.Load() {
+		pipe.fail()
+		return
+	}
+	_ = pipe.closeBy(deadline)
 }
 
 func (t *connectUDPTunnel) sendDatagram(pipe tunnelPipe, b []byte) {
@@ -486,25 +625,104 @@ func (t *connectUDPTunnel) sendDatagram(pipe tunnelPipe, b []byte) {
 	}
 }
 
-func (t *connectUDPTunnel) Close() error {
-	t.close()
+func (t *connectUDPTunnel) Close() error { return t.closeBy(time.Now().Add(alertWriteTimeout)) }
+
+func (t *connectUDPTunnel) closeBy(deadline time.Time) error { return t.endBy(causeClosed, deadline) }
+
+// endBy ends the tunnel with the forms c gives, returning once the stream ended. A stream still
+// ending at deadline gets its failed end, I4.
+func (t *connectUDPTunnel) endBy(c cause, deadline time.Time) error {
+	t.deadline.CompareAndSwap(0, deadline.UnixNano())
+	t.closeInner(c, deadline)
+	t.closeWith(formOf(framed, c, false) == formFailed)
+	timer := time.NewTimer(time.Until(deadline))
+	defer timer.Stop()
+	pipe := t.pipe.Load()
+	if pipe == nil {
+		// The handler is past the admission and stores its pipe or gives up at once.
+		select {
+		case <-t.answered:
+		case <-timer.C:
+		}
+		if pipe = t.pipe.Load(); pipe == nil {
+			return nil
+		}
+	}
+	_ = (*pipe).setWriteDeadline(deadline)
+	select {
+	case <-t.sent:
+	case <-timer.C:
+		if t.ending.Load() {
+			// The normal end has begun under the same deadline, which ends it now.
+			<-t.sent
+			return nil
+		}
+		(*pipe).fail()
+	}
 	return nil
+}
+
+// closeInner runs the closer of every session the tunnel carries, as the closer of any carrier
+// does, I3.
+func (t *connectUDPTunnel) closeInner(c cause, deadline time.Time) {
+	d := t.d
+	d.mu.Lock()
+	// Refused from here on, no inner unit joins the ones closed below.
+	t.refusing.Store(true)
+	var sessions []*Session
+	if flow := d.flows[t.key]; flow != nil {
+		for _, conn := range flow.conns {
+			if conn.sess != nil {
+				sessions = append(sessions, conn.sess)
+			}
+		}
+		for _, u := range flow.udp {
+			if u.sess != nil {
+				sessions = append(sessions, u.sess)
+			}
+		}
+	}
+	d.mu.Unlock()
+	var wg sync.WaitGroup
+	for _, sess := range sessions {
+		wg.Go(func() { _ = sess.endBy(carriedCause(c), deadline) })
+	}
+	wg.Wait()
 }
 
 // close ends the tunnel. Every inner connection is closed with a CONNECTION_CLOSE sent
 // through the tunnel, every datagram flow is closed, the stack is torn down, and the stream
 // is ended once those closes are sent.
-func (t *connectUDPTunnel) close() {
+func (t *connectUDPTunnel) close() { t.closeWith(false) }
+
+// closeWith is close. An inner connection with a request or a stream in flight gets its failed
+// end, and so does every other one when failed reports a failed end of the tunnel's client leg.
+func (t *connectUDPTunnel) closeWith(failed bool) {
 	t.closeOnce.Do(func() {
 		d := t.d
 		d.mu.Lock()
+		t.failed.Store(failed)
+		t.refusing.Store(true)
 		t.closed.Store(true)
-		var qcs []*quic.Conn
+		var inner []innerConn
 		var sockets []net.Conn
+		var pending []expiredConn
 		if flow := d.flows[t.key]; flow != nil {
 			for _, conn := range flow.conns {
-				if conn.qc != nil {
-					qcs = append(qcs, conn.qc)
+				if conn.state.sniffing() {
+					// A connection still being placed has no quic-go connection to refuse it.
+					pending = append(pending, expiredConn{client: flow.client, conn: conn})
+					conn.end()
+				}
+				ic := innerConn{qc: conn.qc, sess: conn.sess}
+				if conn.sess != nil {
+					if cl, ok := conn.sess.closer.(*quicConnCloser); ok {
+						cl.ran.Store(true)
+						ic.legs = cl.legs.Load()
+					}
+				}
+				if ic.qc != nil || ic.legs != nil {
+					inner = append(inner, ic)
 				}
 				d.removeConnLocked(flow, conn)
 			}
@@ -525,9 +743,26 @@ func (t *connectUDPTunnel) close() {
 		d.mu.Unlock()
 
 		// CloseWithError returns once the close has been written, so the packet is queued
-		// before the stack goes and before the stream is ended behind it.
-		for _, qc := range qcs {
-			_ = closeNoError(qc)
+		// before the stack goes and before the stream is ended behind it. The origin legs of
+		// the connections the tunnel carries end with them.
+		for _, ic := range inner {
+			end := closeNoError
+			if failed || ic.inFlight(d.p.srv.requests) {
+				end = closeFailed
+			}
+			// The origin legs first, so a handler woken by the end of the client leg cannot
+			// fail them.
+			if ic.legs != nil {
+				ic.legs.endLegs(failed || ic.inFlight(d.p.srv.requests), time.Now().Add(alertWriteTimeout))
+			}
+			if ic.qc != nil {
+				_ = end(ic.qc)
+			}
+		}
+		for _, r := range pending {
+			// Pending, CONNECTION_REFUSED, docs/lifecycle.md End forms, queued before the end of
+			// the stream as the CONNECTION_CLOSE of the others.
+			d.sendRefusal(r.client, r.conn, quic.ConnectionRefused)
 		}
 		for _, s := range sockets {
 			_ = s.Close()
@@ -545,12 +780,24 @@ func (t *connectUDPTunnel) close() {
 	})
 }
 
+// innerConn is a QUIC connection a tunnel carries, as its tunnel ends it.
+type innerConn struct {
+	qc   *quic.Conn
+	legs *QUICCtx
+	sess *Session
+}
+
+func (ic innerConn) inFlight(requests *requestList) bool {
+	return (ic.legs != nil && ic.legs.streams.Load() > 0) || (ic.sess != nil && requests.hasOf(ic.sess))
+}
+
 // publishTunnel places the tunnel's flow in the demultiplexer, inside the draining critical
 // section, so a shutdown either refuses it or finds it.
 func (d *quicDemux) publishTunnel(t *connectUDPTunnel) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.draining.Load() {
+	// A tunnel reaches here only when it arrived before the start of a drain.
+	if d.closing.Load() {
 		return false
 	}
 	return d.flowLocked(t.key, t.addr, time.Now()) != nil

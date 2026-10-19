@@ -43,7 +43,13 @@ type TCPCtx struct {
 	extra    []net.Conn
 
 	dialOnce sync.Once
-	alerted  bool
+	// mu guards the legs against the closer, which ends them from another goroutine and sets
+	// closed.
+	mu      sync.Mutex
+	alerted bool
+	closed  bool
+	// ending is set once the normal end of the legs began.
+	ending bool
 }
 
 // Context returns a context canceled when the connection ends.
@@ -111,7 +117,13 @@ func (c *TCPCtx) Proxy() *Proxy { return c.p }
 // across [TCPCtx.StartTLS], which upgrades it in place, and is closed when the handler
 // returns. If Dial fails and the handler returns an error, the client connection is reset.
 func (c *TCPCtx) Dial() (net.Conn, error) {
-	c.dialOnce.Do(func() { c.up.Conn, c.dialErr = c.dial() })
+	c.dialOnce.Do(func() {
+		conn, err := c.dial()
+		if err == nil {
+			err = c.keep(conn, &c.up.Conn)
+		}
+		c.dialErr = err
+	})
 	if c.dialErr != nil {
 		return nil, c.dialErr
 	}
@@ -142,15 +154,30 @@ func (c *TCPCtx) serverName() string {
 // Set a dial timeout through ctx. Every call opens a new connection, closed when the handler
 // returns.
 func (c *TCPCtx) DialTo(ctx context.Context, addr string) (net.Conn, error) {
+	if c.ctx.Err() != nil {
+		// A dial after the end of the session opens nothing, I1.
+		return nil, net.ErrClosed
+	}
+	// The closer of the session cancels a dial in progress, whatever ctx, I1.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stop := context.AfterFunc(c.ctx, cancel)
+	defer stop()
 	host, _, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, fmt.Errorf("edge: dial %q: %w", addr, err)
 	}
 	conn, err := c.dialAddr(ctx, addr, host)
 	if err != nil {
+		if c.ctx.Err() != nil {
+			// The dial the closer canceled fails as any dial after it.
+			return nil, net.ErrClosed
+		}
 		return nil, err
 	}
-	c.extra = append(c.extra, conn)
+	if err := c.keep(conn, nil); err != nil {
+		return nil, err
+	}
 	return conn, nil
 }
 
@@ -185,7 +212,8 @@ func (c *TCPCtx) upgradeTLS(ctx context.Context, conn net.Conn, addr, serverName
 	}
 	tc := tlsClient(conn, cfg)
 	if err := tc.HandshakeContext(ctx); err != nil {
-		_ = conn.Close()
+		// A failed TLS layer gives what is under it its failed end, I2.
+		abort(conn)
 		return nil, fmt.Errorf("tls handshake with %s: %w", addr, err)
 	}
 	return tc, nil
@@ -221,14 +249,21 @@ func (c *TCPCtx) StartTLS() error {
 	conn, ok := c.client.Conn.(*peekConn)
 	if !ok {
 		conn = newPeekConn(c.client.Conn, nil, clientHelloPeekSize)
-		c.client.Conn = conn
+		c.swap(&c.client.Conn, conn)
 	}
-	if timeout := p.cfg.transport.TLSHandshakeTimeout; timeout > 0 {
+	// The handler requests the termination a connection placed at its sniff timeout refuses.
+	conn.lateHello = false
+	// The read header timeout bounds the ClientHello and the handshake, as on any connection the
+	// proxy terminates.
+	if timeout := p.cfg.server.readHeaderTimeout; timeout > 0 {
 		_ = conn.SetReadDeadline(time.Now().Add(timeout))
 		defer func() { _ = conn.SetReadDeadline(time.Time{}) }()
 	}
 
 	hello, alert, err := p.peekClientHello(conn)
+	if isTimeout(err) || isPeerReadFailure(err) {
+		return err
+	}
 	if err != nil {
 		return c.refuseTLS(conn, alert, err)
 	}
@@ -244,11 +279,14 @@ func (c *TCPCtx) StartTLS() error {
 
 	tc := tlsServer(conn, p.serverTLSConfig(c.sess, true))
 	if err := tc.HandshakeContext(c.ctx); err != nil {
+		// crypto/tls reports the alert it sent as a local error, and sends none on a read error.
+		var local *net.OpError
+		c.alerted = errors.As(err, &local) && local.Op == "local error"
 		return fmt.Errorf("tls handshake with client for %s: %w", c.target.Authority(), err)
 	}
 	state := tc.ConnectionState()
 	c.tlsState = &state
-	c.client.Conn = tc
+	c.swap(&c.client.Conn, tc)
 	c.sess.tlsState.Store(&state)
 
 	if c.up.Conn != nil {
@@ -257,13 +295,13 @@ func (c *TCPCtx) StartTLS() error {
 		if err != nil {
 			return err
 		}
-		c.up.Conn = up
+		c.swap(&c.up.Conn, up)
 	}
 	return nil
 }
 
 // refuseTLS sends the client a fatal alert and returns err. The connection stays the
-// handler's, and the close after the handler returns drains it as lingerClose does.
+// handler's, and the end after the handler returns drains it as lingerClose does.
 func (c *TCPCtx) refuseTLS(conn net.Conn, alert byte, err error) error {
 	if writeAlert(conn, alert) == nil {
 		c.alerted = true
@@ -277,6 +315,7 @@ func (c *TCPCtx) lingerAfterAlert() {
 	if c.alerted {
 		c.alerted = false
 		lingerClose(c.client.Conn)
+		_ = c.client.Close()
 	}
 }
 
@@ -291,15 +330,85 @@ func (s *heldConn) CloseWrite() error { return closeWrite(s.Conn) }
 
 func (s *heldConn) Abort() { abort(s.Conn) }
 
-// close releases the connections the handler opened, once the handler has returned.
-func (c *TCPCtx) close() {
-	c.lingerAfterAlert()
+// keep records a leg the handler opened, in *slot or among the extra legs when slot is nil, and
+// ends it with an error once the closer has run.
+func (c *TCPCtx) keep(conn net.Conn, slot *net.Conn) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		abort(conn)
+		return net.ErrClosed
+	}
+	if slot != nil {
+		*slot = conn
+	} else {
+		c.extra = append(c.extra, conn)
+	}
+	return nil
+}
+
+// swap replaces the connection of a leg, the closer reading it under the same lock.
+func (c *TCPCtx) swap(slot *net.Conn, conn net.Conn) {
+	c.mu.Lock()
+	*slot = conn
+	c.mu.Unlock()
+}
+
+// legs ends the use of every leg and returns them, the client first, and whether their normal
+// end had begun. normal begins it.
+func (c *TCPCtx) legs(normal bool) ([]net.Conn, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ending := c.ending
+	c.ending = c.ending || normal
+	c.closed = true
+	legs := make([]net.Conn, 0, 2+len(c.extra))
+	legs = append(legs, c.client.Conn)
 	if c.up.Conn != nil {
-		_ = c.up.Close()
+		legs = append(legs, c.up.Conn)
 	}
-	for _, conn := range c.extra {
-		_ = conn.Close()
+	return append(legs, c.extra...), ending
+}
+
+// end runs the closer of the session once the handler returned err, I1. A client leg that got
+// a TLS alert ends first with the normal end of TCP, the alert being an answer, I2.
+func (c *TCPCtx) end(err error) {
+	c.lingerAfterAlert()
+	cs := causeReturned
+	if err != nil {
+		cs = causeHandlerErr
 	}
+	_ = c.sess.endBy(cs, time.Now().Add(alertWriteTimeout))
+}
+
+var errNoHandler = errors.New("edge: TCP entry with no handler")
+
+// tcpCloser is the closer of a session a TCP handler serves, which gives every leg the form of
+// a byte stream.
+type tcpCloser TCPCtx
+
+func (t *tcpCloser) endBy(c cause, deadline time.Time) error {
+	if formOf(byteStream, c, false) == formNormal {
+		legs, _ := (*TCPCtx)(t).legs(true)
+		var wg sync.WaitGroup
+		for _, l := range legs {
+			wg.Go(func() { closeNormallyBy(l, deadline) })
+		}
+		wg.Wait()
+		return nil
+	}
+	legs, ending := (*TCPCtx)(t).legs(false)
+	var wg sync.WaitGroup
+	for _, l := range legs {
+		if ending {
+			// The normal end has begun, and the close completes it.
+			_ = l.Close()
+			continue
+		}
+		wg.Go(func() { abortBy(l, deadline) })
+	}
+	wg.Wait()
+	return nil
 }
 
 // Relay dials the upstream connection and relays the stream in both directions until both

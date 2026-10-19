@@ -316,3 +316,76 @@ func TestTailBody(t *testing.T) {
 		}
 	}
 }
+
+func TestGatedConn_CloseNotifyIsBounded(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	leaf, err := ca.Leaf("pipe.test")
+	require.NoError(t, err)
+	a, b := tcpPair(t)
+	server := tls.Server(a, &tls.Config{Certificates: []tls.Certificate{*leaf}})
+	socket := &gatedConn{Conn: b}
+	client := tls.Client(socket, &tls.Config{ServerName: "pipe.test", RootCAs: ca.CertPool()})
+	handshake := make(chan error, 1)
+	go func() { handshake <- server.Handshake() }()
+	require.NoError(t, client.Handshake())
+	require.NoError(t, <-handshake)
+
+	// Bytes under the TLS layer the server never reads, so the close_notify finds the socket
+	// full.
+	writeUntilFull(socket)
+	start := time.Now()
+	_ = client.Close()
+	assert.Less(t, time.Since(start), 2*alertWriteTimeout, "the close_notify waited past T")
+}
+
+func TestForward_CutCancelsTheDialsInProgress(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	started, canceled := make(chan struct{}, 1), make(chan struct{})
+	tr := DefaultTransport()
+	tr.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+		started <- struct{}{}
+		<-ctx.Done()
+		// A dial returns a little after its cancel, the close of its socket included.
+		time.Sleep(100 * time.Millisecond)
+		close(canceled)
+		return nil, ctx.Err()
+	}
+	p, err := New(WithCA(ca), WithTransport(tr))
+	require.NoError(t, err)
+	p.MustAdd("svc.test/*{any}", forwardHandler)
+	addr := startProxy(t, p)
+	go func() {
+		conn, derr := net.Dial("tcp", addr)
+		if derr != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, _ = fmt.Fprintf(conn, "GET http://svc.test/ HTTP/1.1\r\nHost: svc.test\r\n\r\n")
+		_, _ = io.Copy(io.Discard, conn)
+	}()
+	<-started
+	require.NoError(t, p.Close())
+	select {
+	case <-canceled:
+	default:
+		t.Fatal("the cut returned before a dial it canceled")
+	}
+}
+
+func TestForward_EvictedPoolIsEndedWithTheForwarder(t *testing.T) {
+	f, err := newForwarder(testProxy(t))
+	require.NoError(t, err)
+	first := newUpstreamPool(f.up, "http", "first.test:80", nil)
+	f.mu.Lock()
+	f.pools.Add(poolKey{scheme: "http", fixed: "first.test:80"}, first)
+	for i := range maxPools {
+		f.pools.Add(poolKey{scheme: "http", fixed: fmt.Sprintf("p%d.test:80", i)}, &upstreamPool{h1: &http.Transport{}})
+	}
+	_, listed := f.pools.Peek(poolKey{scheme: "http", fixed: "first.test:80"})
+	f.mu.Unlock()
+	require.False(t, listed)
+	require.Contains(t, f.retired[:], first, "the forwarder forgot a pool to which connections in flight return")
+	f.close()
+}

@@ -41,14 +41,18 @@ func (p *Proxy) ListenAndServeTransparent(addr string) error {
 // routed on that destination, each of its requests on its own authority. A connection with
 // neither a name nor a destination cannot be placed and is closed. Wrap ln in
 // [TransparentListener] for the destination.
+// It always returns a non-nil error and closes ln. After [Proxy.Shutdown] or [Proxy.Close] has
+// begun, the returned error is [ErrProxyClosed], once ln is closed.
 func (p *Proxy) ServeTransparent(ln net.Listener) error {
-	return p.acceptEach(ln, p.ServeConn, "transparent connection closed")
+	return p.acceptEach(ln, p.serveRedirected, "transparent connection closed")
 }
 
 func (p *Proxy) acceptEach(ln net.Listener, serve func(net.Conn) error, closed string) error {
 	// A refused registration means a shutdown started; accepting would run a loop nothing
 	// ever closes.
 	if !p.srv.tryTrackListener(&ln) {
+		// As net/http's Serve does.
+		_ = ln.Close()
 		return ErrProxyClosed
 	}
 	defer p.srv.untrackListener(&ln)
@@ -60,40 +64,71 @@ func (p *Proxy) acceptEach(ln net.Listener, serve func(net.Conn) error, closed s
 			if p.srv.closing.Load() {
 				return ErrProxyClosed
 			}
-			if ne, ok := errors.AsType[net.Error](err); ok && ne.Timeout() {
-				// A temporary accept failure, typically the file descriptor limit. Back
-				// off instead of spinning on it.
+			if temporaryAccept(err) {
+				// Back off instead of spinning on it.
 				delay = min(max(2*delay, 5*time.Millisecond), time.Second)
 				time.Sleep(delay)
 				continue
 			}
+			_ = ln.Close()
 			return err
 		}
 		delay = 0
 
-		p.srv.wg.Go(func() {
+		// Tracked at its accept, so a drain that starts before its goroutine runs serves it.
+		if !p.srv.tryTrack(conn) {
+			abort(conn)
+			continue
+		}
+		go func() {
 			if err := serve(conn); err != nil {
 				p.cfg.logger.Debug("edge: "+closed, slog.String("error", err.Error()))
 			}
-		})
+		}()
 	}
 }
 
 // ServeConn serves one already accepted connection as if it had been transparently
-// redirected. It takes ownership of conn and closes it when done.
+// redirected. It takes ownership of conn and closes it when done. It returns once the
+// connection ended: [ErrProxyClosed] when called after [Proxy.Shutdown] or [Proxy.Close]
+// started or once a cut ended it, nil when a normal cause such as [Session.Close] or a refusal
+// ended it, and otherwise the error that ended it.
 func (p *Proxy) ServeConn(conn net.Conn) error {
 	if !p.srv.tryTrack(conn) {
-		_ = conn.Close()
+		abort(conn)
 		return ErrProxyClosed
 	}
+	var sess *Session
+	err := p.serveRedirectedAs(conn, &sess)
+	if p.srv.cutting() {
+		// The error a handler returns on the end of its context is the cut's.
+		return ErrProxyClosed
+	}
+	if sess != nil {
+		switch c := sess.end.first(); {
+		case c == causeCut:
+			err = ErrProxyClosed
+		case c != causeNone && !c.failed():
+			err = nil
+		}
+	}
+	return err
+}
+
+// serveRedirected serves a redirected connection [server.tryTrack] admitted, and untracks it.
+func (p *Proxy) serveRedirected(conn net.Conn) error { return p.serveRedirectedAs(conn, nil) }
+
+// serveRedirectedAs is serveRedirected, which sets *registered to the session it registers when
+// registered is not nil.
+func (p *Proxy) serveRedirectedAs(conn net.Conn, registered **Session) error {
 	defer func() {
 		_ = conn.Close()
 		p.srv.untrack(conn)
 	}()
 
-	// A shutdown aborts the handshake and the dials still in flight on this connection.
-	// Requests being served are not on this context; they drain through the server.
-	ctx, cancel := context.WithCancel(p.srv.ctx)
+	// The session context ends with the session, by its closer or its end, and a drain leaves
+	// it running.
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	peeked := newPeekConn(conn, nil, clientHelloPeekSize)
@@ -116,25 +151,30 @@ func (p *Proxy) ServeConn(conn net.Conn) error {
 		}
 	}
 
-	head, err := peeked.Peek(1)
-	if err != nil {
-		return nil
+	head, err := peekFirst(peeked, p.cfg.server.sniffTimeout)
+	silent := isTimeout(err)
+	if err != nil && !silent {
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		// A peer reset before the first byte, the connection closed with it.
+		return err
 	}
 	if p.fromItself(conn.RemoteAddr(), conn.LocalAddr(), origin) {
 		abort(conn)
 		return nil
 	}
 
-	if head[0] == tlsHandshakeRecord {
-		return p.serveTransparentTLS(ctx, cancel, peeked, origin)
+	if !silent && head[0] == tlsHandshakeRecord {
+		return p.serveTransparentTLS(ctx, cancel, peeked, origin, registered)
 	}
-	return p.serveTransparentPlain(ctx, cancel, peeked, origin)
+	return p.serveTransparentPlain(ctx, cancel, peeked, origin, silent, registered)
 }
 
 // serveTransparentTLS serves a redirected TLS connection. The destination is the authority
 // it starts from, and the server name in the ClientHello replaces it before the handshake, see
 // [Proxy.placeTLS].
-func (p *Proxy) serveTransparentTLS(ctx context.Context, cancel context.CancelFunc, conn *peekConn, origin netip.AddrPort) error {
+func (p *Proxy) serveTransparentTLS(ctx context.Context, cancel context.CancelFunc, conn *peekConn, origin netip.AddrPort, registered **Session) error {
 	target := Target{Scheme: "https", Port: "443"}
 	if origin.IsValid() {
 		target.Port = fmt.Sprint(origin.Port())
@@ -145,11 +185,20 @@ func (p *Proxy) serveTransparentTLS(ctx context.Context, cancel context.CancelFu
 	sess.cancel = cancel
 	sess.transparent = true
 	sess.setUpstream(origin)
+	if !p.srv.registerSession(sess, (*pendingSocket)(conn)) {
+		conn.Abort()
+		return ErrProxyClosed
+	}
+	if registered != nil {
+		*registered = sess
+	}
+	defer p.srv.untrackSession(sess)
 	return p.terminate(ctx, conn, sess)
 }
 
-// serveTransparentPlain serves a redirected connection that is not TLS.
-func (p *Proxy) serveTransparentPlain(ctx context.Context, cancel context.CancelFunc, conn *peekConn, origin netip.AddrPort) error {
+// serveTransparentPlain serves a redirected connection that is not TLS, as a byte stream when
+// it sent nothing within the sniff timeout.
+func (p *Proxy) serveTransparentPlain(ctx context.Context, cancel context.CancelFunc, conn *peekConn, origin netip.AddrPort, silent bool, registered **Session) error {
 	target := Target{Scheme: "http", Port: "80"}
 	if origin.IsValid() {
 		target = Target{
@@ -163,6 +212,17 @@ func (p *Proxy) serveTransparentPlain(ctx context.Context, cancel context.Cancel
 	sess.cancel = cancel
 	sess.transparent = true
 	sess.setUpstream(origin)
+	if !p.srv.registerSession(sess, (*pendingSocket)(conn)) {
+		conn.Abort()
+		return ErrProxyClosed
+	}
+	if registered != nil {
+		*registered = sess
+	}
+	defer p.srv.untrackSession(sess)
+	if silent {
+		return p.serveSilent(ctx, conn, sess)
+	}
 	return p.servePlain(ctx, conn, sess)
 }
 

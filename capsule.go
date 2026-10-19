@@ -8,6 +8,7 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -38,6 +39,10 @@ const (
 // or delivered a datagram of context ID 0 past maxCapsuleDatagram. The stream is aborted.
 var errTunnelMalformed = errors.New("edge: malformed tunnel stream")
 
+// errTunnelFIN ends a tunnel after its stream ended between two capsules. It is both
+// errTunnelEnded and io.EOF.
+var errTunnelFIN = fmt.Errorf("%w: %w", errTunnelEnded, io.EOF)
+
 // tunnelPipe moves the datagrams of one CONNECT-UDP tunnel, as HTTP Datagrams on an HTTP/3
 // stream or as DATAGRAM capsules on a byte stream. Every datagram starts with its context ID.
 type tunnelPipe interface {
@@ -49,6 +54,11 @@ type tunnelPipe interface {
 	setWriteDeadline(t time.Time) error
 	// close ends the pipe in both directions and unblocks recv and send.
 	close() error
+	// closeBy is close within deadline.
+	closeBy(deadline time.Time) error
+	// fail ends the pipe at once with its failed end. A closer calls it only before the normal
+	// end of the pipe began.
+	fail()
 }
 
 type h3DatagramStream interface {
@@ -59,6 +69,7 @@ type h3DatagramStream interface {
 	SetWriteDeadline(time.Time) error
 	SendDatagram([]byte) error
 	ReceiveDatagram(context.Context) ([]byte, error)
+	Context() context.Context
 }
 
 func oversized(b []byte) bool {
@@ -87,52 +98,125 @@ func frameCapsule(b []byte) []byte {
 // DATAGRAM capsules on the stream, RFC 9297 section 3.5. Capsules of other types are dropped,
 // and the end of the stream ends the tunnel.
 type datagramPipe struct {
-	str      h3DatagramStream
-	base     context.Context
-	wake     context.Context
+	str  h3DatagramStream
+	base context.Context
+	wake context.Context
+	// readErr is the error that ended the read of the stream, set before readDone is closed.
+	readErr  error
 	ended    error
 	deadline atomic.Pointer[time.Time]
 	// caps queues the DATAGRAM capsules, and each one cancels wake so a recv waiting on a
 	// QUIC datagram picks it up.
-	caps       chan []byte
-	done       chan struct{}
+	caps chan []byte
+	done chan struct{}
+	// readDone is closed once the read of the stream ended.
+	readDone   chan struct{}
 	cancelWake context.CancelFunc
 	// timer is armed by recv alone.
 	timer *time.Timer
 	// checked runs once wakeFor found the capsule queue empty, set by tests alone.
-	checked func()
-	// code is the STOP_SENDING close sends, the request cancelled from the proxy and no
-	// error from the client.
-	code      quic.StreamErrorCode
+	checked   func()
 	closeOnce sync.Once
 	mu        sync.Mutex
 	// capsules sends the datagrams as capsules, to a peer without SETTINGS_H3_DATAGRAM.
 	capsules bool
 }
 
-func newDatagramPipe(str h3DatagramStream, code quic.StreamErrorCode, capsules bool) *datagramPipe {
+func newDatagramPipe(str h3DatagramStream, capsules bool) *datagramPipe {
 	return &datagramPipe{
 		str:      str,
-		code:     code,
 		capsules: capsules,
 		caps:     make(chan []byte, capsuleQueue),
 		done:     make(chan struct{}),
+		readDone: make(chan struct{}),
 	}
 }
 
-// run reads the capsules on the stream and calls onEnd when the stream ends.
-func (p *datagramPipe) run(onEnd func()) {
+// streamFailed reports whether the peer reset the stream or broke its framing, waiting for the
+// read of the stream to end, which the end of its connection makes prompt, until deadline. A read
+// still running at deadline gives the failed end, I4.
+func (p *datagramPipe) streamFailed(deadline time.Time) bool {
+	if !waitUntil(p.readDone, deadline) {
+		return true
+	}
+	if errors.Is(p.readErr, io.ErrUnexpectedEOF) || errors.Is(p.readErr, errTunnelMalformed) {
+		return true
+	}
+	se, ok := errors.AsType[*quic.StreamError](p.readErr)
+	return ok && se.Remote
+}
+
+// run reads the capsules of the stream until it ends, then calls onEnd, failed reporting any end
+// but a FIN between two capsules or a clean end of the connection.
+func (p *datagramPipe) run(onEnd func(failed bool)) {
 	go func() {
-		err := errTunnelEnded
 		// The capsule parser reports an end of the stream inside a capsule as
 		// io.ErrUnexpectedEOF, and one between two capsules as io.EOF.
-		if rerr := p.readCapsules(); errors.Is(rerr, io.ErrUnexpectedEOF) || errors.Is(rerr, errTunnelMalformed) {
+		rerr := p.readCapsules()
+		if endedWithConn(rerr) {
+			// quic-go reports the end of the connection to a read ahead of a reset of the
+			// stream that arrived with it, and the next read reports the reset.
+			if _, err := p.str.Read(make([]byte, 1)); err != nil {
+				if se, ok := errors.AsType[*quic.StreamError](err); ok && se.Remote {
+					rerr = err
+				}
+			}
+		}
+		p.readErr = rerr
+		close(p.readDone)
+		var err error
+		switch {
+		case errors.Is(rerr, io.ErrUnexpectedEOF) || errors.Is(rerr, errTunnelMalformed):
 			p.abort()
 			err = errTunnelMalformed
+		case errors.Is(rerr, io.EOF):
+			err = errTunnelFIN
+		default:
+			err = &tunnelEnd{cause: rerr}
 		}
 		p.wakeRecv(err)
-		onEnd()
+		onEnd(!cleanEnd(rerr))
 	}()
+}
+
+// endCause is the error that ended ctx, the request context of pipe. quic-go cancels an HTTP/3
+// request context with no cause once its stream ends, where the stream's context has the error
+// that ended its connection.
+func endCause(ctx context.Context, pipe tunnelPipe) error {
+	cause := context.Cause(ctx)
+	if dp, ok := pipe.(*datagramPipe); ok && errors.Is(cause, context.Canceled) {
+		if sc := dp.str.Context(); sc.Err() != nil {
+			return context.Cause(sc)
+		}
+	}
+	return cause
+}
+
+// tunnelEnd is errTunnelEnded with the error that ended the stream, which it does not unwrap
+// to, since a timeout among them would read as one a reader retries.
+type tunnelEnd struct{ cause error }
+
+func (e *tunnelEnd) Error() string        { return errTunnelEnded.Error() }
+func (e *tunnelEnd) Is(target error) bool { return target == errTunnelEnded }
+
+// cleanEnd reports whether err ends a carrier cleanly: a FIN, or an end of its QUIC connection
+// quicCleanEnd reads as normal, which fails only the messages in flight.
+func cleanEnd(err error) bool {
+	if end, ok := errors.AsType[*tunnelEnd](err); ok {
+		err = end.cause
+	}
+	return errors.Is(err, io.EOF) || quicCleanEnd(err)
+}
+
+// quicCleanEnd reports whether err is the normal end of a QUIC connection: an application code
+// of no error, H3_NO_ERROR or the code 0 quic-go closes an idle pooled HTTP/3 connection with,
+// or the idle timeout. Any other code, a transport error and a stateless reset are failures.
+func quicCleanEnd(err error) bool {
+	if appErr, ok := errors.AsType[*quic.ApplicationError](err); ok {
+		return appErr.ErrorCode == h3NoError || appErr.ErrorCode == 0
+	}
+	_, idle := errors.AsType[*quic.IdleTimeoutError](err)
+	return idle
 }
 
 func (p *datagramPipe) readCapsules() error {
@@ -260,10 +344,15 @@ func (p *datagramPipe) recv(ctx context.Context) ([]byte, error) {
 			return nil, os.ErrDeadlineExceeded
 		case wake.Err() != nil:
 			continue
+		default:
+			// The receive side of the stream ended, and run reports it once its read returns. A
+			// truncated capsule aborts the stream first.
+			<-wake.Done()
+			continue
 		}
 		// The error of a stream or a connection is sticky, and some report themselves as a
 		// timeout, which a reader would retry.
-		return nil, errTunnelEnded
+		return nil, &tunnelEnd{cause: endCause(ctx, p)}
 	}
 }
 
@@ -300,13 +389,25 @@ func (p *datagramPipe) abort() {
 	p.str.CancelRead(quic.StreamErrorCode(http3.ErrCodeMessageError))
 }
 
-// close ends the stream once, and a later close does nothing.
+func (p *datagramPipe) closeBy(time.Time) error { return p.close() }
+
+// fail resets the stream with H3_CONNECT_ERROR, unless close ended it first.
+func (p *datagramPipe) fail() {
+	p.closeOnce.Do(func() {
+		close(p.done)
+		p.str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeConnectError))
+		p.str.CancelRead(quic.StreamErrorCode(http3.ErrCodeConnectError))
+	})
+}
+
+// close ends the stream once with a FIN, and stops the peer's side without an error, RFC 9114
+// section 4.1.1. A later close does nothing.
 func (p *datagramPipe) close() error {
 	var err error
 	p.closeOnce.Do(func() {
 		close(p.done)
 		err = p.str.Close()
-		p.str.CancelRead(p.code)
+		p.str.CancelRead(quic.StreamErrorCode(http3.ErrCodeNoError))
 	})
 	return err
 }
@@ -325,10 +426,18 @@ type capsulePipe struct {
 	pending []byte
 	n       int
 	skip    uint64
+	// socket marks a pipe on a connection.
+	socket bool
 }
 
 func newCapsulePipe(conn net.Conn, br *bufio.Reader) *capsulePipe {
 	return &capsulePipe{conn: conn, br: br}
+}
+
+// newSocketCapsulePipe is newCapsulePipe on a connection an Upgrade left behind, the pipe's
+// alone, which ends with the normal end of its transport.
+func newSocketCapsulePipe(conn net.Conn, br *bufio.Reader) *capsulePipe {
+	return &capsulePipe{conn: conn, br: br, socket: true}
 }
 
 // recv returns the next datagram, and aborts the stream when it ends inside a capsule or
@@ -449,4 +558,21 @@ func (p *capsulePipe) send(b []byte) error {
 func (p *capsulePipe) setReadDeadline(t time.Time) error  { return p.conn.SetReadDeadline(t) }
 func (p *capsulePipe) setWriteDeadline(t time.Time) error { return p.conn.SetWriteDeadline(t) }
 
-func (p *capsulePipe) close() error { return p.conn.Close() }
+func (p *capsulePipe) fail() { abort(p.conn) }
+
+// close ends the stream with its half-close first, so an HTTP/2 stream the proxy opened ends
+// with END_STREAM before the reset that stops its peer. A write still pending delays the
+// half-close for T at most.
+func (p *capsulePipe) close() error { return p.closeBy(time.Now().Add(alertWriteTimeout)) }
+
+func (p *capsulePipe) closeBy(deadline time.Time) error {
+	if p.socket {
+		closeNormallyBy(p.conn, deadline)
+		return nil
+	}
+	if cw, ok := p.conn.(closeWriter); ok {
+		_ = p.conn.SetWriteDeadline(deadline)
+		_ = cw.CloseWrite()
+	}
+	return p.conn.Close()
+}

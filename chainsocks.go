@@ -195,12 +195,32 @@ func (c *socks5UDPConn) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
+// Close returns at once, as the Close of a socket does. A closer ends the association with
+// closeBy or Abort.
 func (c *socks5UDPConn) Close() error {
 	c.closeOnce.Do(func() {
 		_ = c.sock.Close()
 		_ = c.ctrl.Close()
 	})
 	return nil
+}
+
+// closeBy ends the association by deadline, its control connection with the normal end of TCP,
+// docs/lifecycle.md End forms, Datagram flow.
+func (c *socks5UDPConn) closeBy(deadline time.Time) error {
+	c.closeOnce.Do(func() {
+		_ = c.sock.Close()
+		closeNormallyBy(c.ctrl, deadline)
+	})
+	return nil
+}
+
+// Abort ends the association at once, its control connection with the failed end of TCP.
+func (c *socks5UDPConn) Abort() {
+	c.closeOnce.Do(func() {
+		_ = c.sock.Close()
+		abort(c.ctrl)
+	})
 }
 
 func (c *socks5UDPConn) LocalAddr() net.Addr                { return c.sock.LocalAddr() }

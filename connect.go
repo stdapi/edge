@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/stdapi/edge/internal/stringsutil"
 )
@@ -23,7 +24,7 @@ import (
 // authority is known at all. Which kind the connection carries is decided once the traffic
 // says so, past the handshake, and an authority that admits no kind the connection turns
 // out to speak is refused there instead.
-func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request, identity string) {
+func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request, identity string, rq *request) {
 	target, err := targetFromConnect(r)
 	if err != nil {
 		p.writeStatus(w, r, http.StatusBadRequest, err.Error())
@@ -36,14 +37,14 @@ func (p *Proxy) serveConnect(w http.ResponseWriter, r *http.Request, identity st
 	}
 
 	if r.ProtoMajor >= 2 {
-		p.connectStream(w, r, target, identity)
+		p.connectStream(w, r, target, identity, rq)
 		return
 	}
-	p.connectHijack(w, r, target, identity)
+	p.connectHijack(w, r, target, identity, rq)
 }
 
 // connectHijack takes over an HTTP/1.1 connection after CONNECT.
-func (p *Proxy) connectHijack(w http.ResponseWriter, r *http.Request, target Target, identity string) {
+func (p *Proxy) connectHijack(w http.ResponseWriter, r *http.Request, target Target, identity string, rq *request) {
 	rc := http.NewResponseController(w)
 	client, brw, err := rc.Hijack()
 	if err != nil {
@@ -71,20 +72,31 @@ func (p *Proxy) connectHijack(w http.ResponseWriter, r *http.Request, target Tar
 	sess.remoteAddr, sess.localAddr = front.remoteAddr, front.localAddr
 	sess.identity = identity
 	sess.setDestination(target)
+	// The socket rides what the front connection rides, docs/lifecycle.md Handover.
+	sess.carrier = front.carrier
 
 	// A hijacked connection is invisible to http.Server, so only the registry can end it.
-	if !p.srv.tryTrack(conn) {
-		_ = conn.Close()
+	front.handOver()
+	if !p.srv.trackRegistered(conn) {
+		abort(conn)
 		return
 	}
 	defer func() {
 		_ = conn.Close()
 		p.srv.untrack(conn)
 	}()
+	if !p.srv.registerSession(sess, (*pendingSocket)(conn)) {
+		abort(conn)
+		return
+	}
+	defer p.srv.untrackSession(sess)
+	p.srv.requests.release(rq)
 
 	// Termination answers before reaching the upstream: a handler may serve the whole
 	// exchange locally, and the client needs the connection open to send its ClientHello.
 	if werr := writeRawStatus(brw, http.StatusOK); werr != nil {
+		// The client did not get its acceptance, a failed end of its leg, I1.
+		_ = sess.endBy(causePeerFailed, time.Now().Add(alertWriteTimeout))
 		return
 	}
 	if ierr := p.terminate(ctx, conn, sess); ierr != nil {
@@ -94,49 +106,44 @@ func (p *Proxy) connectHijack(w http.ResponseWriter, r *http.Request, target Tar
 
 // hijackedContext returns the context of a connection taken over after r, the one
 // ConnContext built, which ends when the connection closes. The request context ends at the
-// hijack and would cut a handshake or a dial there.
+// hijack and would cut a handshake or a dial there. A drain ends neither: the session ends by
+// its peers, its handler or its closer.
 func (p *Proxy) hijackedContext(r *http.Request) (context.Context, context.CancelFunc) {
 	base := context.WithoutCancel(r.Context())
 	if s := sessionFromRequest(r); s != nil {
 		base = s.Context()
 	}
-	return p.untilShutdown(base)
-}
-
-// untilShutdown returns a child of base that also ends once the proxy begins to close.
-// http.Server cancels no context of a hijacked connection when a shutdown begins.
-func (p *Proxy) untilShutdown(base context.Context) (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithCancel(base)
-	go func() {
-		select {
-		case <-p.srv.ctx.Done():
-			cancel()
-		case <-ctx.Done():
-		}
-	}()
-	return ctx, cancel
+	return context.WithCancel(base)
 }
 
 // connectStream handles a CONNECT carried on an HTTP/2 or HTTP/3 stream, where the stream
 // itself is the connection rather than the whole transport.
-func (p *Proxy) connectStream(w http.ResponseWriter, r *http.Request, target Target, identity string) {
+func (p *Proxy) connectStream(w http.ResponseWriter, r *http.Request, target Target, identity string, rq *request) {
 	front := sessionFromRequest(r)
 	local, remote := front.localAddr, front.remoteAddr
 
+	// The server ends the stream as this handler returns, so the cut waits for the return before
+	// it ends the connection under the stream, I3.
+	p.srv.serving.add()
+	defer p.srv.serving.done()
+
 	stream := newH2Stream(w, r, local, remote)
-	cut := streamCut{stream}
-	ctx, cancel := context.WithCancel(r.Context())
+	// The session ends through its closer alone, which the end of the request runs, I1.
+	ctx, cancel := context.WithCancel(context.WithoutCancel(r.Context()))
 	defer cancel()
 	sess := newSession(p, ctx, nil, target, 0, 0)
+	cut := &streamCut{s: stream, cancel: cancel, sess: sess}
 	sess.cancel = cancel
 	sess.localAddr, sess.remoteAddr = local, remote
 	sess.identity = identity
 	sess.setDestination(target)
-	sess.closer = cut
+	sess.carrier = front
+	defer sess.endWith(parentOf(r, front))()
 
 	// A refused registration means the proxy is stopping. Returning would let net/http answer
 	// 200 for a connection that is already gone, so the stream is reset instead.
-	if !p.srv.tryTrack(cut) {
+	if !p.srv.trackRegistered(cut) {
+		stream.Abort()
 		panic(http.ErrAbortHandler)
 	}
 	defer func() {
@@ -148,6 +155,12 @@ func (p *Proxy) connectStream(w http.ResponseWriter, r *http.Request, target Tar
 			panic(http.ErrAbortHandler)
 		}
 	}()
+	if !p.srv.registerSession(sess, cut) {
+		stream.Abort()
+		return
+	}
+	defer p.srv.untrackSession(sess)
+	p.srv.requests.release(rq)
 
 	stream.writeHeader(http.StatusOK)
 
@@ -200,6 +213,10 @@ func writeRawStatus(w io.Writer, code int) error {
 	sb = append(sb, ' ')
 	sb = append(sb, reason...)
 	sb = append(sb, "\r\n"...)
+	if code >= http.StatusBadRequest {
+		// A refusal written on a connection taken from net/http ends that connection.
+		sb = append(sb, "Connection: close\r\n"...)
+	}
 	if body != "" {
 		sb = append(sb, "Content-Type: text/plain; charset=utf-8\r\nContent-Length: "...)
 		sb = strconv.AppendInt(sb, int64(len(body)), 10)

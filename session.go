@@ -9,7 +9,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
-	"io"
 	"net"
 	"net/http"
 	"net/netip"
@@ -20,6 +19,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/quic-go/quic-go"
 	"github.com/stdapi/edge/internal/stringsutil"
 )
 
@@ -125,12 +125,25 @@ type Session struct {
 	remoteAddr net.Addr
 	localAddr  net.Addr
 	ctx        context.Context
-	p          *Proxy
-	// closer ends the connection. Each listener sets its own, a connection, a CONNECT stream,
-	// or the bookkeeping a QUIC connection needs, before the session is registered and never
-	// after.
-	closer   io.Closer
+	// closer ends the legs of the session. Each listener sets its own, a connection, a CONNECT
+	// stream, or the bookkeeping a QUIC connection needs, at the registration of the session,
+	// and the admission replaces the closer of a pending socket. Guarded by the server lock
+	// once the session is registered.
+	closer   sessionCloser
 	closeErr error
+	// pendingTLS is set instead of tlsState when the session is created before the handshake,
+	// so TLS() can read the state once it exists.
+	pendingTLS connectionStater
+	// httpConn is the connection of the HTTP requests of the session. Aborting it gives
+	// an HTTP/1.1 response in flight its failed end.
+	httpConn net.Conn
+	// streamsCtx is the context the requests of an HTTP/3 connection derive from, which its end
+	// cancels. quic-go also cancels the context of a request once its send side ends.
+	streamsCtx context.Context
+	// cancelRequests cancels the context of every request of an HTTP connection, nil elsewhere.
+	// Guarded by the server lock where a server sets it after the session is registered.
+	cancelRequests context.CancelFunc
+	p              *Proxy
 	// cancel ends ctx. Every session [Proxy.Sessions] reports has one, so Close ends the
 	// session without waiting for the goroutines serving it.
 	cancel context.CancelFunc
@@ -139,10 +152,7 @@ type Session struct {
 	tlsState atomic.Pointer[tls.ConnectionState]
 	// entry is the one serving a connection whose handler owns it, TCP, QUIC or WebSocket,
 	// and nil where each unit is routed on its own. Atomic for the same reason as tlsState.
-	entry atomic.Pointer[entry]
-	// pendingTLS is set instead of tlsState when the session is created before the handshake,
-	// so TLS() can read the state once it exists.
-	pendingTLS  connectionStater
+	entry       atomic.Pointer[entry]
 	clientHello atomic.Pointer[ClientHello]
 	// leaf is the certificate the proxy presented on a terminated connection.
 	leaf atomic.Pointer[x509.Certificate]
@@ -151,6 +161,11 @@ type Session struct {
 	upgrade *http.Request
 	// via is the CONNECT-UDP tunnel this session arrived through, nil off a socket.
 	via *Session
+	// carrier is the session on the connection of which the session is a stream, nil when the
+	// session has a socket of its own. carried lists the sessions it is the carrier of. Both
+	// are guarded by the server lock.
+	carrier *Session
+	carried map[*Session]struct{}
 	// verified is the decision a connection took on the last name it checked. The requests of
 	// an HTTP/2 or HTTP/3 connection read and write it concurrently.
 	verified atomic.Pointer[verifiedHost]
@@ -164,16 +179,21 @@ type Session struct {
 	// every request.
 	dial     string
 	identity string
+	end      unitEnd
 	// servableAs holds the kinds the traffic allows, most specific first, and stays empty
 	// where only the decided kind was ever possible.
 	servableAs []Kind
 	id         uint64
-	closeOnce  sync.Once
 	// proto is the protocol of the connection. The front listener builds its session from
 	// ConnContext, before the protocol is known, so unlike every other field it is written
 	// once a request has been read, from a goroutine serving one of them.
 	proto atomic.Uint32
-	kind  Kind
+	// requested is set once a request of the connection reached a handler.
+	requested atomic.Bool
+	// requestsEnded is set once the requests of the session were canceled, under the server
+	// lock.
+	requestsEnded bool
+	kind          Kind
 	// perRequest marks a plaintext connection nothing decided as a connection, which
 	// [Proxy.Sessions] does not report. Each request is routed alone, or refused when the host
 	// of the first request is admitted by nothing, which sets refused.
@@ -184,20 +204,29 @@ type Session struct {
 	tunnel bool
 	// ended is set by Close under the server lock, so a registration racing it is refused.
 	ended bool
+	// shard is where the requests of the session are listed.
+	shard uint8
+	// serving is set while the session counts in server.serving, guarded by the server lock.
+	serving bool
+	// admitted is set once an entry admitted the session, guarded by the server lock.
+	admitted bool
 	// hasSchemeField marks a front connection whose HTTP/2 requests have their :scheme in
 	// schemeHeader.
 	hasSchemeField bool
 }
 
 func newSession(p *Proxy, ctx context.Context, c net.Conn, target Target, kind Kind, proto Protocol) *Session {
+	id := sessionSeq.Add(1)
 	s := &Session{
-		id:        sessionSeq.Add(1),
+		id:        id,
+		shard:     uint8(id % requestShards),
 		p:         p,
 		target:    target,
 		kind:      kind,
 		createdAt: time.Now(),
 		ctx:       ctx,
 	}
+	s.end.done = make(chan struct{})
 	s.setProtocol(proto)
 	if c != nil {
 		s.remoteAddr = c.RemoteAddr()
@@ -378,28 +407,230 @@ func (s *Session) ALPN() string {
 
 // Close ends the session at once, without draining, and the requests or streams in flight
 // fail. Once it returns, [Proxy.Sessions] no longer reports the session and its context is
-// done, even while a handler serving it has yet to return. It ends this session and nothing
-// else. The client sees the end in its own protocol, a FIN, a CONNECTION_CLOSE or a stream
-// reset, and is free to come back, to be authenticated and admitted again on the entries as
-// they stand then. A datagram flow has no such signal and the client sees its replies stop.
-// Closing a session that already ended is a no-op. Revoking an identity uses the same call,
-// see [Session.Identity].
+// done, even while a handler serving it has yet to return. It ends this session, the requests
+// and the sessions on its connection, and nothing else. On the session of a connection to the
+// proxy itself, it ends that connection with no GOAWAY. A byte stream ends with a reset on each
+// of its connections, a request or a stream in flight with its reset, and a datagram flow stops
+// relaying. The client is free to come back, to be authenticated and admitted again on the
+// entries as they stand then. Closing a session that already ended is a no-op. Revoking an
+// identity uses the same call, see [Session.Identity].
 func (s *Session) Close() error {
-	if s.closer == nil {
+	_ = s.endBy(causeClosed, time.Now().Add(alertWriteTimeout))
+	return nil
+}
+
+// endBy ends the session by deadline with the forms c gives, unless an earlier cause did, I1.
+// A later call lowers the deadline of the end in progress and returns once it ended.
+func (s *Session) endBy(c cause, deadline time.Time) error { return s.endAfter(c, deadline, nil) }
+
+// endAfter is endBy with answer, the answer of a refusal, written once c is stored and before
+// the closer runs, so no later cause changes the forms of the session.
+func (s *Session) endAfter(c cause, deadline time.Time, answer func()) error {
+	if s.p == nil || s.end.done == nil {
+		if answer != nil {
+			answer()
+		}
 		return nil
 	}
-	s.closeOnce.Do(func() {
-		s.p.srv.endSession(s)
-		// The closer comes first, so a handler returning on its context cannot end the stream
-		// cleanly before the cut resets it.
-		if err := s.closer.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
-			s.closeErr = err
+	if !s.end.begin(c, deadline) {
+		<-s.end.done
+		return s.closeErr
+	}
+	defer close(s.end.done)
+	if answer != nil {
+		answer()
+	}
+	closer, carried := s.p.srv.endSession(s)
+	if closer == nil || c == causeHandedOver {
+		return nil
+	}
+	c = s.end.first()
+	if c == causeCarrierEnded && (s.inFlight(closer) || streamFailed(closer, s.end.by())) {
+		// A peer end of the carrier fails a unit with a message in flight, and one the peer
+		// reset before it ended the carrier, I3.
+		c = causePeerFailed
+		s.end.cause.Store(uint32(c))
+	}
+	// What the session carries ends before the connection under it, I3, and before the
+	// contexts it derives from are canceled, so a handler returning on its context finds the
+	// cause of the carrier stored.
+	if len(carried) > 0 {
+		var wg sync.WaitGroup
+		for _, sub := range carried {
+			wg.Go(func() { _ = sub.endBy(carriedCause(c), s.end.by()) })
 		}
-		if s.cancel != nil {
-			s.cancel()
-		}
-	})
+		wg.Wait()
+	}
+	s.p.srv.requests.closeOf(s)
+	s.endRequests()
+	if s.Protocol() == HTTP3 && !s.p.srv.requests.waitOf(s, s.end.by()) {
+		// quic-go resets the stream of a request only as its handler returns, so the
+		// connection waits for it, and one still in flight at the deadline gives it its failed
+		// end, docs/lifecycle.md Limits.
+		c = causeTimeout
+	}
+	// The closer comes first, so a handler returning on its context cannot end the stream
+	// cleanly before the cut resets it.
+	if err := closer.endBy(c, s.end.by()); err != nil && !errors.Is(err, net.ErrClosed) {
+		s.closeErr = err
+	}
+	if s.cancel != nil {
+		s.cancel()
+	}
 	return s.closeErr
+}
+
+// armRequests sets cancel as the end of the requests of the session and streams as the context
+// they derive from, for a server that reads its connection after the session was registered.
+// A session that already ended them runs cancel at once.
+func (s *Session) armRequests(cancel context.CancelFunc, streams context.Context) {
+	srv := s.p.srv
+	srv.mu.Lock()
+	ended := s.requestsEnded
+	if !ended {
+		s.cancelRequests, s.streamsCtx = cancel, streams
+	}
+	srv.mu.Unlock()
+	if ended {
+		cancel()
+	}
+}
+
+// endRequests cancels the context of the requests of the session.
+func (s *Session) endRequests() {
+	srv := s.p.srv
+	srv.mu.Lock()
+	cancel := s.cancelRequests
+	s.requestsEnded = true
+	srv.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+// endWith runs the closer of the session once parent ends, with the cause that ended it, as
+// quic-go ends the streams of a connection with its close error. parent is the context the
+// session was opened under, the request context of a stream. The returned function stops it.
+func (s *Session) endWith(parent context.Context) func() bool {
+	return context.AfterFunc(parent, func() {
+		_ = s.endBy(s.causeOfParent(parent), time.Now().Add(alertWriteTimeout))
+	})
+}
+
+// parentOf returns the context the session a request r opens ends with: on HTTP/2 and HTTP/3
+// the context of its connection, a reset of the stream reaching the session as a read, I1.
+// net/http cancels the request context at a reset of the stream, and quic-go once the proxy
+// ended the send side of the stream, docs/lifecycle.md Limits.
+func parentOf(r *http.Request, carrier *Session) context.Context {
+	if r.ProtoMajor >= 2 && carrier != nil && carrier.streamsCtx != nil {
+		return carrier.streamsCtx
+	}
+	return r.Context()
+}
+
+// causeOfParent is the cause a session reads in the end of parent: the cut, the cause of its
+// carrier once the carrier ended, and otherwise a peer end of the carrier, a failure unless
+// the error that ended parent reads as a clean end.
+func (s *Session) causeOfParent(parent context.Context) cause {
+	err := context.Cause(parent)
+	if errors.Is(err, errCut) {
+		return causeCut
+	}
+	if c, ok := s.carrierEnd(); ok {
+		return c
+	}
+	if cleanEnd(err) {
+		return causeCarrierEnded
+	}
+	return causePeerFailed
+}
+
+// endedWithConn reports whether err ended a stream because its connection ended, where a reset
+// of the stream or a message it broke is a failure of the stream itself. net/http gives the
+// streams of an HTTP/2 connection that ended the error "client disconnected", which it does not
+// export.
+func endedWithConn(err error) bool {
+	if _, ok := errors.AsType[*quic.ApplicationError](err); ok {
+		return true
+	}
+	if _, ok := errors.AsType[*quic.IdleTimeoutError](err); ok {
+		return true
+	}
+	return err != nil && strings.Contains(err.Error(), "client disconnected")
+}
+
+// carrierEnd returns the cause the end of its carrier gives the session, once the carrier
+// ended or the connection under it read the end of its peer. net/http ends the streams of a
+// connection before its close runs the closer of the carrier.
+func (s *Session) carrierEnd() (cause, bool) {
+	if s.carrier == nil {
+		return causeNone, false
+	}
+	if c := s.carrier.end.first(); c != causeNone {
+		return carriedCause(c), true
+	}
+	switch peerEndOf(s.carrier.httpConn) {
+	case peerClean:
+		return carriedCause(causePeer), true
+	case peerFailed:
+		return carriedCause(causePeerFailed), true
+	}
+	return causeNone, false
+}
+
+// inFlight reports whether a message of the session is in flight: a request it carries, or a
+// stream of the connection its closer ends.
+func (s *Session) inFlight(closer sessionCloser) bool {
+	if s.p.srv.requests.hasOf(s) {
+		return true
+	}
+	f, ok := closer.(interface{ inFlight() bool })
+	return ok && f.inFlight()
+}
+
+// streamFailed reports whether the peer reset the stream a closer ends or broke its framing
+// before it ended the carrier, the read of that stream waited for until deadline.
+func streamFailed(closer sessionCloser, deadline time.Time) bool {
+	f, ok := closer.(interface{ streamFailed(time.Time) bool })
+	return ok && f.streamFailed(deadline)
+}
+
+// waitUntil reports whether done is closed by deadline, a done already closed reading true at a
+// deadline already past.
+func waitUntil(done <-chan struct{}, deadline time.Time) bool {
+	select {
+	case <-done:
+		return true
+	default:
+	}
+	t := time.NewTimer(time.Until(deadline))
+	defer t.Stop()
+	select {
+	case <-done:
+		return true
+	case <-t.C:
+		return false
+	}
+}
+
+// carriedCause is the cause a unit gets from the end of its carrier with cause c, I3.
+func carriedCause(c cause) cause {
+	switch c {
+	case causePeer, causeReturned:
+		return causeCarrierEnded
+	case causeHandlerErr, causeTimeout:
+		return causePeerFailed
+	}
+	return c
+}
+
+// handOver ends the session at the hijack of its socket by a session it registers, with no end
+// form. A later Close returns nil.
+func (s *Session) handOver() {
+	if s == nil {
+		return
+	}
+	_ = s.endBy(causeHandedOver, time.Now())
 }
 
 // CreatedAt returns when the session began.
@@ -593,4 +824,103 @@ func schemeForPort(port string) string {
 		return "https"
 	}
 	return "http"
+}
+
+// cause is why a unit ends. The first cause stored decides the end forms of the unit.
+type cause uint32
+
+const (
+	causeNone cause = iota
+	// causePeer is a leg its peer ended normally.
+	causePeer
+	// causePeerFailed is a leg its peer ended with a failure or on which it broke its protocol.
+	causePeerFailed
+	causeReturned
+	causeHandlerErr
+	causeClosed
+	causeCut
+	// causeRefused is a refusal the proxy answered, causeRejected one with no answer.
+	causeRefused
+	causeRejected
+	// causeIdle is a timer the Timers table of docs/lifecycle.md gives as normal.
+	causeIdle
+	// causeTimeout is a timer that table gives as failed.
+	causeTimeout
+	// causeHandedOver ends a connection whose socket a session it registered took, with no form.
+	causeHandedOver
+	// causeCarrierEnded is the normal end of a carrier, which a byte stream on it reads as a
+	// failure, I3.
+	causeCarrierEnded
+)
+
+func (c cause) failed() bool {
+	return c == causePeerFailed || c == causeHandlerErr || c == causeTimeout
+}
+
+// form is the end a layer gets.
+type form uint8
+
+const (
+	formNone form = iota
+	formNormal
+	formFailed
+)
+
+// class is the class of a unit, which decides with its cause the form of its layers.
+type class uint8
+
+const (
+	byteStream class = iota
+	framed
+	datagramFlow
+)
+
+// formOf is the form a layer of a unit of class cl gets when c ends the unit, I2. answered
+// reports an answer of the proxy other than the acceptance.
+func formOf(cl class, c cause, answered bool) form {
+	switch {
+	case c == causeHandedOver:
+		return formNone
+	case cl == datagramFlow:
+		return formNormal
+	case cl == byteStream:
+		if c == causePeer || c == causeReturned || c == causeRefused || answered {
+			return formNormal
+		}
+		return formFailed
+	case c.failed():
+		return formFailed
+	}
+	return formNormal
+}
+
+// unitEnd is the end of one unit. The first cause wins, as the close error of a quic-go
+// connection does, and the deadline only moves earlier, I4.
+type unitEnd struct {
+	// done is closed once the closer ended.
+	done     chan struct{}
+	deadline atomic.Int64
+	cause    atomic.Uint32
+}
+
+// begin stores c unless a cause is stored, lowers the deadline to d, and reports whether c is
+// the first cause.
+func (e *unitEnd) begin(c cause, d time.Time) bool {
+	first := e.cause.CompareAndSwap(uint32(causeNone), uint32(c))
+	n := d.UnixNano()
+	for {
+		old := e.deadline.Load()
+		if old != 0 && old <= n || e.deadline.CompareAndSwap(old, n) {
+			return first
+		}
+	}
+}
+
+func (e *unitEnd) first() cause { return cause(e.cause.Load()) }
+
+func (e *unitEnd) by() time.Time { return time.Unix(0, e.deadline.Load()) }
+
+// sessionCloser ends the legs of a session with the forms c gives, by deadline, I2 and I4.
+type sessionCloser interface {
+	endBy(c cause, deadline time.Time) error
 }

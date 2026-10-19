@@ -23,6 +23,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -379,7 +380,8 @@ func TestConn_CloseBehindAStuckWrite(t *testing.T) {
 
 	start := time.Now()
 	require.NoError(t, c.Close())
-	assert.Less(t, time.Since(start), 3*time.Second, "Close waited on the stuck write")
+	// The failed write leaves a frame cut short, so no GOAWAY follows it.
+	assert.Less(t, time.Since(start), closeTimeout+500*time.Millisecond, "Close waited on the stuck write")
 	select {
 	case werr := <-wrote:
 		require.Error(t, werr)
@@ -583,9 +585,12 @@ func TestConn_KeepAlive(t *testing.T) {
 				assert.EqualValues(t, 1, pings.Load(), "one PING, then the connection ends")
 				return
 			}
-			time.Sleep(600 * time.Millisecond)
-			require.NoError(t, c.Err(), "an answering peer keeps the connection")
+			deadline := time.Now().Add(5 * time.Second)
+			for pings.Load() < 3 && time.Now().Before(deadline) {
+				time.Sleep(10 * time.Millisecond)
+			}
 			assert.GreaterOrEqual(t, pings.Load(), int32(3))
+			require.NoError(t, c.Err(), "an answering peer keeps the connection")
 		})
 	}
 }
@@ -5294,4 +5299,114 @@ type slowConn struct {
 func (c *slowConn) Write(b []byte) (int, error) {
 	time.Sleep(c.delay)
 	return c.Conn.Write(b)
+}
+
+func TestConn_KeepAliveFailureResetsTheSocket(t *testing.T) {
+	cli, srv := tcpPair(t)
+	ended := make(chan error, 1)
+	go func() {
+		peer, err := startFakePeer(srv)
+		if err != nil {
+			ended <- err
+			return
+		}
+		for {
+			if _, rerr := peer.fr.ReadFrame(); rerr != nil {
+				ended <- rerr
+				return
+			}
+		}
+	}()
+	c, err := Client(cli, 100*time.Millisecond)
+	require.NoError(t, err)
+	defer func() { _ = c.Close() }()
+	select {
+	case err := <-ended:
+		assert.ErrorIs(t, err, syscall.ECONNRESET)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the silent peer was not found out")
+	}
+}
+
+func TestConn_CloseReadsWhatThePeerSendsAfterItsGoAway(t *testing.T) {
+	cli, srv := tcpPair(t)
+	peerEnd := make(chan error, 1)
+	go func() {
+		peer, err := startFakePeer(srv)
+		if err != nil {
+			peerEnd <- err
+			return
+		}
+		for {
+			f, rerr := peer.fr.ReadFrame()
+			if rerr != nil {
+				peerEnd <- rerr
+				return
+			}
+			if _, ok := f.(*http2.GoAwayFrame); ok {
+				break
+			}
+		}
+		// A peer answers the GOAWAY with its own once it read it.
+		time.Sleep(100 * time.Millisecond)
+		peer.wmu.Lock()
+		err = peer.fr.WriteGoAway(0, http2.ErrCodeNo, nil)
+		peer.wmu.Unlock()
+		if err != nil {
+			peerEnd <- err
+			return
+		}
+		// A write after the end of a socket closed at once meets its reset.
+		time.Sleep(100 * time.Millisecond)
+		peer.wmu.Lock()
+		err = peer.fr.WritePing(false, [8]byte{1})
+		peer.wmu.Unlock()
+		if err != nil {
+			peerEnd <- err
+			return
+		}
+		_, err = io.Copy(io.Discard, srv)
+		peerEnd <- err
+	}()
+
+	c, err := Client(cli, 0)
+	require.NoError(t, err)
+	select {
+	case <-c.settingsSeen:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the client never saw the peer's SETTINGS")
+	}
+	require.NoError(t, c.Close())
+	select {
+	case err := <-peerEnd:
+		assert.NoError(t, err, "the peer reads the FIN of the connection")
+	case <-time.After(3 * time.Second):
+		t.Fatal("the peer never read the end")
+	}
+}
+
+func TestConn_CloseByEndsTheReadPastTheEndAtItsDeadline(t *testing.T) {
+	cli, srv := tcpPair(t)
+	go func() {
+		peer, err := startFakePeer(srv)
+		if err != nil {
+			return
+		}
+		// The peer reads and never ends its side.
+		for {
+			if _, err := peer.fr.ReadFrame(); err != nil {
+				return
+			}
+		}
+	}()
+	c, err := Client(cli, 0)
+	require.NoError(t, err)
+	select {
+	case <-c.settingsSeen:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the client never saw the peer's SETTINGS")
+	}
+	start := time.Now()
+	require.NoError(t, c.CloseBy(start.Add(closeTimeout/4)))
+	assert.Less(t, time.Since(start), closeTimeout/2)
 }

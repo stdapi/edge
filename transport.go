@@ -224,7 +224,7 @@ func newHTTP3Transport(up *upstreamDialer, fixed string, proxy *url.URL) http.Ro
 			if err != nil {
 				return nil, err
 			}
-			return quicOn(ctx, sock, addr, cfg, qcfg)
+			return up.quicOn(ctx, sock, addr, cfg, qcfg)
 		},
 	}
 }
@@ -253,6 +253,16 @@ func (c noICMPConn) Read(b []byte) (int, error) {
 		}
 	}
 }
+
+// closeBy and Abort reach the ends of the socket under the filter, a chained exit's included.
+func (c noICMPConn) closeBy(deadline time.Time) error {
+	if cb, ok := c.Conn.(interface{ closeBy(time.Time) error }); ok {
+		return cb.closeBy(deadline)
+	}
+	return c.Close()
+}
+
+func (c noICMPConn) Abort() { abort(c.Conn) }
 
 func (c noICMPConn) Write(b []byte) (int, error) {
 	n, err := c.Conn.Write(b)

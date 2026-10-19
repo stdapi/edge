@@ -550,6 +550,90 @@ func TestQUIC_RefusalCodes(t *testing.T) {
 	}
 }
 
+func TestQUIC_IncompleteClientHelloIsRefusedAtItsTTL(t *testing.T) {
+	p := testProxy(t)
+	p.MustAdd(h3Authority+"/", okHandler)
+	addr := startQUIC(t, p)
+	client, _ := udpClient(t)
+	a := newQUICAttemptOffering(t, quicsniff.Version1, h3Authority, []string{"h3"})
+	sendDatagram(t, client, addr, a.packet(0, cryptoFrameOf(0, a.hello[:len(a.hello)/2])).sized(t, 1200))
+
+	var d *quicDemux
+	require.Eventually(t, func() bool {
+		p.srv.mu.Lock()
+		for dm := range p.srv.quics {
+			d = dm
+		}
+		p.srv.mu.Unlock()
+		if d == nil {
+			return false
+		}
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		aged := false
+		for _, flow := range d.flows {
+			for _, conn := range flow.conns {
+				conn.lastSeen = time.Now().Add(-2 * quicSniffTTL)
+				aged = true
+			}
+		}
+		return aged
+	}, 5*time.Second, 10*time.Millisecond)
+	d.sweepIdle()
+	assert.EqualValues(t, quic.ConnectionRefused, wantCloseBack(t, client, a, 5*time.Second))
+}
+
+func TestQUIC_CutRefusesAConnectionStillBeingPlaced(t *testing.T) {
+	p := testProxy(t)
+	p.MustAdd(h3Authority+"/", okHandler)
+	addr := startQUIC(t, p)
+	client, _ := udpClient(t)
+	a := newQUICAttemptOffering(t, quicsniff.Version1, h3Authority, []string{"h3"})
+	sendDatagram(t, client, addr, a.packet(0, cryptoFrameOf(0, a.hello[:len(a.hello)/2])).sized(t, 1200))
+	require.Eventually(t, func() bool {
+		p.srv.mu.Lock()
+		defer p.srv.mu.Unlock()
+		for d := range p.srv.quics {
+			d.mu.Lock()
+			n := d.sniffing
+			d.mu.Unlock()
+			if n > 0 {
+				return true
+			}
+		}
+		return false
+	}, 5*time.Second, 10*time.Millisecond)
+
+	require.NoError(t, p.Close())
+	assert.EqualValues(t, quic.ConnectionRefused, wantCloseBack(t, client, a, 5*time.Second))
+}
+
+func TestQUIC_SessionCloseEndsAConnectionInItsHandshake(t *testing.T) {
+	p, addr := quicHTTPServer(t)
+	client, _ := udpClient(t)
+	a := newQUICAttemptOffering(t, quicsniff.Version1, h3Authority, []string{"h3"})
+	// The ClientHello alone, the client never finishes its handshake.
+	sendDatagram(t, client, addr, a.first(t))
+	_, err := readDatagram(t, client, 5*time.Second)
+	require.NoError(t, err, "no server flight")
+
+	sess := waitForSessions(t, p, 1)[0]
+	require.NoError(t, sess.Close())
+	deadline := time.Now().Add(2 * alertWriteTimeout)
+	for {
+		dg, err := readDatagram(t, client, time.Until(deadline))
+		require.NoError(t, err, "no CONNECTION_CLOSE within T")
+		frames, ok := openServerInitial(a.version, a.dcid, []byte(dg))
+		if !ok {
+			continue
+		}
+		if c, ok := initialFrames(frames); ok && slices.Contains(c.types, uint64(0x1c)) {
+			assert.EqualValues(t, 0x0c, c.closeCode, "the close is not APPLICATION_ERROR")
+			return
+		}
+	}
+}
+
 func TestQUIC_RefusalAnswersAnAttemptOnce(t *testing.T) {
 	addr := quicServer(t, h3Authority)
 	client, _ := udpClient(t)
@@ -1791,4 +1875,263 @@ func TestQUIC_DetachedConnectionKeepsItsStackUntilReleased(t *testing.T) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	assert.Same(t, it, d.evictableLocked())
+}
+
+func TestUDPFlow_SessionCloseStopsTheReplies(t *testing.T) {
+	origin, _ := udpSinkOrigin(t)
+	p, err := New()
+	require.NoError(t, err)
+	entered, gate := make(chan struct{}, 1), make(chan struct{})
+	replied := make(chan error, 1)
+	p.MustAdd[UDP](origin.String(), func(c *DatagramCtx) error {
+		if c.Inbound() {
+			return nil
+		}
+		select {
+		case entered <- struct{}{}:
+		default:
+		}
+		<-gate
+		replied <- c.Reply([]byte("late"))
+		return nil
+	})
+	addr := startQUICRedirected(t, p, origin)
+	client, _ := udpClient(t)
+	sendTo(t, client, addr, "hello")
+	waitEntered(t, entered)
+
+	require.NoError(t, waitForSessions(t, p, 1)[0].Close())
+	close(gate)
+	assert.ErrorIs(t, <-replied, net.ErrClosed)
+	_, err = readDatagram(t, client, 300*time.Millisecond)
+	assert.Error(t, err, "the client received a reply after Session.Close ended the flow")
+}
+
+func TestQUIC_SessionCloseInTheHandshakeRunsNoHandler(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+	ran := make(chan struct{}, 1)
+	p.MustAdd[QUIC](h3Authority, func(*QUICCtx) error {
+		ran <- struct{}{}
+		return nil
+	})
+	addr := startQUIC(t, p)
+	raw, err := loopbackUDP()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = raw.Close() })
+	pc := &delayedPC{PacketConn: raw, delay: 300 * time.Millisecond}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		conn, derr := quic.Dial(ctx, pc, net.UDPAddrFromAddrPort(addr),
+			&tls.Config{ServerName: h3Authority, RootCAs: poolOf(ca), NextProtos: []string{"raw"}, MinVersion: tls.VersionTLS13},
+			&quic.Config{MaxIdleTimeout: 10 * time.Second, HandshakeIdleTimeout: 3 * time.Second})
+		if derr == nil {
+			_ = conn.CloseWithError(0, "")
+		}
+	}()
+	sess := waitForSessions(t, p, 1)[0]
+	require.NoError(t, sess.Close())
+	select {
+	case <-ran:
+		t.Fatal("the handler ran after Session.Close of its session")
+	case <-time.After(time.Second):
+	}
+}
+
+// delayedPC delays every datagram written after the first one read, holding back the
+// client's Handshake flight.
+type delayedPC struct {
+	net.PacketConn
+	got   atomic.Bool
+	delay time.Duration
+}
+
+func (c *delayedPC) ReadFrom(b []byte) (int, net.Addr, error) {
+	n, a, err := c.PacketConn.ReadFrom(b)
+	if n > 0 {
+		c.got.Store(true)
+	}
+	return n, a, err
+}
+
+func (c *delayedPC) WriteTo(b []byte, addr net.Addr) (int, error) {
+	if c.got.Load() {
+		cp := bytes.Clone(b)
+		go func() {
+			time.Sleep(c.delay)
+			_, _ = c.PacketConn.WriteTo(cp, addr)
+		}()
+		return len(b), nil
+	}
+	return c.PacketConn.WriteTo(b, addr)
+}
+
+func TestQUIC_ConnectionRefusedAtItsTTLHoldsNoBuffer(t *testing.T) {
+	p := testProxy(t)
+	p.MustAdd(h3Authority+"/", okHandler)
+	addr := startQUIC(t, p)
+	client, _ := udpClient(t)
+	a := newQUICAttemptOffering(t, quicsniff.Version1, h3Authority, []string{"h3"})
+	first := a.packet(0, cryptoFrameOf(0, a.hello[:len(a.hello)/2])).sized(t, 1200)
+	sendDatagram(t, client, addr, first)
+
+	var d *quicDemux
+	require.Eventually(t, func() bool {
+		p.srv.mu.Lock()
+		for dm := range p.srv.quics {
+			d = dm
+		}
+		p.srv.mu.Unlock()
+		if d == nil {
+			return false
+		}
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		aged := false
+		for _, flow := range d.flows {
+			for _, conn := range flow.conns {
+				conn.lastSeen = time.Now().Add(-2 * quicSniffTTL)
+				aged = true
+			}
+		}
+		return aged
+	}, 5*time.Second, 10*time.Millisecond)
+	d.sweepIdle()
+	wantCloseBack(t, client, a, 5*time.Second)
+	// A retransmission refreshes the memory of the refusal.
+	sendDatagram(t, client, addr, first)
+	require.Eventually(t, func() bool {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		for _, flow := range d.flows {
+			for _, conn := range flow.conns {
+				if conn.state != connRejected || conn.pendingBytes > 0 || conn.sniffer != nil {
+					return false
+				}
+			}
+		}
+		return true
+	}, 3*time.Second, 10*time.Millisecond, "a refused connection keeps its buffers")
+}
+
+func TestQUICDemux_CutRefusesANewConnection(t *testing.T) {
+	for _, phase := range []string{"drain", "cut"} {
+		t.Run(phase, func(t *testing.T) {
+			ca, err := GenerateCA()
+			require.NoError(t, err)
+			p, err := New(WithCA(ca))
+			require.NoError(t, err)
+			p.MustAdd[QUIC](h3Authority, relayQUIC)
+			addr := startQUIC(t, p)
+			var d *quicDemux
+			require.Eventually(t, func() bool {
+				p.srv.mu.Lock()
+				defer p.srv.mu.Unlock()
+				for dm := range p.srv.quics {
+					d = dm
+				}
+				return d != nil
+			}, 5*time.Second, 10*time.Millisecond)
+			if phase == "drain" {
+				d.mu.Lock()
+				d.draining.Store(true)
+				d.mu.Unlock()
+			} else {
+				d.refuseNew()
+			}
+			pc, err := loopbackUDP()
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = pc.Close() })
+			dctx, dcancel := context.WithTimeout(t.Context(), 2*time.Second)
+			defer dcancel()
+			_, err = quic.Dial(dctx, pc, net.UDPAddrFromAddrPort(addr),
+				&tls.Config{ServerName: h3Authority, RootCAs: poolOf(ca), NextProtos: []string{"doq"}, MinVersion: tls.VersionTLS13},
+				&quic.Config{HandshakeIdleTimeout: 2 * time.Second})
+			t.Logf("%s: dial error %v", phase, err)
+			var te *quic.TransportError
+			if !errors.As(err, &te) || te.ErrorCode != quic.ConnectionRefused {
+				t.Errorf("%s: no CONNECTION_REFUSED", phase)
+			}
+		})
+	}
+}
+
+type legEndRecorder struct {
+	net.Conn
+	deadline atomic.Pointer[time.Time]
+	closed   atomic.Bool
+	aborted  atomic.Bool
+}
+
+func (c *legEndRecorder) closeBy(deadline time.Time) error {
+	c.deadline.Store(&deadline)
+	return nil
+}
+func (c *legEndRecorder) Close() error { c.closed.Store(true); return nil }
+func (c *legEndRecorder) Abort()       { c.aborted.Store(true) }
+
+func TestUDPFlow_CloserEndsTheLegsByTheirCloseByWithItsDeadline(t *testing.T) {
+	pc, err := loopbackUDP()
+	require.NoError(t, err)
+	d, err := newQUICDemux(testProxy(t), pc)
+	require.NoError(t, err)
+	t.Cleanup(d.close)
+	leg, alt := &legEndRecorder{}, &legEndRecorder{}
+	from := flowKey{addr: netip.MustParseAddrPort("127.0.0.1:5000")}
+	u := &udpFlow{upstream: noICMPConn{leg}, alts: map[string]*udpAlt{"alt": {conn: noICMPConn{alt}}}, id: udpKey{origin: netip.MustParseAddrPort("127.0.0.1:6000")}}
+	d.mu.Lock()
+	d.flows[from] = &quicFlow{conns: map[string]*quicConn{}, udp: map[udpKey]*udpFlow{u.id: u}}
+	d.udps++
+	d.mu.Unlock()
+
+	deadline := time.Now().Add(300 * time.Millisecond)
+	require.NoError(t, (&udpFlowCloser{d: d, u: u, flow: from}).endBy(causeClosed, deadline))
+	for _, c := range []*legEndRecorder{leg, alt} {
+		got := c.deadline.Load()
+		require.NotNil(t, got, "a leg of the flow was closed with no end form, Close called: %t", c.closed.Load())
+		require.True(t, got.Equal(deadline), "a leg of the flow ended past the deadline of its closer")
+	}
+
+	late := &legEndRecorder{}
+	abort(noICMPConn{late})
+	require.True(t, late.aborted.Load(), "the failed end of a leg did not reach the exit under the filter")
+}
+
+type blockingLeg struct {
+	net.Conn
+	release chan struct{}
+}
+
+func (c *blockingLeg) closeBy(time.Time) error { <-c.release; return nil }
+func (c *blockingLeg) Close() error            { return nil }
+
+func TestUDPFlow_FlowTakenOffItsClientStaysRegisteredUntilItsCloserEnded(t *testing.T) {
+	pc, err := loopbackUDP()
+	require.NoError(t, err)
+	d, err := newQUICDemux(testProxy(t), pc)
+	require.NoError(t, err)
+	t.Cleanup(d.close)
+	leg := &blockingLeg{release: make(chan struct{})}
+	from := flowKey{addr: netip.MustParseAddrPort("127.0.0.1:5000")}
+	sess := &Session{}
+	u := &udpFlow{upstream: leg, sess: sess, id: udpKey{origin: netip.MustParseAddrPort("127.0.0.1:6000")}}
+	d.mu.Lock()
+	// As the eviction and the sweep do.
+	d.ending[u] = from
+	d.mu.Unlock()
+	ended := make(chan struct{})
+	go func() {
+		d.removeUDPFlow(from, u, causeIdle, time.Now().Add(time.Second))
+		close(ended)
+	}()
+	time.Sleep(50 * time.Millisecond)
+	require.Contains(t, d.appendSessions(nil, false), sess, "the cut misses a flow whose closer runs")
+	require.True(t, d.serving(), "the drain misses a flow whose closer runs")
+	close(leg.release)
+	<-ended
+	require.NotContains(t, d.appendSessions(nil, false), sess)
+	require.False(t, d.serving())
 }

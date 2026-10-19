@@ -121,13 +121,16 @@ type Conn struct {
 
 	streams map[uint32]*Stream
 
-	frames       chan frame
-	readMore     chan struct{}
-	msgs         chan msg
-	writeCh      chan *bytes.Buffer
-	wroteCh      chan error
-	done         chan struct{}
-	ended        chan struct{}
+	frames   chan frame
+	readMore chan struct{}
+	msgs     chan msg
+	writeCh  chan *bytes.Buffer
+	wroteCh  chan error
+	done     chan struct{}
+	ended    chan struct{}
+	// readEnded is closed once readFrames returned, and readBy bounds the read past the end in
+	// nanoseconds since the epoch, zero for closeTimeout.
+	readEnded    chan struct{}
 	settingsSeen chan struct{}
 	keepTimer    *time.Timer
 	// ready lists the streams with a write pending, served round robin from rr.
@@ -139,6 +142,7 @@ type Conn struct {
 	encBuf bytes.Buffer
 
 	recv      inflow
+	readBy    atomic.Int64
 	keepAlive time.Duration
 
 	sendWindow    int64
@@ -288,6 +292,7 @@ func Client(nc net.Conn, keepAlive time.Duration) (*Conn, error) {
 		wroteCh:       make(chan error, 1),
 		done:          make(chan struct{}),
 		ended:         make(chan struct{}),
+		readEnded:     make(chan struct{}),
 		settingsSeen:  make(chan struct{}),
 		keepAlive:     keepAlive,
 		sendWindow:    defaultWindow,
@@ -337,6 +342,7 @@ func Client(nc net.Conn, keepAlive time.Duration) (*Conn, error) {
 // DATA frame, so DATA is copied out and a frame still referencing the buffer waits for
 // serve to be done with it.
 func (c *Conn) readFrames() {
+	defer close(c.readEnded)
 	for {
 		f, err := c.fr.ReadFrame()
 		fr := frame{err: err}
@@ -356,6 +362,7 @@ func (c *Conn) readFrames() {
 		select {
 		case c.frames <- fr:
 		case <-c.done:
+			c.discard()
 			return
 		}
 		if err != nil {
@@ -370,10 +377,15 @@ func (c *Conn) readFrames() {
 		select {
 		case <-c.readMore:
 		case <-c.done:
+			c.discard()
 			return
 		}
 	}
 }
+
+// discard reads and drops what the peer still sends once the connection ended, until its end
+// or the read deadline shutdown set, so the close that follows leaves nothing unread.
+func (c *Conn) discard() { _, _ = io.Copy(io.Discard, c.nc) }
 
 // writeLoop writes what serve hands it. The socket's write deadline is serve's alone, so
 // the one a shutdown sets is never raised back.
@@ -1178,24 +1190,59 @@ func (c *Conn) shutdown(err error, goAway bool, code http2.ErrCode) {
 	close(c.done)
 	// A write stuck on the socket returns at the deadline, and the write goroutine with it.
 	_ = c.nc.SetWriteDeadline(time.Now().Add(closeTimeout))
+	// A write that failed left a frame cut short, which only the failed end of the transport
+	// may follow.
+	wrote := true
 	if c.writing {
-		<-c.wroteCh
+		wrote = <-c.wroteCh == nil
 		c.writing = false
 	}
 	close(c.writeCh)
-	if goAway {
+	if goAway && wrote {
 		// The frames encoded before a graceful GOAWAY, those of a Write that returned, are
 		// written ahead of it. An error drops them, RFC 9113 section 5.4.1.
 		if code != http2.ErrCodeNo {
 			c.out.Reset()
 		}
-		if werr := c.fr.WriteGoAway(0, code, nil); werr == nil {
+		wrote = c.fr.WriteGoAway(0, code, nil) == nil
+		if wrote {
 			_ = c.nc.SetWriteDeadline(time.Now().Add(closeTimeout))
-			_, _ = c.nc.Write(c.out.Bytes())
+			_, err := c.nc.Write(c.out.Bytes())
+			wrote = err == nil
 		}
 	}
-	_ = c.nc.Close()
+	if goAway && wrote {
+		// The normal end of the transport: its half-close, then what the peer still sends read
+		// until its end, within closeTimeout.
+		if cw, ok := c.nc.(interface{ CloseWrite() error }); ok && cw.CloseWrite() == nil {
+			by := time.Now().Add(closeTimeout)
+			if n := c.readBy.Load(); n != 0 && n < by.UnixNano() {
+				by = time.Unix(0, n)
+			}
+			_ = c.nc.SetReadDeadline(by)
+			<-c.readEnded
+		}
+		_ = c.nc.Close()
+	} else {
+		// A connection that failed ends with the failed end of its transport.
+		abortConn(c.nc)
+	}
 	close(c.ended)
+}
+
+// abortConn ends nc so its peer reads a failure: a reset socket, and no close_notify under TLS.
+func abortConn(nc net.Conn) {
+	switch c := nc.(type) {
+	case interface{ Abort() }:
+		c.Abort()
+	case interface{ NetConn() net.Conn }:
+		abortConn(c.NetConn())
+	case interface{ SetLinger(sec int) error }:
+		_ = c.SetLinger(0)
+		_ = nc.Close()
+	default:
+		_ = nc.Close()
+	}
 }
 
 // CanOpen reports whether the connection takes a new stream, which it does until it ends,
@@ -1224,6 +1271,13 @@ func (c *Conn) Close() error {
 	c.send(msg{kind: msgClose})
 	<-c.ended
 	return nil
+}
+
+// CloseBy is Close, the read of what the peer still sends after the GOAWAY ending by deadline,
+// shared with what the caller ended before.
+func (c *Conn) CloseBy(deadline time.Time) error {
+	c.readBy.Store(deadline.UnixNano())
+	return c.Close()
 }
 
 // Open sends a CONNECT and returns the stream once the peer answered it, with the answer.

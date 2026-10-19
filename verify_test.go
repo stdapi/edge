@@ -174,6 +174,23 @@ func TestNameVerification_DecideTransparent(t *testing.T) {
 	}
 }
 
+func TestNameVerification_FailedLookupIsTriedAgain(t *testing.T) {
+	r := &fakeResolver{err: errors.New("lookup failed")}
+	p := testProxy(t, WithNameVerification(VerifyReject), WithNameResolver(r))
+	p.MustAdd("example.test/", forwardHandler)
+	sess := newSession(p, t.Context(), nil, Target{}, KindHTTP, HTTP11)
+	sess.setUpstream(netip.MustParseAddrPort("9.9.9.9:80"))
+	target := Target{Scheme: "http", Host: "example.test", Port: "80"}
+
+	_, ok := p.verifyRequestHost(t.Context(), sess, target, KindHTTP)
+	assert.False(t, ok)
+	r.err = nil
+	r.addrs = map[string][]netip.Addr{"example.test": addrsOf("9.9.9.9")}
+	_, ok = p.verifyRequestHost(t.Context(), sess, target, KindHTTP)
+	assert.True(t, ok)
+	assert.EqualValues(t, 2, r.calls.Load())
+}
+
 func TestNameVerification_OptionValidation(t *testing.T) {
 	_, err := New(WithNameVerification(verifySentinel))
 	require.ErrorIs(t, err, ErrInvalidConfig)

@@ -13,6 +13,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -37,10 +39,12 @@ func (p *Proxy) serveWebSocketUpgrade(c *routeCtx, w http.ResponseWriter, r *htt
 
 	if resp.StatusCode != http.StatusSwitchingProtocols {
 		// The origin declined the upgrade. Its answer is an ordinary response and travels
-		// back as one.
+		// back as one, and ends the client connection before its next bytes, which may be frames.
+		w.Header().Set("Connection", "close")
+		c.rq.markHeader()
 		if werr := writeResponse(w, r, resp); werr != nil {
 			p.logf(r.Context(), slog.LevelDebug, "write websocket handshake response", sess, werr)
-			abortIfCut(w, werr)
+			abortIfCut(w, r, werr)
 		}
 		return
 	}
@@ -53,6 +57,7 @@ func (p *Proxy) serveWebSocketUpgrade(c *routeCtx, w http.ResponseWriter, r *htt
 // spliceWebSocket takes over both ends of an upgraded connection and runs the frame handler
 // between them.
 func (p *Proxy) spliceWebSocket(c *routeCtx, w http.ResponseWriter, r *http.Request, resp *http.Response, handler WebSocket) error {
+	raw, top := c.takeUpstreamConn()
 	backend, ok := resp.Body.(io.ReadWriteCloser)
 	if !ok {
 		if resp.Body != nil {
@@ -68,39 +73,60 @@ func (p *Proxy) spliceWebSocket(c *routeCtx, w http.ResponseWriter, r *http.Requ
 		return fmt.Errorf("hijack for websocket upgrade: %w", err)
 	}
 	defer func() { _ = client.Close() }()
+	sessionFromRequest(r).handOver()
 
 	sctx, scancel := p.webSocketContext(r)
 	defer scancel()
 	// After the hijack http.Server neither closes nor waits for the connection, so tracking
 	// it here is what lets a shutdown and a route change reach it. A refusal means the proxy
 	// is stopping, and the 101 has not been written yet, so the client sees the upgrade fail.
-	pipe := &upgradedPipe{client: client, backend: backend}
+	pipe := &upgradedPipe{client: client, backend: backend, raw: raw, accepted: make(chan struct{})}
 	sess := p.pipeSession(c, r, KindWebSocket, c.entry, pipe, sctx, scancel)
 	// The handler owns the request it is handed, so the copy is what a later decision reads.
 	sess.upgrade = r.Clone(r.Context())
 
-	if !p.srv.tryTrack(pipe) {
+	if !p.srv.trackRegistered(pipe) {
+		// The cut started, which gives both connections their failed end.
+		abort(client)
+		if raw != nil {
+			abort(raw)
+		}
 		return nil
 	}
 	defer p.srv.untrack(pipe)
 
 	// The 101 has not reached the client yet, so a connection the entries would now decide
 	// differently is refused with an ordinary status.
-	if !p.srv.admitSession(sess) {
+	if aerr := p.srv.admitSession(sess, nil); aerr != nil {
+		if raw != nil {
+			abort(raw)
+		}
+		if errors.Is(aerr, errSessionEnded) {
+			abort(client)
+			return aerr
+		}
 		p.logf(r.Context(), slog.LevelDebug, "upgrade refused, the entries changed while it was admitted", sess, nil)
-		return writeRawStatus(brw, http.StatusForbidden)
+		werr := writeRawStatus(brw, http.StatusForbidden)
+		closeNormally(client)
+		return werr
 	}
 	defer p.srv.untrackSession(sess)
+	p.srv.requests.release(c.rq)
 
 	// Response.Write copies the body after the headers, and here the body is the connection
 	// itself. Leaving it in place would block forever draining a stream that only ends when
 	// the peers are done talking.
 	resp.Body = nil
-	if err := resp.Write(brw); err != nil {
-		return fmt.Errorf("write upgrade response: %w", err)
+	err = resp.Write(brw)
+	if err == nil {
+		err = brw.Flush()
 	}
-	if err := brw.Flush(); err != nil {
-		return fmt.Errorf("flush upgrade response: %w", err)
+	if err != nil {
+		// The client did not get the 101, a failed end of its leg, which the origin that sent it
+		// gets too, I1.
+		close(pipe.accepted)
+		_ = sess.endBy(causePeerFailed, time.Now().Add(alertWriteTimeout))
+		return fmt.Errorf("write upgrade response: %w", err)
 	}
 
 	ctx, cancel := context.WithCancelCause(sctx)
@@ -118,10 +144,23 @@ func (p *Proxy) spliceWebSocket(c *routeCtx, w http.ResponseWriter, r *http.Requ
 		identity: c.identity,
 		maxFrame: p.cfg.server.maxFrameBytes,
 	}
-	wc.setHops(client, &hijackedReader{br: brw.Reader, conn: client}, backend)
+	wc.setHops(client, &hijackedReader{br: brw.Reader, conn: client}, backend, raw, top)
 	defer wc.stop()
+	pipe.ws.Store(wc)
+	close(pipe.accepted)
+	if sess.end.first() != causeNone {
+		// A closer that ran during the 101 ends the session with its Close frames, I1.
+		<-sess.end.done
+		return nil
+	}
 
-	return runKindHandler(p, sess, func() error { return handler(wc) })
+	herr := runKindHandler(p, sess, func() error { return handler(wc) })
+	cs := causeReturned
+	if herr != nil {
+		cs = causeHandlerErr
+	}
+	_ = sess.endBy(cs, time.Now().Add(alertWriteTimeout))
+	return herr
 }
 
 // webSocketContext returns the context of a WebSocket session, with the values of the
@@ -132,7 +171,7 @@ func (p *Proxy) webSocketContext(r *http.Request) (context.Context, context.Canc
 	if s := sessionFromRequest(r); s != nil {
 		base = s.Context()
 	}
-	return p.untilShutdown(context.WithoutCancel(base))
+	return context.WithCancel(context.WithoutCancel(base))
 }
 
 // serveUpgradedStream serves what an upgrade left behind as the byte stream it now is. HTTP
@@ -140,8 +179,13 @@ func (p *Proxy) webSocketContext(r *http.Request) (context.Context, context.Canc
 // authority, or refused when there is none.
 func (p *Proxy) serveUpgradedStream(c *routeCtx, w http.ResponseWriter, r *http.Request, resp *http.Response, sess *Session) error {
 	target := Target{Scheme: c.scheme, Host: c.host, Port: c.port}
+	raw, top := c.takeUpstreamConn()
 	e, params := p.admitWith(target, KindTCP)
 	if e == nil {
+		// The origin switched protocols for a stream the proxy refuses, and gets its failed end.
+		if raw != nil {
+			abort(raw)
+		}
 		if resp.Body != nil {
 			_ = resp.Body.Close()
 		}
@@ -169,30 +213,12 @@ func (p *Proxy) serveUpgradedStream(c *routeCtx, w http.ResponseWriter, r *http.
 		return fmt.Errorf("hijack for protocol upgrade: %w", err)
 	}
 	defer func() { _ = client.Close() }()
+	sessionFromRequest(r).handOver()
 
 	ctx, cancel := p.hijackedContext(r)
 	defer cancel()
-	pipe := &upgradedPipe{client: client, backend: backend}
+	pipe := &upgradedPipe{client: client, backend: backend, raw: raw}
 	upSess := p.pipeSession(c, r, KindTCP, e, pipe, ctx, cancel)
-
-	if !p.srv.tryTrack(pipe) {
-		return nil
-	}
-	defer p.srv.untrack(pipe)
-
-	if !p.srv.admitSession(upSess) {
-		p.logf(r.Context(), slog.LevelDebug, "upgrade refused, the entries changed while it was admitted", upSess, nil)
-		return writeRawStatus(brw, http.StatusForbidden)
-	}
-	defer p.srv.untrackSession(upSess)
-
-	resp.Body = nil
-	if err := resp.Write(brw); err != nil {
-		return fmt.Errorf("write upgrade response: %w", err)
-	}
-	if err := brw.Flush(); err != nil {
-		return fmt.Errorf("flush upgrade response: %w", err)
-	}
 
 	sc := &TCPCtx{
 		ctx:      ctx,
@@ -211,11 +237,50 @@ func (p *Proxy) serveUpgradedStream(c *routeCtx, w http.ResponseWriter, r *http.
 	}
 	// The far side is the connection the 101 left behind. Marking the dial done makes Relay
 	// use it instead of opening another.
-	sc.up.Conn = pipeConn{ReadWriteCloser: backend}
+	sc.up.Conn = pipeConn{ReadWriteCloser: backend, raw: raw, top: top}
 	sc.dialOnce.Do(func() {})
-	defer sc.close()
+	upSess.closer = (*tcpCloser)(sc)
 
-	return runKindHandler(p, upSess, func() error { return handler(sc) })
+	if !p.srv.trackRegistered(pipe) {
+		// The cut started, which gives both connections their failed end.
+		abort(client)
+		if raw != nil {
+			abort(raw)
+		}
+		return nil
+	}
+	defer p.srv.untrack(pipe)
+
+	if aerr := p.srv.admitSession(upSess, nil); aerr != nil {
+		if raw != nil {
+			abort(raw)
+		}
+		if errors.Is(aerr, errSessionEnded) {
+			abort(client)
+			return aerr
+		}
+		p.logf(r.Context(), slog.LevelDebug, "upgrade refused, the entries changed while it was admitted", upSess, nil)
+		werr := writeRawStatus(brw, http.StatusForbidden)
+		closeNormally(client)
+		return werr
+	}
+	defer p.srv.untrackSession(upSess)
+	p.srv.requests.release(c.rq)
+
+	resp.Body = nil
+	if err = resp.Write(brw); err == nil {
+		err = brw.Flush()
+	}
+	if err != nil {
+		// The client did not get the 101, a failed end of its leg, which the origin that sent it
+		// gets too, I1.
+		_ = upSess.endBy(causePeerFailed, time.Now().Add(alertWriteTimeout))
+		return fmt.Errorf("write upgrade response: %w", err)
+	}
+
+	err = runKindHandler(p, upSess, func() error { return handler(sc) })
+	sc.end(err)
+	return err
 }
 
 // hijackedReader reads a hijacked connection through the buffer net/http handed back until it
@@ -253,6 +318,25 @@ func (c bufferedConn) Abort() { abort(c.Conn) }
 // with no addresses and no deadlines of its own, and closing it is what ends it.
 type pipeConn struct {
 	io.ReadWriteCloser
+	// raw is the socket of the upstream connection the 101 arrived on and top the connection
+	// over it, TLS included, both nil when the proxy could not record them.
+	raw, top net.Conn
+}
+
+// CloseWrite half-closes the upstream connection, a close_notify under TLS.
+func (c pipeConn) CloseWrite() error {
+	if c.top == nil {
+		return c.Close()
+	}
+	return closeWrite(c.top)
+}
+
+// Abort resets the upstream connection, which closing the body of the 101 ends with a FIN.
+func (c pipeConn) Abort() {
+	if c.raw != nil {
+		abort(c.raw)
+	}
+	_ = c.Close()
 }
 
 func (pipeConn) LocalAddr() net.Addr              { return emptyAddr{} }
@@ -268,9 +352,46 @@ var _ net.Conn = pipeConn{}
 type upgradedPipe struct {
 	client  net.Conn
 	backend io.Closer
+	// raw is the socket under backend, nil when the transport handed over none.
+	raw net.Conn
+	// accepted is closed once the 101 of a WebSocket session was written or failed, ws set
+	// when it was written. It is nil on a pipe served by a TCP entry.
+	accepted chan struct{}
+	// ws is the WebSocket served on the pipe once its handler runs.
+	ws atomic.Pointer[WebSocketCtx]
 }
 
-func (u *upgradedPipe) Close() error {
+func (u *upgradedPipe) Close() error { return u.endBy(causeCut, time.Now().Add(alertWriteTimeout)) }
+
+func (u *upgradedPipe) endBy(c cause, deadline time.Time) error {
+	failed := formOf(framed, c, false) == formFailed
+	if u.accepted != nil && !failed {
+		// A framed session gets its acceptance first, the 101 in progress.
+		waitUntil(u.accepted, deadline)
+	}
+	if ws := u.ws.Load(); ws != nil {
+		if failed {
+			ws.abortHops(deadline)
+			return nil
+		}
+		ws.endBy(c == causeClosed || c == causeCut, deadline)
+		return nil
+	}
+	if failed || c == causeCut || c == causeClosed || u.accepted != nil {
+		// No handler runs, so the pipe ends as a byte stream, each leg with its failed end.
+		var wg sync.WaitGroup
+		wg.Go(func() { abortBy(u.client, deadline) })
+		switch b := u.backend.(type) {
+		case net.Conn:
+			abortBy(b, deadline)
+		default:
+			if u.raw != nil {
+				abortBy(u.raw, deadline)
+			}
+		}
+		wg.Wait()
+		return u.backend.Close()
+	}
 	cerr := u.client.Close()
 	berr := u.backend.Close()
 	return errors.Join(cerr, berr)
@@ -281,13 +402,18 @@ func (u *upgradedPipe) Close() error {
 // It gets a session of its own because a request routes on its Host header, which can differ
 // from the CONNECT authority. Reusing the connection's would report an authority the pipe does
 // not talk to, and a sweep would keep the wrong one.
-func (p *Proxy) pipeSession(c *routeCtx, r *http.Request, kind Kind, e *entry, pipe io.Closer,
+func (p *Proxy) pipeSession(c *routeCtx, r *http.Request, kind Kind, e *entry, pipe *upgradedPipe,
 	ctx context.Context, cancel context.CancelFunc,
 ) *Session {
 	target := Target{Scheme: c.scheme, Host: c.host, Port: c.port}
 	sess := newSession(p, ctx, nil, target, kind, protoOfRequest(r))
 	sess.cancel = cancel
 	sess.closer = pipe
+	// The socket rides what the connection that sent the upgrade rides, docs/lifecycle.md
+	// Handover.
+	if from := sessionFromRequest(r); from != nil {
+		sess.carrier = from.carrier
+	}
 	sess.entry.Store(e)
 	// An upgrade outlives the request that established it, so a revocation can only reach it
 	// through the identity that request carried.

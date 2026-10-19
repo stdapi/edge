@@ -15,12 +15,15 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/quic-go/quic-go/http3"
+	"github.com/stdapi/edge/internal/netutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/net/http2"
@@ -34,29 +37,14 @@ func readErrWithin(t *testing.T, c net.Conn, d time.Duration) error {
 	return err
 }
 
-func TestIdleTracker_ArmClosesTheTunnel(t *testing.T) {
-	client, upstream := net.Pipe()
-	defer func() { _ = upstream.Close() }()
-
-	tracker := newIdleTracker(0, client, upstream)
-	defer tracker.stop()
-
-	// Nothing runs until a half-close arms it.
-	require.ErrorIs(t, readErrWithin(t, client, 100*time.Millisecond), os.ErrDeadlineExceeded)
-
-	tracker.arm(20 * time.Millisecond)
-	assert.ErrorIs(t, readErrWithin(t, client, 2*time.Second), io.ErrClosedPipe)
-}
-
-func TestIdleTracker_ArmedTimerIsPushedBackByTraffic(t *testing.T) {
+func TestIdleTracker_TimerIsPushedBackByTraffic(t *testing.T) {
 	client, upstream := net.Pipe()
 	defer func() { _ = client.Close() }()
 	defer func() { _ = upstream.Close() }()
 
-	tracker := newIdleTracker(0, client, upstream)
+	tracker := newIdleTracker(100*time.Millisecond, client, upstream)
 	defer tracker.stop()
 
-	tracker.arm(100 * time.Millisecond)
 	for range 5 {
 		time.Sleep(30 * time.Millisecond)
 		tracker.touch()
@@ -64,30 +52,6 @@ func TestIdleTracker_ArmedTimerIsPushedBackByTraffic(t *testing.T) {
 
 	err := readErrWithin(t, client, 10*time.Millisecond)
 	assert.ErrorIs(t, err, os.ErrDeadlineExceeded, "traffic must keep the tunnel open")
-}
-
-func TestIdleTracker_ArmDoesNotOverrideAConfiguredTimeout(t *testing.T) {
-	client, upstream := net.Pipe()
-	defer func() { _ = client.Close() }()
-	defer func() { _ = upstream.Close() }()
-
-	tracker := newIdleTracker(30*time.Millisecond, client, upstream)
-	defer tracker.stop()
-
-	tracker.arm(time.Hour)
-	assert.ErrorIs(t, readErrWithin(t, client, 2*time.Second), io.ErrClosedPipe)
-}
-
-func TestIdleTracker_ArmAfterStopDoesNothing(t *testing.T) {
-	client, upstream := net.Pipe()
-	defer func() { _ = client.Close() }()
-	defer func() { _ = upstream.Close() }()
-
-	tracker := newIdleTracker(0, client, upstream)
-	tracker.stop()
-	tracker.arm(20 * time.Millisecond)
-
-	assert.ErrorIs(t, readErrWithin(t, client, 60*time.Millisecond), os.ErrDeadlineExceeded)
 }
 
 func TestH2Stream_CloseWriteOnHTTP3KeepsReceiving(t *testing.T) {
@@ -543,4 +507,584 @@ func TestTLSConn_LaterCloseKeepsTheBound(t *testing.T) {
 		assert.ErrorIs(t, server.Close(), net.ErrClosed)
 	}
 	assert.Less(t, <-closed, alertWriteTimeout*3/2)
+}
+
+func TestTLSConn_LaterCloseReturnsAfterTheFirst(t *testing.T) {
+	server, client := tlsPipe(t)
+	go func() { _ = server.Close() }()
+	// The first byte of the close_notify arrives, the rest waits for the peer to read.
+	_, err := client.NetConn().Read(make([]byte, 1))
+	require.NoError(t, err)
+	start := time.Now()
+	assert.ErrorIs(t, server.Close(), net.ErrClosed)
+	assert.Greater(t, time.Since(start), alertWriteTimeout/2)
+}
+
+func TestTLSConn_CloseAfterARecordCutShortResetsTheSocket(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	leaf, err := ca.Leaf("pipe.test")
+	require.NoError(t, err)
+	a, b := tcpPair(t)
+	server := tlsServer(a, &tls.Config{Certificates: []tls.Certificate{*leaf}})
+	client := tls.Client(b, &tls.Config{ServerName: "pipe.test", RootCAs: ca.CertPool()})
+	handshake := make(chan error, 1)
+	go func() { handshake <- client.Handshake() }()
+	require.NoError(t, server.Handshake())
+	require.NoError(t, <-handshake)
+
+	// The client reads nothing, so the socket fills inside a record.
+	require.NoError(t, server.SetWriteDeadline(time.Now().Add(200*time.Millisecond)))
+	_, err = server.Write(make([]byte, 16<<20))
+	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+	require.True(t, server.socket.cut.Load(), "the record was cut short")
+	_ = server.Close()
+	assert.Equal(t, "RST", peerEnd(b, 3*time.Second))
+}
+
+// handshakenTLS returns a TLS server of the proxy and a client over a TCP pair, past a
+// handshake of version at most, and the socket of the client.
+func handshakenTLS(t *testing.T, version uint16) (*tlsConn, *tls.Conn, *net.TCPConn) {
+	t.Helper()
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	leaf, err := ca.Leaf("pipe.test")
+	require.NoError(t, err)
+	a, b := tcpPair(t)
+	server := tlsServer(a, &tls.Config{Certificates: []tls.Certificate{*leaf}, SessionTicketsDisabled: true})
+	client := tls.Client(b, &tls.Config{ServerName: "pipe.test", RootCAs: ca.CertPool(), MaxVersion: version})
+	handshake := make(chan error, 1)
+	go func() { handshake <- client.Handshake() }()
+	require.NoError(t, server.Handshake())
+	require.NoError(t, <-handshake)
+	return server, client, b
+}
+
+func TestTLSConn_CloseWriteHalfClosesOnTLS13Alone(t *testing.T) {
+	t.Run("TLS 1.3", func(t *testing.T) {
+		server, client, socket := handshakenTLS(t, tls.VersionTLS13)
+		require.NoError(t, server.CloseWrite())
+		require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))
+		_, err := client.Read(make([]byte, 1))
+		require.ErrorIs(t, err, io.EOF, "no close_notify")
+		_, err = socket.Read(make([]byte, 1))
+		require.ErrorIs(t, err, io.EOF, "no FIN after the close_notify")
+
+		_, err = client.Write([]byte("up"))
+		require.NoError(t, err)
+		got := make([]byte, 2)
+		require.NoError(t, server.SetReadDeadline(time.Now().Add(5*time.Second)))
+		_, err = io.ReadFull(server, got)
+		require.NoError(t, err)
+		assert.Equal(t, "up", string(got), "the half-close ended the other direction")
+	})
+	t.Run("TLS 1.2", func(t *testing.T) {
+		server, client, _ := handshakenTLS(t, tls.VersionTLS12)
+		require.NoError(t, server.CloseWrite())
+		require.NoError(t, client.SetReadDeadline(time.Now().Add(300*time.Millisecond)))
+		_, err := client.Read(make([]byte, 1))
+		require.ErrorIs(t, err, os.ErrDeadlineExceeded, "a close_notify ends a TLS 1.2 connection")
+	})
+}
+
+func TestEndCopy_RelaysAFINWithoutCloseNotifyAsSuch(t *testing.T) {
+	for _, notify := range []bool{true, false} {
+		t.Run(map[bool]string{true: "close_notify", false: "FIN alone"}[notify], func(t *testing.T) {
+			src, srcClient, srcSocket := handshakenTLS(t, tls.VersionTLS13)
+			dst, _, dstSocket := handshakenTLS(t, tls.VersionTLS13)
+			if notify {
+				require.NoError(t, srcClient.CloseWrite())
+			} else {
+				require.NoError(t, srcSocket.CloseWrite())
+			}
+			require.NoError(t, src.SetReadDeadline(time.Now().Add(5*time.Second)))
+			_, err := io.ReadAll(src)
+			require.NoError(t, err)
+
+			endCopy(src, dst, nil)
+			_ = dst.Close()
+			require.NoError(t, dstSocket.SetReadDeadline(time.Now().Add(5*time.Second)))
+			rest, err := io.ReadAll(dstSocket)
+			require.NoError(t, err)
+			assert.Equal(t, notify, len(rest) > 0, "%d bytes before the FIN", len(rest))
+		})
+	}
+}
+
+func TestBoundedTLSConn_CloseIsBounded(t *testing.T) {
+	for _, failed := range []bool{false, true} {
+		t.Run(map[bool]string{false: "write blocked", true: "write failed"}[failed], func(t *testing.T) {
+			ca, err := GenerateCA()
+			require.NoError(t, err)
+			leaf, err := ca.Leaf("pipe.test")
+			require.NoError(t, err)
+			a, b := tcpPair(t)
+			server := &boundedTLSConn{Conn: tls.Server(a, &tls.Config{Certificates: []tls.Certificate{*leaf}}), done: make(chan struct{})}
+			client := tls.Client(b, &tls.Config{ServerName: "pipe.test", RootCAs: ca.CertPool()})
+			handshake := make(chan error, 1)
+			go func() { handshake <- client.Handshake() }()
+			require.NoError(t, server.Handshake())
+			require.NoError(t, <-handshake)
+			if failed {
+				require.NoError(t, server.SetWriteDeadline(time.Unix(1, 0)))
+				_, err = server.Write([]byte("lost"))
+				require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+			} else {
+				go func() { _, _ = server.Write(make([]byte, 64<<20)) }()
+				time.Sleep(200 * time.Millisecond)
+			}
+			start := time.Now()
+			require.NoError(t, server.Close())
+			assert.Less(t, time.Since(start), 3*alertWriteTimeout/2)
+			if failed {
+				assert.Equal(t, "RST", peerEnd(b, 3*time.Second))
+			}
+		})
+	}
+}
+
+func TestConn_AbortAfterFlushWaitsThroughTheFrontWrappers(t *testing.T) {
+	for name, wrap := range map[string]func(net.Conn) net.Conn{
+		"raw":                  func(c net.Conn) net.Conn { return c },
+		"peek(cancel)":         func(c net.Conn) net.Conn { return newPeekConn(&cancelConn{Conn: c}, nil, 16) },
+		"peek(scheme(cancel))": func(c net.Conn) net.Conn { return newPeekConn(newSchemeConn(&cancelConn{Conn: c}, 1024), nil, 16) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			b, peer := tcpPair(t)
+			// A fixed receive buffer stops the stack from growing the window that drains the queue.
+			require.NoError(t, peer.SetReadBuffer(4<<10))
+			writeUntilFull(b)
+			start := time.Now()
+			abortAfterFlush(wrap(b))
+			assert.GreaterOrEqual(t, time.Since(start), alertWriteTimeout*9/10)
+		})
+	}
+}
+
+func TestConn_NormalEndAfterATLSRecordCutShortResetsTheSocket(t *testing.T) {
+	server, _, socket := handshakenTLS(t, tls.VersionTLS13)
+	// The client reads nothing, so the socket fills inside a record.
+	require.NoError(t, server.SetWriteDeadline(time.Now().Add(200*time.Millisecond)))
+	_, err := server.Write(make([]byte, 16<<20))
+	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+	require.True(t, server.socket.cut.Load(), "the record was cut short")
+	closeNormally(server)
+	assert.Equal(t, "RST", peerEnd(socket, 3*time.Second))
+}
+
+func TestConn_SocketOfReachesThroughEveryWrapper(t *testing.T) {
+	a, _ := tcpPair(t)
+	for name, wrap := range map[string]func(net.Conn) net.Conn{
+		"peek":        func(c net.Conn) net.Conn { return newPeekConn(c, nil, 16) },
+		"held":        func(c net.Conn) net.Conn { return &heldConn{Conn: c} },
+		"buffered":    func(c net.Conn) net.Conn { return bufferedConn{Conn: c} },
+		"served":      func(c net.Conn) net.Conn { return &servedConn{Conn: c} },
+		"tlsServed":   func(c net.Conn) net.Conn { return &tlsServedConn{servedConn: &servedConn{Conn: c}} },
+		"cancel":      func(c net.Conn) net.Conn { return &cancelConn{Conn: c} },
+		"transparent": func(c net.Conn) net.Conn { return transparentConn{Conn: c} },
+		"throttled":   func(c net.Conn) net.Conn { return Throttled(c, 0) },
+		"own":         func(c net.Conn) net.Conn { return &ownConn{Conn: c} },
+		"gated":       func(c net.Conn) net.Conn { return &gatedConn{Conn: c} },
+		"normalEnd":   func(c net.Conn) net.Conn { return normalEnd{Conn: c} },
+		"scheme":      func(c net.Conn) net.Conn { return &schemeConn{Conn: c} },
+		"pipe":        func(c net.Conn) net.Conn { return pipeConn{raw: c} },
+		"tls":         func(c net.Conn) net.Conn { return &tlsConn{socket: tlsSocket{Conn: c}} },
+		"nested":      func(c net.Conn) net.Conn { return &heldConn{Conn: transparentConn{Conn: Throttled(c, 0)}} },
+	} {
+		t.Run(name, func(t *testing.T) {
+			assert.Same(t, a, socketOf(wrap(a)))
+		})
+	}
+}
+
+func TestConn_AbortAfterFlushWaitsForTheQueueThroughAWrapper(t *testing.T) {
+	for name, wrap := range map[string]func(net.Conn) net.Conn{
+		"plain":       func(c net.Conn) net.Conn { return c },
+		"transparent": func(c net.Conn) net.Conn { return transparentConn{Conn: c} },
+		"throttled":   func(c net.Conn) net.Conn { return Throttled(c, 0) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			b, peer := tcpPair(t)
+			if _, err := netutil.UnsentBytes(b); errors.Is(err, errors.ErrUnsupported) {
+				t.Skip("the platform reports no send queue")
+			}
+			// A fixed receive buffer stops the stack from growing the window that drains the queue.
+			require.NoError(t, peer.SetReadBuffer(4<<10))
+			writeUntilFull(b)
+			start := time.Now()
+			abortAfterFlush(wrap(b))
+			assert.GreaterOrEqual(t, time.Since(start), alertWriteTimeout*9/10, "the queue was dropped while it held bytes")
+		})
+	}
+}
+
+func TestTLSConn_FailedWriteWithNothingWrittenEndsWithAFIN(t *testing.T) {
+	a, aPeer := tcpPair(t)
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	leaf, err := ca.Leaf("svc.test")
+	require.NoError(t, err)
+	srv := tlsServer(a, &tls.Config{Certificates: []tls.Certificate{*leaf}})
+	cli := tls.Client(aPeer, &tls.Config{InsecureSkipVerify: true, ServerName: "svc.test"})
+	errc := make(chan error, 1)
+	go func() { errc <- cli.Handshake() }()
+	require.NoError(t, srv.Handshake())
+	require.NoError(t, <-errc)
+
+	_ = srv.SetWriteDeadline(time.Unix(1, 0))
+	n, werr := srv.Write([]byte("x"))
+	require.Error(t, werr)
+	require.Zero(t, n)
+	go closeNormally(srv)
+	_ = aPeer.SetReadDeadline(time.Now().Add(3 * time.Second))
+	_, rerr := io.Copy(io.Discard, aPeer)
+	assert.NoError(t, rerr, "the peer reads a FIN")
+}
+
+func TestPeekConn_LateClientHelloAfterATimedOutRead(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca), WithSniffTimeout(200*time.Millisecond))
+	require.NoError(t, err)
+	read := make(chan error, 2)
+	p.MustAdd[TCP]("svc.test:443", func(c *TCPCtx) error {
+		_ = c.Client().SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+		_, rerr := c.Client().Read(make([]byte, 1))
+		read <- rerr
+		_ = c.Client().SetReadDeadline(time.Time{})
+		b := make([]byte, 9)
+		_, rerr = io.ReadFull(c.Client(), b)
+		if rerr == nil && b[0] == 0x16 {
+			rerr = errors.New("the handler read a ClientHello in the clear")
+		}
+		read <- rerr
+		return rerr
+	})
+	conn := connectRaw(t, startProxy(t, p), "svc.test:443")
+	time.Sleep(400 * time.Millisecond)
+	_, err = conn.Write([]byte{0x16, 0x03, 0x01, 0x00, 0x04, 0x01, 0x00, 0x00, 0x00})
+	require.NoError(t, err)
+	first, second := <-read, <-read
+	t.Logf("first read %v, second read %v", first, second)
+	if !errors.Is(second, errLateClientHello) {
+		t.Errorf("the late ClientHello reached the handler: %v", second)
+	}
+}
+
+func TestPeekConn_LateHelloShortRecordThenFIN(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca), WithSniffTimeout(100*time.Millisecond))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = p.Close() })
+	type result struct {
+		zeroReads int
+		err       error
+	}
+	res := make(chan result, 1)
+	p.MustAdd[TCP]("svc.test:25", func(c *TCPCtx) error {
+		buf := make([]byte, 64)
+		zero := 0
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			n, rerr := c.Client().Read(buf)
+			if rerr != nil {
+				res <- result{zero, rerr}
+				return nil
+			}
+			if n == 0 {
+				zero++
+			}
+		}
+		res <- result{zero, errors.New("no end within 2s")}
+		return nil
+	})
+	conn := connectRaw(t, startProxy(t, p), "svc.test:25")
+	time.Sleep(300 * time.Millisecond)
+	_, err = conn.Write([]byte{0x16, 0x03})
+	require.NoError(t, err)
+	require.NoError(t, conn.(*net.TCPConn).CloseWrite())
+	r := <-res
+	t.Logf("reads of 0 bytes with no error: %d, end: %v", r.zeroReads, r.err)
+	assert.Zero(t, r.zeroReads)
+	assert.NotEqual(t, "no end within 2s", r.err.Error())
+}
+
+func TestPeekConn_LateHelloShortRecordThenFINUnderRelay(t *testing.T) {
+	origin, upstream := oneConnOrigin(t)
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca), WithSniffTimeout(100*time.Millisecond))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = p.Close() })
+	p.MustAdd[TCP](origin, func(c *TCPCtx) error { return c.Relay() })
+	conn := connectRaw(t, startProxy(t, p), origin)
+	up := <-upstream
+	time.Sleep(300 * time.Millisecond)
+	var before, after syscall.Rusage
+	_ = syscall.Getrusage(syscall.RUSAGE_SELF, &before)
+	_, err = conn.Write([]byte{0x16, 0x03})
+	require.NoError(t, err)
+	require.NoError(t, conn.(*net.TCPConn).CloseWrite())
+	_ = up.SetReadDeadline(time.Now().Add(2 * time.Second))
+	got, rerr := io.ReadAll(up)
+	_ = syscall.Getrusage(syscall.RUSAGE_SELF, &after)
+	cpu := time.Duration(after.Utime.Nano() + after.Stime.Nano() - before.Utime.Nano() - before.Stime.Nano())
+	t.Logf("origin read %x, end %v, process CPU over the wait %v", got, rerr, cpu)
+	assert.NoError(t, rerr, "the client's half-close never reached the origin")
+}
+
+// tlsFrontPair returns the client of a TLS front connection and that connection, the client
+// having read the session tickets.
+func tlsFrontPair(t *testing.T) (*tls.Conn, *tlsConn) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	cert, err := ca.Leaf("127.0.0.1")
+	require.NoError(t, err)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	tl := tlsListener{Listener: cancelListener{ln}, cfg: &tls.Config{Certificates: []tls.Certificate{*cert}, MinVersion: tls.VersionTLS13}}
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		c, _ := tl.Accept()
+		_ = c.(*tlsConn).Handshake()
+		accepted <- c
+	}()
+	client, err := tls.Dial("tcp", ln.Addr().String(), &tls.Config{RootCAs: poolOf(ca), ServerName: "127.0.0.1", MinVersion: tls.VersionTLS13})
+	require.NoError(t, err)
+	server := (<-accepted).(*tlsConn)
+	t.Cleanup(func() { _ = server.Close() })
+	_, err = server.Write([]byte("hello"))
+	require.NoError(t, err)
+	_, err = io.ReadFull(client, make([]byte, 5))
+	require.NoError(t, err)
+	return client, server
+}
+
+func TestTLSConn_CloseNotifyReadFirstKeepsTheNormalEndOfItsSocket(t *testing.T) {
+	client, server := tlsFrontPair(t)
+	require.NoError(t, client.Close())
+	_, err := server.Read(make([]byte, 16))
+	require.ErrorIs(t, err, io.EOF)
+	// The client socket is gone, so the late write or the close_notify of the close draws its RST.
+	_, _ = server.Write([]byte("late"))
+	time.Sleep(50 * time.Millisecond)
+	_ = server.Close()
+	require.Equal(t, peerClean, peerEndOf(server))
+	require.Equal(t, causePeer, cancelConnOf(server).causeOfEnd())
+}
+
+func TestTLSConn_RefusedWriteBeforeTheCloseNotifyReadFailsItsSocket(t *testing.T) {
+	client, server := tlsFrontPair(t)
+	_, err := server.Write([]byte("unread"))
+	require.NoError(t, err)
+	time.Sleep(20 * time.Millisecond)
+	// Closed with bytes unread, the client socket resets the connection.
+	require.NoError(t, client.Close())
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err = server.Write([]byte("x")); err != nil {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	require.Error(t, err)
+	_, _ = server.Read(make([]byte, 16))
+	require.Equal(t, peerFailed, peerEndOf(server))
+	require.Equal(t, causePeerFailed, cancelConnOf(server).causeOfEnd())
+}
+
+func TestTLSConn_FINInsideARecordFailsItsSocket(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	cert, err := ca.Leaf("127.0.0.1")
+	require.NoError(t, err)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+	tl := tlsListener{Listener: cancelListener{ln}, cfg: &tls.Config{Certificates: []tls.Certificate{*cert}, MinVersion: tls.VersionTLS13}}
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		c, _ := tl.Accept()
+		_ = c.(*tlsConn).Handshake()
+		accepted <- c
+	}()
+	raw, err := net.Dial("tcp", ln.Addr().String())
+	require.NoError(t, err)
+	defer raw.Close()
+	client := tls.Client(raw, &tls.Config{RootCAs: poolOf(ca), ServerName: "127.0.0.1", MinVersion: tls.VersionTLS13})
+	require.NoError(t, client.Handshake())
+	server := <-accepted
+	defer server.Close()
+
+	// A record header announcing 32 bytes, 3 of them sent, then the FIN.
+	_, err = raw.Write([]byte{0x17, 0x03, 0x03, 0x00, 0x20, 1, 2, 3})
+	require.NoError(t, err)
+	require.NoError(t, raw.(*net.TCPConn).CloseWrite())
+	_, err = server.Read(make([]byte, 64))
+	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+	require.Equal(t, peerFailed, peerEndOf(server))
+	require.Equal(t, causePeerFailed, cancelConnOf(server).causeOfEnd())
+}
+
+func TestBoundedTLSConn_WriteAfterItsOwnHalfCloseIsNoEndOfItsPeer(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	cert, err := ca.Leaf("127.0.0.1")
+	require.NoError(t, err)
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{*cert}, MinVersion: tls.VersionTLS13})
+	require.NoError(t, err)
+	defer ln.Close()
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		c, _ := cancelListener{ln}.Accept()
+		_ = c.(*boundedTLSConn).Handshake()
+		accepted <- c
+	}()
+	client, err := tls.Dial("tcp", ln.Addr().String(), &tls.Config{RootCAs: poolOf(ca), ServerName: "127.0.0.1", MinVersion: tls.VersionTLS13})
+	require.NoError(t, err)
+	defer client.Close()
+	server := (<-accepted).(*boundedTLSConn)
+	defer server.Close()
+	go func() { _, _ = io.Copy(io.Discard, client) }()
+
+	require.NoError(t, server.CloseWrite())
+	_, err = server.Write([]byte("x"))
+	require.Error(t, err)
+	require.Equal(t, causeReturned, server.causeOfEnd())
+}
+
+func TestSessionCancel_KernelTimeoutIsTheFailedEndOfThePeer(t *testing.T) {
+	for _, op := range []string{"read", "write"} {
+		t.Run(op, func(t *testing.T) {
+			err := &net.OpError{Op: op, Net: "tcp", Err: os.NewSyscallError(op, syscall.ETIMEDOUT)}
+			var s sessionCancel
+			if op == "read" {
+				s.noteRead(err)
+			} else {
+				s.noteWrite(err)
+			}
+			require.Equal(t, causePeerFailed, s.causeOfEnd())
+		})
+	}
+}
+
+func TestCancelConn_FailedWriteIsTheFailedEndOfItsPeerBeforeItsHalfCloseAlone(t *testing.T) {
+	for _, halfClosed := range []bool{false, true} {
+		t.Run("half-closed "+strconv.FormatBool(halfClosed), func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			require.NoError(t, err)
+			defer ln.Close()
+			accepted := make(chan net.Conn, 1)
+			go func() {
+				c, _ := cancelListener{ln}.Accept()
+				accepted <- c
+			}()
+			client, err := net.Dial("tcp", ln.Addr().String())
+			require.NoError(t, err)
+			server := (<-accepted).(*cancelConn)
+			defer server.Close()
+			if halfClosed {
+				require.NoError(t, server.CloseWrite())
+			}
+			lingerZero(client)
+			require.NoError(t, client.Close())
+
+			deadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(deadline) {
+				if _, err = server.Write([]byte("x")); err != nil {
+					break
+				}
+				time.Sleep(time.Millisecond)
+			}
+			require.Error(t, err)
+			want := causePeerFailed
+			if halfClosed {
+				want = causeReturned
+			}
+			require.Equal(t, want, server.causeOfEnd(), "%v", err)
+		})
+	}
+}
+
+func TestTLSConn_TerminatedOverAFrontSocketSharesItsRecord(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	cert, err := ca.Leaf("127.0.0.1")
+	require.NoError(t, err)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+	cfg := &tls.Config{Certificates: []tls.Certificate{*cert}, MinVersion: tls.VersionTLS13}
+	accepted := make(chan *tlsConn, 1)
+	sockets := make(chan *cancelConn, 1)
+	go func() {
+		c, _ := cancelListener{ln}.Accept()
+		sockets <- c.(*cancelConn)
+		tc := tlsServer(newPeekConn(c, nil, 1), cfg)
+		_ = tc.Handshake()
+		accepted <- tc
+	}()
+	client, err := tls.Dial("tcp", ln.Addr().String(), &tls.Config{RootCAs: poolOf(ca), ServerName: "127.0.0.1", MinVersion: tls.VersionTLS13})
+	require.NoError(t, err)
+	server, socket := <-accepted, <-sockets
+	defer server.Close()
+	_, err = server.Write([]byte("hello"))
+	require.NoError(t, err)
+	_, err = io.ReadFull(client, make([]byte, 5))
+	require.NoError(t, err)
+
+	_, err = server.Write([]byte("unread"))
+	require.NoError(t, err)
+	time.Sleep(20 * time.Millisecond)
+	// Closed with bytes unread, the client socket resets the connection.
+	require.NoError(t, client.Close())
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err = server.Write([]byte("x")); err != nil {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	require.Error(t, err)
+	_, _ = server.Read(make([]byte, 16))
+	require.Equal(t, peerFailed, peerEndOf(server))
+	require.Equal(t, causePeerFailed, socket.causeOfEnd())
+}
+
+// onceErrConn returns its errors one per read, then io.EOF, as a socket reports a pending error
+// once.
+type onceErrConn struct {
+	net.Conn
+	errs []error
+}
+
+func (c *onceErrConn) Read([]byte) (int, error) {
+	if len(c.errs) == 0 {
+		return 0, io.EOF
+	}
+	err := c.errs[0]
+	c.errs = c.errs[1:]
+	return 0, err
+}
+
+func TestPeekConn_ReadReturnsTheErrorOfAPeek(t *testing.T) {
+	for _, errno := range []syscall.Errno{syscall.ECONNRESET, syscall.ETIMEDOUT} {
+		for _, lateHello := range []bool{false, true} {
+			t.Run(errno.Error()+" late hello "+strconv.FormatBool(lateHello), func(t *testing.T) {
+				failure := &net.OpError{Op: "read", Net: "tcp", Err: os.NewSyscallError("read", errno)}
+				c := newPeekConn(&onceErrConn{errs: []error{failure}}, nil, 6)
+				c.lateHello = lateHello
+				if !lateHello {
+					_, err := c.Peek(1)
+					require.ErrorIs(t, err, errno)
+				}
+				_, err := c.Read(make([]byte, 16))
+				require.ErrorIs(t, err, errno)
+				_, err = c.Read(make([]byte, 16))
+				require.ErrorIs(t, err, io.EOF)
+			})
+		}
+	}
 }

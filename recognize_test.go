@@ -11,7 +11,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -216,4 +218,12 @@ func TestSniff_NonHTTPALPNIsNotHTTP(t *testing.T) {
 	_, err = io.ReadFull(tc, buf)
 	require.NoError(t, err)
 	assert.Equal(t, "hello", string(buf))
+}
+
+func TestIsTimeout(t *testing.T) {
+	op := func(err error) error { return &net.OpError{Op: "read", Net: "tcp", Err: err} }
+	require.True(t, isTimeout(op(os.ErrDeadlineExceeded)))
+	require.False(t, isTimeout(op(os.NewSyscallError("read", syscall.ETIMEDOUT))))
+	require.False(t, isTimeout(op(os.NewSyscallError("read", syscall.ECONNRESET))))
+	require.False(t, isTimeout(io.EOF))
 }

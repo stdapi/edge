@@ -2170,3 +2170,724 @@ func BenchmarkDatagramAdmissionCaptured(b *testing.B) {
 		}
 	}
 }
+
+func dialRawQUIC(t *testing.T, addr netip.AddrPort, ca *CA, alpn string) *quic.Conn {
+	t.Helper()
+	pc, err := loopbackUDP()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = pc.Close() })
+	conn, err := quic.Dial(t.Context(), pc, net.UDPAddrFromAddrPort(addr),
+		&tls.Config{ServerName: h3Authority, RootCAs: poolOf(ca), NextProtos: []string{alpn}, MinVersion: tls.VersionTLS13},
+		&quic.Config{MaxIdleTimeout: 10 * time.Second, HandshakeIdleTimeout: 3 * time.Second})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.CloseWithError(0, "") })
+	return conn
+}
+
+func TestQUIC_SessionCloseEndsTheOriginLegs(t *testing.T) {
+	originCA, err := GenerateCA()
+	require.NoError(t, err)
+	ln, err := quic.ListenAddr("127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{selfSignedFor(t, originCA, h3Authority)},
+		NextProtos:   []string{"raw"},
+		MinVersion:   tls.VersionTLS13,
+	}, &quic.Config{MaxIdleTimeout: 30 * time.Second})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	origins := make(chan *quic.Conn, 2)
+	go func() {
+		for {
+			c, aerr := ln.Accept(context.Background())
+			if aerr != nil {
+				return
+			}
+			origins <- c
+		}
+	}()
+	origin := netip.MustParseAddrPort(ln.Addr().String())
+
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	tr := DefaultTransport()
+	tr.RootCAs = poolOf(originCA)
+	p, err := New(WithCA(ca), WithTransport(tr))
+	require.NoError(t, err)
+	dialed, late := make(chan struct{}), make(chan error, 1)
+	p.MustAdd[QUIC](h3Authority, func(c *QUICCtx) error {
+		if _, derr := c.Dial(); derr != nil {
+			return derr
+		}
+		close(dialed)
+		<-c.Context().Done()
+		_, derr := c.DialTo(context.Background(), origin.String())
+		late <- derr
+		return nil
+	})
+	dialRawQUIC(t, startQUICRedirected(t, p, origin), ca, "raw")
+	<-dialed
+	oc := <-origins
+
+	require.NoError(t, waitForSessions(t, p, 1)[0].Close())
+	select {
+	case <-oc.Context().Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("Session.Close left the origin leg open")
+	}
+	assert.ErrorIs(t, <-late, net.ErrClosed, "a leg opened after Session.Close")
+}
+
+func TestQUIC_HandlerErrorFailsTheConnection(t *testing.T) {
+	for _, tc := range []struct {
+		alpn string
+		code quic.ApplicationErrorCode
+	}{{"doq", 0x1}, {"h3", quic.ApplicationErrorCode(http3.ErrCodeInternalError)}} {
+		t.Run(tc.alpn, func(t *testing.T) {
+			ca, err := GenerateCA()
+			require.NoError(t, err)
+			p, err := New(WithCA(ca))
+			require.NoError(t, err)
+			p.MustAdd[QUIC](h3Authority, func(*QUICCtx) error { return errors.New("boom") })
+			conn := dialRawQUIC(t, startQUIC(t, p), ca, tc.alpn)
+			ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+			defer cancel()
+			_, err = conn.AcceptStream(ctx)
+			var appErr *quic.ApplicationError
+			require.ErrorAs(t, err, &appErr)
+			assert.Equal(t, tc.code, appErr.ErrorCode)
+		})
+	}
+}
+
+func TestQUIC_CutFailsTheRelayedStream(t *testing.T) {
+	originCA, err := GenerateCA()
+	require.NoError(t, err)
+	ln, err := quic.ListenAddr("127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{selfSignedFor(t, originCA, h3Authority)},
+		NextProtos:   []string{"raw"},
+		MinVersion:   tls.VersionTLS13,
+	}, &quic.Config{MaxIdleTimeout: 30 * time.Second})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	read, started := make(chan error, 1), make(chan struct{})
+	go func() {
+		c, aerr := ln.Accept(context.Background())
+		if aerr != nil {
+			return
+		}
+		st, aerr := c.AcceptStream(context.Background())
+		if aerr != nil {
+			return
+		}
+		if _, aerr = io.ReadFull(st, make([]byte, len("partial"))); aerr != nil {
+			return
+		}
+		close(started)
+		_, rerr := io.Copy(io.Discard, st)
+		read <- rerr
+	}()
+	origin := netip.MustParseAddrPort(ln.Addr().String())
+
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	tr := DefaultTransport()
+	tr.RootCAs = poolOf(originCA)
+	p, err := New(WithCA(ca), WithTransport(tr))
+	require.NoError(t, err)
+	p.MustAdd[QUIC](h3Authority, relayQUIC)
+	conn := dialRawQUIC(t, startQUICRedirected(t, p, origin), ca, "raw")
+	st, err := conn.OpenStreamSync(t.Context())
+	require.NoError(t, err)
+	_, err = st.Write([]byte("partial"))
+	require.NoError(t, err)
+	<-started
+
+	require.NoError(t, p.Close())
+	select {
+	case err := <-read:
+		var se *quic.StreamError
+		var ae *quic.ApplicationError
+		assert.True(t, errors.As(err, &se) || errors.As(err, &ae), "the stream the cut ended read %v", err)
+	case <-time.After(3 * time.Second):
+		t.Fatal("the origin stream outlived the cut")
+	}
+}
+
+func TestQUIC_CutRefusesNewConnectionsFromItsStart(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+	var ran atomic.Bool
+	p.MustAdd[QUIC](h3Authority, func(*QUICCtx) error {
+		ran.Store(true)
+		return nil
+	})
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	started := make(chan struct{}, 1)
+	p.MustAdd("allowed.test/", blockingHandler(started, release))
+	quicAddr := startQUIC(t, p)
+	go func() { _, _ = getBody(proxyClient(startProxy(t, p), nil), "http://allowed.test/") }()
+	<-started
+
+	go func() { _ = p.Close() }()
+	// The cut waits on the blocked handler.
+	time.Sleep(200 * time.Millisecond)
+	pc, err := loopbackUDP()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = pc.Close() })
+	ctx, cancel := context.WithTimeout(t.Context(), 700*time.Millisecond)
+	defer cancel()
+	conn, err := quic.Dial(ctx, pc, net.UDPAddrFromAddrPort(quicAddr),
+		&tls.Config{ServerName: h3Authority, RootCAs: poolOf(ca), NextProtos: []string{"doq"}, MinVersion: tls.VersionTLS13},
+		&quic.Config{HandshakeIdleTimeout: 700 * time.Millisecond})
+	if err == nil {
+		_ = conn.CloseWithError(0, "")
+	}
+	assert.Error(t, err, "a QUIC connection was accepted during the cut")
+	assert.False(t, ran.Load(), "a QUIC handler ran during the cut")
+}
+
+func TestServeQUIC_ReturnsWithItsSocketClosedOnceTheCutEnded(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+	cert, err := ca.Leaf("127.0.0.1")
+	require.NoError(t, err)
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	require.NoError(t, err)
+	served := make(chan error, 1)
+	go func() { served <- p.ServeQUIC(pc, *cert) }()
+	time.Sleep(50 * time.Millisecond)
+
+	require.NoError(t, p.Close())
+	select {
+	case err := <-served:
+		assert.ErrorIs(t, err, ErrProxyClosed)
+	case <-time.After(time.Second):
+		t.Fatal("ServeQUIC still runs once Close returned")
+	}
+	_, err = pc.WriteTo([]byte("x"), pc.LocalAddr())
+	assert.ErrorIs(t, err, net.ErrClosed, "the socket of the front outlived the cut")
+}
+
+func TestQUIC_DrainRefusesANewConnection(t *testing.T) {
+	for _, front := range []string{"HTTP/3 front", "demultiplexer"} {
+		t.Run(front, func(t *testing.T) {
+			ca, err := GenerateCA()
+			require.NoError(t, err)
+			p, err := New(WithCA(ca))
+			require.NoError(t, err)
+			p.MustAdd[QUIC](h3Authority, relayQUIC)
+			release := make(chan struct{})
+			t.Cleanup(func() { close(release) })
+			started := make(chan struct{}, 1)
+			p.MustAdd("allowed.test/", blockingHandler(started, release))
+			var addr netip.AddrPort
+			alpn := "doq"
+			if front == "HTTP/3 front" {
+				addr, _ = startQUICFront(t, p, ca)
+				alpn = http3.NextProtoH3
+			} else {
+				addr = startQUIC(t, p)
+			}
+			go func() { _, _ = getBody(proxyClient(startProxy(t, p), nil), "http://allowed.test/") }()
+			<-started
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			go func() { _ = p.Shutdown(ctx) }()
+			time.Sleep(200 * time.Millisecond)
+
+			pc, err := loopbackUDP()
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = pc.Close() })
+			dctx, dcancel := context.WithTimeout(t.Context(), 2*time.Second)
+			defer dcancel()
+			name := h3Authority
+			if front == "HTTP/3 front" {
+				name = "127.0.0.1"
+			}
+			_, err = quic.Dial(dctx, pc, net.UDPAddrFromAddrPort(addr),
+				&tls.Config{ServerName: name, RootCAs: poolOf(ca), NextProtos: []string{alpn}, MinVersion: tls.VersionTLS13},
+				&quic.Config{HandshakeIdleTimeout: 2 * time.Second})
+			var te *quic.TransportError
+			require.ErrorAs(t, err, &te)
+			assert.Equal(t, quic.ConnectionRefused, te.ErrorCode)
+		})
+	}
+}
+
+func TestQUIC_DrainWaitsForAConnectionThatArrivedBefore(t *testing.T) {
+	origin := udpEchoOrigin(t)
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	r := newGatedResolver(origin.Addr())
+	p, err := New(WithCA(ca), WithNameVerification(VerifyReject), WithNameResolver(r))
+	require.NoError(t, err)
+	p.MustAdd("example.test/", okHandler)
+	wrapper, proxyAddr := startTProxyQUIC(t, p, origin)
+
+	pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	wrapper.perClient.Store(pc.LocalAddr().String(), origin)
+	tr := clientTransport(t, pc)
+	dialed := make(chan error, 1)
+	go func() {
+		conn, err := tr.Dial(t.Context(), net.UDPAddrFromAddrPort(proxyAddr), &tls.Config{
+			ServerName: "example.test", RootCAs: poolOf(ca), NextProtos: []string{"h3"}, MinVersion: tls.VersionTLS13,
+		}, &quic.Config{HandshakeIdleTimeout: 5 * time.Second})
+		if err == nil {
+			// The connection reached its server after the start of the drain, which serves at
+			// most the requests below its GOAWAY, and the client closes it.
+			req, rerr := http.NewRequest(http.MethodGet, "https://example.test/", nil)
+			if rerr == nil {
+				if resp, rerr := h3Over(t, conn).RoundTrip(req); rerr == nil {
+					_ = resp.Body.Close()
+				}
+			}
+			_ = conn.CloseWithError(0, "")
+		}
+		dialed <- err
+	}()
+	// The ClientHello waits in the verification of its name while the drain starts.
+	waitEntered(t, r.entered)
+	shut := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		shut <- p.Shutdown(ctx)
+	}()
+	require.Eventually(t, func() bool { return p.srv.closing.Load() }, 2*time.Second, 5*time.Millisecond)
+	select {
+	case err := <-shut:
+		t.Fatalf("the drain ended with %v under a connection that arrived before it", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(r.release)
+	require.NoError(t, <-dialed, "the connection was dropped")
+	require.NoError(t, <-shut)
+}
+
+func TestQUIC_DrainSendsAGoawayOnATerminatedHTTP3Connection(t *testing.T) {
+	// A cut writes it too, which the end of the connection in the front stage may overtake.
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+	p.MustAdd(h3Authority+"/", okHandler)
+	addr := startQUIC(t, p)
+	qc := dialRawQUIC(t, addr, ca, "h3")
+	hc, err := newH3Conn(qc)
+	require.NoError(t, err)
+	select {
+	case <-hc.settings:
+	case <-time.After(3 * time.Second):
+		t.Fatal("no SETTINGS")
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = p.Shutdown(ctx)
+	}()
+	select {
+	case <-hc.goaway:
+	case <-qc.Context().Done():
+		t.Fatalf("the connection ended with no GOAWAY: %v", context.Cause(qc.Context()))
+	case <-time.After(3 * time.Second):
+		t.Fatal("neither GOAWAY nor end")
+	}
+}
+
+// rawQUICOrigin is a QUIC origin for name with ALPN raw, which hands over each connection it
+// accepts.
+func rawQUICOrigin(t *testing.T, ca *CA, name string) (netip.AddrPort, <-chan *quic.Conn) {
+	ln, err := quic.ListenAddr("127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{selfSignedFor(t, ca, name)},
+		NextProtos:   []string{"raw"},
+		MinVersion:   tls.VersionTLS13,
+	}, &quic.Config{MaxIdleTimeout: 30 * time.Second})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	origins := make(chan *quic.Conn, 4)
+	go func() {
+		for {
+			c, aerr := ln.Accept(context.Background())
+			if aerr != nil {
+				return
+			}
+			origins <- c
+		}
+	}()
+	return netip.MustParseAddrPort(ln.Addr().String()), origins
+}
+
+func TestQUIC_IdleTimeoutWithNoStreamGivesTheOtherLegItsNormalEnd(t *testing.T) {
+	originCA, err := GenerateCA()
+	require.NoError(t, err)
+	origin, origins := rawQUICOrigin(t, originCA, h3Authority)
+
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	tr := DefaultTransport()
+	tr.RootCAs = poolOf(originCA)
+	p, err := New(WithCA(ca), WithTransport(tr))
+	require.NoError(t, err)
+	p.MustAdd[QUIC](h3Authority, relayQUIC)
+	addr := startQUICRedirected(t, p, origin)
+
+	pc, err := loopbackUDP()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = pc.Close() })
+	conn, err := quic.Dial(t.Context(), pc, net.UDPAddrFromAddrPort(addr),
+		&tls.Config{ServerName: h3Authority, RootCAs: poolOf(ca), NextProtos: []string{"raw"}, MinVersion: tls.VersionTLS13},
+		&quic.Config{MaxIdleTimeout: time.Second, HandshakeIdleTimeout: 3 * time.Second})
+	require.NoError(t, err)
+	_ = conn
+	oc := <-origins
+	select {
+	case <-oc.Context().Done():
+	case <-time.After(6 * time.Second):
+		t.Fatal("the origin leg outlived the idle timeout of the client leg")
+	}
+	cause := context.Cause(oc.Context())
+	var appErr *quic.ApplicationError
+	require.True(t, errors.As(cause, &appErr), "origin leg ended with %v", cause)
+	require.EqualValues(t, 0, appErr.ErrorCode, "the origin leg got the failed end after an idle timeout with no stream open")
+}
+
+func TestQUIC_SessionCloseGivesTheOriginLegItsNormalEndBeforeTheHandlerFails(t *testing.T) {
+	originCA, err := GenerateCA()
+	require.NoError(t, err)
+	origin, origins := rawQUICOrigin(t, originCA, h3Authority)
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	tr := DefaultTransport()
+	tr.RootCAs = poolOf(originCA)
+	p, err := New(WithCA(ca), WithTransport(tr))
+	require.NoError(t, err)
+	dialed := make(chan struct{})
+	p.MustAdd[QUIC](h3Authority, func(c *QUICCtx) error {
+		if _, derr := c.Dial(); derr != nil {
+			return derr
+		}
+		close(dialed)
+		<-c.Context().Done()
+		return c.Context().Err()
+	})
+	dialRawQUIC(t, startQUICRedirected(t, p, origin), ca, "raw")
+	<-dialed
+	oc := <-origins
+	require.NoError(t, waitForSessions(t, p, 1)[0].Close())
+	select {
+	case <-oc.Context().Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("Session.Close left the origin leg open")
+	}
+	var appErr *quic.ApplicationError
+	require.True(t, errors.As(context.Cause(oc.Context()), &appErr))
+	require.EqualValues(t, 0, appErr.ErrorCode, "Session.Close gave the origin leg its failed end")
+}
+
+func TestQUIC_CutWaitsForTheHandler(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+	started := make(chan struct{})
+	var returned atomic.Bool
+	p.MustAdd[QUIC](h3Authority, func(c *QUICCtx) error {
+		close(started)
+		<-c.Context().Done()
+		time.Sleep(alertWriteTimeout / 4)
+		returned.Store(true)
+		return nil
+	})
+	dialRawQUIC(t, startQUIC(t, p), ca, "raw")
+	<-started
+	require.NoError(t, p.Close())
+	assert.True(t, returned.Load(), "the cut ended before a handler that returns within T")
+}
+
+func TestQUIC_IdleTimeoutAfterAStreamTheHandlerServedGivesTheNormalEnd(t *testing.T) {
+	originCA, err := GenerateCA()
+	require.NoError(t, err)
+	ln, err := quic.ListenAddr("127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{selfSignedFor(t, originCA, h3Authority)},
+		NextProtos:   []string{"raw"},
+		MinVersion:   tls.VersionTLS13,
+	}, &quic.Config{MaxIdleTimeout: 30 * time.Second})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	origins := make(chan *quic.Conn, 1)
+	go func() {
+		c, aerr := ln.Accept(context.Background())
+		if aerr != nil {
+			return
+		}
+		origins <- c
+		for {
+			st, serr := c.AcceptStream(context.Background())
+			if serr != nil {
+				return
+			}
+			go func() {
+				_, _ = io.Copy(st, st)
+				_ = st.Close()
+			}()
+		}
+	}()
+	origin := netip.MustParseAddrPort(ln.Addr().String())
+
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	tr := DefaultTransport()
+	tr.RootCAs = poolOf(originCA)
+	p, err := New(WithCA(ca), WithTransport(tr))
+	require.NoError(t, err)
+	p.MustAdd[QUIC](h3Authority, func(c *QUICCtx) error {
+		for {
+			st, aerr := c.Accept()
+			if aerr != nil {
+				return nil
+			}
+			w, r, oerr := st.Open()
+			if oerr != nil {
+				return oerr
+			}
+			_, _ = io.Copy(w, st.Reader())
+			_ = w.Close()
+			_, _ = io.Copy(st.Writer(), r)
+			_ = st.Writer().Close()
+		}
+	})
+	addr := startQUICRedirected(t, p, origin)
+
+	pc, err := loopbackUDP()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = pc.Close() })
+	conn, err := quic.Dial(t.Context(), pc, net.UDPAddrFromAddrPort(addr),
+		&tls.Config{ServerName: h3Authority, RootCAs: poolOf(ca), NextProtos: []string{"raw"}, MinVersion: tls.VersionTLS13},
+		&quic.Config{MaxIdleTimeout: time.Second, HandshakeIdleTimeout: 3 * time.Second})
+	require.NoError(t, err)
+	st, err := conn.OpenStreamSync(t.Context())
+	require.NoError(t, err)
+	_, err = st.Write([]byte("x"))
+	require.NoError(t, err)
+	require.NoError(t, st.Close())
+	got, err := io.ReadAll(st)
+	require.NoError(t, err)
+	require.Equal(t, "x", string(got))
+	oc := <-origins
+	select {
+	case <-oc.Context().Done():
+	case <-time.After(6 * time.Second):
+		t.Fatal("the origin leg outlived the idle timeout of the client leg")
+	}
+	var appErr *quic.ApplicationError
+	require.True(t, errors.As(context.Cause(oc.Context()), &appErr), "origin leg ended with %v", context.Cause(oc.Context()))
+	assert.EqualValues(t, 0, appErr.ErrorCode, "the idle end with no stream in flight")
+}
+
+func TestQUIC_SessionCloseCancelsADialToInProgress(t *testing.T) {
+	originCA, err := GenerateCA()
+	require.NoError(t, err)
+	origin, _ := rawQUICOrigin(t, originCA, "127.0.0.1")
+	hole, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = hole.Close() })
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	tr := DefaultTransport()
+	tr.RootCAs = poolOf(originCA)
+	p, err := New(WithCA(proxyCA), WithTransport(tr))
+	require.NoError(t, err)
+	dialing := make(chan struct{})
+	type res struct {
+		err error
+		at  time.Time
+	}
+	done := make(chan res, 1)
+	p.MustAdd[QUIC]("127.0.0.1", func(c *QUICCtx) error {
+		close(dialing)
+		_, derr := c.DialTo(context.Background(), hole.LocalAddr().String())
+		done <- res{derr, time.Now()}
+		return derr
+	})
+	front, _ := startQUICFront(t, p, proxyCA)
+	cc := masqueClient(t, front, proxyCA)
+	tunnel, _, err := openTunnel(t, cc, front, origin.String(), nil)
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	_, err = quic.Dial(ctx, tunnel, net.UDPAddrFromAddrPort(origin), &tls.Config{
+		RootCAs: poolOf(proxyCA), ServerName: "127.0.0.1", NextProtos: []string{"raw"}, MinVersion: tls.VersionTLS13,
+	}, &quic.Config{DisablePathMTUDiscovery: true, MaxIdleTimeout: 20 * time.Second})
+	require.NoError(t, err)
+	<-dialing
+	time.Sleep(100 * time.Millisecond)
+	var inner *Session
+	for s := range p.Sessions() {
+		if !s.Tunnel() {
+			inner = s
+		}
+	}
+	require.NotNil(t, inner)
+	start := time.Now()
+	require.NoError(t, inner.Close())
+	r := <-done
+	assert.Less(t, r.at.Sub(start), alertWriteTimeout, "a closer cancels every dial in progress for its unit")
+}
+
+func TestQUIC_HandlerReturnWaitsForItsStreamRelays(t *testing.T) {
+	originCA, err := GenerateCA()
+	require.NoError(t, err)
+	origin, origins := rawQUICOrigin(t, originCA, h3Authority)
+	go func() {
+		for oc := range origins {
+			go func() {
+				st, err := oc.AcceptStream(context.Background())
+				if err != nil {
+					return
+				}
+				b, _ := io.ReadAll(st)
+				time.Sleep(300 * time.Millisecond)
+				_, _ = st.Write(append([]byte("echo:"), b...))
+				_ = st.Close()
+			}()
+		}
+	}()
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	tr := DefaultTransport()
+	tr.RootCAs = poolOf(originCA)
+	p, err := New(WithCA(ca), WithTransport(tr))
+	require.NoError(t, err)
+	p.MustAdd[QUIC](h3Authority, func(c *QUICCtx) error {
+		st, err := c.Accept()
+		if err != nil {
+			return err
+		}
+		go func() { _ = st.Relay() }()
+		// The relay has begun by the return.
+		time.Sleep(100 * time.Millisecond)
+		return nil
+	})
+	conn := dialRawQUIC(t, startQUICRedirected(t, p, origin), ca, "raw")
+	st, err := conn.OpenStreamSync(t.Context())
+	require.NoError(t, err)
+	_, err = st.Write([]byte("hello"))
+	require.NoError(t, err)
+	require.NoError(t, st.Close())
+	_ = st.SetReadDeadline(time.Now().Add(3 * time.Second))
+	b, err := io.ReadAll(st)
+	t.Logf("client read %q, err %v, connection cause %v", b, err, context.Cause(conn.Context()))
+	if string(b) != "echo:hello" {
+		t.Errorf("the relay the handler started was cut by the closer at the handler's return")
+	}
+}
+
+func rawEchoProxy(t *testing.T, alpn string) netip.AddrPort {
+	t.Helper()
+	originCA, err := GenerateCA(WithCASubject("edge raw QUIC origin CA"))
+	require.NoError(t, err)
+	ln, err := quic.ListenAddr("127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{selfSignedFor(t, originCA, h3Authority)},
+		NextProtos:   []string{alpn},
+		MinVersion:   tls.VersionTLS13,
+	}, &quic.Config{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, aerr := ln.Accept(context.Background())
+			if aerr != nil {
+				return
+			}
+			go func() {
+				str, aerr := conn.AcceptStream(context.Background())
+				if aerr != nil {
+					return
+				}
+				b, _ := io.ReadAll(str)
+				_, _ = str.Write(b)
+				_ = str.Close()
+			}()
+		}
+	}()
+	origin, err := netip.ParseAddrPort(ln.Addr().String())
+	require.NoError(t, err)
+	tr := DefaultTransport()
+	tr.RootCAs = poolOf(originCA)
+	p, err := New(WithCA(rawEchoProxyCA), WithTransport(tr))
+	require.NoError(t, err)
+	p.MustAdd[QUIC](h3Authority, func(c *QUICCtx) error {
+		st, aerr := c.Accept()
+		if aerr != nil {
+			return aerr
+		}
+		return st.Relay()
+	})
+	return startQUICRedirected(t, p, origin)
+}
+
+var rawEchoProxyCA = func() *CA {
+	ca, err := GenerateCA()
+	if err != nil {
+		panic(err)
+	}
+	return ca
+}()
+
+func dialRawEcho(t *testing.T, proxyAddr netip.AddrPort, alpn string) (*quic.Conn, string, error) {
+	t.Helper()
+	pc, err := loopbackUDP()
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = pc.Close() })
+	conn, err := quic.Dial(t.Context(), pc, net.UDPAddrFromAddrPort(proxyAddr), &tls.Config{
+		ServerName: h3Authority, RootCAs: poolOf(rawEchoProxyCA), NextProtos: []string{alpn}, MinVersion: tls.VersionTLS13,
+	}, &quic.Config{HandshakeIdleTimeout: 3 * time.Second})
+	require.NoError(t, err)
+	str, err := conn.OpenStreamSync(t.Context())
+	require.NoError(t, err)
+	_, err = str.Write([]byte("hello"))
+	require.NoError(t, err)
+	require.NoError(t, str.Close())
+	_ = str.SetReadDeadline(time.Now().Add(3 * time.Second))
+	b, err := io.ReadAll(str)
+	return conn, string(b), err
+}
+
+func TestQUIC_RelayedReplyReachesTheClientBeforeTheNormalEnd(t *testing.T) {
+	// An h3 offer that only a QUIC entry admits is served stream by stream too.
+	for _, alpn := range []string{"raw", "h3"} {
+		t.Run(alpn, func(t *testing.T) {
+			proxyAddr := rawEchoProxy(t, alpn)
+			for i := range 20 {
+				conn, got, err := dialRawEcho(t, proxyAddr, alpn)
+				require.NoError(t, err, "round %d: the normal end of the connection dropped the relayed reply", i)
+				require.Equal(t, "hello", got)
+				_ = conn.CloseWithError(0, "")
+			}
+		})
+	}
+}
+
+func TestQUIC_NormalEndOfAClientThatNeverClosesComesAtTheDeadline(t *testing.T) {
+	proxyAddr := rawEchoProxy(t, "raw")
+	conn, got, err := dialRawEcho(t, proxyAddr, "raw")
+	require.NoError(t, err)
+	require.Equal(t, "hello", got)
+	start := time.Now()
+	select {
+	case <-conn.Context().Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("the normal end of a connection waited past its deadline for a client that never closes")
+	}
+	elapsed := time.Since(start)
+	require.Greater(t, elapsed, alertWriteTimeout/2, "the connection ended before its client could read what was queued")
+	var appErr *quic.ApplicationError
+	require.ErrorAs(t, context.Cause(conn.Context()), &appErr)
+	require.True(t, appErr.Remote)
+	require.Equal(t, quic.ApplicationErrorCode(0), appErr.ErrorCode)
+}

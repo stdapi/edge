@@ -14,9 +14,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"maps"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"net/netip"
 	"net/url"
 	"os"
@@ -27,6 +29,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/iotest"
 	"time"
 
 	"github.com/quic-go/quic-go"
@@ -36,6 +39,7 @@ import (
 	"github.com/quic-go/quic-go/quicvarint"
 	"github.com/stdapi/edge/internal/h2tunnel"
 	"github.com/stdapi/edge/internal/netutil"
+	"github.com/stdapi/edge/internal/quicsniff"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/net/http2"
@@ -86,11 +90,26 @@ func masqueClient(t *testing.T, addr netip.AddrPort, ca *CA) *http3.ClientConn {
 type masqueConn struct {
 	str      *http3.RequestStream
 	deadline atomic.Pointer[time.Time]
+	// end receives the error that ended the read of the stream's capsules.
+	end chan error
 }
 
 // openTunnel asks the proxy at front for a tunnel to target, host:port, with the given
 // headers. A refusal returns the response the proxy answered with.
 func openTunnel(t *testing.T, cc *http3.ClientConn, front netip.AddrPort, target string, header http.Header) (*masqueConn, *http.Response, error) {
+	t.Helper()
+	return openTunnelReading(t, cc, front, target, header, false)
+}
+
+// openQuietTunnel is openTunnel with no capsule read. quic-go drops a datagram that arrives
+// once the stream was read to its end, so a test of the datagrams the end of a tunnel sends
+// reads none.
+func openQuietTunnel(t *testing.T, cc *http3.ClientConn, front netip.AddrPort, target string) (*masqueConn, *http.Response, error) {
+	t.Helper()
+	return openTunnelReading(t, cc, front, target, nil, true)
+}
+
+func openTunnelReading(t *testing.T, cc *http3.ClientConn, front netip.AddrPort, target string, header http.Header, quiet bool) (*masqueConn, *http.Response, error) {
 	t.Helper()
 	host, port, err := net.SplitHostPort(target)
 	require.NoError(t, err)
@@ -121,18 +140,22 @@ func openTunnel(t *testing.T, cc *http3.ClientConn, front netip.AddrPort, target
 		str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeNoError))
 		return nil, resp, fmt.Errorf("CONNECT-UDP refused with %d", resp.StatusCode)
 	}
-	mc := &masqueConn{str: str}
+	mc := &masqueConn{str: str, end: make(chan error, 1)}
 	t.Cleanup(func() { _ = mc.Close() })
+	if quiet {
+		return mc, resp, nil
+	}
 	go func() {
 		// Capsules are read and dropped so the stream keeps flowing, and its end is the
 		// proxy's.
 		parser := http3.NewCapsuleParser(str)
 		for {
 			_, r, perr := parser.Next()
-			if perr != nil {
-				return
+			if perr == nil {
+				perr = r.Discard()
 			}
-			if perr := r.Discard(); perr != nil {
+			if perr != nil {
+				mc.end <- perr
 				return
 			}
 		}
@@ -557,6 +580,84 @@ func TestConnectUDP_IdentityRevocation(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestConnectUDP_TunnelIdleCountsFromItsLastInnerUnit(t *testing.T) {
+	fx := newUDPFixture(t)
+	origin := newUDPOrigin(t, "127.0.0.1:0", echoReply)
+	tun := fx.mustOpen(t, viaH3, udpReq{target: origin.addr.String()})
+	tun.send(t, 0, []byte("ping"))
+	origin.next(t)
+	tun.recv(t)
+
+	fx.p.srv.mu.Lock()
+	d := fx.p.srv.tunnels
+	fx.p.srv.mu.Unlock()
+	require.NotNil(t, d)
+	age := func() {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		for _, flow := range d.flows {
+			flow.lastSeen = time.Now().Add(-2 * udpFlowIdle)
+		}
+	}
+	tunnels := func() int {
+		n := 0
+		for s := range fx.p.Sessions() {
+			if s.Tunnel() {
+				n++
+			}
+		}
+		return n
+	}
+	open := func() bool {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		for from := range d.flows {
+			if from.tunnel != nil {
+				return true
+			}
+		}
+		return false
+	}
+	// The client has been silent for longer than udpFlowIdle when its last flow ends.
+	age()
+	for s := range fx.p.Sessions() {
+		if !s.Tunnel() {
+			require.NoError(t, s.Close())
+		}
+	}
+	d.sweepIdle()
+	assert.True(t, open(), "the tunnel closed with its last inner unit")
+	age()
+	d.sweepIdle()
+	assert.False(t, open())
+	assert.Eventually(t, func() bool { return tunnels() == 0 }, 5*time.Second, 10*time.Millisecond)
+}
+
+func TestConnectUDP_TunnelIdleCountsFromTheLastPacketOfAConnectionNeverAdopted(t *testing.T) {
+	p, ca, front, origin := masqueProxy(t)
+	cc := masqueClient(t, front, ca)
+	_, _, err := openTunnel(t, cc, front, fmt.Sprintf("%s:%d", h3Authority, origin.Port()), nil)
+	require.NoError(t, err)
+	waitForSessions(t, p, 1)
+	p.srv.mu.Lock()
+	d := p.srv.tunnels
+	p.srv.mu.Unlock()
+	require.NotNil(t, d)
+
+	// The last inner connection was placed long ago, and its handshake never reached its stack.
+	old := time.Now().Add(-2 * udpFlowIdle)
+	d.mu.Lock()
+	for from, flow := range d.flows {
+		if from.tunnel != nil {
+			flow.lastSeen = old
+			flow.conns["lost"] = &quicConn{odcid: "lost", state: connTerminated, lastSeen: old}
+		}
+	}
+	d.mu.Unlock()
+	d.sweepIdle()
+	waitForSessions(t, p, 0)
+}
+
 func TestConnectUDP_IdleTunnelIsClosed(t *testing.T) {
 	p, ca, front, origin := masqueProxy(t)
 	cc := masqueClient(t, front, ca)
@@ -567,7 +668,9 @@ func TestConnectUDP_IdleTunnelIsClosed(t *testing.T) {
 	tunnel := waitForSessions(t, p, 1)[0]
 	require.True(t, tunnel.Tunnel())
 
+	p.srv.mu.Lock()
 	d := p.srv.tunnels
+	p.srv.mu.Unlock()
 	require.NotNil(t, d)
 	d.mu.Lock()
 	for _, flow := range d.flows {
@@ -728,6 +831,8 @@ type fakeH3Stream struct {
 	writeCode atomic.Pointer[quic.StreamErrorCode]
 }
 
+func (s *fakeH3Stream) Context() context.Context { return context.Background() }
+
 func (s *fakeH3Stream) Write(b []byte) (int, error)      { return len(b), nil }
 func (s *fakeH3Stream) Close() error                     { return nil }
 func (s *fakeH3Stream) SetWriteDeadline(time.Time) error { return nil }
@@ -751,9 +856,9 @@ func (s *fakeH3Stream) ReceiveDatagram(ctx context.Context) ([]byte, error) {
 
 func TestConnectUDP_CleanEndOfTheHTTP3StreamResetsNothing(t *testing.T) {
 	str := &fakeH3Stream{Reader: bytes.NewReader(capsuleOf(capsuleDatagram, httpDatagram(0, []byte("last")))), dgrams: make(chan []byte)}
-	pipe := newDatagramPipe(str, quic.StreamErrorCode(http3.ErrCodeNoError), false)
+	pipe := newDatagramPipe(str, false)
 	ended := make(chan struct{})
-	pipe.run(func() { close(ended) })
+	pipe.run(func(bool) { close(ended) })
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	b, err := pipe.recv(ctx)
@@ -766,9 +871,177 @@ func TestConnectUDP_CleanEndOfTheHTTP3StreamResetsNothing(t *testing.T) {
 	assert.Nil(t, str.readCode.Load(), "the stream was stopped")
 }
 
+func TestConnectUDP_HTTP3ConnectionEndReachesTheReaderWithItsCause(t *testing.T) {
+	cases := []struct {
+		name   string
+		err    error
+		failed bool
+	}{
+		{name: "H3_NO_ERROR", err: &quic.ApplicationError{ErrorCode: h3NoError, Remote: true}},
+		{name: "H3_INTERNAL_ERROR", err: &quic.ApplicationError{ErrorCode: quic.ApplicationErrorCode(http3.ErrCodeInternalError), Remote: true}, failed: true},
+		{name: "idle timeout", err: &quic.IdleTimeoutError{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			str := &fakeH3Stream{Reader: iotest.ErrReader(tc.err), dgrams: make(chan []byte)}
+			pipe := newDatagramPipe(str, false)
+			ended := make(chan bool, 1)
+			pipe.run(func(failed bool) { ended <- failed })
+			assert.Equal(t, tc.failed, <-ended)
+			_, err := pipe.recv(t.Context())
+			require.ErrorIs(t, err, errTunnelEnded)
+			assert.Equal(t, tc.failed, !cleanEnd(err))
+		})
+	}
+}
+
+func TestConnectUDP_SessionCloseEndsAnHTTP3TunnelWithoutError(t *testing.T) {
+	fx := newUDPFixture(t)
+	origin := newUDPOrigin(t, "127.0.0.1:0", echoReply)
+	tun := fx.mustOpen(t, viaH3, udpReq{target: origin.addr.String()})
+	tun.send(t, 0, []byte("ping"))
+	origin.next(t)
+	tun.recv(t)
+	var tunnel *Session
+	for s := range fx.p.Sessions() {
+		if s.Tunnel() {
+			tunnel = s
+		}
+	}
+	require.NotNil(t, tunnel)
+	require.NoError(t, tunnel.Close())
+
+	require.ErrorIs(t, tun.waitEnd(t), io.EOF, "the stream ended without its FIN")
+	var err error
+	require.Eventually(t, func() bool {
+		err = tun.write(capsuleOf(capsuleDatagram, httpDatagram(0, []byte("late"))))
+		return err != nil
+	}, 5*time.Second, 10*time.Millisecond)
+	stopped, ok := errors.AsType[*quic.StreamError](err)
+	require.True(t, ok, "the write ended with %v", err)
+	assert.Equal(t, quic.StreamErrorCode(http3.ErrCodeNoError), stopped.ErrorCode)
+}
+
+// endRecorder is a connection that records the order of its ends.
+type endRecorder struct {
+	net.Conn
+	ends []string
+}
+
+func (c *endRecorder) CloseWrite() error { c.ends = append(c.ends, "CloseWrite"); return nil }
+func (c *endRecorder) Close() error      { c.ends = append(c.ends, "Close"); return c.Conn.Close() }
+
+func TestConnectUDP_CapsulePipeOnASocketReadsUntilThePeerEnds(t *testing.T) {
+	a, b := net.Pipe()
+	conn := &endRecorder{Conn: a}
+	pipe := newSocketCapsulePipe(conn, bufio.NewReader(conn))
+	closed := make(chan struct{})
+	go func() {
+		_ = pipe.close()
+		close(closed)
+	}()
+	// net.Pipe has no buffer, so the write returns once the close read it.
+	_, err := b.Write(capsuleOf(capsuleDatagram, httpDatagram(0, []byte("late"))))
+	require.NoError(t, err)
+	select {
+	case <-closed:
+		t.Fatal("the close returned before the peer ended")
+	default:
+	}
+	require.NoError(t, b.Close())
+	<-closed
+	assert.Equal(t, []string{"CloseWrite", "Close"}, conn.ends)
+}
+
+func TestConnectUDP_CapsulePipeHalfClosesBeforeItCloses(t *testing.T) {
+	a, b := net.Pipe()
+	defer b.Close()
+	conn := &endRecorder{Conn: a}
+	pipe := newCapsulePipe(conn, bufio.NewReader(conn))
+	require.NoError(t, pipe.close())
+	assert.Equal(t, []string{"CloseWrite", "Close"}, conn.ends)
+}
+
+// finFirstStream is a fakeH3Stream that, as quic-go does, ends ReceiveDatagram as soon as a
+// read reaches the end of the stream, and blocks that read until release is closed.
+type finFirstStream struct {
+	*fakeH3Stream
+	seen    chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *finFirstStream) Read(b []byte) (int, error) {
+	n, err := s.fakeH3Stream.Read(b)
+	if err != nil {
+		s.once.Do(func() { close(s.seen) })
+		<-s.release
+	}
+	return n, err
+}
+
+func (s *finFirstStream) ReceiveDatagram(ctx context.Context) ([]byte, error) {
+	select {
+	case <-s.seen:
+		return nil, io.EOF
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func TestConnectUDP_RecvReportsHowTheHTTP3StreamEnded(t *testing.T) {
+	capsule := capsuleOf(capsuleDatagram, httpDatagram(0, []byte("truncated")))
+	cases := []struct {
+		name   string
+		stream []byte
+		want   error
+		reset  bool
+	}{
+		{name: "truncated capsule", stream: capsule[:4], want: errTunnelMalformed, reset: true},
+		{name: "fin between capsules", stream: nil, want: io.EOF},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			str := &finFirstStream{
+				fakeH3Stream: &fakeH3Stream{Reader: bytes.NewReader(tc.stream), dgrams: make(chan []byte)},
+				seen:         make(chan struct{}),
+				release:      make(chan struct{}),
+			}
+			pipe := newDatagramPipe(str, false)
+			pipe.run(func(bool) {})
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			got := make(chan error, 1)
+			go func() {
+				_, err := pipe.recv(ctx)
+				got <- err
+			}()
+			<-str.seen
+			var err error
+			select {
+			case err = <-got:
+			case <-time.After(50 * time.Millisecond):
+				close(str.release)
+				err = <-got
+			}
+			select {
+			case <-str.release:
+			default:
+				close(str.release)
+			}
+			require.ErrorIs(t, err, tc.want)
+			if tc.reset {
+				code := str.writeCode.Load()
+				require.NotNil(t, code, "the stream was not reset")
+				assert.Equal(t, quic.StreamErrorCode(http3.ErrCodeMessageError), *code)
+			}
+		})
+	}
+}
+
 func TestConnectUDP_CapsuleQueuedAsRecvWaitsWakesIt(t *testing.T) {
 	str := &fakeH3Stream{Reader: bytes.NewReader(nil), dgrams: make(chan []byte)}
-	pipe := newDatagramPipe(str, quic.StreamErrorCode(http3.ErrCodeNoError), true)
+	pipe := newDatagramPipe(str, true)
 	t.Cleanup(func() { _ = pipe.close() })
 	want := httpDatagram(0, []byte("capsule"))
 	pipe.checked = func() {
@@ -804,8 +1077,8 @@ func TestConnectUDP_HTTP3ReadDeadlineLeavesTheTunnelReadable(t *testing.T) {
 	silent, end := io.Pipe()
 	t.Cleanup(func() { _ = end.Close() })
 	str := &fakeH3Stream{Reader: silent, dgrams: make(chan []byte, 1)}
-	pipe := newDatagramPipe(str, quic.StreamErrorCode(http3.ErrCodeNoError), false)
-	pipe.run(func() {})
+	pipe := newDatagramPipe(str, false)
+	pipe.run(func(bool) {})
 	require.NoError(t, pipe.setReadDeadline(time.Now().Add(50*time.Millisecond)))
 	_, err := pipe.recv(t.Context())
 	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
@@ -829,9 +1102,9 @@ func TestConnectUDP_OversizedDatagramAbortsTheHTTP3Stream(t *testing.T) {
 			if cap(str.dgrams) > 0 {
 				str.dgrams <- oversized
 			}
-			pipe := newDatagramPipe(str, quic.StreamErrorCode(http3.ErrCodeNoError), false)
+			pipe := newDatagramPipe(str, false)
 			ended := make(chan struct{})
-			pipe.run(func() { close(ended) })
+			pipe.run(func(bool) { close(ended) })
 			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 			defer cancel()
 			_, err := pipe.recv(ctx)
@@ -908,18 +1181,24 @@ func (c *capsuleClient) ReadFrom(b []byte) (int, net.Addr, error) {
 		timeout = timer.C
 	}
 	for {
+		var value []byte
 		select {
-		case value := <-c.in:
-			id, n, err := quicvarint.Parse(value)
-			if err != nil || id != 0 {
-				continue
-			}
-			return copy(b, value[n:]), emptyAddr{}, nil
+		case value = <-c.in:
 		case <-c.done:
-			return 0, nil, c.err
+			// A capsule read before the end is still delivered.
+			select {
+			case value = <-c.in:
+			default:
+				return 0, nil, c.err
+			}
 		case <-timeout:
 			return 0, nil, os.ErrDeadlineExceeded
 		}
+		id, n, err := quicvarint.Parse(value)
+		if err != nil || id != 0 {
+			continue
+		}
+		return copy(b, value[n:]), emptyAddr{}, nil
 	}
 }
 
@@ -1360,7 +1639,7 @@ func TestConnectUDP_Capsules_CloseEndsAStalledClient(t *testing.T) {
 
 			start := time.Now()
 			require.NoError(t, tunnel.Close())
-			assert.Less(t, time.Since(start), time.Second, "Close waited on the client")
+			assert.Less(t, time.Since(start), alertWriteTimeout+alertWriteTimeout/2, "Close outlived its deadline")
 			assert.Eventually(t, func() bool { return len(slices.Collect(p.Sessions())) == 0 },
 				3*time.Second, 20*time.Millisecond, "the tunnel outlived its close")
 		})
@@ -2208,7 +2487,7 @@ func exitDialer(t *testing.T, ca *CA) *upstreamDialer {
 	tr.RootCAs = poolOf(ca)
 	tr.TLSHandshakeTimeout = 2 * time.Second
 	u := newUpstreamDialer(tr)
-	t.Cleanup(u.close)
+	t.Cleanup(func() { u.close(time.Now().Add(alertWriteTimeout)) })
 	return u
 }
 
@@ -3854,7 +4133,16 @@ func TestConnectUDP_CloseEndsATunnelBehindAClientThatStoppedAcknowledging(t *tes
 		}
 	}
 	require.NotNil(t, tunnel)
-	require.NoError(t, tunnel.Close())
+	// A carrier hands its tunnel what is left of its own deadline, I4.
+	start := time.Now()
+	require.NoError(t, tunnel.endBy(causeClosed, start.Add(alertWriteTimeout/4)))
+	assert.Less(t, time.Since(start), alertWriteTimeout/2)
+	dp := (*tunnel.closer.(*connectUDPTunnel).pipe.Load()).(*datagramPipe)
+	select {
+	case <-dp.done:
+	default:
+		t.Fatal("Close of the tunnel returned before its stream ended")
+	}
 	assert.Eventually(t, func() bool { return !slices.Contains(slices.Collect(p.Sessions()), tunnel) },
 		2*time.Second, 20*time.Millisecond, "the tunnel outlived its close")
 }
@@ -3945,4 +4233,1230 @@ func TestConnectUDP_HalfCloseOverHTTP2WhileTheSenderIsBlocked(t *testing.T) {
 		t.Fatal("the stream never ended")
 	}
 	time.Sleep(500 * time.Millisecond)
+}
+
+func TestConnectUDP_TunnelResetFailsItsInnerConnections(t *testing.T) {
+	originCA, err := GenerateCA()
+	require.NoError(t, err)
+	ln, err := quic.ListenAddr("127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{selfSignedFor(t, originCA, "127.0.0.1")},
+		NextProtos:   []string{"raw"},
+		MinVersion:   tls.VersionTLS13,
+	}, &quic.Config{MaxIdleTimeout: 30 * time.Second})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	origins := make(chan *quic.Conn, 1)
+	go func() {
+		if c, aerr := ln.Accept(context.Background()); aerr == nil {
+			origins <- c
+		}
+	}()
+	origin := netip.MustParseAddrPort(ln.Addr().String())
+
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	tr := DefaultTransport()
+	tr.RootCAs = poolOf(originCA)
+	p, err := New(WithCA(proxyCA), WithTransport(tr))
+	require.NoError(t, err)
+	dialed := make(chan struct{})
+	p.MustAdd[QUIC]("127.0.0.1", func(c *QUICCtx) error {
+		if _, derr := c.Dial(); derr != nil {
+			return derr
+		}
+		close(dialed)
+		return c.Relay()
+	})
+	front, _ := startQUICFront(t, p, proxyCA)
+	cc := masqueClient(t, front, proxyCA)
+	tunnel, _, err := openTunnel(t, cc, front, origin.String(), nil)
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	_, err = quic.Dial(ctx, tunnel, net.UDPAddrFromAddrPort(origin), &tls.Config{
+		RootCAs: poolOf(proxyCA), ServerName: "127.0.0.1", NextProtos: []string{"raw"}, MinVersion: tls.VersionTLS13,
+	}, &quic.Config{DisablePathMTUDiscovery: true, MaxIdleTimeout: 10 * time.Second})
+	require.NoError(t, err)
+	<-dialed
+	oc := <-origins
+
+	tunnel.str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+	tunnel.str.CancelRead(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+	select {
+	case <-oc.Context().Done():
+		var appErr *quic.ApplicationError
+		require.ErrorAs(t, context.Cause(oc.Context()), &appErr)
+		assert.EqualValues(t, 1, appErr.ErrorCode, "the origin of an inner connection read a clean end")
+	case <-time.After(3 * time.Second):
+		t.Fatal("the reset of the tunnel left its inner connection open")
+	}
+}
+
+func TestConnectUDP_TunnelCloseEndsTheLegsOfItsInnerConnections(t *testing.T) {
+	originCA, err := GenerateCA()
+	require.NoError(t, err)
+	ln, err := quic.ListenAddr("127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{selfSignedFor(t, originCA, "127.0.0.1")},
+		NextProtos:   []string{"raw"},
+		MinVersion:   tls.VersionTLS13,
+	}, &quic.Config{MaxIdleTimeout: 30 * time.Second})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	origins := make(chan *quic.Conn, 1)
+	go func() {
+		if c, aerr := ln.Accept(context.Background()); aerr == nil {
+			origins <- c
+		}
+	}()
+	origin := netip.MustParseAddrPort(ln.Addr().String())
+
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	tr := DefaultTransport()
+	tr.RootCAs = poolOf(originCA)
+	p, err := New(WithCA(proxyCA), WithTransport(tr))
+	require.NoError(t, err)
+	dialed, release := make(chan struct{}), make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	p.MustAdd[QUIC]("127.0.0.1", func(c *QUICCtx) error {
+		if _, derr := c.Dial(); derr != nil {
+			return derr
+		}
+		close(dialed)
+		<-release
+		return nil
+	})
+	front, _ := startQUICFront(t, p, proxyCA)
+	cc := masqueClient(t, front, proxyCA)
+	tunnel, _, err := openTunnel(t, cc, front, origin.String(), nil)
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	_, err = quic.Dial(ctx, tunnel, net.UDPAddrFromAddrPort(origin), &tls.Config{
+		RootCAs: poolOf(proxyCA), ServerName: "127.0.0.1", NextProtos: []string{"raw"}, MinVersion: tls.VersionTLS13,
+	}, &quic.Config{DisablePathMTUDiscovery: true, MaxIdleTimeout: 10 * time.Second})
+	require.NoError(t, err)
+	<-dialed
+	oc := <-origins
+
+	tunnels := slices.DeleteFunc(slices.Collect(p.Sessions()), func(s *Session) bool { return !s.Tunnel() })
+	require.Len(t, tunnels, 1)
+	require.NoError(t, tunnels[0].Close())
+	select {
+	case <-oc.Context().Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close on the tunnel left the origin leg of an inner connection open")
+	}
+}
+
+func TestConnectUDP_DrainKeepsATunnelThatArrivedBefore(t *testing.T) {
+	fx := newUDPFixture(t)
+	origin := newUDPOrigin(t, "127.0.0.1:0", echoReply)
+	tun := fx.mustOpen(t, viaH3, udpReq{target: origin.addr.String()})
+	tun.send(t, 0, []byte("ping"))
+	origin.next(t)
+	tun.recv(t)
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	go func() { _ = fx.p.Shutdown(ctx) }()
+	// Past the idle end of an HTTP/3 connection with no request in flight.
+	time.Sleep(2*alertWriteTimeout + 500*time.Millisecond)
+	tun.send(t, 0, []byte("during the drain"))
+	origin.next(t)
+	tun.recv(t)
+}
+
+// nameGate blocks the lookup of name until release is closed.
+type nameGate struct {
+	inner   *fakeResolver
+	name    string
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (g *nameGate) LookupNetIP(ctx context.Context, network, host string) ([]netip.Addr, error) {
+	if host == g.name {
+		g.entered <- struct{}{}
+		<-g.release
+	}
+	return g.inner.LookupNetIP(ctx, network, host)
+}
+
+func TestConnectUDP_DrainServesATunnelReadBeforeIt(t *testing.T) {
+	for _, front := range []string{viaH3, viaH2, viaH1} {
+		t.Run(front, func(t *testing.T) {
+			if front == viaH2 && !extendedConnectEnabled() {
+				t.Skip("run with GODEBUG=http2xconnect=1, Go's HTTP/2 server refuses extended CONNECT without it")
+			}
+			fx := newUDPFixture(t)
+			gate := &nameGate{inner: fx.resolver, name: "echo.udp.test", entered: make(chan struct{}, 1), release: make(chan struct{})}
+			fx.p.cfg.resolver = gate
+			origin := newUDPOrigin(t, "127.0.0.1:0", echoReply)
+			first := fx.mustOpen(t, front, udpReq{target: origin.addr.String()})
+			first.send(t, 0, []byte("ping"))
+			origin.next(t)
+			first.recv(t)
+
+			opened := make(chan *udpTunnel, 1)
+			go func() {
+				opened <- fx.open(t, front, udpReq{target: net.JoinHostPort("echo.udp.test", fmt.Sprint(origin.addr.Port()))})
+			}()
+			<-gate.entered
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			go func() { _ = fx.p.Shutdown(ctx) }()
+			require.Eventually(t, func() bool { return fx.p.srv.closing.Load() }, 2*time.Second, 5*time.Millisecond)
+			time.Sleep(100 * time.Millisecond)
+			close(gate.release)
+			tun := <-opened
+			assert.NotEqual(t, http.StatusServiceUnavailable, tun.status, "a CONNECT-UDP read before the drain is refused as one that arrived after it")
+		})
+	}
+}
+
+func TestConnectUDP_DemuxBroughtUpDuringTheDrainDrains(t *testing.T) {
+	for _, front := range []string{viaH3, viaH1} {
+		t.Run(front, func(t *testing.T) {
+			fx := newUDPFixture(t)
+			gate := &nameGate{inner: fx.resolver, name: "echo.udp.test", entered: make(chan struct{}, 1), release: make(chan struct{})}
+			fx.p.cfg.resolver = gate
+			origin := newUDPOrigin(t, "127.0.0.1:0", echoReply)
+			opened := make(chan *udpTunnel, 1)
+			go func() {
+				opened <- fx.open(t, front, udpReq{target: net.JoinHostPort("echo.udp.test", fmt.Sprint(origin.addr.Port()))})
+			}()
+			<-gate.entered
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			go func() { _ = fx.p.Shutdown(ctx) }()
+			require.Eventually(t, func() bool { return fx.p.srv.closing.Load() }, 2*time.Second, 5*time.Millisecond)
+			time.Sleep(100 * time.Millisecond)
+			close(gate.release)
+			<-opened
+			fx.p.srv.mu.Lock()
+			d := fx.p.srv.tunnels
+			fx.p.srv.mu.Unlock()
+			require.NotNil(t, d)
+			require.True(t, d.draining.Load(), "the demultiplexer of the tunnels refuses the QUIC connections that arrive after the start of the drain")
+		})
+	}
+}
+
+func TestConnectUDP_CleanEndOfTheFrontFailsOnlyTheInnerConnectionsInFlight(t *testing.T) {
+	cases := []struct {
+		name   string
+		stream bool
+		code   quic.ApplicationErrorCode
+	}{
+		{name: "no stream open", code: 0},
+		{name: "a stream in flight", stream: true, code: 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			originCA, err := GenerateCA()
+			require.NoError(t, err)
+			origin, origins := rawQUICOrigin(t, originCA, "127.0.0.1")
+			proxyCA, err := GenerateCA()
+			require.NoError(t, err)
+			tr := DefaultTransport()
+			tr.RootCAs = poolOf(originCA)
+			p, err := New(WithCA(proxyCA), WithTransport(tr))
+			require.NoError(t, err)
+			p.MustAdd[QUIC]("127.0.0.1", relayQUIC)
+			front, _ := startQUICFront(t, p, proxyCA)
+			cc := masqueClient(t, front, proxyCA)
+			tunnel, _, err := openTunnel(t, cc, front, origin.String(), nil)
+			require.NoError(t, err)
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			qc, err := quic.Dial(ctx, tunnel, net.UDPAddrFromAddrPort(origin), &tls.Config{
+				RootCAs: poolOf(proxyCA), ServerName: "127.0.0.1", NextProtos: []string{"raw"}, MinVersion: tls.VersionTLS13,
+			}, &quic.Config{DisablePathMTUDiscovery: true, MaxIdleTimeout: 10 * time.Second})
+			require.NoError(t, err)
+			oc := <-origins
+			if tc.stream {
+				st, serr := qc.OpenStreamSync(ctx)
+				require.NoError(t, serr)
+				_, serr = st.Write([]byte("x"))
+				require.NoError(t, serr)
+				ost, serr := oc.AcceptStream(ctx)
+				require.NoError(t, serr)
+				_, serr = io.ReadFull(ost, make([]byte, 1))
+				require.NoError(t, serr)
+			} else {
+				time.Sleep(100 * time.Millisecond)
+			}
+
+			require.NoError(t, cc.CloseWithError(0x100, ""))
+			select {
+			case <-oc.Context().Done():
+			case <-time.After(3 * time.Second):
+				t.Fatal("the origin leg outlived the end of the front connection")
+			}
+			appErr, ok := errors.AsType[*quic.ApplicationError](context.Cause(oc.Context()))
+			require.True(t, ok, "origin leg ended with %v", context.Cause(oc.Context()))
+			assert.Equal(t, tc.code, appErr.ErrorCode)
+		})
+	}
+}
+
+// eofHeld is a tunnel with an end that its QUIC client reads only at release, and with writes
+// past its half-close dropped. quic-go closes every connection of a transport after its socket
+// ends or fails a write, before the packets it already received.
+type eofHeld struct {
+	*capsuleClient
+	release chan struct{}
+	halfway atomic.Bool
+}
+
+func (c *eofHeld) CloseWrite() error {
+	c.halfway.Store(true)
+	return c.capsuleClient.CloseWrite()
+}
+
+func (c *eofHeld) WriteTo(b []byte, addr net.Addr) (int, error) {
+	if c.halfway.Load() {
+		return len(b), nil
+	}
+	return c.capsuleClient.WriteTo(b, addr)
+}
+
+func (c *eofHeld) ReadFrom(b []byte) (int, net.Addr, error) {
+	n, addr, err := c.capsuleClient.ReadFrom(b)
+	if err != nil && !errors.Is(err, os.ErrDeadlineExceeded) {
+		<-c.release
+	}
+	return n, addr, err
+}
+
+func TestConnectUDP_Capsules_ClientFINFailsOnlyTheInnerHTTP3ConnectionsInFlight(t *testing.T) {
+	cases := []struct {
+		name    string
+		request bool
+		code    quic.ApplicationErrorCode
+	}{
+		{name: "idle", code: quic.ApplicationErrorCode(http3.ErrCodeNoError)},
+		{name: "a request in flight", request: true, code: quic.ApplicationErrorCode(http3.ErrCodeInternalError)},
+	}
+	for _, f := range capsuleFronts {
+		for _, tc := range cases {
+			t.Run(f.name+"/"+tc.name, func(t *testing.T) {
+				skipWithoutExtendedConnect(t, f)
+				ca, err := GenerateCA()
+				require.NoError(t, err)
+				resolver := &fakeResolver{addrs: map[string][]netip.Addr{h3Authority: {netip.MustParseAddr("127.0.0.1")}}}
+				p, err := New(WithCA(ca), WithNameResolver(resolver))
+				require.NoError(t, err)
+				started := make(chan struct{}, 1)
+				p.MustAdd(h3Authority+"/+{any}", func(c *HTTPCtx) (*http.Response, error) {
+					if c.Request().URL.Path != "/hold" {
+						return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody}, nil
+					}
+					started <- struct{}{}
+					<-c.Request().Context().Done()
+					return nil, c.Request().Context().Err()
+				})
+				front := startTLSFront(t, p, ca, f.alpn)
+				open := f.open(t, front, ca)
+				origin := netip.MustParseAddrPort("127.0.0.1:443")
+				target := fmt.Sprintf("%s:%d", h3Authority, origin.Port())
+				pconn, _, err := open(target, nil)
+				require.NoError(t, err)
+				held := &eofHeld{capsuleClient: pconn, release: make(chan struct{})}
+				t.Cleanup(func() { close(held.release) })
+				inner, qc := innerH3(t, held, origin, h3Authority, ca)
+				_, err = getThrough(inner, "https://"+target+"/done")
+				require.NoError(t, err)
+				var conn *Session
+				for _, s := range waitForSessions(t, p, 2) {
+					if !s.Tunnel() {
+						conn = s
+					}
+				}
+				require.NotNil(t, conn)
+				if tc.request {
+					go func() { _, _ = getThrough(inner, "https://"+target+"/hold") }()
+					<-started
+				} else {
+					require.Eventually(t, func() bool { return !p.srv.requests.hasOf(conn) }, 3*time.Second, 5*time.Millisecond)
+				}
+
+				require.NoError(t, held.CloseWrite())
+				requireEnded(t, qc, "the FIN of the tunnel left its inner connection open")
+				appErr, ok := errors.AsType[*quic.ApplicationError](context.Cause(qc.Context()))
+				require.True(t, ok, "the inner connection ended with %v", context.Cause(qc.Context()))
+				assert.Equal(t, tc.code, appErr.ErrorCode)
+			})
+		}
+	}
+}
+
+func TestConnectUDP_Capsules_SessionCloseGivesTheInnerHTTP3ConnectionsTheirNormalEnd(t *testing.T) {
+	cases := []struct {
+		name    string
+		request bool
+		code    quic.ApplicationErrorCode
+	}{
+		{name: "idle", code: quic.ApplicationErrorCode(http3.ErrCodeNoError)},
+		{name: "a request in flight", request: true, code: quic.ApplicationErrorCode(http3.ErrCodeNoError)},
+	}
+	for _, f := range capsuleFronts {
+		for _, tc := range cases {
+			t.Run(f.name+"/"+tc.name, func(t *testing.T) {
+				skipWithoutExtendedConnect(t, f)
+				ca, err := GenerateCA()
+				require.NoError(t, err)
+				resolver := &fakeResolver{addrs: map[string][]netip.Addr{h3Authority: {netip.MustParseAddr("127.0.0.1")}}}
+				p, err := New(WithCA(ca), WithNameResolver(resolver))
+				require.NoError(t, err)
+				started := make(chan struct{}, 1)
+				p.MustAdd(h3Authority+"/+{any}", func(c *HTTPCtx) (*http.Response, error) {
+					if c.Request().URL.Path != "/hold" {
+						return &http.Response{StatusCode: http.StatusNoContent, Body: http.NoBody}, nil
+					}
+					started <- struct{}{}
+					<-c.Request().Context().Done()
+					return nil, c.Request().Context().Err()
+				})
+				front := startTLSFront(t, p, ca, f.alpn)
+				open := f.open(t, front, ca)
+				origin := netip.MustParseAddrPort("127.0.0.1:443")
+				target := fmt.Sprintf("%s:%d", h3Authority, origin.Port())
+				pconn, _, err := open(target, nil)
+				require.NoError(t, err)
+				held := &eofHeld{capsuleClient: pconn, release: make(chan struct{})}
+				t.Cleanup(func() { close(held.release) })
+				inner, qc := innerH3(t, held, origin, h3Authority, ca)
+				_, err = getThrough(inner, "https://"+target+"/done")
+				require.NoError(t, err)
+				var conn *Session
+				for _, s := range waitForSessions(t, p, 2) {
+					if !s.Tunnel() {
+						conn = s
+					}
+				}
+				require.NotNil(t, conn)
+				if tc.request {
+					go func() { _, _ = getThrough(inner, "https://"+target+"/hold") }()
+					<-started
+				} else {
+					require.Eventually(t, func() bool { return !p.srv.requests.hasOf(conn) }, 3*time.Second, 5*time.Millisecond)
+				}
+
+				var tunnel *Session
+				for s := range p.Sessions() {
+					if s.Tunnel() {
+						tunnel = s
+					}
+				}
+				require.NotNil(t, tunnel)
+				require.NoError(t, tunnel.Close())
+				requireEnded(t, qc, "Session.Close of the tunnel left its inner connection open")
+				appErr, ok := errors.AsType[*quic.ApplicationError](context.Cause(qc.Context()))
+				require.True(t, ok, "the inner connection ended with %v", context.Cause(qc.Context()))
+				assert.Equal(t, tc.code, appErr.ErrorCode)
+			})
+		}
+	}
+}
+
+func TestConnectUDP_SessionCloseOfATunnelEndsItsStreamBeforeItReturns(t *testing.T) {
+	fx := newUDPFixture(t)
+	origin := newUDPOrigin(t, "127.0.0.1:0", echoReply)
+	tun := fx.mustOpen(t, viaH3, udpReq{target: origin.addr.String()})
+	tun.send(t, 0, []byte("ping"))
+	origin.next(t)
+	tun.recv(t)
+	tunnels := slices.DeleteFunc(slices.Collect(fx.p.Sessions()), func(s *Session) bool { return !s.Tunnel() })
+	require.Len(t, tunnels, 1)
+	ct := tunnels[0].closer.(*connectUDPTunnel)
+	require.NoError(t, tunnels[0].Close())
+	dp := (*ct.pipe.Load()).(*datagramPipe)
+	select {
+	case <-dp.done:
+	default:
+		t.Fatal("Session.Close of the tunnel returned before its stream ended")
+	}
+	select {
+	case <-ct.sent:
+	default:
+		t.Fatal("Session.Close of the tunnel returned before the sender drained the CONNECTION_CLOSE of its inner connections")
+	}
+}
+
+func TestConnectUDP_SessionCloseBeforeTheAcceptanceEndsTheTunnelInTheCall(t *testing.T) {
+	for _, front := range []string{viaH1, viaH3} {
+		t.Run(front, func(t *testing.T) {
+			fx := newUDPFixture(t)
+			origin := newUDPOrigin(t, "127.0.0.1:0", echoReply)
+			addr := fx.frontAddr(t, front)
+			path, _, authority := udpReq{target: origin.addr.String()}.resolve(addr)
+			// The client takes whatever end the tunnel gets.
+			attempt := func() {
+				if front == viaH1 {
+					conn, err := net.Dial("tcp", addr)
+					if err != nil {
+						return
+					}
+					defer func() { _ = conn.Close() }()
+					_, _ = fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: %s\r\n%s: ?1\r\n\r\n",
+						path, authority, connectUDPUpgrade, http3.CapsuleProtocolHeader)
+					_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+					_, _ = io.Copy(io.Discard, conn)
+					return
+				}
+				cc, _ := fx.h3Conn(t)
+				ctx, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+				defer cancel()
+				str, err := cc.OpenRequestStream(ctx)
+				if err != nil {
+					return
+				}
+				req, _ := http.NewRequest(http.MethodConnect, "https://"+authority+path, nil)
+				req.Proto = connectUDPUpgrade
+				req.Header.Set(http3.CapsuleProtocolHeader, "?1")
+				if str.SendRequestHeader(req) == nil {
+					if _, err = str.ReadResponse(); err == nil {
+						_, _ = io.Copy(io.Discard, str)
+					}
+				}
+				str.CancelRead(0)
+			}
+			early := 0
+			for range 20 {
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					attempt()
+				}()
+				var tunnel *Session
+				for tunnel == nil {
+					for s := range fx.p.Sessions() {
+						if s.Tunnel() {
+							tunnel = s
+						}
+					}
+				}
+				ct := tunnel.closer.(*connectUDPTunnel)
+				require.NoError(t, tunnel.Close())
+				select {
+				case <-ct.sent:
+				default:
+					early++
+				}
+				<-done
+				require.Eventually(t, func() bool {
+					for s := range fx.p.Sessions() {
+						if s.Tunnel() {
+							return false
+						}
+					}
+					return true
+				}, 3*time.Second, 5*time.Millisecond)
+			}
+			assert.Zero(t, early, "Session.Close returned before the tunnel stream ended")
+		})
+	}
+}
+
+func TestConnectUDP_SessionCloseOfAnH1TunnelClosesItsSocketAfterItsFIN(t *testing.T) {
+	fx := newUDPFixture(t)
+	origin := newUDPOrigin(t, "127.0.0.1:0", echoReply)
+	addr := fx.frontAddr(t, viaH1)
+	path, _, authority := udpReq{target: origin.addr.String()}.resolve(addr)
+	var head strings.Builder
+	fmt.Fprintf(&head, "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: %s\r\n%s: ?1\r\n\r\n",
+		path, authority, connectUDPUpgrade, http3.CapsuleProtocolHeader)
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	_, err = conn.Write([]byte(head.String()))
+	require.NoError(t, err)
+	br := bufio.NewReader(conn)
+	status, _ := readHead(t, br)
+	require.Equal(t, http.StatusSwitchingProtocols, status)
+
+	var tunnel *Session
+	require.Eventually(t, func() bool {
+		for s := range fx.p.Sessions() {
+			if s.Tunnel() {
+				tunnel = s
+			}
+		}
+		return tunnel != nil
+	}, 3*time.Second, 5*time.Millisecond)
+	ct := tunnel.closer.(*connectUDPTunnel)
+	// A carrier hands its tunnel what is left of its own deadline, I4.
+	start := time.Now()
+	require.NoError(t, tunnel.endBy(causeClosed, start.Add(alertWriteTimeout/4)))
+	assert.Less(t, time.Since(start), alertWriteTimeout/2)
+	select {
+	case <-ct.sent:
+	default:
+		t.Fatal("Session.Close returned before the tunnel stream ended")
+	}
+	time.Sleep(alertWriteTimeout / 10)
+	_, err = io.ReadAll(br)
+	require.NoError(t, err, "the FIN of the tunnel")
+	_, err = conn.Write([]byte("x"))
+	require.NoError(t, err, "the tunnel socket was reset after its FIN")
+}
+
+func TestConnectUDP_TunnelCloseGivesItsInnerConnectionsTheirNormalEnd(t *testing.T) {
+	for _, mode := range []string{"tunnel", "inner", "cut"} {
+		closeInner := mode == "inner"
+		for _, stream := range []bool{false, true} {
+			name := mode
+			if stream {
+				name += "/stream"
+			}
+			t.Run(name, func(t *testing.T) {
+				originCA, err := GenerateCA()
+				require.NoError(t, err)
+				origin, origins := rawQUICOrigin(t, originCA, "127.0.0.1")
+				proxyCA, err := GenerateCA()
+				require.NoError(t, err)
+				tr := DefaultTransport()
+				tr.RootCAs = poolOf(originCA)
+				p, err := New(WithCA(proxyCA), WithTransport(tr))
+				require.NoError(t, err)
+				p.MustAdd[QUIC]("127.0.0.1", relayQUIC)
+				front, _ := startQUICFront(t, p, proxyCA)
+				cc := masqueClient(t, front, proxyCA)
+				tunnel, _, err := openTunnel(t, cc, front, origin.String(), nil)
+				require.NoError(t, err)
+				ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+				defer cancel()
+				qc, err := quic.Dial(ctx, tunnel, net.UDPAddrFromAddrPort(origin), &tls.Config{
+					RootCAs: poolOf(proxyCA), ServerName: "127.0.0.1", NextProtos: []string{"raw"}, MinVersion: tls.VersionTLS13,
+				}, &quic.Config{DisablePathMTUDiscovery: true, MaxIdleTimeout: 10 * time.Second})
+				require.NoError(t, err)
+				oc := <-origins
+				if stream {
+					st, serr := qc.OpenStreamSync(ctx)
+					require.NoError(t, serr)
+					_, serr = st.Write([]byte("x"))
+					require.NoError(t, serr)
+					ost, serr := oc.AcceptStream(ctx)
+					require.NoError(t, serr)
+					_, serr = io.ReadFull(ost, make([]byte, 1))
+					require.NoError(t, serr)
+				} else {
+					time.Sleep(100 * time.Millisecond)
+				}
+				var target *Session
+				for s := range p.Sessions() {
+					if s.Tunnel() != closeInner {
+						target = s
+					}
+				}
+				require.NotNil(t, target)
+				if mode == "cut" {
+					require.NoError(t, p.Close())
+				} else {
+					require.NoError(t, target.Close())
+				}
+				select {
+				case <-oc.Context().Done():
+				case <-time.After(3 * time.Second):
+					t.Fatal("origin leg outlived the close")
+				}
+				appErr, ok := errors.AsType[*quic.ApplicationError](context.Cause(oc.Context()))
+				require.True(t, ok, "origin leg ended with %v", context.Cause(oc.Context()))
+				select {
+				case <-qc.Context().Done():
+				case <-time.After(3 * time.Second):
+					t.Fatal("client leg outlived the close")
+				}
+				cErr, _ := errors.AsType[*quic.ApplicationError](context.Cause(qc.Context()))
+				assert.Equal(t, quic.ApplicationErrorCode(0), appErr.ErrorCode, "Session.Close gives the layers under the messages their normal end")
+				if cErr != nil {
+					// At a cut, the front stage may close the front before the client read the close of
+					// the inner connection queued ahead of it.
+					want := []quic.ApplicationErrorCode{0}
+					if mode == "cut" {
+						want = append(want, h3NoError)
+					}
+					assert.Contains(t, want, cErr.ErrorCode, "client leg code")
+				}
+			})
+		}
+	}
+}
+
+type slowPacketConn struct {
+	*masqueConn
+	n     atomic.Int64
+	delay time.Duration
+}
+
+func TestConnectUDP_TunnelCloseWaitsForAHandshakeItBlocks(t *testing.T) {
+	for _, closeTunnel := range []bool{false, true} {
+		name := "inner"
+		if closeTunnel {
+			name = "tunnel"
+		}
+		t.Run(name, func(t *testing.T) {
+			originCA, err := GenerateCA()
+			require.NoError(t, err)
+			origin, _ := rawQUICOrigin(t, originCA, "127.0.0.1")
+			proxyCA, err := GenerateCA()
+			require.NoError(t, err)
+			tr := DefaultTransport()
+			tr.RootCAs = poolOf(originCA)
+			p, err := New(WithCA(proxyCA), WithTransport(tr))
+			require.NoError(t, err)
+			p.MustAdd[QUIC]("127.0.0.1", relayQUIC)
+			front, _ := startQUICFront(t, p, proxyCA)
+			cc := masqueClient(t, front, proxyCA)
+			mc, _, err := openTunnel(t, cc, front, origin.String(), nil)
+			require.NoError(t, err)
+			pc := &slowPacketConn{masqueConn: mc, delay: 150 * time.Millisecond}
+			dialed := make(chan error, 1)
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				qc, derr := quic.Dial(ctx, pc, net.UDPAddrFromAddrPort(origin), &tls.Config{
+					RootCAs: poolOf(proxyCA), ServerName: "127.0.0.1", NextProtos: []string{"raw"}, MinVersion: tls.VersionTLS13,
+				}, &quic.Config{DisablePathMTUDiscovery: true, MaxIdleTimeout: 10 * time.Second})
+				if qc != nil {
+					t.Cleanup(func() { _ = qc.CloseWithError(0, "") })
+				}
+				dialed <- derr
+			}()
+			var tunnel, inner *Session
+			require.Eventually(t, func() bool {
+				for s := range p.Sessions() {
+					if s.Tunnel() {
+						tunnel = s
+					} else if cl, ok := s.closer.(*quicConnCloser); ok {
+						cl.d.mu.Lock()
+						accepted := cl.conn.qc != nil
+						cl.d.mu.Unlock()
+						if accepted {
+							inner = s
+						}
+					}
+				}
+				return tunnel != nil && inner != nil
+			}, 3*time.Second, time.Millisecond)
+			target := inner
+			if closeTunnel {
+				target = tunnel
+			}
+			start := time.Now()
+			require.NoError(t, target.Close())
+			assert.Less(t, time.Since(start), alertWriteTimeout/2, "the close waited on packets of the connection it ends")
+			assert.NoError(t, <-dialed)
+			if !closeTunnel {
+				return
+			}
+			select {
+			case end := <-mc.end:
+				assert.ErrorIs(t, end, io.EOF, "the tunnel stream did not get its normal end")
+			case <-time.After(4 * time.Second):
+				t.Fatal("the tunnel stream did not end")
+			}
+		})
+	}
+}
+
+func TestConnectUDP_TunnelCloseEstablishedEnd(t *testing.T) {
+	originCA, err := GenerateCA()
+	require.NoError(t, err)
+	origin, _ := rawQUICOrigin(t, originCA, "127.0.0.1")
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	tr := DefaultTransport()
+	tr.RootCAs = poolOf(originCA)
+	p, err := New(WithCA(proxyCA), WithTransport(tr))
+	require.NoError(t, err)
+	p.MustAdd[QUIC]("127.0.0.1", relayQUIC)
+	front, _ := startQUICFront(t, p, proxyCA)
+	cc := masqueClient(t, front, proxyCA)
+	mc, _, err := openTunnel(t, cc, front, origin.String(), nil)
+	require.NoError(t, err)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	qc, err := quic.Dial(ctx, mc, net.UDPAddrFromAddrPort(origin), &tls.Config{
+		RootCAs: poolOf(proxyCA), ServerName: "127.0.0.1", NextProtos: []string{"raw"}, MinVersion: tls.VersionTLS13,
+	}, &quic.Config{DisablePathMTUDiscovery: true, MaxIdleTimeout: 10 * time.Second})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = qc.CloseWithError(0, "") })
+	var tunnel *Session
+	require.Eventually(t, func() bool {
+		for s := range p.Sessions() {
+			if s.Tunnel() {
+				tunnel = s
+			}
+		}
+		return tunnel != nil
+	}, 3*time.Second, time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
+	start := time.Now()
+	require.NoError(t, tunnel.Close())
+	assert.Less(t, time.Since(start), alertWriteTimeout/2)
+	select {
+	case end := <-mc.end:
+		assert.ErrorIs(t, end, io.EOF, "the tunnel stream did not get its normal end")
+	case <-time.After(4 * time.Second):
+		t.Fatal("the tunnel stream did not end")
+	}
+}
+
+func TestConnectUDP_TunnelCloseEstablishedEndOwnReader(t *testing.T) {
+	originCA, err := GenerateCA()
+	require.NoError(t, err)
+	origin, _ := rawQUICOrigin(t, originCA, "127.0.0.1")
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	tr := DefaultTransport()
+	tr.RootCAs = poolOf(originCA)
+	p, err := New(WithCA(proxyCA), WithTransport(tr))
+	require.NoError(t, err)
+	p.MustAdd[QUIC]("127.0.0.1", relayQUIC)
+	front, _ := startQUICFront(t, p, proxyCA)
+	cc := masqueClient(t, front, proxyCA)
+	host, port, _ := net.SplitHostPort(origin.String())
+	req, _ := http.NewRequest(http.MethodConnect, fmt.Sprintf("https://%s%s%s/%s/", front, connectUDPPath, host, port), nil)
+	req.Proto = "connect-udp"
+	req.Header.Set(http3.CapsuleProtocolHeader, "?1")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	str, err := cc.OpenRequestStream(ctx)
+	require.NoError(t, err)
+	require.NoError(t, str.SendRequestHeader(req))
+	resp, err := str.ReadResponse()
+	require.NoError(t, err)
+	require.Equal(t, 200, resp.StatusCode)
+	readEnd := make(chan error, 1)
+	go func() {
+		parser := http3.NewCapsuleParser(str)
+		for {
+			_, r, perr := parser.Next()
+			if perr != nil {
+				readEnd <- perr
+				return
+			}
+			if perr := r.Discard(); perr != nil {
+				readEnd <- perr
+				return
+			}
+		}
+	}()
+	mc := &masqueConn{str: str}
+	qc, err := quic.Dial(ctx, mc, net.UDPAddrFromAddrPort(origin), &tls.Config{
+		RootCAs: poolOf(proxyCA), ServerName: "127.0.0.1", NextProtos: []string{"raw"}, MinVersion: tls.VersionTLS13,
+	}, &quic.Config{DisablePathMTUDiscovery: true, MaxIdleTimeout: 10 * time.Second})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = qc.CloseWithError(0, "") })
+	var tunnel *Session
+	require.Eventually(t, func() bool {
+		for s := range p.Sessions() {
+			if s.Tunnel() {
+				tunnel = s
+			}
+		}
+		return tunnel != nil
+	}, 3*time.Second, time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
+	require.NoError(t, tunnel.Close())
+	select {
+	case e := <-readEnd:
+		assert.ErrorIs(t, e, io.EOF, "the tunnel stream did not get its normal end")
+	case <-time.After(4 * time.Second):
+		t.Fatal("the tunnel stream did not end")
+	}
+	select {
+	case <-qc.Context().Done():
+		// The CONNECTION_CLOSE travels as a datagram, which the end of the stream can overtake.
+		if appErr, ok := errors.AsType[*quic.ApplicationError](context.Cause(qc.Context())); ok {
+			assert.Equal(t, quic.ApplicationErrorCode(0), appErr.ErrorCode, "the inner connection did not get its normal end")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("the inner connection outlived its tunnel")
+	}
+}
+
+func TestConnectUDP_TunnelEndsWithItsLastFlowAtIdle(t *testing.T) {
+	fx := newUDPFixture(t)
+	origin := newUDPOrigin(t, "127.0.0.1:0", echoReply)
+	tun := fx.mustOpen(t, viaH3, udpReq{target: origin.addr.String()})
+	tun.send(t, 0, []byte("ping"))
+	origin.next(t)
+	tun.recv(t)
+
+	fx.p.srv.mu.Lock()
+	d := fx.p.srv.tunnels
+	fx.p.srv.mu.Unlock()
+	require.NotNil(t, d)
+	old := time.Now().Add(-udpFlowIdle - time.Second)
+	d.mu.Lock()
+	for from, flow := range d.flows {
+		if from.tunnel == nil {
+			continue
+		}
+		flow.lastSeen = old
+		for _, u := range flow.udp {
+			u.touch(old)
+			// Wakes the reader, which reads the flow as idle.
+			_ = u.upstream.SetReadDeadline(time.Now())
+		}
+	}
+	d.mu.Unlock()
+	require.Eventually(t, func() bool {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		for from, flow := range d.flows {
+			if from.tunnel != nil && len(flow.udp) > 0 {
+				return false
+			}
+		}
+		return true
+	}, 3*time.Second, 5*time.Millisecond)
+	d.mu.Lock()
+	for from, flow := range d.flows {
+		if from.tunnel != nil {
+			t.Logf("tunnel lastSeen after the flow ended at its idle timer: %v ago", time.Since(flow.lastSeen))
+		}
+	}
+	d.mu.Unlock()
+	d.sweepIdle()
+	d.mu.Lock()
+	open := false
+	for from := range d.flows {
+		if from.tunnel != nil {
+			open = true
+		}
+	}
+	d.mu.Unlock()
+	if open {
+		t.Errorf("the tunnel outlived its last flow, which ended at udpFlowIdle")
+	}
+}
+
+func TestConnectUDP_TunnelResetByItsClientFailsItsStream(t *testing.T) {
+	p, ca, front, origin := masqueProxy(t)
+	cc := masqueClient(t, front, ca)
+	mc, _, err := openTunnel(t, cc, front, fmt.Sprintf("%s:%d", h3Authority, origin.Port()), nil)
+	require.NoError(t, err)
+	waitForSessions(t, p, 1)
+	mc.str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+	select {
+	case end := <-mc.end:
+		t.Logf("the client read the end of the tunnel stream as %v", end)
+		if errors.Is(end, io.EOF) {
+			t.Errorf("a tunnel its client reset ended with a FIN, the normal end of its stream")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("no end")
+	}
+}
+
+func TestConnectUDP_TunnelEndRefusesTheConnectionsItStillPlaces(t *testing.T) {
+	p, ca, front, origin := masqueProxy(t)
+	cc := masqueClient(t, front, ca)
+	pconn, _, err := openQuietTunnel(t, cc, front, fmt.Sprintf("%s:%d", h3Authority, origin.Port()))
+	require.NoError(t, err)
+	a := newQUICAttemptOffering(t, quicsniff.Version1, h3Authority, []string{"h3"})
+	_, err = pconn.WriteTo(a.packet(0, cryptoFrameOf(0, a.hello[:len(a.hello)/2])).sized(t, 1200), nil)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		p.srv.mu.Lock()
+		d := p.srv.tunnels
+		p.srv.mu.Unlock()
+		if d == nil {
+			return false
+		}
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		return d.sniffing > 0
+	}, 5*time.Second, 10*time.Millisecond)
+	tunnel := waitForSessions(t, p, 1)[0]
+	require.True(t, tunnel.Tunnel())
+	require.NoError(t, tunnel.Close())
+
+	require.NoError(t, pconn.SetReadDeadline(time.Now().Add(3*time.Second)))
+	buf := make([]byte, 2048)
+	for {
+		n, _, err := pconn.ReadFrom(buf)
+		require.NoError(t, err, "the tunnel ended with no CONNECTION_CLOSE for the connection it was placing")
+		frames, ok := openServerInitial(a.version, a.dcid, buf[:n])
+		if !ok {
+			continue
+		}
+		if c, ok := initialFrames(frames); ok && slices.Contains(c.types, uint64(0x1c)) {
+			require.EqualValues(t, quic.ConnectionRefused, c.closeCode)
+			return
+		}
+	}
+}
+
+func TestConnectUDP_CleanEndOfAnHTTP2FrontGivesTheTunnelItsNormalEnd(t *testing.T) {
+	if !extendedConnectEnabled() {
+		t.Skip("needs GODEBUG=http2xconnect=1")
+	}
+	for _, how := range []string{"close", "goaway"} {
+		t.Run(how, func(t *testing.T) {
+			originCA, err := GenerateCA()
+			require.NoError(t, err)
+			origin, origins := rawQUICOrigin(t, originCA, "127.0.0.1")
+			proxyCA, err := GenerateCA()
+			require.NoError(t, err)
+			tr := DefaultTransport()
+			tr.RootCAs = poolOf(originCA)
+			p, err := New(WithCA(proxyCA), WithTransport(tr))
+			require.NoError(t, err)
+			p.MustAdd[QUIC]("127.0.0.1", relayQUIC)
+			front := startTLSFront(t, p, proxyCA, "h2")
+
+			tc := dialFront(t, front, proxyCA, "h2")
+			cc, err := h2tunnel.Client(tc, 0)
+			require.NoError(t, err)
+			req := h2tunnel.Request{
+				Protocol:  "connect-udp",
+				Scheme:    "https",
+				Authority: front.String(),
+				Path:      connectUDPPath + url.PathEscape("127.0.0.1") + "/" + strconv.Itoa(int(origin.Port())) + "/",
+				Header:    http.Header{http3.CapsuleProtocolHeader: {"?1"}},
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			str, resp, err := cc.Open(ctx, req)
+			require.NoError(t, err)
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			pc := newCapsuleClient(str)
+
+			qc, err := quic.Dial(ctx, pc, net.UDPAddrFromAddrPort(origin), &tls.Config{
+				RootCAs: poolOf(proxyCA), ServerName: "127.0.0.1", NextProtos: []string{"raw"}, MinVersion: tls.VersionTLS13,
+			}, &quic.Config{DisablePathMTUDiscovery: true, MaxIdleTimeout: 10 * time.Second})
+			require.NoError(t, err)
+			_ = qc
+			oc := <-origins
+			time.Sleep(200 * time.Millisecond)
+
+			var tunnel *Session
+			for s := range p.Sessions() {
+				if s.Tunnel() {
+					tunnel = s
+				}
+			}
+			require.NotNil(t, tunnel)
+
+			if how == "goaway" {
+				// A GOAWAY then the close of the connection.
+				_ = cc.Close()
+			} else {
+				_ = tc.Close()
+			}
+			select {
+			case <-oc.Context().Done():
+			case <-time.After(3 * time.Second):
+				t.Fatal("the origin leg outlived the end of the front connection")
+			}
+			appErr, ok := errors.AsType[*quic.ApplicationError](context.Cause(oc.Context()))
+			require.True(t, ok, "origin leg ended with %v", context.Cause(oc.Context()))
+			require.EqualValues(t, 0, appErr.ErrorCode, "the inner connection got its failed end")
+		})
+	}
+}
+
+func TestConnectUDP_TunnelOnAnEndedCarrierEndsThroughItsCloser(t *testing.T) {
+	p := testProxy(t)
+	p.MustAdd[UDP]("127.0.0.1:9", forwardDatagram)
+	defer p.Close()
+	ended, cancel := context.WithCancel(context.Background())
+	cancel()
+	front := newSession(p, context.Background(), nil, Target{}, KindHTTP, HTTP2)
+	front.streamsCtx = ended
+	r := httptest.NewRequest(http.MethodGet, "https://127.0.0.1"+connectUDPPath+"127.0.0.1/9/", nil)
+	r.Method = http.MethodConnect
+	r.ProtoMajor, r.ProtoMinor, r.Proto = 2, 0, "HTTP/2.0"
+	r = r.WithContext(context.WithValue(context.Background(), sessionKey{}, front))
+	func() {
+		// The handler may reset the stream of a tunnel already ended.
+		defer func() { _ = recover() }()
+		p.serveConnectUDP(httptest.NewRecorder(), r, "", nil)
+	}()
+	require.Eventually(t, func() bool {
+		for range p.Sessions() {
+			return false
+		}
+		return true
+	}, 3*time.Second, 10*time.Millisecond, "a tunnel on an ended carrier stayed listed")
+}
+
+func TestConnectUDP_ClientResetOfAnHTTP2TunnelFailsItsInnerConnections(t *testing.T) {
+	if !extendedConnectEnabled() {
+		t.Skip("needs GODEBUG=http2xconnect=1")
+	}
+	debug := WithLogger(slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	cases := []struct {
+		name      string
+		opts      []ProxyOption
+		datagram  int
+		size      int
+		closeConn bool
+	}{
+		{name: "reset", datagram: 40},
+		{name: "burst then reset", datagram: 40, size: 13_000},
+		{name: "reset then close", datagram: 40, closeConn: true},
+		{name: "burst then reset then close", datagram: 40, size: 13_000, closeConn: true},
+		{name: "flood then reset then close", datagram: 40, size: 900_000, closeConn: true},
+		{name: "flood of empty datagrams logged then reset then close", opts: []ProxyOption{debug}, size: 900_000, closeConn: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clientResetOfAnHTTP2Tunnel(t, tc.closeConn, tc.datagram, tc.size, tc.opts...)
+		})
+	}
+}
+
+// clientResetOfAnHTTP2Tunnel resets the tunnel stream behind size bytes of capsules carrying
+// datagrams of the given length, net/http handing out the bytes buffered before a reset ahead of
+// it, and ends the connection when closeConn.
+func clientResetOfAnHTTP2Tunnel(t *testing.T, closeConn bool, datagram, size int, opts ...ProxyOption) {
+	codes := map[quic.ApplicationErrorCode]int{}
+	for range 5 {
+		originCA, err := GenerateCA()
+		require.NoError(t, err)
+		origin, origins := rawQUICOrigin(t, originCA, "127.0.0.1")
+		proxyCA, err := GenerateCA()
+		require.NoError(t, err)
+		tr := DefaultTransport()
+		tr.RootCAs = poolOf(originCA)
+		p, err := New(append([]ProxyOption{WithCA(proxyCA), WithTransport(tr)}, opts...)...)
+		require.NoError(t, err)
+		p.MustAdd[QUIC]("127.0.0.1", relayQUIC)
+		front := startTLSFront(t, p, proxyCA, "h2")
+
+		tc := dialFront(t, front, proxyCA, "h2")
+		cc, err := h2tunnel.Client(tc, 0)
+		require.NoError(t, err)
+		req := h2tunnel.Request{
+			Protocol:  "connect-udp",
+			Scheme:    "https",
+			Authority: front.String(),
+			Path:      connectUDPPath + url.PathEscape("127.0.0.1") + "/" + strconv.Itoa(int(origin.Port())) + "/",
+			Header:    http.Header{http3.CapsuleProtocolHeader: {"?1"}},
+		}
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		str, resp, err := cc.Open(ctx, req)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		pc := newCapsuleClient(str)
+		_, err = quic.Dial(ctx, pc, net.UDPAddrFromAddrPort(origin), &tls.Config{
+			RootCAs: poolOf(proxyCA), ServerName: "127.0.0.1", NextProtos: []string{"raw"}, MinVersion: tls.VersionTLS13,
+		}, &quic.Config{DisablePathMTUDiscovery: true, MaxIdleTimeout: 10 * time.Second})
+		require.NoError(t, err)
+		oc := <-origins
+		time.Sleep(200 * time.Millisecond)
+
+		var data []byte
+		for len(data) < size {
+			payload := make([]byte, 1+datagram)
+			if datagram > 0 {
+				payload[1] = 0x40
+			}
+			data = quicvarint.Append(data, 0)
+			data = quicvarint.Append(data, uint64(len(payload)))
+			data = append(data, payload...)
+		}
+		fr := http2.NewFramer(tc, nil)
+		for len(data) > 0 {
+			n := min(len(data), 16384)
+			require.NoError(t, fr.WriteData(1, false, data[:n]))
+			data = data[n:]
+		}
+		require.NoError(t, fr.WriteRSTStream(1, http2.ErrCodeCancel))
+		if closeConn {
+			_ = tc.Close()
+		}
+		select {
+		case <-oc.Context().Done():
+		case <-time.After(3 * time.Second):
+			t.Fatal("origin leg outlived")
+		}
+		appErr, ok := errors.AsType[*quic.ApplicationError](context.Cause(oc.Context()))
+		require.True(t, ok, "%v", context.Cause(oc.Context()))
+		codes[appErr.ErrorCode]++
+		cancel()
+		_ = p.Close()
+	}
+	require.Zero(t, codes[0], "a client reset of the tunnel stream gave the inner connection its normal end")
+}
+
+// countedPacketConn counts the datagrams written through it.
+type countedPacketConn struct {
+	net.PacketConn
+	writes atomic.Int64
+}
+
+func (c *countedPacketConn) WriteTo(b []byte, addr net.Addr) (int, error) {
+	n, err := c.PacketConn.WriteTo(b, addr)
+	c.writes.Add(1)
+	return n, err
+}
+
+func TestConnectUDP_ClientResetOfAnHTTP3TunnelBeforeItsConnectionEndsFailsItsInnerConnections(t *testing.T) {
+	// quic-go drops a RESET_STREAM still queued at CONNECTION_CLOSE, docs/lifecycle.md Limits,
+	// so the client sends its reset before the close.
+	for _, gap := range []time.Duration{200 * time.Microsecond, time.Millisecond} {
+		t.Run(gap.String(), func(t *testing.T) {
+			originCA, err := GenerateCA()
+			require.NoError(t, err)
+			origin, origins := rawQUICOrigin(t, originCA, "127.0.0.1")
+			proxyCA, err := GenerateCA()
+			require.NoError(t, err)
+			tr := DefaultTransport()
+			tr.RootCAs = poolOf(originCA)
+			p, err := New(WithCA(proxyCA), WithTransport(tr))
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = p.Close() })
+			p.MustAdd[QUIC]("127.0.0.1", relayQUIC)
+			front, _ := startQUICFront(t, p, proxyCA)
+			udp, err := loopbackUDP()
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = udp.Close() })
+			pc := &countedPacketConn{PacketConn: udp}
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			qconn, err := quic.Dial(ctx, pc, net.UDPAddrFromAddrPort(front), &tls.Config{
+				RootCAs: poolOf(proxyCA), ServerName: "127.0.0.1", NextProtos: []string{http3.NextProtoH3}, MinVersion: tls.VersionTLS13,
+			}, &quic.Config{EnableDatagrams: true, InitialPacketSize: 1350})
+			require.NoError(t, err)
+			h3 := &http3.Transport{EnableDatagrams: true}
+			t.Cleanup(func() { _ = h3.Close() })
+			cc := h3.NewClientConn(qconn)
+			<-cc.ReceivedSettings()
+			mc, _, err := openQuietTunnel(t, cc, front, origin.String())
+			require.NoError(t, err)
+			_, err = quic.Dial(ctx, mc, net.UDPAddrFromAddrPort(origin), &tls.Config{
+				RootCAs: poolOf(proxyCA), ServerName: "127.0.0.1", NextProtos: []string{"raw"}, MinVersion: tls.VersionTLS13,
+			}, &quic.Config{DisablePathMTUDiscovery: true, MaxIdleTimeout: 10 * time.Second})
+			require.NoError(t, err)
+			oc := <-origins
+			time.Sleep(200 * time.Millisecond)
+			sent := pc.writes.Load()
+			mc.str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+			mc.str.CancelRead(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+			// The connection is idle, so the next packet the client writes carries the reset.
+			deadline := time.Now().Add(2 * time.Second)
+			for pc.writes.Load() == sent && time.Now().Before(deadline) {
+				time.Sleep(50 * time.Microsecond)
+			}
+			require.Greater(t, pc.writes.Load(), sent, "the client wrote no reset")
+			time.Sleep(gap)
+			_ = qconn.CloseWithError(quic.ApplicationErrorCode(http3.ErrCodeNoError), "")
+			select {
+			case <-oc.Context().Done():
+			case <-time.After(3 * time.Second):
+				t.Fatal("the origin leg outlived the end of the tunnel")
+			}
+			appErr, ok := errors.AsType[*quic.ApplicationError](context.Cause(oc.Context()))
+			require.True(t, ok, "%v", context.Cause(oc.Context()))
+			require.NotZero(t, appErr.ErrorCode, "a client reset of the tunnel stream gave the inner connection its normal end")
+		})
+	}
 }

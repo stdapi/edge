@@ -109,11 +109,19 @@ type upstreamDialer struct {
 	h3Dialing  map[string]*dialCall
 	tcpDialing map[string]chan struct{}
 	own        *ownSockets
+	// live keeps the sockets the dialer opened until they close, and quics its QUIC connections
+	// until they end, both guarded by liveMu. A socket closes under mu, so liveMu comes after it.
+	live  map[net.Conn]struct{}
+	quics map[*quic.Conn]*quicLeg
+	// dialing counts the dials in progress, which close waits for.
+	dialing gauge
 	// draining holds the HTTP/2 connections replaced after a GOAWAY while their last tunnels
 	// end, so that close reaches them.
 	draining []*h2tunnel.Conn
 	mu       sync.Mutex
-	// closed refuses a proxy connection opened after close, so none outlives the forwarder.
+	liveMu   sync.Mutex
+	// closed refuses a socket and a proxy connection opened after close, so none outlives the
+	// forwarder.
 	closed bool
 }
 
@@ -127,35 +135,114 @@ func newUpstreamDialer(t *Transport) *upstreamDialer {
 		h3Dialing:  make(map[string]*dialCall),
 		tcpDialing: make(map[string]chan struct{}),
 		own:        newOwnSockets(),
+		live:       make(map[net.Conn]struct{}),
+		quics:      make(map[*quic.Conn]*quicLeg),
 	}
 }
 
 // dialRaw dials with [Transport.DialContext] and records the socket it returns until it is
 // closed. Every connection the proxy opens upstream starts here.
+//
+// The dialer keeps every socket it opened until the socket closes, and refuses a dial once it
+// is closed, in the pool stage of the cut.
 func (u *upstreamDialer) dialRaw(ctx context.Context, network, addr string) (net.Conn, error) {
+	u.mu.Lock()
+	closed := u.closed
+	if !closed {
+		u.dialing.add()
+	}
+	u.mu.Unlock()
+	if closed {
+		return nil, net.ErrClosed
+	}
+	defer u.dialing.done()
 	c, err := u.t.dialer()(ctx, network, addr)
 	if err != nil || c == nil {
 		return c, err
 	}
-	return u.own.track(network, c), nil
+	tc := u.own.track(network, c)
+	r := recordOf(tc)
+	if r != nil {
+		r.forget = func() {
+			u.liveMu.Lock()
+			delete(u.live, tc)
+			u.liveMu.Unlock()
+		}
+	}
+	u.mu.Lock()
+	if u.closed {
+		u.mu.Unlock()
+		abort(tc)
+		return nil, net.ErrClosed
+	}
+	if r != nil {
+		u.liveMu.Lock()
+		u.live[tc] = struct{}{}
+		u.liveMu.Unlock()
+	}
+	u.mu.Unlock()
+	return tc, nil
 }
 
-func (u *upstreamDialer) close() {
+// close ends what the dialer opened, the read past the end of a chained HTTP/2 connection
+// ending by deadline, I4.
+func (u *upstreamDialer) close(deadline time.Time) {
 	u.mu.Lock()
 	u.closed = true
+	u.mu.Unlock()
+	// The dials canceled before return before the sockets they opened are ended. A DialContext
+	// that ignores its context returns past deadline.
+	if zero := u.dialing.zeroed(); zero != nil {
+		waitUntil(zero, deadline)
+	}
+	u.mu.Lock()
 	conns, h2conns, draining := u.conns, u.h2conns, u.draining
 	u.conns, u.h2conns, u.draining = nil, nil, nil
 	u.mu.Unlock()
+	proxies := make(map[*quic.Conn]struct{}, len(conns))
 	for _, cc := range conns {
-		_ = cc.CloseWithError(0, "")
+		proxies[cc.qc] = struct{}{}
+	}
+
+	// What the pools did not end as idle has a request in flight, or belongs to a pool evicted
+	// before the last maxPools the forwarder keeps: its failed end, from the top down, so a
+	// QUIC connection on a chained exit ends before the proxy connection under it, I3.
+	u.liveMu.Lock()
+	quics := make([]*quic.Conn, 0, len(u.quics))
+	for qc := range u.quics {
+		if _, proxy := proxies[qc]; !proxy {
+			quics = append(quics, qc)
+		}
+	}
+	u.liveMu.Unlock()
+	var wg sync.WaitGroup
+	for _, qc := range quics {
+		wg.Go(func() { _ = closeQUIC(qc, failedCode(qc), deadline) })
+	}
+	wg.Wait()
+
+	// Then the proxy connections together, then the socket under the HTTP/3 ones.
+	for _, cc := range conns {
+		wg.Go(func() { _ = cc.CloseWithError(h3NoError, "") })
 	}
 	for _, cc := range h2conns {
-		_ = cc.Close()
+		wg.Go(func() { _ = cc.CloseBy(deadline) })
 	}
 	for _, cc := range draining {
-		_ = cc.Close()
+		wg.Go(func() { _ = cc.CloseBy(deadline) })
 	}
+	wg.Wait()
 	_ = u.h3.Close()
+
+	u.liveMu.Lock()
+	live := make([]net.Conn, 0, len(u.live))
+	for c := range u.live {
+		live = append(live, c)
+	}
+	u.liveMu.Unlock()
+	for _, c := range live {
+		abort(c)
+	}
 }
 
 // selectProxy returns the proxy [Transport.Proxy] selects for req, nil for a direct
@@ -247,11 +334,12 @@ func (u *upstreamDialer) dialQUIC(ctx context.Context, addr string, tlsCfg *tls.
 	if err != nil {
 		return nil, err
 	}
-	return quicOn(ctx, sock, addr, tlsCfg, qcfg)
+	return u.quicOn(ctx, sock, addr, tlsCfg, qcfg)
 }
 
-// quicOn opens a QUIC connection on a connected socket and ties the socket to it.
-func quicOn(ctx context.Context, sock net.Conn, addr string, tlsCfg *tls.Config, qcfg *quic.Config) (*quic.Conn, error) {
+// quicOn opens a QUIC connection on a connected socket and ties the socket to it. The dialer
+// keeps the connection until it ends.
+func (u *upstreamDialer) quicOn(ctx context.Context, sock net.Conn, addr string, tlsCfg *tls.Config, qcfg *quic.Config) (*quic.Conn, error) {
 	if sock.RemoteAddr() == nil {
 		_ = sock.Close()
 		return nil, fmt.Errorf("edge: dial %s: the dialer returned a socket with no peer", addr)
@@ -265,19 +353,126 @@ func quicOn(ctx context.Context, sock net.Conn, addr string, tlsCfg *tls.Config,
 		qcfg.DisablePathMTUDiscovery = true
 	}
 	tr := &quic.Transport{Conn: packetConnOf(sock)}
-	// The socket goes first, so the read loop the transport waits on ends whatever the socket
-	// does with a read deadline.
-	release := func() {
-		_ = sock.Close()
-		_ = tr.Close()
-	}
 	conn, err := tr.Dial(ctx, sock.RemoteAddr(), tlsCfg, qcfg)
 	if err != nil {
-		release()
+		abort(sock)
+		_ = tr.Close()
 		return nil, err
 	}
-	context.AfterFunc(conn.Context(), release)
+	leg := &quicLeg{sock: sock, done: make(chan struct{})}
+	u.liveMu.Lock()
+	u.quics[conn] = leg
+	u.liveMu.Unlock()
+	if isExit(sock) {
+		quicLegs.Store(conn, leg)
+	}
+	context.AfterFunc(conn.Context(), func() {
+		// The socket goes first, so the read loop the transport waits on ends whatever the
+		// socket does with a read deadline. A chained exit under it gets the form of the end
+		// of the connection, I2, and the connection stays the dialer's until the exit ended.
+		if quicCleanEnd(context.Cause(conn.Context())) {
+			closeLegBy(sock, leg.by())
+		} else {
+			abort(sock)
+		}
+		_ = tr.Close()
+		quicLegs.Delete(conn)
+		u.liveMu.Lock()
+		delete(u.quics, conn)
+		u.liveMu.Unlock()
+		close(leg.done)
+	})
 	return conn, nil
+}
+
+// quicLeg is a QUIC connection the dialer opened, with the socket under it.
+type quicLeg struct {
+	sock net.Conn
+	// done is closed once the connection and its socket ended.
+	done chan struct{}
+	// timer gives the exit its failed end at the deadline, guarded by mu.
+	timer *time.Timer
+	// deadline is the deadline of the closer ending the connection, in nanoseconds since the
+	// epoch, zero before.
+	deadline atomic.Int64
+	mu       sync.Mutex
+}
+
+// quicLegs finds the leg of a QUIC connection opened on a chained exit, the writes of which can
+// block. The map is process-wide, keyed by the connection, and each dialer reaches its own legs
+// through quics.
+var quicLegs sync.Map
+
+// isExit reports whether sock has an end of its own, as a chained exit, a CONNECT-UDP tunnel or
+// a SOCKS5 association, has.
+func isExit(sock net.Conn) bool {
+	_, ok := sock.(interface{ closeBy(time.Time) error })
+	return ok
+}
+
+// by is the deadline of the end of the socket, T from now when no closer set one.
+func (l *quicLeg) by() time.Time {
+	if n := l.deadline.Load(); n != 0 {
+		return time.Unix(0, n)
+	}
+	return time.Now().Add(alertWriteTimeout)
+}
+
+// arm bounds the end of the leg by deadline: a write to the exit returns then, and an exit
+// still ending gets its failed end, I4.
+func (l *quicLeg) arm(deadline time.Time) {
+	// Under the lock, two closers that arm at once leave the earlier deadline.
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	n := deadline.UnixNano()
+	if old := l.deadline.Load(); old == 0 || n < old {
+		l.deadline.Store(n)
+	}
+	by := l.by()
+	_ = l.sock.SetWriteDeadline(by)
+	if l.timer != nil {
+		// An earlier deadline of a second closer moves the end earlier, I4.
+		l.timer.Reset(time.Until(by))
+		return
+	}
+	l.timer = time.AfterFunc(time.Until(by), func() {
+		select {
+		case <-l.done:
+		default:
+			abort(l.sock)
+		}
+	})
+}
+
+// closeQUIC closes qc with code by deadline. On a chained exit quic-go writes the
+// CONNECTION_CLOSE through writes the next proxy may keep blocked, so the close runs on its own and the
+// call returns once the exit ended or at deadline, I4.
+func closeQUIC(qc *quic.Conn, code quic.ApplicationErrorCode, deadline time.Time) error {
+	v, ok := quicLegs.Load(qc)
+	if !ok {
+		return qc.CloseWithError(code, "")
+	}
+	leg := v.(*quicLeg)
+	leg.arm(deadline)
+	go func() { _ = qc.CloseWithError(code, "") }()
+	waitUntil(leg.done, deadline)
+	return nil
+}
+
+// armExits bounds by deadline the end of every QUIC connection the dialer opened on a chained
+// exit, for the closes quic-go's transports run themselves.
+func (u *upstreamDialer) armExits(deadline time.Time) {
+	u.liveMu.Lock()
+	legs := make([]*quicLeg, 0, len(u.quics))
+	for _, leg := range u.quics {
+		if isExit(leg.sock) {
+			legs = append(legs, leg)
+		}
+	}
+	u.liveMu.Unlock()
+	for _, leg := range legs {
+		leg.arm(deadline)
+	}
 }
 
 // proxyAddr returns the host:port a proxy URL is reached at.
@@ -819,8 +1014,15 @@ func openTunnelOn(ctx context.Context, cc *http3.ClientConn, proxy *url.URL, hos
 	if err != nil {
 		return nil, err
 	}
-	pipe := newDatagramPipe(str, quic.StreamErrorCode(http3.ErrCodeNoError), false)
-	pipe.run(func() { _ = pipe.close() })
+	pipe := newDatagramPipe(str, false)
+	pipe.run(func(failed bool) {
+		// The next proxy's end of the stream reaches it in the same form, I2.
+		if failed {
+			pipe.fail()
+			return
+		}
+		_ = pipe.close()
+	})
 	return pipe, nil
 }
 
@@ -942,32 +1144,37 @@ func (u *upstreamDialer) shareH2Conn(proxy *url.URL, tc net.Conn) (*h2tunnel.Con
 		return nil, false, fmt.Errorf("dial proxy %s: %w", proxy.Redacted(), err)
 	}
 	key := proxyAddr(proxy)
+	// A connection ends off the lock, its socket leaving the dialer's records as it closes.
 	u.mu.Lock()
-	defer u.mu.Unlock()
 	if u.closed {
+		u.mu.Unlock()
 		_ = cc.Close()
 		return nil, false, net.ErrClosed
 	}
 	if other := u.h2conns[key]; other != nil {
 		if other.CanOpen() {
+			u.mu.Unlock()
 			_ = cc.Close()
 			return other, true, nil
 		}
 		u.retireLocked(other)
 	}
 	u.h2conns[key] = cc
+	u.mu.Unlock()
 	return cc, false, nil
 }
 
 // retire ends an HTTP/2 connection once its tunnels end, and with the dialer.
 func (u *upstreamDialer) retire(cc *h2tunnel.Conn) {
 	u.mu.Lock()
-	defer u.mu.Unlock()
-	if u.closed {
-		_ = cc.Close()
-		return
+	closed := u.closed
+	if !closed {
+		u.retireLocked(cc)
 	}
-	u.retireLocked(cc)
+	u.mu.Unlock()
+	if closed {
+		_ = cc.Close()
+	}
 }
 
 func (u *upstreamDialer) retireLocked(cc *h2tunnel.Conn) {
@@ -1040,13 +1247,15 @@ func upgradeOn(conn net.Conn, proxy *url.URL, host, port string) (tunnelPipe, er
 	}
 	// Capsules the proxy sent right behind the 101 may already be in the buffer.
 	early, _ := br.Peek(br.Buffered())
-	return newCapsulePipe(conn, bufio.NewReader(io.MultiReader(bytes.NewReader(slices.Clone(early)), conn))), nil
+	return newSocketCapsulePipe(conn, bufio.NewReader(io.MultiReader(bytes.NewReader(slices.Clone(early)), conn))), nil
 }
 
 // h3ProxyConn is the HTTP/3 connection to a proxy. The tunnels on it report the addresses of
 // its QUIC connection.
 type h3ProxyConn struct {
 	*http3.ClientConn
+	// qc is the connection under the client, which a failed end closes.
+	qc            *quic.Conn
 	local, remote net.Addr
 }
 
@@ -1097,7 +1306,8 @@ func (u *upstreamDialer) runDial(ctx context.Context, proxy *url.URL, key string
 	defer u.mu.Unlock()
 	delete(u.h3Dialing, key)
 	if call.err == nil && u.closed {
-		_ = call.cc.CloseWithError(0, "")
+		// A leg a dial opens after the dialer ended gets its failed end, I1.
+		_ = closeFailed(call.cc.qc)
 		call.cc, call.err = nil, net.ErrClosed
 	}
 	if call.err == nil {
@@ -1130,6 +1340,8 @@ func (u *upstreamDialer) dropH3Conn(proxy *url.URL, cc *h3ProxyConn) {
 }
 
 func (u *upstreamDialer) openProxyConn(ctx context.Context, proxy *url.URL, addr string) (*h3ProxyConn, error) {
+	ctx, done := context.WithTimeout(ctx, proxyConnectTimeout)
+	defer done()
 	// The proxy itself is dialed directly, it cannot be reached through itself.
 	sock, err := u.dialRaw(ctx, "udp", addr)
 	if err != nil {
@@ -1139,7 +1351,7 @@ func (u *upstreamDialer) openProxyConn(ctx context.Context, proxy *url.URL, addr
 	cfg.MinVersion = tls.VersionTLS13
 	cfg.ServerName = proxy.Hostname()
 	cfg.NextProtos = []string{http3.NextProtoH3}
-	qc, err := quicOn(ctx, sock, addr, cfg, &quic.Config{
+	qc, err := u.quicOn(ctx, sock, addr, cfg, &quic.Config{
 		EnableDatagrams:      true,
 		HandshakeIdleTimeout: u.t.TLSHandshakeTimeout,
 		MaxIdleTimeout:       u.t.IdleConnTimeout,
@@ -1155,12 +1367,12 @@ func (u *upstreamDialer) openProxyConn(ctx context.Context, proxy *url.URL, addr
 	select {
 	case <-cc.ReceivedSettings():
 	case <-ctx.Done():
-		_ = cc.CloseWithError(0, "")
+		_ = closeFailed(qc)
 		return nil, ctx.Err()
 	case <-cc.Context().Done():
 		return nil, context.Cause(cc.Context())
 	}
-	return &h3ProxyConn{ClientConn: cc, local: qc.LocalAddr(), remote: qc.RemoteAddr()}, nil
+	return &h3ProxyConn{ClientConn: cc, qc: qc, local: qc.LocalAddr(), remote: qc.RemoteAddr()}, nil
 }
 
 // h3StreamConn is a CONNECT tunnel on an HTTP/3 stream as a net.Conn. The stream frames its
@@ -1208,7 +1420,7 @@ func (c *h3StreamConn) Write(b []byte) (int, error) {
 	if err != nil && isTimeout(err) {
 		// The deadline may have cut a frame short, and the proxy cannot parse the stream past
 		// it.
-		c.str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+		c.str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeConnectError))
 	}
 	return n, err
 }
@@ -1223,13 +1435,14 @@ func (c *h3StreamConn) Close() error {
 	if c.closed.Swap(true) {
 		return nil
 	}
-	if c.wmu.TryLock() {
-		_ = c.str.Close()
-		c.wmu.Unlock()
-	} else {
-		// A write blocked on flow control only returns on a reset.
-		c.str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
+	if !c.wmu.TryLock() {
+		// A write blocked on flow control only returns on a reset, the failed end of the stream.
+		c.str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeConnectError))
+		c.str.CancelRead(quic.StreamErrorCode(http3.ErrCodeConnectError))
+		return nil
 	}
+	_ = c.str.Close()
+	c.wmu.Unlock()
 	c.str.CancelRead(quic.StreamErrorCode(http3.ErrCodeNoError))
 	return nil
 }
@@ -1306,12 +1519,23 @@ func (c *connectUDPConn) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
-// Close returns at once. The demultiplexer closes a flow on its read loop, and a pipe over
-// TLS closes within alertWriteTimeout.
+// Close returns at once, as the Close of a socket does, and the pipe ends within
+// alertWriteTimeout. A closer ends the exit with closeBy or Abort.
 func (c *connectUDPConn) Close() error {
 	c.closeOnce.Do(func() { go func() { _ = c.pipe.close() }() })
 	return nil
 }
+
+// closeBy ends the exit by deadline before it returns, as the closer of the flow ends its legs,
+// I1.
+func (c *connectUDPConn) closeBy(deadline time.Time) error {
+	var err error
+	c.closeOnce.Do(func() { err = c.pipe.closeBy(deadline) })
+	return err
+}
+
+// Abort gives the exit its failed end at once.
+func (c *connectUDPConn) Abort() { c.closeOnce.Do(c.pipe.fail) }
 
 func (c *connectUDPConn) LocalAddr() net.Addr                { return emptyAddr{} }
 func (c *connectUDPConn) RemoteAddr() net.Addr               { return c.remote }
@@ -1434,7 +1658,9 @@ func (o *ownSockets) datagram(addr netip.AddrPort) bool {
 // ownRecord releases one record of ownSockets, once. A socket releases it before it closes,
 // so a peer that saw the close finds the record gone.
 type ownRecord struct {
-	o        *ownSockets
+	o *ownSockets
+	// forget removes the socket from the sockets the dialer still keeps, nil for none.
+	forget   func()
 	key      ownKey
 	released atomic.Bool
 }
@@ -1449,6 +1675,22 @@ func (r *ownRecord) release() {
 		delete(sh.m, r.key)
 	}
 	sh.mu.Unlock()
+	if r.forget != nil {
+		r.forget()
+	}
+}
+
+// recordOf returns the record of a socket track returned, nil for one it left untracked.
+func recordOf(c net.Conn) *ownRecord {
+	switch c := c.(type) {
+	case *ownTCPConn:
+		return &c.own
+	case *ownUDPConn:
+		return &c.own
+	case *ownConn:
+		return &c.own
+	}
+	return nil
 }
 
 // ownTCPConn keeps the methods of *net.TCPConn, the half-close and the splice net/http and the

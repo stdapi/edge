@@ -11,6 +11,8 @@ import (
 	"net/netip"
 	"slices"
 	"strings"
+	"sync/atomic"
+	"time"
 
 	"golang.org/x/net/http2/hpack"
 )
@@ -75,8 +77,12 @@ type schemeConn struct {
 	p      *Proxy
 	scheme string
 	out    []byte
-	outPos int
-	maxStr int
+	// headerBy is the bound of the first request header in nanoseconds since the epoch, zero
+	// once it is read. asked is the read deadline last asked for, applied once the bound goes.
+	headerBy atomic.Int64
+	asked    atomic.Int64
+	outPos   int
+	maxStr   int
 
 	// The frame being read.
 	left      int
@@ -140,6 +146,44 @@ func schemeConnOf(c net.Conn) *schemeConn {
 
 func (c *schemeConn) NetConn() net.Conn { return c.Conn }
 
+// SetReadDeadline is the read deadline of the connection, capped by the bound of its first
+// request header, which counts from the accept.
+func (c *schemeConn) SetReadDeadline(t time.Time) error {
+	var asked int64
+	if !t.IsZero() {
+		asked = t.UnixNano()
+	}
+	c.asked.Store(asked)
+	if by := c.headerBy.Load(); by != 0 && (t.IsZero() || t.UnixNano() > by) {
+		t = time.Unix(0, by)
+	}
+	return c.Conn.SetReadDeadline(t)
+}
+
+func (c *schemeConn) SetDeadline(t time.Time) error {
+	if err := c.SetReadDeadline(t); err != nil {
+		return err
+	}
+	return c.SetWriteDeadline(t)
+}
+
+// boundHeader caps the read deadlines at t until the first request header is read. A zero t
+// lifts the cap and gives the connection the read deadline last asked for.
+func (c *schemeConn) boundHeader(t time.Time) {
+	if !t.IsZero() {
+		c.headerBy.Store(t.UnixNano())
+		return
+	}
+	if c.headerBy.Swap(0) == 0 {
+		return
+	}
+	var asked time.Time
+	if n := c.asked.Load(); n != 0 {
+		asked = time.Unix(0, n)
+	}
+	_ = c.Conn.SetReadDeadline(asked)
+}
+
 func (c *schemeConn) CloseWrite() error { return closeWrite(c.Conn) }
 
 func (c *schemeConn) Abort() { abort(c.Conn) }
@@ -192,6 +236,17 @@ func (c *schemeConn) Read(p []byte) (int, error) {
 	}
 }
 
+// http2 decides, as the first read would, whether the connection uses HTTP/2, from the ALPN of
+// a TLS connection or the preface of a plaintext one. What it reads is read again by the server.
+func (c *schemeConn) http2() (bool, error) {
+	if c.state == schemeUndecided {
+		if err := c.decide(); err != nil {
+			return false, err
+		}
+	}
+	return c.state == schemeFrames, nil
+}
+
 // decide reads the frames of an HTTP/2 connection and passes any other through. In plaintext
 // it decides on the first byte that leaves the preface, so a short HTTP/1.1 request is never
 // delayed.
@@ -213,6 +268,13 @@ func (c *schemeConn) decide() error {
 		return errFromItself
 	}
 	if isTLS && cs.ConnectionState().NegotiatedProtocol != "h2" {
+		// The first byte of a request, awaited under the deadline of the front as on plaintext.
+		if c.br == nil {
+			c.br = bufio.NewReader(c.Conn)
+		}
+		if _, err := c.br.Peek(1); err != nil {
+			return err
+		}
 		c.state = schemeRaw
 		return nil
 	}

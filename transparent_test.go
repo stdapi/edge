@@ -61,6 +61,8 @@ func (c *originConn) OriginalDestination() (netip.AddrPort, error) { return c.or
 
 func (c *originConn) CloseWrite() error { return closeWrite(c.Conn) }
 
+func (c *originConn) Abort() { abort(c.Conn) }
+
 // startTransparentRedirected starts p on a loopback port whose connections report where they
 // were headed.
 func startTransparentRedirected(t *testing.T, p *Proxy, origin func(net.Conn) (netip.AddrPort, error)) string {
@@ -1307,4 +1309,188 @@ func TestTransparent_PlaintextPortStaysTheDestinations(t *testing.T) {
 	sessions := waitForSessions(t, p, 1)
 	assert.Equal(t, "b.test", sessions[0].Target().Host)
 	assert.Equal(t, originURL.Port(), sessions[0].Target().Port)
+}
+
+func TestTransparent_StreamNothingAdmitsIsReset(t *testing.T) {
+	p := testProxy(t)
+	p.MustAdd[TCP]("other.test", noopStream)
+	addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) {
+		return netip.MustParseAddrPort("192.0.2.1:25"), nil
+	})
+	c, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer c.Close()
+	_, err = c.Write([]byte{0x00, 0x01, 0x02, 0x03})
+	require.NoError(t, err)
+	assert.Equal(t, "RST", peerEnd(c, 3*time.Second))
+}
+
+func TestTransparent_SilentConnectionIsServedAsAStream(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		c, aerr := ln.Accept()
+		if aerr != nil {
+			return
+		}
+		t.Cleanup(func() { _ = c.Close() })
+		_, _ = io.WriteString(c, "220 banner\r\n")
+	}()
+	dest := netip.MustParseAddrPort(ln.Addr().String())
+	p := testProxy(t, WithSniffTimeout(300*time.Millisecond))
+	p.MustAdd[TCP](ln.Addr().String(), relayStream)
+	addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) { return dest, nil })
+
+	client, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer client.Close()
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(3*time.Second)))
+	line, err := bufio.NewReader(client).ReadString('\n')
+	require.NoError(t, err)
+	assert.Equal(t, "220 banner\r\n", line)
+}
+
+func TestTransparent_StalledClientHelloIsReset(t *testing.T) {
+	p := testProxy(t, WithReadHeaderTimeout(300*time.Millisecond))
+	p.MustAdd[TCP]("a.test", relayStream)
+	addr := startTransparentRedirected(t, p, func(net.Conn) (netip.AddrPort, error) {
+		return netip.MustParseAddrPort("127.0.0.1:443"), nil
+	})
+	client, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer client.Close()
+	// A record header announcing more than is sent.
+	_, err = client.Write([]byte{0x16, 0x03, 0x01, 0x01, 0x00, 0x01})
+	require.NoError(t, err)
+	assert.Equal(t, "RST", peerEnd(client, 3*time.Second))
+}
+
+func TestTransparent_ServeConnReturnsErrProxyClosedAfterACut(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+	running := make(chan struct{})
+	p.MustAdd[TCP]("svc.test", func(c *TCPCtx) error {
+		close(running)
+		<-c.Context().Done()
+		return c.Context().Err()
+	})
+	cl, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer cl.Close()
+	served := make(chan error, 1)
+	go func() {
+		sc, aerr := cl.Accept()
+		if aerr == nil {
+			served <- p.ServeConn(sc)
+		}
+	}()
+	conn, err := net.Dial("tcp", cl.Addr().String())
+	require.NoError(t, err)
+	defer conn.Close()
+	tc := tls.Client(conn, &tls.Config{ServerName: "svc.test", RootCAs: ca.CertPool(), NextProtos: []string{"x-test"}})
+	require.NoError(t, tc.Handshake())
+	<-running
+	require.NoError(t, p.Close())
+	select {
+	case err := <-served:
+		require.ErrorIs(t, err, ErrProxyClosed)
+	case <-time.After(5 * time.Second):
+		t.Fatal("ServeConn did not return")
+	}
+}
+
+func TestTransparent_ServeConnReturnsNilForANormalCause(t *testing.T) {
+	serveConn := func(t *testing.T, p *Proxy) (net.Conn, <-chan error) {
+		cl, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = cl.Close() })
+		served := make(chan error, 1)
+		go func() {
+			if sc, aerr := cl.Accept(); aerr == nil {
+				served <- p.ServeConn(sc)
+			}
+		}()
+		conn, err := net.Dial("tcp", cl.Addr().String())
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = conn.Close() })
+		return conn, served
+	}
+	wait := func(t *testing.T, served <-chan error) error {
+		select {
+		case err := <-served:
+			return err
+		case <-time.After(5 * time.Second):
+			t.Fatal("ServeConn did not return")
+			return nil
+		}
+	}
+
+	t.Run("session close", func(t *testing.T) {
+		ca, err := GenerateCA()
+		require.NoError(t, err)
+		p, err := New(WithCA(ca))
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = p.Close() })
+		running := make(chan struct{})
+		p.MustAdd[TCP]("svc.test", func(c *TCPCtx) error {
+			close(running)
+			<-c.Context().Done()
+			return c.Context().Err()
+		})
+		conn, served := serveConn(t, p)
+		tc := tls.Client(conn, &tls.Config{ServerName: "svc.test", RootCAs: ca.CertPool(), NextProtos: []string{"x-test"}})
+		require.NoError(t, tc.Handshake())
+		<-running
+		require.NoError(t, waitForSessions(t, p, 1)[0].Close())
+		require.NoError(t, wait(t, served), "ServeConn returned an error after Session.Close")
+	})
+	t.Run("refusal", func(t *testing.T) {
+		p := testProxy(t)
+		t.Cleanup(func() { _ = p.Close() })
+		conn, served := serveConn(t, p)
+		_, err := conn.Write([]byte{0})
+		require.NoError(t, err)
+		require.NoError(t, wait(t, served), "ServeConn returned an error after a refusal")
+	})
+}
+
+func TestTransparent_ServeConnReportsAPeerReset(t *testing.T) {
+	for name, first := range map[string][]byte{
+		"before the first byte":  nil,
+		"inside the ClientHello": {0x16, 0x03, 0x01, 0x01, 0x00, 0x01},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ca, err := GenerateCA()
+			require.NoError(t, err)
+			p, err := New(WithCA(ca), WithSniffTimeout(2*time.Second))
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = p.Close() })
+			p.MustAdd("reset.test/", okHandler)
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			require.NoError(t, err)
+			defer ln.Close()
+			client, err := net.Dial("tcp", ln.Addr().String())
+			require.NoError(t, err)
+			server, err := ln.Accept()
+			require.NoError(t, err)
+			done := make(chan error, 1)
+			go func() { done <- p.ServeConn(server) }()
+			if first != nil {
+				_, err = client.Write(first)
+				require.NoError(t, err)
+				time.Sleep(100 * time.Millisecond)
+			}
+			require.NoError(t, client.(*net.TCPConn).SetLinger(0))
+			require.NoError(t, client.Close())
+			select {
+			case err := <-done:
+				require.Error(t, err, "ServeConn hid the peer reset that ended its connection")
+			case <-time.After(3 * time.Second):
+				t.Fatal("ServeConn did not return")
+			}
+		})
+	}
 }

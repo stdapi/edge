@@ -23,6 +23,7 @@ import (
 	"net/textproto"
 	"net/url"
 	"regexp"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -395,7 +396,7 @@ func TestHTTP_ResetOfTheRequestStreamResetsTheResponseOverHTTP3(t *testing.T) {
 	m := s.message(true)
 	code, ok := h3ErrCode(m.err)
 	require.True(t, ok, "the response ended with %v", m.err)
-	assert.Equal(t, http3.ErrCodeRequestCanceled, code)
+	assert.Equal(t, http3.ErrCodeInternalError, code, "quic-go gives a reset before the response header no other code")
 	assert.Nil(t, m.fields, "a response preceded the reset")
 	assert.Equal(t, "RST_STREAM CANCEL", b.origin.nextNote(t))
 }
@@ -5865,8 +5866,9 @@ var proxyConformance = []conformanceCase{
 			assert.Equal(t, "\x01ping", b.origin.nextNote(t))
 			s.CancelWrite(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
 			_, err := io.ReadAll(s.br)
-			_, reset := h3ErrCode(err)
+			code, reset := h3ErrCode(err)
 			assert.True(t, reset, "the proxy ended its direction with a FIN")
+			assert.Equal(t, http3.ErrCodeConnectError, code)
 		},
 	},
 	{
@@ -6358,4 +6360,693 @@ func BenchmarkForwardWithBody(b *testing.B) {
 		_, _ = io.Copy(io.Discard, resp.Body)
 		_ = resp.Body.Close()
 	}
+}
+
+func TestHTTP_ForwardRequestAfterTheCutReachesNoOrigin(t *testing.T) {
+	var hits atomic.Int32
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+	}))
+	defer origin.Close()
+
+	p := testProxy(t)
+	started, release := make(chan struct{}), make(chan struct{})
+	forwarded := make(chan error, 1)
+	p.MustAdd("127.0.0.1/+{rest}", func(c *HTTPCtx) (*http.Response, error) {
+		close(started)
+		<-release
+		resp, err := c.ForwardRequest(c.Request().Clone(context.Background()))
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+		forwarded <- err
+		return nil, errors.New("done")
+	})
+	addr := startProxy(t, p)
+	go func() {
+		if resp, err := proxyClient(addr, nil).Get(origin.URL + "/x"); err == nil {
+			_ = resp.Body.Close()
+		}
+	}()
+	<-started
+	go func() { _ = p.Close() }()
+	time.Sleep(100 * time.Millisecond)
+	close(release)
+	assert.ErrorIs(t, <-forwarded, net.ErrClosed)
+	assert.Zero(t, hits.Load(), "an upstream request sent after the cut reached the origin")
+}
+
+// rawHTTPOrigin answers each request on its one connection with a response that stops after
+// partial bytes when partial is set, and reports how the proxy ended the connection.
+func rawHTTPOrigin(t *testing.T, partial bool) (string, <-chan string) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	ended := make(chan string, 1)
+	go func() {
+		c, aerr := ln.Accept()
+		if aerr != nil {
+			return
+		}
+		defer c.Close()
+		br := bufio.NewReader(c)
+		if _, rerr := http.ReadRequest(br); rerr != nil {
+			return
+		}
+		if partial {
+			_, _ = io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npartial")
+		} else {
+			_, _ = io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndone")
+		}
+		ended <- peerEnd(c, 5*time.Second)
+	}()
+	return ln.Addr().String(), ended
+}
+
+func TestHTTP_UpstreamRequestCanceledMidResponseIsReset(t *testing.T) {
+	for _, how := range []string{"cut", "client gone"} {
+		t.Run(how, func(t *testing.T) {
+			origin, ended := rawHTTPOrigin(t, true)
+			tr := DefaultTransport()
+			tr.DialContext = pinnedDialer(origin)
+			p := testProxy(t, WithTransport(tr))
+			p.MustAdd("allowed.test/", forwardHandler)
+			conn, err := net.Dial("tcp", startProxy(t, p))
+			require.NoError(t, err)
+			defer conn.Close()
+			_, err = io.WriteString(conn, "GET http://allowed.test/ HTTP/1.1\r\nHost: allowed.test\r\n\r\n")
+			require.NoError(t, err)
+			br := bufio.NewReader(conn)
+			resp, err := http.ReadResponse(br, nil)
+			require.NoError(t, err)
+			_, err = io.ReadFull(resp.Body, make([]byte, len("partial")))
+			require.NoError(t, err)
+			if how == "cut" {
+				require.NoError(t, p.Close())
+			} else {
+				_ = conn.Close()
+			}
+			assert.Equal(t, "RST", <-ended, "the origin read a clean end of a request the proxy canceled")
+		})
+	}
+}
+
+func TestHTTP_UpstreamConnectionAfterACompleteExchangeEndsCleanly(t *testing.T) {
+	origin, ended := rawHTTPOrigin(t, false)
+	tr := DefaultTransport()
+	tr.DialContext = pinnedDialer(origin)
+	p := testProxy(t, WithTransport(tr))
+	p.MustAdd("allowed.test/", forwardHandler)
+	body, err := getBody(proxyClient(startProxy(t, p), nil), "http://allowed.test/")
+	require.NoError(t, err)
+	require.Equal(t, "done", body)
+	require.NoError(t, p.Close())
+	assert.Equal(t, "FIN", <-ended)
+}
+
+// cutUpstream forwards a request of proto the origin keeps open, cuts the proxy and returns how
+// the origin read the end.
+func cutUpstream(t *testing.T, proto string) error {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+	ends := make(chan error, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		br := bufio.NewReader(c)
+		if _, err := http.ReadRequest(br); err != nil {
+			ends <- err
+			return
+		}
+		_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+		_, err = io.Copy(io.Discard, br)
+		ends <- err
+	}()
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+	p := testProxy(t)
+	p.MustAdd("127.0.0.1/", forwardHandler)
+	addr := startProxy(t, p)
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer conn.Close()
+	_, err = io.WriteString(conn, "GET http://127.0.0.1:"+port+"/ "+proto+"\r\nHost: 127.0.0.1:"+port+"\r\n\r\n")
+	require.NoError(t, err)
+	time.Sleep(200 * time.Millisecond)
+	go func() { _ = p.Close() }()
+	return <-ends
+}
+
+func TestHTTP_CutUpstreamRequestIsReset(t *testing.T) {
+	for _, proto := range []string{"HTTP/1.1", "HTTP/1.0"} {
+		t.Run(proto, func(t *testing.T) {
+			assert.Error(t, cutUpstream(t, proto), "the origin read a FIN for a canceled upstream request")
+		})
+	}
+}
+
+func TestHTTP_CutUpstreamTLSRequestIsResetWithoutCloseNotify(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	leaf, err := ca.Leaf("127.0.0.1")
+	require.NoError(t, err)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+	ends := make(chan error, 1)
+	go func() {
+		raw, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		c := tls.Server(raw, &tls.Config{Certificates: []tls.Certificate{*leaf}, NextProtos: []string{"http/1.1"}})
+		defer c.Close()
+		br := bufio.NewReader(c)
+		if _, err := http.ReadRequest(br); err != nil {
+			ends <- err
+			return
+		}
+		_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+		_, err = br.ReadByte()
+		ends <- err
+	}()
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+	tr := DefaultTransport()
+	tr.RootCAs = ca.CertPool()
+	p, err := New(WithCA(ca), WithTransport(tr))
+	require.NoError(t, err)
+	p.MustAdd("127.0.0.1/", forwardHandler)
+	addr := startProxy(t, p)
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer conn.Close()
+	_, err = io.WriteString(conn, "GET https://127.0.0.1:"+port+"/ HTTP/1.1\r\nHost: 127.0.0.1:"+port+"\r\n\r\n")
+	require.NoError(t, err)
+	time.Sleep(300 * time.Millisecond)
+	go func() { _ = p.Close() }()
+	err = <-ends
+	require.NotErrorIs(t, err, io.EOF, "the origin read a close_notify for a canceled upstream request")
+}
+
+func TestHTTP_SessionCloseCancelsTheUpstreamRequestOfAnHTTP11Request(t *testing.T) {
+	arrived := make(chan struct{}, 1)
+	ended := make(chan time.Time, 1)
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		arrived <- struct{}{}
+		select {
+		case <-r.Context().Done():
+		case <-time.After(4 * time.Second):
+		}
+		ended <- time.Now()
+	}))
+	defer origin.Close()
+	p := testProxy(t)
+	sessc := make(chan *Session, 1)
+	p.MustAdd("127.0.0.1/*{any}", func(c *HTTPCtx) (*http.Response, error) {
+		sessc <- c.Session()
+		return c.Forward()
+	})
+	conn, err := net.Dial("tcp", startProxy(t, p))
+	require.NoError(t, err)
+	defer conn.Close()
+	_, err = io.WriteString(conn, "GET "+origin.URL+"/x HTTP/1.1\r\nHost: "+origin.Listener.Addr().String()+"\r\n\r\n")
+	require.NoError(t, err)
+	sess := <-sessc
+	<-arrived
+	start := time.Now()
+	require.NoError(t, sess.Close())
+	// The upstream request ends with the request closer, before the normal end of the connection.
+	assert.Less(t, (<-ended).Sub(start), alertWriteTimeout/2)
+}
+
+func TestHTTP_UpgradeFieldOnHTTP10After1xx(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				br := bufio.NewReader(c)
+				for {
+					req, err := http.ReadRequest(br)
+					if err != nil {
+						return
+					}
+					t.Logf("origin got %s %s %v", req.Method, req.Proto, req.Header)
+					_, _ = c.Write([]byte("HTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"))
+				}
+			}()
+		}
+	}()
+	p := testProxy(t)
+	p.MustAdd("127.0.0.1/*{any}", forwardHandler)
+	addr := startProxy(t, p)
+	for _, hdr := range []string{"", "Connection: Upgrade\r\nUpgrade: foo\r\n"} {
+		c, err := net.Dial("tcp", addr)
+		require.NoError(t, err)
+		_, err = fmt.Fprintf(c, "GET http://%s/ HTTP/1.0\r\nHost: %s\r\n%s\r\n", ln.Addr(), ln.Addr(), hdr)
+		require.NoError(t, err)
+		_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+		resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+		if err != nil {
+			t.Errorf("with %q: no response: %v", hdr, err)
+			buf := make([]byte, 1<<22)
+			n := runtime.Stack(buf, true)
+			for _, g := range strings.Split(string(buf[:n]), "\n\n") {
+				if strings.Contains(g, "edge.") && (strings.Contains(g, "http.go") || strings.Contains(g, "forward.go")) {
+					t.Logf("%s", g)
+				}
+			}
+		} else {
+			t.Logf("with %q: %s", hdr, resp.Status)
+		}
+		if hdr != "" {
+			time.Sleep(10 * time.Millisecond)
+		}
+		_ = c.Close()
+	}
+	time.Sleep(200 * time.Millisecond)
+	_ = p.Close()
+	time.Sleep(500 * time.Millisecond)
+	before := runtime.NumGoroutine()
+	_ = before
+	buf := make([]byte, 1<<20)
+	n := runtime.Stack(buf, true)
+	for _, g := range strings.Split(string(buf[:n]), "\n\n") {
+		if strings.Contains(g, "infoRelay") {
+			t.Logf("after Close: %s", g[:200])
+		}
+	}
+}
+
+func TestHTTP_ConnectionCloseResponseEndsWithFIN(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+	var resets, fins atomic.Int32
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				br := bufio.NewReader(c)
+				if _, err := http.ReadRequest(br); err != nil {
+					return
+				}
+				_, _ = c.Write([]byte("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nok"))
+				_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+				_, err := br.ReadByte()
+				if errors.Is(err, syscall.ECONNRESET) {
+					resets.Add(1)
+				} else {
+					fins.Add(1)
+				}
+			}()
+		}
+	}()
+	p := testProxy(t)
+	p.MustAdd("127.0.0.1/*{any}", forwardHandler)
+	client := proxyClient(startProxy(t, p), nil)
+	for range 300 {
+		resp, err := client.Get("http://" + ln.Addr().String() + "/")
+		require.NoError(t, err)
+		_, _ = io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+	}
+	time.Sleep(500 * time.Millisecond)
+	t.Logf("origin read a FIN %d times, a reset %d times", fins.Load(), resets.Load())
+	if resets.Load() > 0 {
+		t.Errorf("a complete exchange ended with a reset")
+	}
+}
+
+func TestHTTP_UpstreamBodyClosedEarlyResetsTheOrigin(t *testing.T) {
+	origin, ended := rawHTTPOrigin(t, true)
+	tr := DefaultTransport()
+	tr.DialContext = pinnedDialer(origin)
+	p := testProxy(t, WithTransport(tr))
+	p.MustAdd("allowed.test/", func(c *HTTPCtx) (*http.Response, error) {
+		resp, err := c.Forward()
+		if err != nil {
+			return nil, err
+		}
+		_, _ = io.ReadFull(resp.Body, make([]byte, len("partial")))
+		_ = resp.Body.Close()
+		time.Sleep(500 * time.Millisecond)
+		return Status(http.StatusTeapot), nil
+	})
+	conn, err := net.Dial("tcp", startProxy(t, p))
+	require.NoError(t, err)
+	defer conn.Close()
+	_, err = io.WriteString(conn, "GET http://allowed.test/ HTTP/1.1\r\nHost: allowed.test\r\n\r\n")
+	require.NoError(t, err)
+	got := <-ended
+	t.Logf("origin read %s", got)
+	require.Equal(t, "RST", got, "an upstream request whose response was not read to its end got a clean end")
+}
+
+func TestHTTP_UpstreamBodyClosedEarlyResetsATLSOrigin(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	leaf, err := ca.Leaf("127.0.0.1")
+	require.NoError(t, err)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+	ends := make(chan error, 1)
+	go func() {
+		raw, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		c := tls.Server(raw, &tls.Config{Certificates: []tls.Certificate{*leaf}, NextProtos: []string{"http/1.1"}})
+		defer c.Close()
+		br := bufio.NewReader(c)
+		if _, err := http.ReadRequest(br); err != nil {
+			ends <- err
+			return
+		}
+		_, _ = io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npartial")
+		_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+		_, err = br.ReadByte()
+		ends <- err
+	}()
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+	tr := DefaultTransport()
+	tr.RootCAs = ca.CertPool()
+	p, err := New(WithCA(ca), WithTransport(tr))
+	require.NoError(t, err)
+	p.MustAdd("127.0.0.1/", func(c *HTTPCtx) (*http.Response, error) {
+		resp, err := c.Forward()
+		if err != nil {
+			return nil, err
+		}
+		_, _ = io.ReadFull(resp.Body, make([]byte, len("partial")))
+		_ = resp.Body.Close()
+		time.Sleep(500 * time.Millisecond)
+		return Status(http.StatusTeapot), nil
+	})
+	addr := startProxy(t, p)
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer conn.Close()
+	_, err = io.WriteString(conn, "GET https://127.0.0.1:"+port+"/ HTTP/1.1\r\nHost: 127.0.0.1:"+port+"\r\n\r\n")
+	require.NoError(t, err)
+	err = <-ends
+	t.Logf("origin read %v (reset=%v)", err, errors.Is(err, syscall.ECONNRESET))
+	require.NotErrorIs(t, err, io.EOF, "the origin read a close_notify for an upstream request whose response was not read to its end")
+}
+
+func TestHTTP_CutResetsTheHTTP11UpstreamOfAnHTTP2Client(t *testing.T) {
+	for _, how := range []string{"cut", "client reset"} {
+		t.Run(how, func(t *testing.T) {
+			origin, ended := rawHTTPOrigin(t, true)
+			tr := DefaultTransport()
+			tr.DialContext = pinnedDialer(origin)
+			p := testProxy(t, WithTransport(tr))
+			p.MustAdd("allowed.test/", forwardHandler)
+			conn, err := net.Dial("tcp", startProxy(t, p))
+			require.NoError(t, err)
+			defer conn.Close()
+			require.NoError(t, conn.SetDeadline(time.Now().Add(5*time.Second)))
+			_, err = io.WriteString(conn, http2.ClientPreface)
+			require.NoError(t, err)
+			fr := http2.NewFramer(conn, conn)
+			fr.ReadMetaHeaders = hpack.NewDecoder(4096, nil)
+			require.NoError(t, fr.WriteSettings())
+			var buf bytes.Buffer
+			enc := hpack.NewEncoder(&buf)
+			for _, f := range []hpack.HeaderField{
+				{Name: ":method", Value: http.MethodGet},
+				{Name: ":scheme", Value: "http"},
+				{Name: ":authority", Value: "allowed.test"},
+				{Name: ":path", Value: "/"},
+			} {
+				require.NoError(t, enc.WriteField(f))
+			}
+			require.NoError(t, fr.WriteHeaders(http2.HeadersFrameParam{StreamID: 1, BlockFragment: buf.Bytes(), EndHeaders: true, EndStream: true}))
+		loop:
+			for {
+				f, err := fr.ReadFrame()
+				require.NoError(t, err)
+				switch f := f.(type) {
+				case *http2.SettingsFrame:
+					if !f.IsAck() {
+						_ = fr.WriteSettingsAck()
+					}
+				case *http2.DataFrame:
+					break loop
+				}
+			}
+			if how == "cut" {
+				go func() { _ = p.Close() }()
+			} else {
+				require.NoError(t, fr.WriteRSTStream(1, http2.ErrCodeCancel))
+			}
+			got := <-ended
+			t.Logf("origin read %s", got)
+			require.Equal(t, "RST", got, "the origin read a clean end of a request the proxy canceled")
+		})
+	}
+}
+
+func TestHTTP_UpstreamBodyDrainedByTheTransportReusesItsConnection(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+	served := make(chan int, 4)
+	ends := make(chan string, 4)
+	var conns atomic.Int32
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			idx := int(conns.Add(1))
+			go func() {
+				defer c.Close()
+				br := bufio.NewReader(c)
+				for {
+					_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+					if _, err := http.ReadRequest(br); err != nil {
+						ends <- peerEnd(c, 0)
+						return
+					}
+					served <- idx
+					_, _ = io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\n"+strings.Repeat("x", 100))
+				}
+			}()
+		}
+	}()
+	tr := DefaultTransport()
+	tr.DialContext = pinnedDialer(ln.Addr().String())
+	p := testProxy(t, WithTransport(tr))
+	p.MustAdd("allowed.test/partial", func(c *HTTPCtx) (*http.Response, error) {
+		resp, err := c.Forward()
+		if err != nil {
+			return nil, err
+		}
+		_, _ = io.ReadFull(resp.Body, make([]byte, 7))
+		_ = resp.Body.Close()
+		return Status(http.StatusTeapot), nil
+	})
+	p.MustAdd("allowed.test/full", forwardHandler)
+	addr := startProxy(t, p)
+	get := func(path string) {
+		conn, err := net.Dial("tcp", addr)
+		require.NoError(t, err)
+		defer conn.Close()
+		_, err = io.WriteString(conn, "GET http://allowed.test"+path+" HTTP/1.1\r\nHost: allowed.test\r\n\r\n")
+		require.NoError(t, err)
+		resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+		require.NoError(t, err)
+		_, _ = io.Copy(io.Discard, resp.Body)
+	}
+	get("/partial")
+	first := <-served
+	time.Sleep(200 * time.Millisecond)
+	get("/full")
+	require.Equal(t, first, <-served, "the transport drained a complete response and did not reuse its connection")
+	select {
+	case end := <-ends:
+		t.Fatalf("the connection of a drained response ended with %s", end)
+	default:
+	}
+}
+
+func TestHTTP_LateCloseOfAReadBodyLeavesTheNextRequestOnItsConnection(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+	bHeader := make(chan struct{})
+	bResult := make(chan string, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		br := bufio.NewReader(c)
+		req, err := http.ReadRequest(br)
+		if err != nil {
+			return
+		}
+		_, _ = io.Copy(io.Discard, req.Body)
+		_, _ = io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndone")
+		_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+		if req, err = http.ReadRequest(br); err != nil {
+			bResult <- "second request: " + err.Error()
+			return
+		}
+		close(bHeader)
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			bResult <- fmt.Sprintf("second body after %q: %v", body, err)
+			return
+		}
+		bResult <- "second body " + string(body)
+		_, _ = io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+	}()
+	tr := DefaultTransport()
+	tr.DialContext = pinnedDialer(ln.Addr().String())
+	p := testProxy(t, WithTransport(tr))
+	aRead := make(chan struct{})
+	p.MustAdd("allowed.test/a", func(c *HTTPCtx) (*http.Response, error) {
+		resp, err := c.Forward()
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		close(aRead)
+		<-bHeader
+		time.Sleep(100 * time.Millisecond)
+		return Text(http.StatusOK, string(b)), nil
+	})
+	p.MustAdd("allowed.test/b", forwardHandler)
+	addr := startProxy(t, p)
+
+	go func() {
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = io.WriteString(conn, "GET http://allowed.test/a HTTP/1.1\r\nHost: allowed.test\r\n\r\n")
+		_, _ = io.Copy(io.Discard, conn)
+	}()
+	<-aRead
+	conn, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer conn.Close()
+	_, err = io.WriteString(conn, "POST http://allowed.test/b HTTP/1.1\r\nHost: allowed.test\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n")
+	require.NoError(t, err)
+	<-bHeader
+	time.Sleep(400 * time.Millisecond)
+	_, err = io.WriteString(conn, "6\r\n world\r\n0\r\n\r\n")
+	require.NoError(t, err)
+	require.Equal(t, "second body hello world", <-bResult, "the late Close of a response read to its end failed the request that reused its connection")
+}
+
+func TestHTTP_FanOutAbandonedResponseResetsItsOrigin(t *testing.T) {
+	for _, aFirst := range []bool{true, false} {
+		t.Run(fmt.Sprintf("first read first %t", aFirst), func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			require.NoError(t, err)
+			defer ln.Close()
+			bEnd := make(chan string, 1)
+			go func() {
+				for {
+					c, err := ln.Accept()
+					if err != nil {
+						return
+					}
+					go func() {
+						defer c.Close()
+						req, err := http.ReadRequest(bufio.NewReader(c))
+						if err != nil {
+							return
+						}
+						if req.URL.Path == "/a" {
+							_, _ = io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\ndone")
+							_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+							_, _ = io.Copy(io.Discard, c)
+							return
+						}
+						_, _ = io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npartial")
+						bEnd <- peerEnd(c, 5*time.Second)
+					}()
+				}
+			}()
+			tr := DefaultTransport()
+			tr.DialContext = pinnedDialer(ln.Addr().String())
+			p := testProxy(t, WithTransport(tr))
+			p.MustAdd("allowed.test/a", func(c *HTTPCtx) (*http.Response, error) {
+				a, err := c.Forward()
+				if err != nil {
+					return nil, err
+				}
+				reqB := c.Request().Clone(c.Request().Context())
+				reqB.URL.Path = "/b"
+				b, err := c.ForwardRequest(reqB)
+				if err != nil {
+					return nil, err
+				}
+				if aFirst {
+					_, _ = io.ReadAll(a.Body)
+					_ = a.Body.Close()
+				}
+				_, _ = io.ReadFull(b.Body, make([]byte, len("partial")))
+				_ = b.Body.Close()
+				_, _ = io.ReadAll(a.Body)
+				_ = a.Body.Close()
+				return Status(http.StatusTeapot), nil
+			})
+			conn, err := net.Dial("tcp", startProxy(t, p))
+			require.NoError(t, err)
+			defer conn.Close()
+			_, err = io.WriteString(conn, "GET http://allowed.test/a HTTP/1.1\r\nHost: allowed.test\r\n\r\n")
+			require.NoError(t, err)
+			require.Equal(t, "RST", <-bEnd, "the abandoned response of the second round trip got a clean end")
+		})
+	}
+}
+
+func TestHTTP_RelayOfALiveExchangeServesNoOtherRoundTrip(t *testing.T) {
+	c := &routeCtx{w: httptest.NewRecorder()}
+	relay := c.infoRelay(context.Background())
+	g := &gatedConn{}
+	relay.conn.Store(g)
+	relay.gen.Store(g.begin(nil))
+	require.NotSame(t, relay, c.infoRelay(context.Background()), "a relay with an exchange in flight served another round trip")
+
+	relay = c.relay
+	relay.conn.Store(g)
+	gen := g.begin(nil)
+	relay.gen.Store(gen)
+	require.True(t, g.settle(gen, exOpen, exAbandoned))
+	require.NotSame(t, relay, c.infoRelay(context.Background()), "a relay with an abandoned exchange the transport may still drain served another round trip")
+
+	relay = c.relay
+	relay.conn.Store(g)
+	gen = g.begin(nil)
+	relay.gen.Store(gen)
+	g.idle(gen)
+	require.Same(t, relay, c.infoRelay(context.Background()), "a relay with no exchange in flight was not reused")
+	g.begin(nil)
+	require.NoError(t, (&h1Body{ReadCloser: io.NopCloser(strings.NewReader("")), g: g, gen: gen}).Close())
+	require.False(t, g.failed(), "the late Close of a body abandoned the next exchange on its connection")
 }

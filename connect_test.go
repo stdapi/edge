@@ -363,11 +363,73 @@ func TestConnect_ShutdownDeadlineCutsAnH2StreamOutsideItsHandlerIO(t *testing.T)
 	defer cancel()
 	err := p.Shutdown(ctx)
 	assert.True(t, errors.Is(err, context.DeadlineExceeded), "%v", err)
-	assertResetCode(t, assertStreamReset(t, resp), http2.ErrCodeInternal)
+	// The client reads the reset or the end of the connection, see the limits in
+	// docs/lifecycle.md.
+	assertStreamReset(t, resp)
 	select {
 	case <-ended:
 	case <-time.After(2 * time.Second):
 		t.Fatal("the handler context did not end")
+	}
+}
+
+func TestConnect_CloseWaitsForTheRequestsInFlightBeforeItReturns(t *testing.T) {
+	p, _, resp := openH2ConnectTo(t, sinkOrigin(t), func(c *TCPCtx) error {
+		<-c.Context().Done()
+		return nil
+	})
+	var returned atomic.Bool
+	started := make(chan struct{})
+	p.MustAdd("allowed.test/", func(c *HTTPCtx) (*http.Response, error) {
+		close(started)
+		<-c.Request().Context().Done()
+		time.Sleep(500 * time.Millisecond)
+		returned.Store(true)
+		return nil, c.Request().Context().Err()
+	})
+	addr := startProxy(t, p)
+	go func() { _, _ = getBody(proxyClient(addr, nil), "http://allowed.test/") }()
+	<-started
+
+	closed := make(chan struct{})
+	go func() {
+		_ = p.Close()
+		close(closed)
+	}()
+	assertStreamReset(t, resp)
+	<-closed
+	assert.True(t, returned.Load(), "the cut returned before the handler of a request in flight")
+}
+
+func TestConnect_CloseEndsTheContextOfAnH2StreamNotYetAdmitted(t *testing.T) {
+	res := newGatedResolver(netip.MustParseAddr("127.0.0.1"))
+	p := testProxy(t, WithNameVerification(VerifyReject), WithNameResolver(res))
+	p.MustAdd("name.test/", okHandler)
+	p.MustAdd[TCP]("127.0.0.1:443", func(*TCPCtx) error { return nil })
+	raw, err := net.Dial("tcp", startProxy(t, p))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = raw.Close() })
+	cc, err := (&http2.Transport{AllowHTTP: true}).NewClientConn(raw)
+	require.NoError(t, err)
+	pr, pw := io.Pipe()
+	t.Cleanup(func() { _ = pw.Close() })
+	req, err := http.NewRequest(http.MethodConnect, "https://127.0.0.1:443", pr)
+	require.NoError(t, err)
+	resp, err := cc.RoundTrip(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	go func() {
+		tc := tls.Client(&tunnelConn{r: resp.Body, w: pw}, &tls.Config{ServerName: "name.test", InsecureSkipVerify: true})
+		_ = tc.Handshake()
+	}()
+	<-res.entered
+
+	require.NoError(t, p.Close())
+	select {
+	case err := <-res.ctxErr:
+		assert.ErrorIs(t, err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("the name lookup outlived Close")
 	}
 }
 
@@ -1157,4 +1219,155 @@ func TestConnect_RefusedDialResetsTheTerminatedClient(t *testing.T) {
 	require.NoError(t, err)
 	_, err = tc.Read(make([]byte, 1))
 	assert.ErrorIs(t, err, syscall.ECONNRESET, "the session ended cleanly where the dial failed")
+}
+
+func TestConnect_CarrierPeerResetFailsTheStream(t *testing.T) {
+	origin, upstream := oneConnOrigin(t)
+	p := testProxy(t)
+	dialed := make(chan struct{})
+	returned := make(chan error, 1)
+	p.MustAdd[TCP](origin, func(c *TCPCtx) error {
+		if _, err := c.Dial(); err != nil {
+			return err
+		}
+		close(dialed)
+		<-c.Context().Done()
+		returned <- nil
+		return nil
+	})
+	addr := startProxy(t, p)
+	raw, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	cc, err := (&http2.Transport{AllowHTTP: true}).NewClientConn(raw)
+	require.NoError(t, err)
+	pr, pw := io.Pipe()
+	t.Cleanup(func() { _ = pw.Close() })
+	req, err := http.NewRequest(http.MethodConnect, "https://"+origin, pr)
+	require.NoError(t, err)
+	resp, err := cc.RoundTrip(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	_, err = pw.Write([]byte{0})
+	require.NoError(t, err)
+	<-dialed
+	up := <-upstream
+	require.NoError(t, raw.(*net.TCPConn).SetLinger(0))
+	require.NoError(t, raw.Close())
+	select {
+	case <-returned:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the handler context did not end with its carrier")
+	}
+	assert.Equal(t, "RST", peerEnd(up, 2*time.Second), "origin leg of a byte stream whose carrier its peer reset")
+}
+
+func TestConnect_H3NormalEndStopsTheClientDirectionWithNoError(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	_, rstr := openH3ConnectTo(t, ln, func(c *TCPCtx) error {
+		_, err := c.Client().Read(make([]byte, 1))
+		return err
+	})
+	_, err = rstr.Write([]byte{0})
+	require.NoError(t, err)
+	require.NoError(t, rstr.SetReadDeadline(time.Now().Add(3*time.Second)))
+	_, err = io.Copy(io.Discard, rstr)
+	require.NoError(t, err, "the proxy's direction ended with no FIN")
+	var werr error
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		if _, werr = rstr.Write([]byte("x")); werr != nil {
+			break
+		}
+	}
+	var se *quic.StreamError
+	require.ErrorAs(t, werr, &se)
+	require.Equal(t, quic.StreamErrorCode(http3.ErrCodeNoError), se.ErrorCode, "the normal end of a CONNECT stream stopped the client's direction with an error code")
+}
+
+func TestConnect_H2ClientResetReachesTheHandlerAsARead(t *testing.T) {
+	origin, upstream := oneConnOrigin(t)
+	p := testProxy(t)
+	type seen struct {
+		ctxDone  bool
+		writeErr error
+	}
+	got := make(chan seen, 1)
+	p.MustAdd[TCP](origin, func(c *TCPCtx) error {
+		up, err := c.Dial()
+		if err != nil {
+			return err
+		}
+		_, _ = io.Copy(io.Discard, c.Client())
+		time.Sleep(100 * time.Millisecond)
+		var s seen
+		s.ctxDone = c.Context().Err() != nil
+		_, s.writeErr = up.Write([]byte("bye"))
+		got <- s
+		return nil
+	})
+	raw, err := net.Dial("tcp", startProxy(t, p))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = raw.Close() })
+	cc, err := (&http2.Transport{AllowHTTP: true}).NewClientConn(raw)
+	require.NoError(t, err)
+	pr, pw := io.Pipe()
+	t.Cleanup(func() { _ = pw.Close() })
+	ctx, cancel := context.WithCancel(t.Context())
+	req, err := http.NewRequestWithContext(ctx, http.MethodConnect, "https://"+origin, pr)
+	require.NoError(t, err)
+	resp, err := cc.RoundTrip(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	_, err = pw.Write([]byte{0})
+	require.NoError(t, err)
+	up := <-upstream
+	time.Sleep(100 * time.Millisecond)
+	// RST_STREAM CANCEL from the client.
+	cancel()
+	_ = resp.Body.Close()
+	var s seen
+	select {
+	case s = <-got:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the handler did not read the reset")
+	}
+	require.False(t, s.ctxDone, "the session ended on a peer end while its handler ran, I1")
+	require.NoError(t, s.writeErr, "the closer ran on a peer end while the handler ran, I1")
+	require.NoError(t, up.SetReadDeadline(time.Now().Add(2*time.Second)))
+	b, _ := io.ReadAll(up)
+	require.Equal(t, "bye", string(b))
+}
+
+func TestConnect_CutEndsAnH2StreamPlacedAsHTTPBeforeItsConnection(t *testing.T) {
+	for i := range 5 {
+		p := testProxy(t)
+		p.MustAdd("origin.test/", okHandler)
+		h := dialH2(t, startProxy(t, p))
+		h.h2Connect(t)
+		require.NoError(t, h.fr.WriteData(1, false, []byte("GET / HTTP/1.1\r\nHost: origin.test\r\n\r\n")))
+		var got []byte
+		for !bytes.Contains(got, []byte("\r\n\r\nok")) {
+			d, ok := h.next(t, 1).(*h2Data)
+			require.True(t, ok)
+			got = append(got, d.data...)
+		}
+		go func() { _ = p.Close() }()
+		ended := false
+		for {
+			f, err := h.fr.ReadFrame()
+			if err != nil {
+				break
+			}
+			switch f := f.(type) {
+			case *http2.DataFrame:
+				ended = ended || f.StreamEnded()
+			case *http2.MetaHeadersFrame:
+				ended = ended || f.StreamEnded()
+			case *http2.RSTStreamFrame:
+				ended = true
+			}
+		}
+		require.True(t, ended, "run %d: the cut ended the connection before the stream on it", i)
+	}
 }

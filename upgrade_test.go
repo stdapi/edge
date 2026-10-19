@@ -18,9 +18,11 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"net/netip"
 	"net/url"
 	"os"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -30,6 +32,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 )
 
@@ -189,10 +192,9 @@ func TestUpgrade_TransparentPlaintextPipeIsListedAndClosed(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
 
-	sessions := waitForSessions(t, p, 2)
-	i := slices.IndexFunc(sessions, func(s *Session) bool { return s.Kind() == KindTCP })
-	require.GreaterOrEqual(t, i, 0, "the connection is HTTP, the pipe is the stream")
-	pipe := sessions[i]
+	// The connection served as HTTP ended at the 101, the pipe has its socket.
+	pipe := waitForSessions(t, p, 1)[0]
+	assert.Equal(t, KindTCP, pipe.Kind())
 	assert.Equal(t, "ws.example.test", pipe.Target().Host)
 	assert.True(t, pipe.Transparent())
 
@@ -233,14 +235,9 @@ func TestUpgrade_HostDivergesFromTheConnectAuthority(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
 
-	// The connection and the pipe, each reporting the authority it talks to.
-	sessions := waitForSessions(t, p, 2)
-	hosts := make([]string, 0, 2)
-	for _, s := range sessions {
-		hosts = append(hosts, s.Target().Host)
-	}
-	slices.Sort(hosts)
-	assert.Equal(t, []string{"a.example.test", "b.example.test"}, hosts)
+	// The connection served as HTTP ended at the 101, and the pipe reports the authority of its
+	// request.
+	assert.Equal(t, "b.example.test", waitForSessions(t, p, 1)[0].Target().Host)
 
 	// The pipe is a stream past the 101, so what admits it is the stream entry on the host
 	// its request named, not the one the connection was opened for.
@@ -254,8 +251,37 @@ func TestUpgrade_HostDivergesFromTheConnectAuthority(t *testing.T) {
 			closed++
 		}
 	}
-	assert.Equal(t, 1, closed, "the pipe is swept while its connection stays allowed")
+	assert.Equal(t, 1, closed, "the pipe is swept")
 	assert.Equal(t, true, p.Admits(target("a.example.test:80"), KindHTTP))
+}
+
+func TestUpgrade_NothingServesTheStreamSoTheOriginIsNotAskedToSwitch(t *testing.T) {
+	asked := make(chan string, 1)
+	origin := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		asked <- r.Header.Get("Upgrade")
+		_, _ = io.WriteString(w, "plain")
+	}))
+	t.Cleanup(origin.Close)
+	originURL, _ := url.Parse(origin.URL)
+
+	ca, _ := GenerateCA()
+	tr := DefaultTransport()
+	tr.RootCAs = originPool(t, origin)
+	p, err := New(WithCA(ca), WithTransport(tr))
+	require.NoError(t, err)
+	p.MustAdd(originHost(originURL)+"/ws", forwardHandler)
+
+	raw, err := dialThroughProxy(t, startProxy(t, p), originURL.Host, ca)
+	require.NoError(t, err)
+	defer func() { _ = raw.Close() }()
+	_, err = fmt.Fprintf(raw, upgradeRequest, "/ws", originURL.Host)
+	require.NoError(t, err)
+	resp, err := http.ReadResponse(bufio.NewReader(raw), nil)
+	require.NoError(t, err)
+	body, _ := io.ReadAll(resp.Body)
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "plain", string(body))
+	assert.Empty(t, <-asked, "the origin was asked to switch protocols")
 }
 
 func TestUpgrade_RefusedWhenTheRouteGoesAwayFirst(t *testing.T) {
@@ -295,11 +321,10 @@ func TestUpgrade_RefusedWhenTheRouteGoesAwayFirst(t *testing.T) {
 	resp, err := http.ReadResponse(bufio.NewReader(raw), nil)
 	require.NoError(t, err)
 	assert.Equal(t, http.StatusForbidden, resp.StatusCode, "the client never sees the 101")
-	// The refusal is written before the hijack, so the client reads an ordinary status and
-	// keeps its connection. What matters is that no pipe was left behind: the one session is
-	// the terminated connection itself.
-	sessions := waitForSessions(t, p, 1)
-	assert.Equal(t, KindHTTP, sessions[0].Kind())
+	// The refusal is written before the hijack, so the client reads an ordinary status, and a
+	// refused upgrade ends its HTTP/1.1 connection. No pipe is left behind.
+	assert.True(t, resp.Close, "the refusal keeps the connection")
+	waitForSessions(t, p, 0)
 }
 
 func TestUpgrade_CloseEndsAPipeOnAFrontConnection(t *testing.T) {
@@ -367,7 +392,7 @@ func TestUpgrade_SessionCloseEndsAStalledClient(t *testing.T) {
 
 	start := time.Now()
 	_ = sess.Close()
-	assert.Less(t, time.Since(start), alertWriteTimeout, "Close blocked on the client")
+	assert.Less(t, time.Since(start), alertWriteTimeout+alertWriteTimeout/2, "Close outlived its deadline")
 	assertSessionEnded(t, p, sess)
 	assert.Eventually(t, func() bool { return len(slices.Collect(p.Sessions())) == 0 },
 		alertWriteTimeout, 10*time.Millisecond, "the pipe outlived its close")
@@ -522,7 +547,7 @@ func TestUpgrade_WebSocketCloseTowardTheOriginIsBounded(t *testing.T) {
 	client := &stalledPeer{wake: make(chan struct{})}
 	origin := &stalledPipe{closed: make(chan struct{})}
 	wc := &WebSocketCtx{ctx: context.Background(), cancel: func(error) {}}
-	wc.setHops(client, bytes.NewReader((wsFrame{head: 0x81, payload: []byte("x")}).bytes()), origin)
+	wc.setHops(client, bytes.NewReader((wsFrame{head: 0x81, payload: []byte("x")}).bytes()), origin, nil, nil)
 
 	done := make(chan error, 1)
 	go func() {
@@ -548,7 +573,7 @@ func TestUpgrade_WebSocketCloseOnAFailureIsBounded(t *testing.T) {
 	client := &stalledPeer{wake: make(chan struct{})}
 	wc := &WebSocketCtx{ctx: context.Background(), cancel: func(error) {}}
 	// Unmasked, which fails the connection toward a client that stopped reading.
-	wc.setHops(client, bytes.NewReader((wsFrame{head: 0x81, payload: []byte("x")}).bytes()), discardPipe{})
+	wc.setHops(client, bytes.NewReader((wsFrame{head: 0x81, payload: []byte("x")}).bytes()), discardPipe{}, nil, nil)
 
 	done := make(chan error, 1)
 	go func() {
@@ -580,8 +605,61 @@ func pipeWebSocket(t *testing.T) (*WebSocketCtx, net.Conn, net.Conn) {
 		_ = originEnd.Close()
 	})
 	wc := &WebSocketCtx{ctx: ctx, cancel: cancel}
-	wc.setHops(client, client, origin)
+	wc.setHops(client, client, origin, nil, nil)
 	return wc, clientEnd, originEnd
+}
+
+func TestUpgrade_WebSocketEndSendsEachPeerItsClose(t *testing.T) {
+	cases := []struct {
+		name        string
+		goingAway   bool
+		clientClose bool
+		partial     bool
+		toClient    []byte
+		toOrigin    []byte
+	}{
+		{name: "handler returned nil", toClient: closePayload(1000, ""), toOrigin: closePayload(1000, "")},
+		{name: "session closed", goingAway: true, toClient: closePayload(1001, ""), toOrigin: closePayload(1001, "")},
+		{name: "the client sent its Close", clientClose: true, toClient: closePayload(1001, ""), toOrigin: closePayload(1000, "")},
+		{name: "a message started toward the client", partial: true, toOrigin: closePayload(1000, "")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			wc, clientConn, originConn := pipeWebSocket(t)
+			client := &wsEnd{t: t, conn: clientConn, br: bufio.NewReader(clientConn), client: true}
+			origin := &wsEnd{t: t, conn: originConn, br: bufio.NewReader(originConn)}
+			if tc.clientClose {
+				go client.send(client.frame(0x88, closePayload(1001, "")))
+				f, err := wc.Outbound().ReadFrame()
+				require.NoError(t, err)
+				require.Equal(t, OpClose, f.Opcode())
+			}
+			if tc.partial {
+				go func() { _ = wc.toClient.write(Frame{opcode: OpText, payload: []byte("a")}) }()
+				client.want(0x01, []byte("a"))
+			}
+			ended := make(chan struct{})
+			go func() {
+				wc.end(tc.goingAway)
+				close(ended)
+			}()
+			toOrigin := make(chan []wsFrame, 1)
+			go func() { toOrigin <- origin.wantEnd() }()
+			toClient := client.wantEnd()
+			checkClose := func(frames []wsFrame, want []byte, peer string) {
+				if want == nil {
+					assert.Empty(t, frames, "the %s got a Close", peer)
+					return
+				}
+				require.Len(t, frames, 1, "the %s got no Close", peer)
+				assert.Equal(t, byte(0x88), frames[0].head)
+				assert.Equal(t, want, frames[0].payload, "the Close toward the %s", peer)
+			}
+			checkClose(toClient, tc.toClient, "client")
+			checkClose(<-toOrigin, tc.toOrigin, "origin")
+			<-ended
+		})
+	}
 }
 
 func sendClientFrame(t *testing.T, conn net.Conn) {
@@ -1723,5 +1801,912 @@ func TestUpgrade_InsideAnHTTP2Connect(t *testing.T) {
 		assert.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
 	case <-time.After(2 * time.Second):
 		t.Fatal("the upgrade was not answered")
+	}
+}
+
+func TestUpgrade_CloseDoesNotWaitForAnOpenWebSocket(t *testing.T) {
+	origin, originURL := wsOrigin(t, nil)
+	p := testProxy(t)
+	p.MustAdd(originHost(originURL)+"/ws", func(c *WebSocketCtx) error { return c.Relay() })
+	resp := wsUpgrade(t, startProxy(t, p), origin, "")
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+	waitForSessions(t, p, 1)
+
+	start := time.Now()
+	require.NoError(t, p.Close())
+	assert.Less(t, time.Since(start), alertWriteTimeout/2)
+}
+
+func TestUpgrade_CloseDoesNotWaitForAnOpenPipe(t *testing.T) {
+	origin := plainUpgradeOrigin(t)
+	originURL, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+	p := testProxy(t)
+	p.MustAdd[TCP](originHost(originURL), func(c *TCPCtx) error { return c.Relay() })
+	p.MustAdd(originHost(originURL)+"/ws", forwardHandler)
+	raw, err := net.Dial("tcp", startProxy(t, p))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = raw.Close() })
+	_, err = io.WriteString(raw, "GET "+origin.URL+"/ws HTTP/1.1\r\nHost: "+originURL.Host+"\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\n")
+	require.NoError(t, err)
+	br := bufio.NewReader(raw)
+	resp, err := http.ReadResponse(br, nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+	_, err = io.WriteString(raw, "ping\n")
+	require.NoError(t, err)
+	_, err = br.ReadString('\n')
+	require.NoError(t, err)
+
+	start := time.Now()
+	require.NoError(t, p.Close())
+	assert.Less(t, time.Since(start), alertWriteTimeout/2)
+}
+
+func TestUpgrade_HandoverEndsTheSessionServedAsHTTP(t *testing.T) {
+	origin := upgradeOrigin(t)
+	originURL, _ := url.Parse(origin.URL)
+	ca, _ := GenerateCA()
+	tr := DefaultTransport()
+	tr.RootCAs = originPool(t, origin)
+	p, err := New(WithCA(ca), WithTransport(tr))
+	require.NoError(t, err)
+	p.MustAdd[TCP](originHost(originURL), relayStream)
+	outer := make(chan *Session, 1)
+	p.MustAdd(originHost(originURL)+"/ws", func(c *HTTPCtx) (*http.Response, error) {
+		outer <- c.Session()
+		return c.Forward()
+	})
+	raw, err := dialThroughProxy(t, startProxy(t, p), originURL.Host, ca)
+	require.NoError(t, err)
+	defer func() { _ = raw.Close() }()
+	_, err = fmt.Fprintf(raw, upgradeRequest, "/ws", originURL.Host)
+	require.NoError(t, err)
+	br := bufio.NewReader(raw)
+	resp, err := http.ReadResponse(br, nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+	sess := <-outer
+
+	listed := waitForSessions(t, p, 1)
+	assert.NotSame(t, sess, listed[0], "the session served as HTTP is still listed after the 101")
+	require.NoError(t, sess.Close())
+	require.NoError(t, raw.SetDeadline(time.Now().Add(5*time.Second)))
+	_, err = io.WriteString(raw, "ping\n")
+	require.NoError(t, err)
+	line, err := br.ReadString('\n')
+	require.NoError(t, err, "Close on the session served as HTTP ended the pipe")
+	assert.Equal(t, "ping\n", line)
+}
+
+// rawUpgradeOrigin answers one upgrade request with a 101 and reports how the proxy ended the
+// connection.
+func rawUpgradeOrigin(t *testing.T) (string, <-chan string) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	ended := make(chan string, 1)
+	go func() {
+		c, aerr := ln.Accept()
+		if aerr != nil {
+			return
+		}
+		defer c.Close()
+		if _, rerr := http.ReadRequest(bufio.NewReader(c)); rerr != nil {
+			return
+		}
+		_, _ = io.WriteString(c, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: echo\r\nConnection: Upgrade\r\n\r\n")
+		ended <- peerEnd(c, 5*time.Second)
+	}()
+	return ln.Addr().String(), ended
+}
+
+func TestUpgrade_OriginLegOfAPipeEnds(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		handler TCP
+		want    string
+	}{
+		{"handler error", func(*TCPCtx) error { return errors.New("handler failure") }, "RST"},
+		{"no stream entry", nil, "RST"},
+		{"handler returns nil", func(*TCPCtx) error { return nil }, "FIN"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			origin, ended := rawUpgradeOrigin(t)
+			tr := DefaultTransport()
+			tr.DialContext = pinnedDialer(origin)
+			p := testProxy(t, WithTransport(tr))
+			if tc.handler != nil {
+				p.MustAdd[TCP]("ws.example.test", tc.handler)
+			}
+			p.MustAdd("ws.example.test/ws", forwardHandler)
+			conn, err := net.Dial("tcp", startProxy(t, p))
+			require.NoError(t, err)
+			defer conn.Close()
+			_, err = fmt.Fprintf(conn, "GET http://ws.example.test/ws HTTP/1.1\r\nHost: ws.example.test\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\n")
+			require.NoError(t, err)
+			assert.Equal(t, tc.want, <-ended)
+		})
+	}
+}
+
+func TestUpgrade_WebSocketEndLeavesAnotherPooledConnectionAlone(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+	ended := make(chan string, 64)
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				br := bufio.NewReader(c)
+				for {
+					if _, err := http.ReadRequest(br); err != nil {
+						ended <- fmt.Sprintf("%v %v", c.RemoteAddr(), err)
+						return
+					}
+					_, _ = io.WriteString(c, "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+				}
+			}()
+		}
+	}()
+	_, xport, _ := net.SplitHostPort(ln.Addr().String())
+
+	origin, originURL := wsOrigin(t, nil)
+	p := testProxy(t)
+	p.MustAdd("127.0.0.1/x", forwardHandler)
+	p.MustAdd(originHost(originURL)+"/ws", func(*WebSocketCtx) error { return nil })
+	addr := startProxy(t, p)
+
+	for i := range 5 {
+		conn, err := net.Dial("tcp", addr)
+		require.NoError(t, err)
+		_, err = io.WriteString(conn, "GET http://127.0.0.1:"+xport+"/x HTTP/1.1\r\nHost: 127.0.0.1:"+xport+"\r\n\r\n")
+		require.NoError(t, err)
+		resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+		require.NoError(t, err)
+		_, _ = io.ReadAll(resp.Body)
+		_ = conn.Close()
+
+		raw, err := net.Dial("tcp", addr)
+		require.NoError(t, err)
+		_, err = fmt.Fprintf(raw, "GET %s/ws HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n"+
+			"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", origin.URL, originURL.Host)
+		require.NoError(t, err)
+		br := bufio.NewReader(raw)
+		wresp, err := http.ReadResponse(br, nil)
+		require.NoError(t, err)
+		require.Equal(t, http.StatusSwitchingProtocols, wresp.StatusCode)
+		_ = raw.SetReadDeadline(time.Now().Add(3 * time.Second))
+		_, _ = io.Copy(io.Discard, br)
+		_ = raw.Close()
+
+		select {
+		case e := <-ended:
+			t.Fatalf("iteration %d: the pooled connection to the HTTP origin ended with the WebSocket session: %s", i, e)
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
+}
+
+// pipeSessions counts the byte-stream sessions p lists.
+func pipeSessions(p *Proxy) int {
+	n := 0
+	for s := range p.Sessions() {
+		if s.Kind() == KindTCP {
+			n++
+		}
+	}
+	return n
+}
+
+func TestUpgrade_PipeNormalEndIsBoundedWhenTheOriginStalls(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	go func() {
+		c, aerr := ln.Accept()
+		if aerr != nil {
+			return
+		}
+		defer c.Close()
+		if _, rerr := http.ReadRequest(bufio.NewReader(c)); rerr != nil {
+			return
+		}
+		_, _ = io.WriteString(c, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: echo\r\nConnection: Upgrade\r\n\r\n")
+		_, _ = io.Copy(io.Discard, c)
+		<-release
+	}()
+	tr := DefaultTransport()
+	tr.DialContext = pinnedDialer(ln.Addr().String())
+	p := testProxy(t, WithTransport(tr))
+	returned := make(chan struct{})
+	p.MustAdd[TCP]("ws.example.test", func(*TCPCtx) error { close(returned); return nil })
+	p.MustAdd("ws.example.test/ws", forwardHandler)
+	conn, err := net.Dial("tcp", startProxy(t, p))
+	require.NoError(t, err)
+	defer conn.Close()
+	_, err = fmt.Fprintf(conn, "GET http://ws.example.test/ws HTTP/1.1\r\nHost: ws.example.test\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\n")
+	require.NoError(t, err)
+	<-returned
+	assert.Equal(t, "FIN", peerEnd(conn, 3*time.Second))
+	_ = conn.Close()
+	assert.Eventually(t, func() bool { return pipeSessions(p) == 0 }, 2*alertWriteTimeout, 20*time.Millisecond,
+		"the normal end of the pipe waits for its origin")
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	assert.NoError(t, p.Shutdown(ctx))
+}
+
+func TestUpgrade_PipeClientLegEndsWithAFINOverUnreadBytes(t *testing.T) {
+	for _, front := range []string{"explicit", "serveconn"} {
+		t.Run(front, func(t *testing.T) {
+			origin, _ := rawUpgradeOrigin(t)
+			tr := DefaultTransport()
+			tr.DialContext = pinnedDialer(origin)
+			p := testProxy(t, WithTransport(tr))
+			p.MustAdd[TCP]("ws.example.test", func(*TCPCtx) error {
+				time.Sleep(300 * time.Millisecond)
+				return nil
+			})
+			p.MustAdd("ws.example.test/ws", forwardHandler)
+			var conn net.Conn
+			var err error
+			target := "/ws"
+			if front == "explicit" {
+				conn, err = net.Dial("tcp", startProxy(t, p))
+				target = "http://ws.example.test/ws"
+			} else {
+				cl, lerr := net.Listen("tcp", "127.0.0.1:0")
+				require.NoError(t, lerr)
+				defer cl.Close()
+				go func() {
+					sc, aerr := cl.Accept()
+					if aerr == nil {
+						_ = p.ServeConn(sc)
+					}
+				}()
+				conn, err = net.Dial("tcp", cl.Addr().String())
+			}
+			require.NoError(t, err)
+			defer conn.Close()
+			_, err = fmt.Fprintf(conn, "GET %s HTTP/1.1\r\nHost: ws.example.test\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\n", target)
+			require.NoError(t, err)
+			br := bufio.NewReader(conn)
+			resp, err := http.ReadResponse(br, nil)
+			require.NoError(t, err)
+			require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+			_, err = conn.Write([]byte("unread bytes"))
+			require.NoError(t, err)
+			assert.Equal(t, "FIN", peerEnd(conn, 3*time.Second))
+		})
+	}
+}
+
+func TestUpgrade_WebSocketDeclinedByTheOriginEndsTheClientConnection(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "no", http.StatusForbidden)
+	}))
+	t.Cleanup(origin.Close)
+	tr := DefaultTransport()
+	tr.DialContext = pinnedDialer(origin.Listener.Addr().String())
+	p := testProxy(t, WithTransport(tr))
+	p.MustAdd[WebSocket]("ws.example.test/ws", func(c *WebSocketCtx) error { return c.Relay() })
+	conn, err := net.Dial("tcp", startProxy(t, p))
+	require.NoError(t, err)
+	defer conn.Close()
+	require.NoError(t, conn.SetDeadline(time.Now().Add(3*time.Second)))
+	_, err = fmt.Fprintf(conn, "GET http://ws.example.test/ws HTTP/1.1\r\nHost: ws.example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n")
+	require.NoError(t, err)
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	require.NoError(t, err)
+	_, _ = io.Copy(io.Discard, resp.Body)
+	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+	assert.True(t, resp.Close, "the client connection stays open")
+	_, err = br.ReadByte()
+	assert.ErrorIs(t, err, io.EOF)
+}
+
+// wsHalfOrigin is an origin that answers the upgrade, reads one Close frame, echoes a Close with
+// code, and reports the frame it read and how its reads then ended.
+func wsHalfOrigin(t *testing.T, code uint16) (string, <-chan string) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	report := make(chan string, 1)
+	go func() {
+		c, aerr := ln.Accept()
+		if aerr != nil {
+			return
+		}
+		defer func() { _ = c.Close() }()
+		br := bufio.NewReader(c)
+		if _, rerr := http.ReadRequest(br); rerr != nil {
+			return
+		}
+		_, _ = io.WriteString(c, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+		_ = c.SetReadDeadline(time.Now().Add(5 * time.Second))
+		head := make([]byte, 8)
+		if _, rerr := io.ReadFull(br, head); rerr != nil {
+			report <- "read close: " + rerr.Error()
+			return
+		}
+		_, werr := c.Write([]byte{0x88, 0x02, byte(code >> 8), byte(code)})
+		_, rerr := io.Copy(io.Discard, br)
+		report <- fmt.Sprintf("%x %v %v", head[:2], werr, rerr)
+	}()
+	return ln.Addr().String(), report
+}
+
+func TestUpgrade_WebSocketNilReturnGivesTheOriginItsNormalEnd(t *testing.T) {
+	origin, report := wsHalfOrigin(t, 1000)
+	tr := DefaultTransport()
+	tr.DialContext = pinnedDialer(origin)
+	p := testProxy(t, WithTransport(tr))
+	p.MustAdd("ws.example.test/ws", func(*WebSocketCtx) error { return nil })
+	conn, err := net.Dial("tcp", startProxy(t, p))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	_, err = fmt.Fprintf(conn, "GET http://ws.example.test/ws HTTP/1.1\r\nHost: ws.example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
+	require.NoError(t, err)
+	select {
+	case s := <-report:
+		assert.Equal(t, "8882 <nil> <nil>", s, "the Close frame, the echo written, then the FIN")
+	case <-time.After(6 * time.Second):
+		t.Fatal("the origin never read its end")
+	}
+}
+
+func TestUpgrade_WebSocketSessionCloseWritesWholeCloseFramesToBothPeers(t *testing.T) {
+	origin, report := wsHalfOrigin(t, 1001)
+	tr := DefaultTransport()
+	tr.DialContext = pinnedDialer(origin)
+	p := testProxy(t, WithTransport(tr))
+	running := make(chan *Session, 1)
+	p.MustAdd("ws.example.test/ws", func(c *WebSocketCtx) error {
+		running <- c.Session()
+		return c.Relay()
+	})
+	conn, err := net.Dial("tcp", startProxy(t, p))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	_, err = fmt.Fprintf(conn, "GET http://ws.example.test/ws HTTP/1.1\r\nHost: ws.example.test\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
+	require.NoError(t, err)
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+	sess := <-running
+	go func() { _ = sess.Close() }()
+
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(5*time.Second)))
+	f := make([]byte, 4)
+	_, err = io.ReadFull(br, f)
+	require.NoError(t, err)
+	assert.Equal(t, []byte{0x88, 0x02, 0x03, 0xe9}, f, "a Close frame with 1001")
+	_, err = conn.Write([]byte{0x88, 0x82, 1, 2, 3, 4, 0x03 ^ 1, 0xe9 ^ 2})
+	require.NoError(t, err)
+	_, err = io.Copy(io.Discard, br)
+	require.NoError(t, err, "the client reads the FIN")
+	select {
+	case s := <-report:
+		assert.Equal(t, "8882 <nil> <nil>", s)
+	case <-time.After(6 * time.Second):
+		t.Fatal("the origin never read its end")
+	}
+}
+
+func TestUpgrade_PipeKeepsTheHalfCloseUnderAHandlerTrace(t *testing.T) {
+	for _, traced := range []bool{false, true} {
+		t.Run(fmt.Sprint("traced=", traced), func(t *testing.T) {
+			ln, err := net.Listen("tcp", "127.0.0.1:0")
+			require.NoError(t, err)
+			defer ln.Close()
+			originErr := make(chan error, 1)
+			go func() {
+				c, err := ln.Accept()
+				if err != nil {
+					originErr <- err
+					return
+				}
+				defer c.Close()
+				br := bufio.NewReader(c)
+				if _, err := http.ReadRequest(br); err != nil {
+					originErr <- err
+					return
+				}
+				_, _ = io.WriteString(c, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: echo\r\nConnection: Upgrade\r\n\r\n")
+				_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+				_, err = io.Copy(io.Discard, br)
+				if err != nil {
+					originErr <- fmt.Errorf("origin read: %w", err)
+					return
+				}
+				_, err = io.WriteString(c, "bye\n")
+				originErr <- err
+			}()
+			_, port, _ := net.SplitHostPort(ln.Addr().String())
+			p := testProxy(t)
+			p.MustAdd[TCP]("127.0.0.1", relayStream)
+			p.MustAdd("127.0.0.1/ws", func(c *HTTPCtx) (*http.Response, error) {
+				r := c.Request()
+				if traced {
+					r = r.WithContext(httptrace.WithClientTrace(r.Context(), &httptrace.ClientTrace{}))
+				}
+				return c.ForwardRequest(r)
+			})
+			raw, err := net.Dial("tcp", startProxy(t, p))
+			require.NoError(t, err)
+			defer raw.Close()
+			_, err = fmt.Fprintf(raw, upgradeRequest, "http://127.0.0.1:"+port+"/ws", "127.0.0.1:"+port)
+			require.NoError(t, err)
+			br := bufio.NewReader(raw)
+			resp, err := http.ReadResponse(br, nil)
+			require.NoError(t, err)
+			require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+			require.NoError(t, raw.(*net.TCPConn).CloseWrite())
+			require.NoError(t, raw.SetReadDeadline(time.Now().Add(4*time.Second)))
+			line, err := br.ReadString('\n')
+			require.NoError(t, err)
+			require.NoError(t, <-originErr)
+			require.Equal(t, "bye\n", line, "the half-close of the client ended the upstream connection")
+		})
+	}
+}
+
+func TestUpgrade_PipeNormalEndOverTLSIsImmediate(t *testing.T) {
+	for _, version := range []uint16{tls.VersionTLS13, tls.VersionTLS12} {
+		t.Run(tls.VersionName(version), func(t *testing.T) {
+			origin := upgradeOrigin(t)
+			originURL, err := url.Parse(origin.URL)
+			require.NoError(t, err)
+			ca, err := GenerateCA()
+			require.NoError(t, err)
+			tr := DefaultTransport()
+			tr.RootCAs = originPool(t, origin)
+			p, err := New(WithCA(ca), WithTransport(tr))
+			require.NoError(t, err)
+			returned := make(chan time.Time, 1)
+			p.MustAdd[TCP](originHost(originURL), func(c *TCPCtx) error {
+				returned <- time.Now()
+				return nil
+			})
+			p.MustAdd(originHost(originURL)+"/ws", forwardHandler)
+			addr := startProxy(t, p)
+			raw, err := net.Dial("tcp", addr)
+			require.NoError(t, err)
+			defer raw.Close()
+			_, err = fmt.Fprintf(raw, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", originURL.Host, originURL.Host)
+			require.NoError(t, err)
+			br := bufio.NewReader(raw)
+			resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+			require.NoError(t, err)
+			require.Equal(t, 200, resp.StatusCode)
+			host, _ := splitHostPort(originURL.Host)
+			tc := tls.Client(raw, &tls.Config{ServerName: host, RootCAs: ca.CertPool(), MinVersion: version, MaxVersion: version, NextProtos: []string{"http/1.1"}})
+			require.NoError(t, tc.Handshake())
+			_, err = fmt.Fprintf(tc, "GET /ws HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\n", originURL.Host)
+			require.NoError(t, err)
+			tbr := bufio.NewReader(tc)
+			up, err := http.ReadResponse(tbr, nil)
+			require.NoError(t, err)
+			require.Equal(t, 101, up.StatusCode)
+			at := <-returned
+			require.NoError(t, raw.SetReadDeadline(time.Now().Add(5*time.Second)))
+			_, err = io.ReadAll(tbr)
+			require.NoError(t, err, "the close_notify of the normal end")
+			assert.Less(t, time.Since(at), alertWriteTimeout/2)
+		})
+	}
+}
+
+// stalledTLSWebSocketOrigin answers the upgrade with 101 over TLS and never reads again.
+// stalledTLSWebSocketOrigin answers the upgrade with 101 over TLS and never reads again.
+func stalledTLSWebSocketOrigin(t *testing.T, maxVersion uint16) *httptest.Server {
+	release := make(chan struct{})
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, brw, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+		_ = brw.Flush()
+		<-release
+	}))
+	srv.TLS = &tls.Config{MaxVersion: maxVersion}
+	srv.StartTLS()
+	t.Cleanup(func() { close(release); srv.Close() })
+	return srv
+}
+
+func TestUpgrade_WebSocketEndWithAStalledTLSOriginIsBounded(t *testing.T) {
+	for _, version := range []uint16{tls.VersionTLS12, tls.VersionTLS13} {
+		for _, by := range []string{"Session.Close", "cut"} {
+			t.Run(tls.VersionName(version)+"/"+by, func(t *testing.T) {
+				stalledTLSWebSocketEnd(t, version, by == "cut")
+			})
+		}
+	}
+}
+
+func stalledTLSWebSocketEnd(t *testing.T, version uint16, cut bool) {
+	origin := stalledTLSWebSocketOrigin(t, version)
+	u, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+	tr := DefaultTransport()
+	tr.RootCAs = originPool(t, origin)
+	p := testProxy(t, WithTransport(tr))
+	running := make(chan *Session, 1)
+	p.MustAdd(originHost(u)+"/ws", func(c *WebSocketCtx) error {
+		running <- c.Session()
+		return c.Relay()
+	})
+	conn, err := net.Dial("tcp", startProxy(t, p))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	_, err = fmt.Fprintf(conn, "GET https://%s/ws HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", u.Host, u.Host)
+	require.NoError(t, err)
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+	sess := <-running
+	go func() { _, _ = io.Copy(io.Discard, br) }()
+
+	// Masked binary frames of 512 KiB, until the origin's buffers are full.
+	frame := make([]byte, 14+512<<10)
+	frame[0], frame[1] = 0x82, 0x80|127
+	n := 512 << 10
+	for i := range 8 {
+		frame[2+i] = byte(uint64(n) >> (56 - 8*i))
+	}
+	go func() {
+		for {
+			if _, err := conn.Write(frame); err != nil {
+				return
+			}
+		}
+	}()
+	time.Sleep(2 * time.Second)
+
+	done := make(chan time.Duration, 1)
+	start := time.Now()
+	go func() {
+		if cut {
+			_ = p.Close()
+		} else {
+			_ = sess.Close()
+		}
+		done <- time.Since(start)
+	}()
+	bound := 2 * alertWriteTimeout
+	if cut {
+		bound = 7 * alertWriteTimeout
+	}
+	select {
+	case d := <-done:
+		require.Less(t, d, bound)
+	case <-time.After(10 * time.Second):
+		t.Fatal("the end did not return within 10 s")
+	}
+}
+
+func TestUpgrade_PipeHalfCloseTowardATLSOrigin(t *testing.T) {
+	for _, version := range []uint16{tls.VersionTLS12, tls.VersionTLS13} {
+		t.Run(tls.VersionName(version), func(t *testing.T) {
+			seen := make(chan string, 1)
+			srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, brw, err := http.NewResponseController(w).Hijack()
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+				_, _ = brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: echo\r\nConnection: Upgrade\r\n\r\n")
+				_ = brw.Flush()
+				_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+				b, err := io.ReadAll(brw)
+				seen <- fmt.Sprintf("read %q, end %v", b, err)
+				_, _ = io.WriteString(conn, "bye\n")
+			}))
+			srv.TLS = &tls.Config{MaxVersion: version}
+			srv.StartTLS()
+			t.Cleanup(srv.Close)
+			u, err := url.Parse(srv.URL)
+			require.NoError(t, err)
+			tr := DefaultTransport()
+			tr.RootCAs = originPool(t, srv)
+			p := testProxy(t, WithTransport(tr))
+			p.MustAdd[TCP](originHost(u), relayStream)
+			p.MustAdd(originHost(u)+"/ws", forwardHandler)
+			raw, err := net.Dial("tcp", startProxy(t, p))
+			require.NoError(t, err)
+			defer raw.Close()
+			_, err = fmt.Fprintf(raw, upgradeRequest, "https://"+u.Host+"/ws", u.Host)
+			require.NoError(t, err)
+			br := bufio.NewReader(raw)
+			resp, err := http.ReadResponse(br, nil)
+			require.NoError(t, err)
+			require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+			_, err = io.WriteString(raw, "hello")
+			require.NoError(t, err)
+			time.Sleep(100 * time.Millisecond)
+			require.NoError(t, raw.(*net.TCPConn).CloseWrite())
+			start := time.Now()
+			got := <-seen
+			if version == tls.VersionTLS12 {
+				// TLS 1.2 has no half-close, so the origin reads none.
+				assert.Contains(t, got, "timeout")
+			} else {
+				assert.Equal(t, `read "hello", end <nil>`, got)
+				assert.Less(t, time.Since(start), alertWriteTimeout)
+			}
+			require.NoError(t, raw.SetReadDeadline(time.Now().Add(4*time.Second)))
+			line, err := br.ReadString('\n')
+			require.NoError(t, err)
+			assert.Equal(t, "bye\n", line)
+		})
+	}
+}
+
+func TestUpgrade_WebSocketHandshakeAfterA1xx(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				br := bufio.NewReader(c)
+				req, err := http.ReadRequest(br)
+				if err != nil {
+					return
+				}
+				_, _ = c.Write([]byte("HTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\nHTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " +
+					wsAccept(req.Header.Get("Sec-WebSocket-Key")) + "\r\n\r\n"))
+				_, _ = io.Copy(io.Discard, br)
+			}()
+		}
+	}()
+	p := testProxy(t)
+	p.MustAdd("127.0.0.1/ws", func(c *WebSocketCtx) error { return c.Relay() })
+	c, err := net.Dial("tcp", startProxy(t, p))
+	require.NoError(t, err)
+	defer c.Close()
+	_, err = fmt.Fprintf(c, "GET http://%s/ws HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n"+
+		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", ln.Addr(), ln.Addr())
+	require.NoError(t, err)
+	_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(c), nil)
+	if err != nil {
+		t.Errorf("the upgrade got no answer: %v", err)
+	} else {
+		t.Logf("%s", resp.Status)
+	}
+	_ = c.Close()
+	_ = p.Close()
+	time.Sleep(500 * time.Millisecond)
+	buf := make([]byte, 1<<22)
+	n := runtime.Stack(buf, true)
+	t.Logf("goroutines in got1xx after Proxy.Close: %d", strings.Count(string(buf[:n]), "(*infoRelay).got1xx"))
+}
+
+func TestUpgrade_PipeNormalEndTowardATLS12Origin(t *testing.T) {
+	for _, version := range []uint16{tls.VersionTLS13, tls.VersionTLS12} {
+		t.Run(tls.VersionName(version), func(t *testing.T) {
+			seen := make(chan time.Time, 1)
+			srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, brw, err := http.NewResponseController(w).Hijack()
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+				_, _ = brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: echo\r\nConnection: Upgrade\r\n\r\n")
+				_ = brw.Flush()
+				_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+				_, err = io.ReadAll(brw)
+				t.Logf("origin read end: %v", err)
+				seen <- time.Now()
+			}))
+			srv.TLS = &tls.Config{MaxVersion: version}
+			srv.StartTLS()
+			t.Cleanup(srv.Close)
+			u, err := url.Parse(srv.URL)
+			require.NoError(t, err)
+			tr := DefaultTransport()
+			tr.RootCAs = originPool(t, srv)
+			p := testProxy(t, WithTransport(tr))
+			returned := make(chan time.Time, 1)
+			p.MustAdd[TCP](originHost(u), func(c *TCPCtx) error {
+				returned <- time.Now()
+				return nil
+			})
+			p.MustAdd(originHost(u)+"/ws", forwardHandler)
+			raw, err := net.Dial("tcp", startProxy(t, p))
+			require.NoError(t, err)
+			defer raw.Close()
+			_, err = fmt.Fprintf(raw, upgradeRequest, "https://"+u.Host+"/ws", u.Host)
+			require.NoError(t, err)
+			resp, err := http.ReadResponse(bufio.NewReader(raw), nil)
+			require.NoError(t, err)
+			require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+			at := <-returned
+			end := <-seen
+			t.Logf("origin read its end %v after the handler returned", end.Sub(at))
+			if end.Sub(at) > alertWriteTimeout/2 {
+				t.Errorf("the normal end toward the origin took %v", end.Sub(at))
+			}
+		})
+	}
+}
+
+func TestWebSocket_ProtocolErrorCloseMidMessage(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		conn, brw, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+		// The first fragment of a text message, FIN clear.
+		_, _ = brw.Write([]byte{0x01, 0x03, 'a', 'b', 'c'})
+		_ = brw.Flush()
+		_, _ = io.Copy(io.Discard, brw)
+	}))
+	t.Cleanup(origin.Close)
+	u, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+	p := testProxy(t)
+	p.MustAdd(originHost(u)+"/ws", relayFrames)
+	raw, err := net.Dial("tcp", startProxy(t, p))
+	require.NoError(t, err)
+	defer raw.Close()
+	_, err = fmt.Fprintf(raw, "GET %s/ws HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n"+
+		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", origin.URL, u.Host)
+	require.NoError(t, err)
+	br := bufio.NewReader(raw)
+	resp, err := http.ReadResponse(br, nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+	frag := make([]byte, 5)
+	require.NoError(t, raw.SetReadDeadline(time.Now().Add(3*time.Second)))
+	_, err = io.ReadFull(br, frag)
+	require.NoError(t, err)
+	require.Equal(t, byte(0x01), frag[0])
+	// An unmasked frame from the client breaks RFC 6455 section 5.1.
+	_, err = raw.Write([]byte{0x81, 0x01, 'x'})
+	require.NoError(t, err)
+	rest, err := io.ReadAll(br)
+	t.Logf("after the fragment the client read %x, end %v", rest, err)
+	if len(rest) > 0 && rest[0]&0x0f == 0x08 {
+		t.Errorf("a Close frame went to the client in the middle of a message the proxy had started")
+	}
+}
+
+func TestWebSocket_GoingAwayCloseKeepsThePeerCode(t *testing.T) {
+	wc, clientConn, originConn := pipeWebSocket(t)
+	client := &wsEnd{t: t, conn: clientConn, br: bufio.NewReader(clientConn), client: true}
+	origin := &wsEnd{t: t, conn: originConn, br: bufio.NewReader(originConn)}
+	go client.send(client.frame(0x88, closePayload(4000, "")))
+	f, err := wc.Outbound().ReadFrame()
+	require.NoError(t, err)
+	require.Equal(t, OpClose, f.Opcode())
+	ended := make(chan struct{})
+	go func() { wc.end(true); close(ended) }()
+	go func() { _ = origin.wantEnd() }()
+	frames := client.wantEnd()
+	require.Len(t, frames, 1)
+	t.Logf("Close toward the client: %d", binary.BigEndian.Uint16(frames[0].payload))
+	assert.Equal(t, closePayload(4000, ""), frames[0].payload)
+	<-ended
+}
+
+func TestWebSocket_ProtocolBreakCloseCodeTowardTheOtherPeer(t *testing.T) {
+	ws := openWS(t, wsConf{})
+	ws.client.send(wsFrame{head: 0x81, payload: []byte("Hello")})
+	ws.client.wantFailed(1002)
+	frames := ws.origin.wantEnd()
+	require.Len(t, frames, 1)
+	code := binary.BigEndian.Uint16(frames[0].payload)
+	t.Logf("Close toward the origin: %d", code)
+	assert.Equal(t, uint16(1000), code)
+}
+
+type upgradeBody struct{ io.ReadWriteCloser }
+
+func TestUpgrade_WebSocketPipeWithNoHandlerEndsBothLegsWithTheirFailedEnd(t *testing.T) {
+	for name, c := range map[string]cause{"peer failed": causePeerFailed, "session close before the 101": causeClosed} {
+		t.Run(name, func(t *testing.T) {
+			peerClient, client := tcpPair(t)
+			peerOrigin, origin := tcpPair(t)
+			pipe := &upgradedPipe{client: client, backend: upgradeBody{origin}, raw: origin, accepted: make(chan struct{})}
+			deadline := time.Now().Add(300 * time.Millisecond)
+			if err := pipe.endBy(c, deadline); err != nil {
+				require.ErrorIs(t, err, net.ErrClosed)
+			}
+			require.False(t, time.Now().After(deadline.Add(100*time.Millisecond)), "the end of the pipe ran past its deadline")
+			require.Equal(t, "RST", peerEnd(peerClient, time.Second), "client leg")
+			require.Equal(t, "RST", peerEnd(peerOrigin, time.Second), "origin leg")
+		})
+	}
+}
+
+func TestUpgrade_PipeStartTLSRefusalEndsTheClientNormally(t *testing.T) {
+	origin, _ := rawUpgradeOrigin(t)
+	tr := DefaultTransport()
+	tr.DialContext = pinnedDialer(origin)
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithTransport(tr), WithCA(ca))
+	require.NoError(t, err)
+	p.MustAdd[TCP]("ws.example.test:80", func(c *TCPCtx) error { return c.StartTLS() })
+	p.MustAdd("ws.example.test:80/ws", forwardHandler)
+	conn, err := net.Dial("tcp", startProxy(t, p))
+	require.NoError(t, err)
+	defer conn.Close()
+	_, err = fmt.Fprintf(conn, "GET http://ws.example.test/ws HTTP/1.1\r\nHost: ws.example.test\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\n")
+	require.NoError(t, err)
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+	_, err = conn.Write([]byte{0x16, 0x03, 0x01, 0x00, 0x04, 0x01, 0x00, 0x00, 0x00})
+	require.NoError(t, err)
+	require.NoError(t, conn.SetReadDeadline(time.Now().Add(3*time.Second)))
+	b, err := io.ReadAll(br)
+	require.NoError(t, err, "the refusal of a StartTLS, an answer, ended the stream with a reset")
+	require.NotEmpty(t, b, "no alert")
+}
+
+func TestUpgrade_PipeOnAnH2ConnectEndsWithItsCarrier(t *testing.T) {
+	origin, _ := rawUpgradeOrigin(t)
+	tr := DefaultTransport()
+	tr.DialContext = pinnedDialer(origin)
+	p := testProxy(t, WithTransport(tr))
+	started, returned := make(chan struct{}), make(chan struct{})
+	p.MustAdd[TCP]("allowed.test:80", func(c *TCPCtx) error {
+		close(started)
+		<-c.Context().Done()
+		close(returned)
+		return nil
+	})
+	p.MustAdd("allowed.test/ws", forwardHandler)
+	raw, err := net.Dial("tcp", startProxy(t, p))
+	require.NoError(t, err)
+	cc, err := (&http2.Transport{AllowHTTP: true}).NewClientConn(raw)
+	require.NoError(t, err)
+	pr, pw := io.Pipe()
+	t.Cleanup(func() { _ = pw.Close() })
+	req, err := http.NewRequest(http.MethodConnect, "https://allowed.test:80", pr)
+	require.NoError(t, err)
+	resp, err := cc.RoundTrip(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	_, err = io.WriteString(pw, "GET /ws HTTP/1.1\r\nHost: allowed.test\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\n")
+	require.NoError(t, err)
+	select {
+	case <-started:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the pipe handler did not start")
+	}
+	require.NoError(t, raw.(*net.TCPConn).SetLinger(0))
+	require.NoError(t, raw.Close())
+	select {
+	case <-returned:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the pipe on a stream outlived the peer reset of its carrier, I3")
 	}
 }

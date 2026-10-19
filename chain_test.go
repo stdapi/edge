@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -834,7 +835,7 @@ func TestChain_ReplacedHTTP2ConnectionEndsWithTheDialer(t *testing.T) {
 	require.NotSame(t, cc1, cc2, "a connection going away is not reused")
 	require.NoError(t, cc1.Err(), "a connection with a tunnel on it stays until the tunnel ends")
 
-	u.close()
+	u.close(time.Now().Add(alertWriteTimeout))
 	for i, srv := range []net.Conn{srv1, srv2} {
 		// The GOAWAY the close sends arrives ahead of the end, and a socket closed with the
 		// peer's bytes still unread ends in a reset rather than an EOF.
@@ -850,6 +851,34 @@ func TestChain_ReplacedHTTP2ConnectionEndsWithTheDialer(t *testing.T) {
 	}
 	_, err = str.Read(make([]byte, 1))
 	require.Error(t, err)
+}
+
+func TestChain_SecondHTTP2ConnectionToAProxyEndsWithoutTheDialerLock(t *testing.T) {
+	cli1, srv1 := tcpPair(t)
+	h2Peer(t, srv1)
+	cli2, srv2 := tcpPair(t)
+	h2Peer(t, srv2)
+	tr := &Transport{DialContext: func(context.Context, string, string) (net.Conn, error) { return cli2, nil }}
+	u := newUpstreamDialer(tr)
+	defer u.close(time.Now().Add(alertWriteTimeout))
+	proxy, err := url.Parse("https://proxy.test:443")
+	require.NoError(t, err)
+	cc1, _, err := u.shareH2Conn(proxy, cli1)
+	require.NoError(t, err)
+
+	tc, err := u.dialRaw(t.Context(), "tcp", "proxy.test:443")
+	require.NoError(t, err)
+	shared := make(chan *h2tunnel.Conn, 1)
+	go func() {
+		cc, _, _ := u.shareH2Conn(proxy, tc)
+		shared <- cc
+	}()
+	select {
+	case cc := <-shared:
+		require.Same(t, cc1, cc, "the connection already shared was not reused")
+	case <-time.After(3 * time.Second):
+		t.Fatal("the end of a second connection to the proxy waits for the lock its caller holds")
+	}
 }
 
 // h2Proxies dials fake HTTP/2 proxies over TLS, one connection per dial, each answering
@@ -920,7 +949,7 @@ func (p *h2Proxies) dialer(t *testing.T) *upstreamDialer {
 	tr.DialContext = p.dial
 	tr.RootCAs = poolOf(p.ca)
 	u := newUpstreamDialer(tr)
-	t.Cleanup(u.close)
+	t.Cleanup(func() { u.close(time.Now().Add(alertWriteTimeout)) })
 	return u
 }
 
@@ -1160,7 +1189,7 @@ func TestChain_TCPStreamJoinsTheHTTP3ConnectionAFlowOpened(t *testing.T) {
 func TestChain_HTTP3ConnectionGoingAwayIsLeft(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
-	proxyAddr, srv := h3ConnectEcho(t, ca)
+	proxyAddr, srv := h3ConnectEcho(t, ca, nil)
 	front, _ := chainedFront(t, ca, "https://"+proxyAddr.String(), onQUIC)
 	up := front.srv.fwd.up
 	proxy := &url.URL{Scheme: "https", Host: proxyAddr.String()}
@@ -1363,7 +1392,8 @@ func TestChain_TunnelOverHTTP3IsAConnection(t *testing.T) {
 func TestChain_WriteDeadlineResetsTheStreamAlone(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
-	proxyAddr, _ := h3ConnectEcho(t, ca)
+	ends := make(chan error, 2)
+	proxyAddr, _ := h3ConnectEcho(t, ca, ends)
 	front, _ := chainedFront(t, ca, "https://"+proxyAddr.String(), onQUIC)
 	up := front.srv.fwd.up
 
@@ -1382,6 +1412,14 @@ func TestChain_WriteDeadlineResetsTheStreamAlone(t *testing.T) {
 	_, err = late.Write([]byte("again"))
 	require.Error(t, err, "the stream is reset")
 	assert.False(t, isTimeout(err))
+	select {
+	case err = <-ends:
+		reset, ok := errors.AsType[*quic.StreamError](err)
+		require.True(t, ok, "the proxy read %v", err)
+		assert.Equal(t, quic.StreamErrorCode(http3.ErrCodeConnectError), reset.ErrorCode)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the proxy did not read the end of the stream")
+	}
 
 	_, err = other.Write([]byte("pong"))
 	require.NoError(t, err)
@@ -1391,7 +1429,9 @@ func TestChain_WriteDeadlineResetsTheStreamAlone(t *testing.T) {
 	assert.Equal(t, "pong", string(buf))
 }
 
-func h3ConnectEcho(t *testing.T, ca *CA) (netip.AddrPort, *http3.Server) {
+// h3ConnectEcho is an HTTP/3 proxy echoing what each CONNECT stream carries. It sends the
+// error that ends the read of each stream on ends when ends is not nil.
+func h3ConnectEcho(t *testing.T, ca *CA, ends chan<- error) (netip.AddrPort, *http3.Server) {
 	t.Helper()
 	cert, err := ca.Leaf("127.0.0.1")
 	require.NoError(t, err)
@@ -1417,6 +1457,9 @@ func h3ConnectEcho(t *testing.T, ca *CA) (netip.AddrPort, *http3.Server) {
 					_ = rc.Flush()
 				}
 				if rerr != nil {
+					if ends != nil {
+						ends <- rerr
+					}
 					return
 				}
 			}
@@ -1433,7 +1476,7 @@ func h3ConnectEcho(t *testing.T, ca *CA) (netip.AddrPort, *http3.Server) {
 func TestChain_H3ProxyWithoutCONNECTUDPCarriesCONNECT(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
-	proxyAddr, _ := h3ConnectEcho(t, ca)
+	proxyAddr, _ := h3ConnectEcho(t, ca, nil)
 	front, dialer := chainedFront(t, ca, "https://"+proxyAddr.String(), onQUIC)
 	up := front.srv.fwd.up
 
@@ -1458,7 +1501,7 @@ func TestChain_H3ProxyWithoutCONNECTUDPCarriesCONNECT(t *testing.T) {
 func TestChain_ConcurrentCONNECTsShareOneHTTP3Dial(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
-	proxyAddr, _ := h3ConnectEcho(t, ca)
+	proxyAddr, _ := h3ConnectEcho(t, ca, nil)
 	front, dialer := chainedFront(t, ca, "https://"+proxyAddr.String(), onQUIC)
 	up := front.srv.fwd.up
 
@@ -1483,7 +1526,7 @@ func TestChain_ConcurrentCONNECTsShareOneHTTP3Dial(t *testing.T) {
 func TestChain_WaiterDialsWhenTheHTTP3DialWasCancelled(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
-	proxyAddr, _ := h3ConnectEcho(t, ca)
+	proxyAddr, _ := h3ConnectEcho(t, ca, nil)
 	tr := DefaultTransport()
 	tr.RootCAs = poolOf(ca)
 	tr.Proxy = fixedProxy("https://" + proxyAddr.String())
@@ -1503,7 +1546,7 @@ func TestChain_WaiterDialsWhenTheHTTP3DialWasCancelled(t *testing.T) {
 		return defaultDialer.DialContext(ctx, network, addr)
 	}
 	u := newUpstreamDialer(tr)
-	t.Cleanup(u.close)
+	t.Cleanup(func() { u.close(time.Now().Add(alertWriteTimeout)) })
 	proxy := &url.URL{Scheme: "https", Host: proxyAddr.String()}
 
 	initCtx, cancel := context.WithCancel(t.Context())
@@ -1617,7 +1660,7 @@ func TestChain_HTTP11ProxyIsDialedOncePerCONNECTOnceKnown(t *testing.T) {
 		return defaultDialer.DialContext(ctx, network, address)
 	}
 	u := newUpstreamDialer(tr)
-	t.Cleanup(u.close)
+	t.Cleanup(func() { u.close(time.Now().Add(alertWriteTimeout)) })
 	proxy := &url.URL{Scheme: "https", Host: addr}
 
 	var wg sync.WaitGroup
@@ -2564,4 +2607,288 @@ func TestChain_CapsuleExitCloseReturnsAtOnce(t *testing.T) {
 	start := time.Now()
 	require.NoError(t, c.Close())
 	assert.Less(t, time.Since(start), alertWriteTimeout/2, "Close blocked on a proxy that stopped reading")
+}
+
+func TestChain_ExitUnderAQUICLegGetsTheFormOfItsEnd(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(fmt.Sprintf("failed %t", fail), func(t *testing.T) { chainedQUICExitEnd(t, fail) })
+	}
+}
+
+func chainedQUICExitEnd(t *testing.T, fail bool) {
+	originCA, err := GenerateCA(WithCASubject("edge raw QUIC origin CA"))
+	require.NoError(t, err)
+	ln, err := quic.ListenAddr("127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{selfSignedFor(t, originCA, h3Authority)},
+		NextProtos:   []string{"raw"},
+		MinVersion:   tls.VersionTLS13,
+	}, &quic.Config{})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, aerr := ln.Accept(context.Background())
+			if aerr != nil {
+				return
+			}
+			_ = conn
+		}
+	}()
+	origin, err := netip.ParseAddrPort(ln.Addr().String())
+	require.NoError(t, err)
+
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	backTr := DefaultTransport()
+	backTr.RootCAs = poolOf(originCA)
+	back, err := New(WithCA(ca), WithTransport(backTr))
+	require.NoError(t, err)
+	back.MustAdd[UDP]("127.0.0.1", forwardDatagram)
+	back.MustAdd[QUIC](h3Authority, relayQUIC)
+	backFront, _ := startQUICFront(t, back, ca)
+
+	frontTr := DefaultTransport()
+	frontTr.RootCAs = poolOf(originCA)
+	frontTr.Proxy = fixedProxy("https://" + backFront.String())
+	pool := poolOf(originCA)
+	pool.AddCert(ca.cert)
+	frontTr.RootCAs = pool
+	front, err := New(WithCA(ca), WithTransport(frontTr))
+	require.NoError(t, err)
+	dialed := make(chan error, 1)
+	release := make(chan struct{})
+	front.MustAdd[QUIC](h3Authority, func(c *QUICCtx) error {
+		_, derr := c.Dial()
+		dialed <- derr
+		if derr != nil {
+			return derr
+		}
+		<-release
+		if fail {
+			return assert.AnError
+		}
+		return nil
+	})
+	frontAddr := startQUICRedirected(t, front, origin)
+
+	pc, err := loopbackUDP()
+	require.NoError(t, err)
+	defer func() { _ = pc.Close() }()
+	conn, err := quic.Dial(t.Context(), pc, net.UDPAddrFromAddrPort(frontAddr), &tls.Config{
+		ServerName: h3Authority, RootCAs: poolOf(ca), NextProtos: []string{"raw"}, MinVersion: tls.VersionTLS13,
+	}, &quic.Config{HandshakeIdleTimeout: 3 * time.Second})
+	require.NoError(t, err)
+	defer func() { _ = conn.CloseWithError(0, "") }()
+	require.NoError(t, <-dialed)
+
+	var tunnel *Session
+	for _, s := range waitForSessions(t, back, 2) {
+		if s.Via() == nil {
+			tunnel = s
+		}
+	}
+	require.NotNil(t, tunnel)
+	close(release)
+	select {
+	case <-tunnel.end.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the tunnel of the exit did not end")
+	}
+	c := tunnel.end.first()
+	if fail {
+		require.Equal(t, causePeerFailed, c, "a failed leg gave its exit stream its normal end")
+	} else {
+		require.Equal(t, causePeer, c, "a leg ended normally gave its exit stream its failed end")
+	}
+}
+
+// stallExit is a connected socket whose writes block once stalled, as a capsule exit does when
+// the next proxy stops reading, until its closeBy or Abort runs.
+type stallExit struct {
+	*net.UDPConn
+	stall   atomic.Bool
+	release chan struct{}
+	once    sync.Once
+}
+
+func (s *stallExit) Write(b []byte) (int, error) {
+	if s.stall.Load() {
+		<-s.release
+		return 0, net.ErrClosed
+	}
+	return s.UDPConn.Write(b)
+}
+
+func (s *stallExit) unblock()                { s.once.Do(func() { close(s.release) }) }
+func (s *stallExit) closeBy(time.Time) error { s.unblock(); return s.UDPConn.Close() }
+func (s *stallExit) Abort()                  { s.unblock(); _ = s.UDPConn.Close() }
+
+func TestChain_QUICLegOverAStalledExitEndsByTheDeadlineOfItsCloser(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	origin := h3Origin(t, ca)
+	u := newUpstreamDialer(DefaultTransport())
+	udp, err := net.DialUDP("udp4", nil, net.UDPAddrFromAddrPort(origin))
+	require.NoError(t, err)
+	sock := &stallExit{UDPConn: udp, release: make(chan struct{})}
+	t.Cleanup(sock.unblock)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := u.quicOn(ctx, sock, origin.String(), &tls.Config{
+		RootCAs: poolOf(ca), ServerName: h3Authority, NextProtos: []string{"h3"}, MinVersion: tls.VersionTLS13,
+	}, &quic.Config{})
+	require.NoError(t, err)
+	time.Sleep(100 * time.Millisecond)
+
+	sock.stall.Store(true)
+	q := &QUICCtx{dialed: conn}
+	deadline := time.Now().Add(300 * time.Millisecond)
+	done := make(chan struct{})
+	go func() {
+		q.endLegs(false, deadline)
+		close(done)
+	}()
+	select {
+	case <-done:
+		require.WithinDuration(t, deadline, time.Now(), 200*time.Millisecond)
+	case <-time.After(3 * alertWriteTimeout):
+		t.Fatal("the end of a QUIC leg over a stalled exit ran past the deadline of its closer")
+	}
+	select {
+	case <-conn.Context().Done():
+	case <-time.After(time.Second):
+		t.Fatal("the leg outlived the failed end of its exit")
+	}
+	u.liveMu.Lock()
+	_, kept := u.quics[conn]
+	u.liveMu.Unlock()
+	require.Eventually(t, func() bool {
+		u.liveMu.Lock()
+		defer u.liveMu.Unlock()
+		_, kept = u.quics[conn]
+		return !kept
+	}, time.Second, 10*time.Millisecond, "the dialer kept a leg whose exit ended")
+}
+
+func TestChain_PooledH3ConnectionEndedByItsPoolGivesItsExitTheNormalEnd(t *testing.T) {
+	for _, how := range []string{"pool", "cut"} {
+		t.Run(how, func(t *testing.T) {
+			originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
+			require.NoError(t, err)
+			origin := h3Origin(t, originCA)
+			ca, err := GenerateCA()
+			require.NoError(t, err)
+
+			backTr := DefaultTransport()
+			backTr.RootCAs = poolOf(originCA)
+			back, err := New(WithCA(ca), WithTransport(backTr))
+			require.NoError(t, err)
+			back.MustAdd[UDP]("127.0.0.1", forwardDatagram)
+			back.MustAdd[QUIC](h3Authority, relayQUIC)
+			backFront, _ := startQUICFront(t, back, ca)
+
+			frontTr := DefaultTransport()
+			frontTr.AllowHTTP3 = true
+			frontTr.RootCAs = poolOf(ca)
+			frontTr.Proxy = fixedProxy("https://" + backFront.String())
+			front, err := New(WithCA(ca), WithTransport(frontTr))
+			require.NoError(t, err)
+			front.MustAdd(h3Authority+"/+{any}", func(c *HTTPCtx) (*http.Response, error) { return c.Forward() })
+			frontAddr := startQUICRedirected(t, front, origin)
+
+			tr := dialQUICTo(frontAddr, poolOf(ca))
+			defer func() { _ = tr.Close() }()
+			req, err := http.NewRequest(http.MethodGet, "https://"+h3Authority+":"+strconv.Itoa(int(frontAddr.Port()))+"/echo", nil)
+			require.NoError(t, err)
+			resp, err := tr.RoundTrip(req)
+			require.NoError(t, err)
+			_, _ = io.ReadAll(resp.Body)
+			require.NoError(t, resp.Body.Close())
+
+			var tunnel *Session
+			for _, s := range waitForSessions(t, back, 2) {
+				if s.Tunnel() {
+					tunnel = s
+				}
+			}
+			require.NotNil(t, tunnel)
+			time.Sleep(100 * time.Millisecond)
+
+			if how == "pool" {
+				front.srv.fwd.mu.Lock()
+				pools := front.srv.fwd.pools.Values()
+				front.srv.fwd.mu.Unlock()
+				for _, pool := range pools {
+					pool.close()
+				}
+			} else {
+				_ = front.Close()
+			}
+			select {
+			case <-tunnel.end.done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the tunnel of the exit did not end")
+			}
+			require.NotEqual(t, causePeerFailed, tunnel.end.first(), "the exit of an idle pooled connection got its failed end")
+		})
+	}
+}
+
+func TestChain_CloseOfAnotherProxyLeavesAChainedQUICLeg(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	origin := h3Origin(t, ca)
+	u := newUpstreamDialer(DefaultTransport())
+	udp, err := net.DialUDP("udp4", nil, net.UDPAddrFromAddrPort(origin))
+	require.NoError(t, err)
+	sock := &stallExit{UDPConn: udp, release: make(chan struct{})}
+	t.Cleanup(sock.unblock)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := u.quicOn(ctx, sock, origin.String(), &tls.Config{
+		RootCAs: poolOf(ca), ServerName: h3Authority, NextProtos: []string{"h3"}, MinVersion: tls.VersionTLS13,
+	}, &quic.Config{KeepAlivePeriod: 100 * time.Millisecond})
+	require.NoError(t, err)
+	defer conn.CloseWithError(0, "")
+
+	other, err := New()
+	require.NoError(t, err)
+	require.NoError(t, other.Close())
+
+	select {
+	case <-conn.Context().Done():
+		t.Fatalf("the leg of one dialer ended when another proxy closed: %v", context.Cause(conn.Context()))
+	case <-time.After(3 * alertWriteTimeout):
+	}
+}
+
+func TestChain_EarlierDeadlineOfASecondCloserBoundsTheLeg(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	origin := h3Origin(t, ca)
+	u := newUpstreamDialer(DefaultTransport())
+	udp, err := net.DialUDP("udp4", nil, net.UDPAddrFromAddrPort(origin))
+	require.NoError(t, err)
+	sock := &stallExit{UDPConn: udp, release: make(chan struct{})}
+	t.Cleanup(sock.unblock)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := u.quicOn(ctx, sock, origin.String(), &tls.Config{
+		RootCAs: poolOf(ca), ServerName: h3Authority, NextProtos: []string{"h3"}, MinVersion: tls.VersionTLS13,
+	}, &quic.Config{})
+	require.NoError(t, err)
+	time.Sleep(100 * time.Millisecond)
+	sock.stall.Store(true)
+	v, _ := quicLegs.Load(conn)
+	leg := v.(*quicLeg)
+	start := time.Now()
+	go func() { _ = closeQUIC(conn, 0, start.Add(2*time.Second)) }()
+	time.Sleep(20 * time.Millisecond)
+	_ = closeQUIC(conn, 0, start.Add(300*time.Millisecond))
+	select {
+	case <-leg.done:
+		require.WithinDuration(t, start.Add(300*time.Millisecond), time.Now(), 300*time.Millisecond)
+	case <-time.After(3 * time.Second):
+		t.Fatal("leg never ended")
+	}
 }

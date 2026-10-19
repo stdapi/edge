@@ -9,22 +9,30 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"net/netip"
 	"net/url"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/net/http2"
 )
 
 // waitForSessions polls until the proxy reports want sessions. A session is registered by the
@@ -248,6 +256,49 @@ func TestSession_WebSocketEndsAtCloseWithoutWaitingForItsHandler(t *testing.T) {
 	require.NoError(t, sess.Close())
 	assertSessionEnded(t, p, sess)
 	assert.Error(t, ctx.Err(), "the context of the handler is live")
+}
+
+func TestSession_CloseSendsTheWebSocketClientGoingAway(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	client, p := wsThroughProxy(t, func(*WebSocketCtx) error {
+		<-release
+		return nil
+	})
+	sess := waitForSessions(t, p, 1)[0]
+	require.NoError(t, sess.Close())
+	frames := client.wantEnd()
+	require.Len(t, frames, 1)
+	assert.Equal(t, byte(0x88), frames[0].head)
+	assert.Equal(t, closePayload(1001, ""), frames[0].payload)
+}
+
+func TestSession_WebSocketHandlerReturningNilSendsANormalClose(t *testing.T) {
+	client, _ := wsThroughProxy(t, func(*WebSocketCtx) error { return nil })
+	frames := client.wantEnd()
+	require.Len(t, frames, 1)
+	assert.Equal(t, byte(0x88), frames[0].head)
+	assert.Equal(t, closePayload(1000, ""), frames[0].payload)
+}
+
+// wsThroughProxy upgrades a client to a WebSocket served by h through a proxy, and returns
+// the client past the 101.
+func wsThroughProxy(t *testing.T, h WebSocket) (*wsEnd, *Proxy) {
+	t.Helper()
+	origin, originURL := wsOrigin(t, nil)
+	p := testProxy(t)
+	p.MustAdd(originHost(originURL)+"/ws", h)
+	raw, err := net.Dial("tcp", startProxy(t, p))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = raw.Close() })
+	_, err = fmt.Fprintf(raw, "GET %s/ws HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n"+
+		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", origin.URL, originURL.Host)
+	require.NoError(t, err)
+	br := bufio.NewReader(raw)
+	resp, err := http.ReadResponse(br, nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+	return &wsEnd{t: t, conn: raw, br: br, client: true}, p
 }
 
 func TestSession_FrontIsNeverStale(t *testing.T) {
@@ -504,13 +555,13 @@ func TestSession_AdmitAfterChange(t *testing.T) {
 			}
 
 			admitted := decide()
-			require.True(t, p.srv.admitSession(admitted))
+			require.NoError(t, p.srv.admitSession(admitted, nil))
 			require.Len(t, slices.Collect(p.Sessions()), 1)
 			p.srv.untrackSession(admitted)
 
 			late := decide()
 			tc.change(t, p)
-			assert.False(t, p.srv.admitSession(late), "decided before the change, registered after it")
+			assert.Error(t, p.srv.admitSession(late, nil), "decided before the change, registered after it")
 			assert.Empty(t, slices.Collect(p.Sessions()), "a refused connection is not reported")
 		})
 	}
@@ -840,10 +891,10 @@ func TestSession_AdmissionRefusedOnceEnded(t *testing.T) {
 			ctx, cancel := context.WithCancel(t.Context())
 			sess := newSession(p, ctx, nil, Target{Scheme: "https", Host: "example.test", Port: "443"}, KindTCP, 0)
 			sess.cancel = cancel
-			sess.closer = io.NopCloser(nil)
+			sess.closer = noEnd{}
 
 			tc.end(p, sess)
-			assert.False(t, p.srv.admitSession(sess), "a session decided before the end is registered after it")
+			assert.Error(t, p.srv.admitSession(sess, nil), "a session decided before the end is registered after it")
 			assert.Empty(t, slices.Collect(p.Sessions()))
 		})
 	}
@@ -925,4 +976,567 @@ func TestSession_EndsAtTheCutWithoutWaitingForItsHandler(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestSession_CloseOnAFrontSessionEndsTheConnection(t *testing.T) {
+	for _, proto := range []string{"h1", "h2c"} {
+		t.Run(proto, func(t *testing.T) {
+			p := testProxy(t)
+			closed := make(chan error, 1)
+			p.MustAdd("allowed.test/", func(c *HTTPCtx) (*http.Response, error) {
+				closed <- c.Session().Close()
+				return Text(http.StatusOK, "ok"), nil
+			})
+			addr := startProxy(t, p)
+			var client *http.Client
+			if proto == "h1" {
+				client = proxyClient(addr, nil)
+			} else {
+				client = h2cFrontClient(addr)
+			}
+			var conns atomic.Int32
+			trace := &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) {
+				if !info.Reused {
+					conns.Add(1)
+				}
+			}}
+			for range 2 {
+				req, err := http.NewRequestWithContext(httptrace.WithClientTrace(t.Context(), trace), http.MethodGet, "http://allowed.test/", nil)
+				require.NoError(t, err)
+				resp, err := client.Do(req)
+				if err == nil {
+					_, _ = io.Copy(io.Discard, resp.Body)
+					_ = resp.Body.Close()
+				}
+				require.NoError(t, <-closed)
+			}
+			assert.EqualValues(t, 2, conns.Load(), "the front connection served a request after Close on its session")
+		})
+	}
+}
+
+func TestSession_CloseOnAnHTTP3FrontSessionEndsTheConnection(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+	got := make(chan *Session, 1)
+	p.MustAdd("front.example.test/", func(c *HTTPCtx) (*http.Response, error) {
+		got <- c.Session()
+		return Text(http.StatusOK, "ok"), nil
+	})
+	front, _ := startQUICFront(t, p, ca)
+	conn := dialQUICFront(t, front, ca)
+	t.Cleanup(func() { _ = conn.CloseWithError(0, "") })
+	req, err := http.NewRequest(http.MethodGet, "http://front.example.test/", nil)
+	require.NoError(t, err)
+	resp, err := h3Over(t, conn).RoundTrip(req)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+
+	require.NoError(t, (<-got).Close())
+	select {
+	case <-conn.Context().Done():
+		var appErr *quic.ApplicationError
+		require.ErrorAs(t, context.Cause(conn.Context()), &appErr)
+		assert.EqualValues(t, http3.ErrCodeNoError, appErr.ErrorCode)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close on the session left the HTTP/3 front connection open")
+	}
+}
+
+func TestSession_CloseOfAnHTTPConnectionEndsItNormally(t *testing.T) {
+	for _, front := range []string{"explicit", "serveconn"} {
+		t.Run(front, func(t *testing.T) {
+			p := testProxy(t)
+			entered := make(chan *Session, 1)
+			p.MustAdd("ws.example.test/x", func(c *HTTPCtx) (*http.Response, error) {
+				entered <- c.Session()
+				<-c.Request().Context().Done()
+				return nil, c.Request().Context().Err()
+			})
+			var conn net.Conn
+			var err error
+			target := "/x"
+			if front == "explicit" {
+				conn, err = net.Dial("tcp", startProxy(t, p))
+				target = "http://ws.example.test/x"
+			} else {
+				cl, lerr := net.Listen("tcp", "127.0.0.1:0")
+				require.NoError(t, lerr)
+				defer cl.Close()
+				go func() {
+					sc, aerr := cl.Accept()
+					if aerr == nil {
+						_ = p.ServeConn(sc)
+					}
+				}()
+				conn, err = net.Dial("tcp", cl.Addr().String())
+			}
+			require.NoError(t, err)
+			defer conn.Close()
+			_, err = fmt.Fprintf(conn, "POST %s HTTP/1.1\r\nHost: ws.example.test\r\nContent-Length: 100000\r\n\r\n", target)
+			require.NoError(t, err)
+			_, err = conn.Write(make([]byte, 50000))
+			require.NoError(t, err)
+			sess := <-entered
+			time.Sleep(50 * time.Millisecond)
+			require.NoError(t, sess.Close())
+			assert.Equal(t, "FIN", peerEnd(conn, 3*time.Second))
+		})
+	}
+}
+
+func TestSession_CloseEndsTheContextOfAFrontSession(t *testing.T) {
+	for _, mode := range []string{"plaintext", "caller TLS listener"} {
+		t.Run(mode, func(t *testing.T) {
+			p := testProxy(t)
+			done := make(chan bool, 1)
+			p.MustAdd("allowed.test/", func(c *HTTPCtx) (*http.Response, error) {
+				s := c.Session()
+				_ = s.Close()
+				select {
+				case <-s.Context().Done():
+					done <- true
+				case <-time.After(500 * time.Millisecond):
+					done <- false
+				}
+				return Text(http.StatusOK, "ok"), nil
+			})
+			inner, err := net.Listen("tcp", "127.0.0.1:0")
+			require.NoError(t, err)
+			var ln net.Listener = inner
+			if mode != "plaintext" {
+				cert, cerr := p.cfg.ca.Leaf("127.0.0.1")
+				require.NoError(t, cerr)
+				ln = tls.NewListener(inner, &tls.Config{Certificates: []tls.Certificate{*cert}, NextProtos: []string{"http/1.1"}})
+			}
+			go func() { _ = p.Serve(ln) }()
+			t.Cleanup(func() { _ = p.Close() })
+			var conn net.Conn
+			if mode == "plaintext" {
+				conn, err = net.Dial("tcp", inner.Addr().String())
+			} else {
+				conn, err = tls.Dial("tcp", inner.Addr().String(), &tls.Config{ServerName: "127.0.0.1", RootCAs: p.cfg.ca.CertPool(), NextProtos: []string{"http/1.1"}})
+			}
+			require.NoError(t, err)
+			defer conn.Close()
+			_, err = io.WriteString(conn, "GET http://allowed.test/ HTTP/1.1\r\nHost: allowed.test\r\n\r\n")
+			require.NoError(t, err)
+			require.True(t, <-done, "the context of a session is done once Close returned")
+		})
+	}
+}
+
+// closeDeadlines records the deadline of its close and blocks the close until it.
+type closeDeadlines chan time.Time
+
+func (c closeDeadlines) endBy(_ cause, deadline time.Time) error {
+	c <- deadline
+	time.Sleep(time.Until(deadline))
+	return nil
+}
+
+func TestSession_CloseSharesItsDeadlineWithWhatItCarries(t *testing.T) {
+	p := testProxy(t)
+	got := make(closeDeadlines, 2)
+	front := newSession(p, t.Context(), nil, Target{}, KindHTTP, HTTP2)
+	front.cancel = func() {}
+	require.True(t, p.srv.registerSession(front, got))
+	inner := newSession(p, t.Context(), nil, Target{Host: "inner.test", Port: "443"}, KindTCP, HTTP2)
+	inner.cancel = func() {}
+	inner.carrier = front
+	require.True(t, p.srv.registerSession(inner, got))
+
+	start := time.Now()
+	require.NoError(t, front.Close())
+	assert.Less(t, time.Since(start), alertWriteTimeout*3/2, "the carrier's own legs got a deadline of their own")
+	assert.Equal(t, <-got, <-got)
+}
+
+func TestSession_CloseCancelsATerminatedHTTP1Request(t *testing.T) {
+	for _, req := range []string{
+		"POST / HTTP/1.1\r\nHost: api.test\r\nContent-Length: 100\r\n\r\n0123456789",
+		"GET / HTTP/1.1\r\nHost: api.test\r\n\r\n",
+	} {
+		t.Run(req[:4], func(t *testing.T) { closeTerminatedHTTP1Request(t, req) })
+	}
+}
+
+func closeTerminatedHTTP1Request(t *testing.T, raw string) {
+	p, ca := newTLSProxy(t)
+	started := make(chan *HTTPCtx, 1)
+	ended := make(chan time.Duration, 1)
+	p.MustAdd("api.test/", func(c *HTTPCtx) (*http.Response, error) {
+		started <- c
+		begin := time.Now()
+		select {
+		case <-c.Request().Context().Done():
+			ended <- time.Since(begin)
+		case <-time.After(4 * time.Second):
+			ended <- -1
+		}
+		return nil, errors.New("done")
+	})
+	tc := tls.Client(connectRaw(t, startProxy(t, p), "api.test:443"), &tls.Config{ServerName: "api.test", RootCAs: ca.CertPool()})
+	require.NoError(t, tc.Handshake())
+	_, err := tc.Write([]byte(raw))
+	require.NoError(t, err)
+	c := <-started
+	start := time.Now()
+	require.NoError(t, c.Session().Close())
+	t.Logf("Session.Close returned in %v", time.Since(start))
+	d := <-ended
+	if d < 0 {
+		t.Fatal("Session.Close of the session served as HTTP left the request context running")
+	}
+	t.Logf("request context ended %v after Session.Close", d)
+}
+
+func TestSession_CloseCancelsAFrontRequest(t *testing.T) {
+	p := testProxy(t)
+	started := make(chan *HTTPCtx, 1)
+	ended := make(chan time.Duration, 1)
+	p.MustAdd("api.test/", func(c *HTTPCtx) (*http.Response, error) {
+		started <- c
+		begin := time.Now()
+		select {
+		case <-c.Request().Context().Done():
+			ended <- time.Since(begin)
+		case <-time.After(4 * time.Second):
+			ended <- -1
+		}
+		return nil, errors.New("done")
+	})
+	c, err := net.Dial("tcp", startProxy(t, p))
+	require.NoError(t, err)
+	defer c.Close()
+	_, err = c.Write([]byte("POST http://api.test/ HTTP/1.1\r\nHost: api.test\r\nContent-Length: 100\r\n\r\n0123456789"))
+	require.NoError(t, err)
+	hc := <-started
+	require.NoError(t, hc.Session().Close())
+	if d := <-ended; d < 0 {
+		t.Fatal("Session.Close of the front connection left the request context running")
+	} else {
+		t.Logf("ended after %v", d)
+	}
+}
+
+func TestSession_CloseCancelsATerminatedHTTP2Request(t *testing.T) {
+	p, ca := newTLSProxy(t)
+	started := make(chan *HTTPCtx, 1)
+	ended := make(chan time.Duration, 1)
+	p.MustAdd("api.test/", func(c *HTTPCtx) (*http.Response, error) {
+		started <- c
+		begin := time.Now()
+		select {
+		case <-c.Request().Context().Done():
+			ended <- time.Since(begin)
+		case <-time.After(4 * time.Second):
+			ended <- -1
+		}
+		return nil, errors.New("done")
+	})
+	tc := tls.Client(connectRaw(t, startProxy(t, p), "api.test:443"), &tls.Config{ServerName: "api.test", RootCAs: ca.CertPool(), NextProtos: []string{"h2"}})
+	require.NoError(t, tc.Handshake())
+	tr := &http2.Transport{}
+	cc, err := tr.NewClientConn(tc)
+	require.NoError(t, err)
+	pr, pw := io.Pipe()
+	defer pw.Close()
+	go func() { _, _ = pw.Write([]byte("0123456789")) }()
+	req, _ := http.NewRequest(http.MethodPost, "https://api.test/", pr)
+	req.ContentLength = 100
+	go func() { _, _ = cc.RoundTrip(req) }()
+	hc := <-started
+	require.NoError(t, hc.Session().Close())
+	if d := <-ended; d < 0 {
+		t.Fatal("Session.Close of the session served as HTTP/2 left the request context running")
+	} else {
+		t.Logf("ended after %v", d)
+	}
+}
+
+func TestSession_FrontCloseEndsAWebSocketInsideAStream(t *testing.T) {
+	_, originURL := wsOrigin(t, nil)
+	p := testProxy(t)
+	wsSess := make(chan *Session, 1)
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	p.MustAdd(originHost(originURL)+"/ws", func(c *WebSocketCtx) error {
+		wsSess <- c.Session()
+		<-release
+		return nil
+	})
+	front := make(chan *Session, 1)
+	p.MustAdd("front.test/", func(c *HTTPCtx) (*http.Response, error) {
+		front <- c.Session()
+		return Text(http.StatusOK, "ok"), nil
+	})
+	addr := startProxy(t, p)
+	raw, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = raw.Close() })
+	cc, err := (&http2.Transport{AllowHTTP: true}).NewClientConn(raw)
+	require.NoError(t, err)
+	pr, pw := io.Pipe()
+	t.Cleanup(func() { _ = pw.Close() })
+	req, err := http.NewRequest(http.MethodConnect, "http://"+originURL.Host, pr)
+	require.NoError(t, err)
+	req.Host = originURL.Host
+	resp, err := cc.RoundTrip(req)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	_, err = fmt.Fprintf(pw, "GET /ws HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n"+
+		"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", originURL.Host)
+	require.NoError(t, err)
+	br := bufio.NewReader(resp.Body)
+	up, err := http.ReadResponse(br, nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusSwitchingProtocols, up.StatusCode)
+	w := <-wsSess
+
+	freq, err := http.NewRequest(http.MethodGet, "http://front.test/", nil)
+	require.NoError(t, err)
+	fresp, err := cc.RoundTrip(freq)
+	require.NoError(t, err)
+	_, _ = io.Copy(io.Discard, fresp.Body)
+	f := <-front
+
+	start := time.Now()
+	require.NoError(t, f.Close())
+	t.Logf("front Close took %v", time.Since(start))
+	listed := slices.Contains(slices.Collect(p.Sessions()), w)
+	t.Logf("after the front Close: websocket ctx err %v, listed %v", w.Context().Err(), listed)
+	if w.Context().Err() == nil || listed {
+		t.Errorf("the WebSocket session the front connection carries outlives its Close: ctx %v, listed %v", w.Context().Err(), listed)
+	}
+}
+
+func TestSession_FrontCloseResetsACarriedStreamWithAHandlerReturningOnItsContext(t *testing.T) {
+	for _, mode := range []string{"returns-on-context", "parked"} {
+		t.Run(mode, func(t *testing.T) {
+			p := testProxy(t)
+			started := make(chan struct{})
+			release := make(chan struct{})
+			t.Cleanup(func() { close(release) })
+			originAddr, originConns := oneConnOrigin(t)
+			p.MustAdd[TCP]("svc.test:9", func(c *TCPCtx) error {
+				if _, err := c.DialTo(c.Context(), originAddr); err != nil {
+					return err
+				}
+				close(started)
+				if mode == "parked" {
+					<-release
+					return nil
+				}
+				<-c.Context().Done()
+				return nil
+			})
+			front := make(chan *Session, 1)
+			p.MustAdd("front.test/", func(c *HTTPCtx) (*http.Response, error) {
+				front <- c.Session()
+				return Text(http.StatusOK, "ok"), nil
+			})
+			raw, err := net.Dial("tcp", startProxy(t, p))
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = raw.Close() })
+			cc, err := (&http2.Transport{AllowHTTP: true}).NewClientConn(raw)
+			require.NoError(t, err)
+			pr, pw := io.Pipe()
+			t.Cleanup(func() { _ = pw.Close() })
+			req, err := http.NewRequest(http.MethodConnect, "http://svc.test:9", pr)
+			require.NoError(t, err)
+			req.Host = "svc.test:9"
+			resp, err := cc.RoundTrip(req)
+			require.NoError(t, err)
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			_, err = pw.Write([]byte{0})
+			require.NoError(t, err)
+			<-started
+			freq, err := http.NewRequest(http.MethodGet, "http://front.test/", nil)
+			require.NoError(t, err)
+			fresp, err := cc.RoundTrip(freq)
+			require.NoError(t, err)
+			_, _ = io.Copy(io.Discard, fresp.Body)
+			f := <-front
+			require.NoError(t, f.Close())
+			_, rerr := io.ReadAll(resp.Body)
+			t.Logf("the client read the end of the stream as %v", rerr)
+			end := peerEnd(<-originConns, 3*time.Second)
+			t.Logf("the origin read %s", end)
+			if rerr == nil || end != "RST" {
+				t.Errorf("a leg of the carried byte stream ended cleanly on the Close of its front connection: client %v, origin %s", rerr, end)
+			}
+		})
+	}
+}
+
+func TestSession_CloseResetsAnHTTP3FrontRequest(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+	got := make(chan *Session, 1)
+	returned := make(chan error, 1)
+	p.MustAdd("front.example.test/", func(c *HTTPCtx) (*http.Response, error) {
+		got <- c.Session()
+		select {
+		case <-c.Request().Context().Done():
+			returned <- context.Cause(c.Request().Context())
+		case <-time.After(3 * time.Second):
+			returned <- errors.New("request context never ended")
+		}
+		return nil, c.Request().Context().Err()
+	})
+	front, _ := startQUICFront(t, p, ca)
+	conn := dialQUICFront(t, front, ca)
+	req, err := http.NewRequest(http.MethodGet, "http://front.example.test/", nil)
+	require.NoError(t, err)
+	rt := make(chan error, 1)
+	go func() {
+		resp, err := h3Over(t, conn).RoundTrip(req)
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+		rt <- err
+	}()
+	sess := <-got
+	start := time.Now()
+	require.NoError(t, sess.Close())
+	assert.Less(t, time.Since(start), alertWriteTimeout, "Session.Close waited past its deadline")
+	var connErr error
+	select {
+	case <-conn.Context().Done():
+		connErr = context.Cause(conn.Context())
+	case <-time.After(3 * time.Second):
+		t.Fatal("connection not closed")
+	}
+	assert.Error(t, <-returned, "the handler's request context outlived Session.Close")
+	assertH3RequestReset(t, <-rt)
+	appErr, ok := errors.AsType[*quic.ApplicationError](connErr)
+	require.True(t, ok, "the connection ended with %v", connErr)
+	assert.Equal(t, quic.ApplicationErrorCode(http3.ErrCodeNoError), appErr.ErrorCode, "the connection did not get its normal end once its request ended")
+}
+
+func assertH3RequestReset(t *testing.T, err error) {
+	t.Helper()
+	h3e, ok := errors.AsType[*http3.Error](err)
+	require.True(t, ok, "the request ended with %v", err)
+	assert.Contains(t, []http3.ErrCode{http3.ErrCodeRequestCanceled, http3.ErrCodeInternalError}, h3e.ErrorCode, "the request in flight did not get its failed end")
+}
+
+func TestSession_CloseResetsATerminatedHTTP3Request(t *testing.T) {
+	originCA, err := GenerateCA(WithCASubject("edge h3 origin CA"))
+	require.NoError(t, err)
+	origin := h3Origin(t, originCA)
+	proxyCA, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(proxyCA))
+	require.NoError(t, err)
+	got := make(chan *Session, 1)
+	returned := make(chan error, 1)
+	p.MustAdd(h3Authority+"/+{any}", func(c *HTTPCtx) (*http.Response, error) {
+		got <- c.Session()
+		select {
+		case <-c.Request().Context().Done():
+			returned <- context.Cause(c.Request().Context())
+		case <-time.After(3 * time.Second):
+			returned <- errors.New("request context never ended")
+		}
+		return nil, c.Request().Context().Err()
+	})
+	proxyAddr := startQUICRedirected(t, p, origin)
+	tr := dialQUICTo(proxyAddr, poolOf(proxyCA))
+	defer func() { _ = tr.Close() }()
+	req, err := http.NewRequest(http.MethodGet, "https://"+h3Authority+"/echo", nil)
+	require.NoError(t, err)
+	rt := make(chan error, 1)
+	go func() {
+		resp, err := tr.RoundTrip(req)
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+		rt <- err
+	}()
+	sess := <-got
+	start := time.Now()
+	require.NoError(t, sess.Close())
+	assert.Less(t, time.Since(start), alertWriteTimeout, "Session.Close waited past its deadline")
+	assert.Error(t, <-returned, "the handler's request context outlived Session.Close")
+	assertH3RequestReset(t, <-rt)
+}
+
+func TestSession_CloseUnderARelayGivesTheClientNoCloseNotify(t *testing.T) {
+	originCA, err := GenerateCA()
+	require.NoError(t, err)
+	leaf, err := originCA.Leaf("origin.test")
+	require.NoError(t, err)
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{*leaf}, NextProtos: []string{"x-test"}})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		c, aerr := ln.Accept()
+		if aerr != nil {
+			return
+		}
+		t.Cleanup(func() { _ = c.Close() })
+		if _, rerr := c.Read(make([]byte, 1)); rerr != nil {
+			return
+		}
+		_, _ = c.Write(make([]byte, 400<<10))
+		_, _ = io.Copy(io.Discard, c)
+	}()
+
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p := testProxyWithCA(t, ca)
+	p.cfg.transport.RootCAs = originCA.CertPool()
+	p.MustAdd[TCP]("origin.test", func(c *TCPCtx) error { return c.Relay() })
+	p.MustAdd[TCP](ln.Addr().String(), func(c *TCPCtx) error { return c.Relay() })
+	addr := startProxy(t, p)
+
+	d := net.Dialer{Control: func(_, _ string, c syscall.RawConn) error {
+		return c.Control(func(fd uintptr) {
+			_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 4096)
+		})
+	}}
+	raw, err := d.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer raw.Close()
+	_, err = fmt.Fprintf(raw, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", ln.Addr(), ln.Addr())
+	require.NoError(t, err)
+	resp, err := http.ReadResponse(bufio.NewReader(raw), nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	tc := tls.Client(raw, &tls.Config{RootCAs: ca.CertPool(), ServerName: "origin.test", NextProtos: []string{"x-test"}})
+	require.NoError(t, tc.Handshake())
+	_, err = tc.Write([]byte{0})
+	require.NoError(t, err)
+	time.Sleep(300 * time.Millisecond)
+
+	sess := waitForSessions(t, p, 1)[0]
+	closed := make(chan struct{})
+	go func() { _ = sess.Close(); close(closed) }()
+	time.Sleep(200 * time.Millisecond)
+	require.NoError(t, tc.SetReadDeadline(time.Now().Add(3*time.Second)))
+	n, err := io.Copy(io.Discard, tc)
+	t.Logf("client read %d bytes, then %v", n, err)
+	<-closed
+	require.Error(t, err, "the client read a close_notify after Session.Close of a byte stream")
+	require.False(t, errors.Is(err, os.ErrDeadlineExceeded), "the client read no end of a byte stream Session.Close ended")
+}
+
+func TestSession_CloseOfAFreshTerminatedHTTPSession(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p := testProxyWithCA(t, ca)
+	p.MustAdd("allowed.test/", noopHandler)
+	client := connectRaw(t, startProxy(t, p), "allowed.test:443")
+	tc := tls.Client(client, &tls.Config{RootCAs: ca.CertPool(), ServerName: "allowed.test", NextProtos: []string{"http/1.1"}})
+	require.NoError(t, tc.Handshake())
+	require.NoError(t, waitForSessions(t, p, 1)[0].Close())
+	require.NoError(t, tc.SetReadDeadline(time.Now().Add(3*time.Second)))
+	_, err = tc.Read(make([]byte, 1))
+	require.ErrorIs(t, err, io.EOF, "a terminated connection Session.Close ended before its first request got no close_notify")
 }

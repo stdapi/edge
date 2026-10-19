@@ -13,6 +13,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"errors"
 	"io"
 	"log/slog"
 	"math/big"
@@ -24,6 +25,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -696,13 +698,63 @@ func h2cConnect(t *testing.T, addr, authority string) (io.Writer, *bufio.Reader)
 	return pw, bufio.NewReader(resp.Body)
 }
 
-// writeUntilFull writes to c a byte at a time until a write blocks for 100 ms and fails, which
-// leaves the socket buffers full when the peer does not read.
+// writeUntilFull writes to c until a write blocks for 100 ms and fails, which leaves the socket
+// buffers full when the peer does not read.
 func writeUntilFull(c net.Conn) {
+	chunk := make([]byte, 32<<10)
 	for {
 		_ = c.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
-		if _, err := c.Write([]byte{0}); err != nil {
+		if _, err := c.Write(chunk); err != nil {
 			return
 		}
 	}
 }
+
+// peerEnd reads c until it ends and reports how: "FIN", "RST", or "open" when nothing ended it
+// within the bound.
+func peerEnd(c net.Conn, within time.Duration) string {
+	_ = c.SetReadDeadline(time.Now().Add(within))
+	_, err := io.Copy(io.Discard, c)
+	switch {
+	case err == nil:
+		return "FIN"
+	case errors.Is(err, syscall.ECONNRESET):
+		return "RST"
+	case errors.Is(err, os.ErrDeadlineExceeded):
+		return "open"
+	}
+	return err.Error()
+}
+
+// oneConnOrigin accepts one TCP connection and sends it.
+func oneConnOrigin(t *testing.T) (string, <-chan net.Conn) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	conns := make(chan net.Conn, 1)
+	go func() {
+		c, aerr := ln.Accept()
+		if aerr != nil {
+			return
+		}
+		t.Cleanup(func() { _ = c.Close() })
+		conns <- c
+	}()
+	return ln.Addr().String(), conns
+}
+
+// connectStream opens a CONNECT tunnel to authority and sends one byte that is not HTTP, so the
+// tunnel is served as a byte stream.
+func connectStream(t *testing.T, proxyAddr, authority string) net.Conn {
+	t.Helper()
+	c := connectRaw(t, proxyAddr, authority)
+	_, err := c.Write([]byte{0})
+	require.NoError(t, err)
+	return c
+}
+
+// noEnd is a session closer with no leg to end.
+type noEnd struct{}
+
+func (noEnd) endBy(cause, time.Time) error { return nil }

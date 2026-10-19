@@ -6,6 +6,7 @@ package edge
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -16,11 +17,15 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
+	"os"
 	"slices"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/quic-go/quic-go/http3"
+	"github.com/stdapi/edge/internal/netutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -256,8 +261,10 @@ func TestTCP_StartTLS_HandlerReturnEndsAStalledClient(t *testing.T) {
 	tcpSession(t, p)
 
 	<-returned
+	// The legs end within alertWriteTimeout, the normal end of TCP waiting that long at most for
+	// the peer's FIN.
 	assert.Eventually(t, func() bool { return len(slices.Collect(p.Sessions())) == 0 },
-		alertWriteTimeout, 10*time.Millisecond, "the session outlived its handler")
+		2*alertWriteTimeout, 10*time.Millisecond, "the session outlived its handler")
 }
 
 func TestTCP_StartTLS_HandlerReturnEndsAStalledOrigin(t *testing.T) {
@@ -296,8 +303,10 @@ func TestTCP_StartTLS_HandlerReturnEndsAStalledOrigin(t *testing.T) {
 	tcpSession(t, p)
 
 	<-returned
+	// The legs end within alertWriteTimeout, the normal end of TCP waiting that long at most for
+	// the peer's FIN.
 	assert.Eventually(t, func() bool { return len(slices.Collect(p.Sessions())) == 0 },
-		alertWriteTimeout, 10*time.Millisecond, "the session outlived its handler")
+		2*alertWriteTimeout, 10*time.Millisecond, "the session outlived its handler")
 }
 
 func TestTransparent_StartTLS_TerminatesAnInBandUpgrade(t *testing.T) {
@@ -545,17 +554,15 @@ func TestTCP_StartTLS_FailsWithoutAHandshake(t *testing.T) {
 	_, err = raw.Write([]byte("not a handshake, and long enough to be decided on"))
 	require.NoError(t, err)
 	require.Error(t, <-errs)
-	_ = raw.SetReadDeadline(time.Now().Add(3 * time.Second))
-	_, err = raw.Read(make([]byte, 1))
-	assert.ErrorIs(t, err, io.EOF)
+	// crypto/tls sends no alert on a first record that is no handshake, so the end is the failed
+	// one.
+	assert.Equal(t, "RST", peerEnd(raw, 3*time.Second))
 }
 
 func TestTCP_StartTLS_BoundsTheHandshake(t *testing.T) {
 	ca, err := GenerateCA()
 	require.NoError(t, err)
-	tr := DefaultTransport()
-	tr.TLSHandshakeTimeout = 200 * time.Millisecond
-	p, err := New(WithCA(ca), WithTransport(tr))
+	p, err := New(WithCA(ca), WithReadHeaderTimeout(200*time.Millisecond))
 	require.NoError(t, err)
 	errs := make(chan error, 1)
 	p.MustAdd[TCP]("[127.0.0.0/8]", handlerError(errs, startTLSAfterRequest))
@@ -856,4 +863,408 @@ func TestTCP_TunnelRelaysTheHalfClose(t *testing.T) {
 	require.NoError(t, client.(*net.TCPConn).CloseWrite())
 
 	assert.Equal(t, head+rest, <-received)
+}
+
+func TestTCP_SessionCloseResetsEveryLeg(t *testing.T) {
+	for _, front := range []string{"h1", "h2c", "h3"} {
+		for _, how := range []string{"Session.Close", "Proxy.Close"} {
+			t.Run(front+"/"+how, func(t *testing.T) {
+				ln, err := net.Listen("tcp", "127.0.0.1:0")
+				require.NoError(t, err)
+				t.Cleanup(func() { _ = ln.Close() })
+				upstream := make(chan net.Conn, 1)
+				go func() {
+					if c, aerr := ln.Accept(); aerr == nil {
+						t.Cleanup(func() { _ = c.Close() })
+						upstream <- c
+					}
+				}()
+				release := make(chan struct{})
+				t.Cleanup(func() { close(release) })
+				dialed := make(chan struct{})
+				hold := func(c *TCPCtx) error {
+					if _, derr := c.Dial(); derr != nil {
+						return derr
+					}
+					close(dialed)
+					<-release
+					return nil
+				}
+				var p *Proxy
+				switch front {
+				case "h3":
+					var rstr *http3.RequestStream
+					p, rstr = openH3ConnectTo(t, ln, hold)
+					_, err = rstr.Write([]byte{0})
+				case "h2c":
+					p = testProxy(t)
+					p.MustAdd[TCP](ln.Addr().String(), hold)
+					w, _ := h2cConnect(t, startProxy(t, p), ln.Addr().String())
+					_, err = w.Write([]byte{0})
+				default:
+					p = testProxy(t)
+					p.MustAdd[TCP](ln.Addr().String(), hold)
+					connectStream(t, startProxy(t, p), ln.Addr().String())
+				}
+				require.NoError(t, err)
+				<-dialed
+				up := <-upstream
+				if how == "Session.Close" {
+					require.NoError(t, waitForSessions(t, p, 1)[0].Close())
+				} else {
+					require.NoError(t, p.Close())
+				}
+				assert.Equal(t, "RST", peerEnd(up, 2*time.Second), "origin leg")
+			})
+		}
+	}
+}
+
+func TestTCP_HandlerErrorResetsEveryLeg(t *testing.T) {
+	origin, upstream := oneConnOrigin(t)
+	p := testProxy(t)
+	p.MustAdd[TCP](origin, func(c *TCPCtx) error {
+		if _, err := c.Dial(); err != nil {
+			return err
+		}
+		time.Sleep(100 * time.Millisecond)
+		return errors.New("handler failure")
+	})
+	client := connectStream(t, startProxy(t, p), origin)
+	up := <-upstream
+	assert.Equal(t, "RST", peerEnd(client, 2*time.Second), "client leg")
+	assert.Equal(t, "RST", peerEnd(up, 2*time.Second), "origin leg")
+}
+
+func TestTCP_NilReturnEndsEveryLegCleanlyWithBytesUnread(t *testing.T) {
+	origin, upstream := oneConnOrigin(t)
+	p := testProxy(t)
+	p.MustAdd[TCP](origin, func(c *TCPCtx) error {
+		_, err := c.Dial()
+		time.Sleep(100 * time.Millisecond)
+		return err
+	})
+	client := connectStream(t, startProxy(t, p), origin)
+	up := <-upstream
+	_, err := client.Write([]byte("unread by the handler"))
+	require.NoError(t, err)
+	_, err = up.Write([]byte("unread by the handler"))
+	require.NoError(t, err)
+	assert.Equal(t, "FIN", peerEnd(client, 2*time.Second), "client leg")
+	assert.Equal(t, "FIN", peerEnd(up, 2*time.Second), "origin leg")
+}
+
+func TestTCP_SessionCloseDuringTheNormalEndKeepsItsFIN(t *testing.T) {
+	origin, upstream := oneConnOrigin(t)
+	release := make(chan struct{})
+	p := testProxy(t)
+	p.MustAdd[TCP](origin, func(c *TCPCtx) error {
+		_, err := c.Dial()
+		<-release
+		return err
+	})
+	client := connectStream(t, startProxy(t, p), origin)
+	<-upstream
+	sess := waitForSessions(t, p, 1)[0]
+	close(release)
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(2*time.Second)))
+	_, err := client.Read(make([]byte, 1))
+	require.ErrorIs(t, err, io.EOF, "the normal end sent no FIN")
+
+	// The normal end waits for the client's FIN, which never comes, while the session closes.
+	require.NoError(t, sess.Close())
+	time.Sleep(100 * time.Millisecond)
+	_, err = client.Read(make([]byte, 1))
+	assert.ErrorIs(t, err, io.EOF, "the closer reset a leg in its normal end")
+}
+
+func TestTCP_DialAfterSessionCloseFails(t *testing.T) {
+	origin, upstream := oneConnOrigin(t)
+	dialed := make(chan error, 1)
+	p := testProxy(t)
+	p.MustAdd[TCP](origin, func(c *TCPCtx) error {
+		<-c.Context().Done()
+		_, err := c.DialTo(context.Background(), origin)
+		dialed <- err
+		return err
+	})
+	connectStream(t, startProxy(t, p), origin)
+	require.NoError(t, waitForSessions(t, p, 1)[0].Close())
+	assert.Error(t, <-dialed)
+	select {
+	case up := <-upstream:
+		assert.Equal(t, "RST", peerEnd(up, 2*time.Second), "a leg opened after the closer ran")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestTCP_DialAfterTheCutFails(t *testing.T) {
+	origin, upstream := oneConnOrigin(t)
+	cut, dialed := make(chan struct{}), make(chan error, 1)
+	p := testProxy(t)
+	p.MustAdd[TCP](origin, func(c *TCPCtx) error {
+		<-cut
+		_, err := c.DialTo(context.Background(), origin)
+		dialed <- err
+		return err
+	})
+	connectStream(t, startProxy(t, p), origin)
+	waitForSessions(t, p, 1)
+	require.NoError(t, p.Close())
+	close(cut)
+	assert.ErrorIs(t, <-dialed, net.ErrClosed)
+	select {
+	case <-upstream:
+		t.Error("a dial after the cut reached the origin")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestTCP_H2TunnelEndsOnTheOriginHalfClose(t *testing.T) {
+	const head = "head"
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = ln.Close() })
+	received := make(chan string, 1)
+	halfClosed := make(chan time.Time, 1)
+	go func() {
+		conn, aerr := ln.Accept()
+		if aerr != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		first := make([]byte, len(head))
+		if _, rerr := io.ReadFull(conn, first); rerr != nil {
+			received <- "read: " + rerr.Error()
+			return
+		}
+		_, _ = conn.Write([]byte("hi"))
+		_ = conn.(*net.TCPConn).CloseWrite()
+		halfClosed <- time.Now()
+		tail, _ := io.ReadAll(conn)
+		received <- string(first) + string(tail)
+	}()
+
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+	p.MustAdd[TCP](ln.Addr().String(), relayStream)
+	w, r := h2cConnect(t, startProxy(t, p), ln.Addr().String())
+	_, err = w.Write([]byte(head))
+	require.NoError(t, err)
+	var at time.Time
+	select {
+	case at = <-halfClosed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the origin was never reached")
+	}
+
+	type read struct {
+		b   []byte
+		err error
+	}
+	got := make(chan read, 1)
+	go func() {
+		b, rerr := io.ReadAll(r)
+		got <- read{b, rerr}
+	}()
+	select {
+	case rd := <-got:
+		require.NoError(t, rd.err)
+		assert.Equal(t, "hi", string(rd.b))
+	case <-time.After(time.Until(at.Add(alertWriteTimeout / 2))):
+		t.Fatal("the half-close of the origin did not end the stream")
+	}
+	select {
+	case s := <-received:
+		assert.Equal(t, head, s, "the origin reads its normal end, the later upload stopped")
+	case <-time.After(3 * time.Second):
+		t.Fatal("the origin never saw the end")
+	}
+}
+
+func TestTCP_H2TunnelNormalEndIsImmediate(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+	returned := make(chan time.Time, 1)
+	p.MustAdd[TCP]("svc.test:7000", func(c *TCPCtx) error {
+		_, _ = c.Client().Write([]byte("bye"))
+		returned <- time.Now()
+		return nil
+	})
+	w, r := h2cConnect(t, startProxy(t, p), "svc.test:7000")
+	_, err = w.Write([]byte("hello"))
+	require.NoError(t, err)
+	b, err := io.ReadAll(r)
+	require.NoError(t, err)
+	assert.Equal(t, "bye", string(b))
+	assert.Less(t, time.Since(<-returned), alertWriteTimeout/2)
+}
+
+func TestTCP_StartTLSTerminatesAClientHelloAfterTheSniffTimeout(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca), WithSniffTimeout(200*time.Millisecond))
+	require.NoError(t, err)
+	res := make(chan error, 1)
+	p.MustAdd[TCP]("svc.test:465", func(c *TCPCtx) error {
+		serr := c.StartTLS()
+		res <- serr
+		return serr
+	})
+	conn := connectRaw(t, startProxy(t, p), "svc.test:465")
+	time.Sleep(400 * time.Millisecond)
+	cli := tls.Client(conn, &tls.Config{InsecureSkipVerify: true, ServerName: "svc.test"})
+	_ = cli.SetDeadline(time.Now().Add(3 * time.Second))
+	require.NoError(t, cli.Handshake())
+	select {
+	case serr := <-res:
+		assert.NoError(t, serr, "StartTLS terminates the ClientHello the handler asked for")
+	case <-time.After(3 * time.Second):
+		t.Fatal("no StartTLS result")
+	}
+}
+
+func TestTCP_CloseCancelsADialToInProgressWhateverItsContext(t *testing.T) {
+	for _, by := range []string{"Session.Close", "cut"} {
+		t.Run(by, func(t *testing.T) {
+			canceled := make(chan bool, 1)
+			tr := DefaultTransport()
+			tr.DialContext = func(ctx context.Context, _, _ string) (net.Conn, error) {
+				select {
+				case <-ctx.Done():
+					canceled <- true
+					return nil, ctx.Err()
+				case <-time.After(5 * time.Second):
+					canceled <- false
+					return nil, errors.New("the dial was never canceled")
+				}
+			}
+			p := testProxy(t, WithTransport(tr))
+			running := make(chan *Session, 1)
+			p.MustAdd[TCP]("stream.test", func(c *TCPCtx) error {
+				running <- c.Session()
+				_, err := c.DialTo(context.Background(), "blackhole.test:1")
+				return err
+			})
+			conn, err := net.Dial("tcp", startProxy(t, p))
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = conn.Close() })
+			_, err = fmt.Fprintf(conn, "CONNECT stream.test:5000 HTTP/1.1\r\nHost: stream.test:5000\r\n\r\n")
+			require.NoError(t, err)
+			resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: http.MethodConnect})
+			require.NoError(t, err)
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+			_, err = io.WriteString(conn, "\x01\x02hello")
+			require.NoError(t, err)
+			sess := <-running
+			time.Sleep(200 * time.Millisecond)
+			if by == "cut" {
+				require.NoError(t, p.Close())
+			} else {
+				require.NoError(t, sess.Close())
+			}
+			select {
+			case ok := <-canceled:
+				assert.True(t, ok, "a closer cancels every dial in progress for its unit")
+			case <-time.After(2 * time.Second):
+				t.Fatal("the dial outlived the close")
+			}
+		})
+	}
+}
+
+func TestTCP_HandlerErrorResetsOnceTheQueueIsAcknowledged(t *testing.T) {
+	origin, _ := oneConnOrigin(t)
+	p := testProxy(t)
+	returned := make(chan time.Time, 1)
+	p.MustAdd[TCP](origin, func(c *TCPCtx) error {
+		writeUntilFull(c.Client())
+		_ = c.Client().SetWriteDeadline(time.Time{})
+		returned <- time.Now()
+		return errors.New("handler failure")
+	})
+	// A receive buffer of a fixed size grows no further, so the client kernel never takes in
+	// the queue the client does not read.
+	d := net.Dialer{Control: func(_, _ string, c syscall.RawConn) error {
+		return c.Control(func(fd uintptr) {
+			_ = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_RCVBUF, 4096)
+		})
+	}}
+	client, err := d.Dial("tcp", startProxy(t, p))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = client.Close() })
+	_, err = fmt.Fprintf(client, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", origin, origin)
+	require.NoError(t, err)
+	var head []byte
+	for !bytes.HasSuffix(head, []byte("\r\n\r\n")) {
+		b := make([]byte, 1)
+		_, err = client.Read(b)
+		require.NoError(t, err)
+		head = append(head, b...)
+	}
+	require.Contains(t, string(head), " 200 ")
+	_, err = client.Write([]byte{0})
+	require.NoError(t, err)
+	tc := socketOf(client)
+	if _, err := netutil.UnsentBytes(tc); errors.Is(err, errors.ErrUnsupported) {
+		t.Skip("no send queue")
+	}
+	r := <-returned
+	// The client never reads, so the queue on the proxy side stays full.
+	failedAt := make(chan time.Time, 1)
+	go func() {
+		chunk := make([]byte, 1024)
+		for {
+			_ = client.SetWriteDeadline(time.Now().Add(20 * time.Millisecond))
+			if _, err := client.Write(chunk); err != nil && !errors.Is(err, os.ErrDeadlineExceeded) {
+				if !errors.Is(err, syscall.ECONNRESET) && !errors.Is(err, syscall.EPIPE) {
+					t.Errorf("the client write failed with %v, no reset", err)
+				}
+				failedAt <- time.Now()
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+	select {
+	case f := <-failedAt:
+		t.Logf("reset %v after the handler returned", f.Sub(r))
+		assert.GreaterOrEqual(t, f.Sub(r), alertWriteTimeout*8/10, "the client leg was reset with bytes still queued")
+	case <-time.After(3 * time.Second):
+		t.Fatal("the client leg never ended")
+	}
+}
+
+func TestTCP_RelayIdleTimeoutFailsEveryLeg(t *testing.T) {
+	origin, upstream := oneConnOrigin(t)
+	side, sideConns := oneConnOrigin(t)
+	p := testProxy(t)
+	relayErr := make(chan error, 1)
+	p.MustAdd[TCP](origin, func(c *TCPCtx) error {
+		up, err := c.Dial()
+		if err != nil {
+			return err
+		}
+		if _, err := c.DialTo(context.Background(), side); err != nil {
+			return err
+		}
+		_, _, err = (&Relayer{IdleTimeout: 100 * time.Millisecond}).Relay(c.Client(), up)
+		relayErr <- err
+		return err
+	})
+	connectStream(t, startProxy(t, p), origin)
+	<-upstream
+	sideConn := <-sideConns
+	select {
+	case err := <-relayErr:
+		t.Logf("Relay returned %v at its idle timeout", err)
+		assert.Error(t, err, "the failed timer reached the handler as nil")
+	case <-time.After(3 * time.Second):
+		t.Fatal("relay did not end")
+	}
+	assert.Equal(t, "RST", peerEnd(sideConn, 2*time.Second), "a leg of a unit a failed timer ended")
 }
