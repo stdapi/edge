@@ -93,6 +93,9 @@ func (txn *Txn) Delete[H Handler](pattern string, opts ...MatcherOption[H]) (Ent
 	if len(e.matchers) > txn.p.cfg.maxMatchers {
 		return Entry[H]{}, fmt.Errorf("%w: %w", ErrInvalidEntry, ErrTooManyMatchers)
 	}
+	if hasDuplicateMatcher(e.matchers) {
+		return Entry[H]{}, fmt.Errorf("%w: duplicate matcher", ErrInvalidEntry)
+	}
 
 	var adm *entry
 	if kind.requiresPath() {

@@ -2471,18 +2471,6 @@ func TestRouting_Matchers(t *testing.T) {
 			params:   []Param{{Key: "any", Value: "example.com"}},
 		},
 		{
-			name: "match with the same query matcher twice",
-			entries: []registration{
-				{pattern: "example.com/{name}/bar/baz"},
-				{pattern: "+{any}/foo/bar", matchers: []RequestMatcher{QueryMatcher{"a", "b"}, QueryMatcher{"a", "b"}}},
-			},
-			host:     "example.com",
-			target:   "/foo/bar?a=b",
-			want:     "+{any}/foo/bar",
-			matchers: 2,
-			params:   []Param{{Key: "any", Value: "example.com"}},
-		},
-		{
 			name: "match many query matchers",
 			entries: []registration{
 				{pattern: "example.com/{name}/bar/baz"},

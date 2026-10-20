@@ -244,6 +244,23 @@ func TestEntry_MaxMatchers(t *testing.T) {
 	assert.Equal(t, 1, p.Len())
 }
 
+func TestEntry_DuplicateMatchers(t *testing.T) {
+	q := must(MatchQuery("a", "b"))
+	h := must(MatchHeader("c", "d"))
+	p := testProxy(t)
+	p.MustAdd("api.test/v1", noopHandler, WithRequestMatchers[HTTP](q))
+
+	_, err := p.Add("api.test/v1", noopHandler, WithRequestMatchers[HTTP](q, h, q))
+	assert.ErrorIs(t, err, ErrInvalidEntry)
+	_, err = p.Add("api.test/v1", noopHandler, WithMethods[HTTP](http.MethodGet), WithMethods[HTTP](http.MethodGet))
+	assert.ErrorIs(t, err, ErrInvalidEntry)
+	_, err = p.Update("api.test/v1", noopHandler, WithRequestMatchers[HTTP](q, q))
+	assert.ErrorIs(t, err, ErrInvalidEntry)
+	_, err = p.Delete[HTTP]("api.test/v1", WithRequestMatchers[HTTP](q, q))
+	assert.ErrorIs(t, err, ErrInvalidEntry)
+	assert.Equal(t, 1, p.Len())
+}
+
 func TestEntry_MatcherEvaluatedOncePerLookup(t *testing.T) {
 	var calls int
 	p := testProxy(t)

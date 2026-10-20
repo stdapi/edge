@@ -146,6 +146,17 @@ outer:
 	return true
 }
 
+func hasDuplicateMatcher(matchers []RequestMatcher) bool {
+	for i := 1; i < len(matchers); i++ {
+		for _, m := range matchers[:i] {
+			if m.Equal(matchers[i]) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (e *entry) matchersWithin(other *entry) bool {
 outer:
 	for _, a := range e.matchers {

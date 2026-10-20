@@ -410,6 +410,9 @@ func newEntry[H Handler](p *Proxy, pattern string, handler H, opts ...EntryOptio
 	if len(e.matchers) > p.cfg.maxMatchers {
 		return nil, fmt.Errorf("%w: %w", ErrInvalidEntry, ErrTooManyMatchers)
 	}
+	if hasDuplicateMatcher(e.matchers) {
+		return nil, fmt.Errorf("%w: duplicate matcher", ErrInvalidEntry)
+	}
 	if len(e.matchers) == 0 && e.priority > 0 {
 		return nil, fmt.Errorf("%w: priority requires matchers", ErrInvalidEntry)
 	}
