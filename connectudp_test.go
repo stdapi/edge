@@ -208,9 +208,15 @@ func (c *masqueConn) SetWriteDeadline(time.Time) error  { return nil }
 // trusts the certificates ca mints, and returns a round tripper on it.
 func innerH3(t *testing.T, pconn net.PacketConn, origin netip.AddrPort, name string, ca *CA) (*http3.ClientConn, *quic.Conn) {
 	t.Helper()
+	view := &quicView{PacketConn: pconn}
+	if prev, ok := quicViews.Swap(pconn, view); ok {
+		prev.(*quicView).retired.Store(true)
+		// A deadline the retired transport set before is lifted.
+		_ = pconn.SetReadDeadline(time.Time{})
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	qconn, err := quic.DialEarly(ctx, pconn, net.UDPAddrFromAddrPort(origin), &tls.Config{
+	qconn, err := quic.DialEarly(ctx, view, net.UDPAddrFromAddrPort(origin), &tls.Config{
 		RootCAs:    poolOf(ca),
 		ServerName: name,
 		NextProtos: []string{http3.NextProtoH3},
@@ -220,6 +226,35 @@ func innerH3(t *testing.T, pconn net.PacketConn, origin netip.AddrPort, name str
 	tr := &http3.Transport{}
 	t.Cleanup(func() { _ = tr.Close() })
 	return tr.NewClientConn(qconn), qconn
+}
+
+// quicViews maps a tunnel to the view of its last QUIC dial.
+var quicViews sync.Map
+
+// quicView is the tunnel one QUIC dial reads. The transport of a dial sets the read deadline
+// of its socket once the IDs of its closed connection expired, so a later dial on the same tunnel
+// retires the view of the one before: its reads end and its deadlines do nothing.
+type quicView struct {
+	net.PacketConn
+	retired atomic.Bool
+}
+
+func (v *quicView) ReadFrom(b []byte) (int, net.Addr, error) {
+	if v.retired.Load() {
+		return 0, nil, net.ErrClosed
+	}
+	n, addr, err := v.PacketConn.ReadFrom(b)
+	if v.retired.Load() {
+		return 0, nil, net.ErrClosed
+	}
+	return n, addr, err
+}
+
+func (v *quicView) SetReadDeadline(t time.Time) error {
+	if v.retired.Load() {
+		return nil
+	}
+	return v.PacketConn.SetReadDeadline(t)
 }
 
 // requireEnded waits for a QUIC connection to end, which a CONNECTION_CLOSE from the proxy or
@@ -1202,6 +1237,23 @@ func (c *capsuleClient) ReadFrom(b []byte) (int, net.Addr, error) {
 	}
 }
 
+// streamEnd waits for the end of the stream and returns its error, os.ErrDeadlineExceeded past
+// within. The QUIC connection in the tunnel sets the read deadline of the client when it
+// closes, so ReadFrom cannot wait for the end.
+func (c *capsuleClient) streamEnd(within time.Duration) error {
+	t := time.NewTimer(within)
+	defer t.Stop()
+	for {
+		select {
+		case <-c.in:
+		case <-c.done:
+			return c.err
+		case <-t.C:
+			return os.ErrDeadlineExceeded
+		}
+	}
+}
+
 func (c *capsuleClient) WriteTo(b []byte, _ net.Addr) (int, error) {
 	out := make([]byte, 1+len(b))
 	copy(out[1:], b)
@@ -1431,8 +1483,7 @@ func TestConnectUDP_Capsules_TerminatesTheInnerHTTP3(t *testing.T) {
 			require.NoError(t, tunnel.Close())
 			assertSessionEnded(t, p, tunnel)
 			waitForSessions(t, p, 0)
-			require.NoError(t, pconn.SetReadDeadline(time.Now().Add(5*time.Second)))
-			_, _, err = pconn.ReadFrom(make([]byte, 64))
+			err = pconn.streamEnd(5 * time.Second)
 			require.Error(t, err)
 			assert.NotErrorIs(t, err, os.ErrDeadlineExceeded, "the stream ended rather than went quiet")
 
