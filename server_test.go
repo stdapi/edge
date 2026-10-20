@@ -3323,17 +3323,20 @@ func TestLifecycle_DrainServesATerminatedRequestWhoseHeaderStraddlesT(t *testing
 func TestLifecycle_ShutdownWaitsForAConnectionAcceptedAtItsStart(t *testing.T) {
 	var once sync.Once
 	started := make(chan struct{})
-	acceptedHook = func() {
-		once.Do(func() {
-			close(started)
-			time.Sleep(300 * time.Millisecond)
-		})
-	}
-	defer func() { acceptedHook = nil }()
 	p := testProxy(t)
 	p.MustAdd("allowed.test/", okHandler)
-	addr := startProxy(t, p)
-	conn, err := net.Dial("tcp", addr)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	go func() {
+		_ = p.Serve(delayAcceptListener{ln, func() {
+			once.Do(func() {
+				close(started)
+				time.Sleep(300 * time.Millisecond)
+			})
+		}})
+	}()
+	t.Cleanup(func() { _ = p.Close() })
+	conn, err := net.Dial("tcp", ln.Addr().String())
 	require.NoError(t, err)
 	defer conn.Close()
 	<-started
@@ -4193,20 +4196,25 @@ func TestShutdown_TLSFrontConnectionRecordedAfterTheStartWithNoReadHeaderTimeout
 	var once sync.Once
 	accepted := make(chan struct{})
 	release := make(chan struct{})
-	acceptedHook = func() {
-		once.Do(func() {
-			close(accepted)
-			<-release
-		})
-	}
-	defer func() { acceptedHook = nil }()
 	ca, err := GenerateCA()
 	require.NoError(t, err)
 	p := testProxyWithCA(t, ca, WithReadHeaderTimeout(0))
 	p.MustAdd("allowed.test/", okHandler)
-	addr, _ := startProxyTLS(t, p, ca)
+	cert, err := ca.Leaf("127.0.0.1")
+	require.NoError(t, err)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	go func() {
+		_ = p.ServeTLS(delayAcceptListener{ln, func() {
+			once.Do(func() {
+				close(accepted)
+				<-release
+			})
+		}}, *cert)
+	}()
+	t.Cleanup(func() { _ = p.Close() })
 	// Accepted before the start, recorded once endWaiting ran, and silent.
-	raw, err := net.Dial("tcp", addr)
+	raw, err := net.Dial("tcp", ln.Addr().String())
 	require.NoError(t, err)
 	defer raw.Close()
 	<-accepted
@@ -4414,6 +4422,66 @@ func TestShutdown_SecondCallKeepsTheDrainOfTheFirst(t *testing.T) {
 	assert.Less(t, time.Since(start), alertWriteTimeout+300*time.Millisecond)
 }
 
+func TestClose_FrontConnectionHandedOverBeforeItsSessionEndsOnce(t *testing.T) {
+	for _, proto := range []string{"http/1.1", "h2"} {
+		t.Run(proto, func(t *testing.T) {
+			ca, err := GenerateCA()
+			require.NoError(t, err)
+			p := testProxyWithCA(t, ca)
+			var served atomic.Int32
+			p.MustAdd("allowed.test/", func(c *HTTPCtx) (*http.Response, error) {
+				served.Add(1)
+				return okHandler(c)
+			})
+			// The server has the connection and has not recorded its session when the front
+			// stage begins, and records it once the end that stage gave the connection returned.
+			srv := p.srv.h1
+			if proto == "h2" {
+				srv = p.srv.h2
+			}
+			connContext := srv.ConnContext
+			entered := make(chan struct{})
+			var once sync.Once
+			srv.ConnContext = func(ctx context.Context, c net.Conn) context.Context {
+				once.Do(func() {
+					close(entered)
+					for p.srv.frontStageBy.Load() == 0 {
+						time.Sleep(time.Millisecond)
+					}
+					time.Sleep(alertWriteTimeout + 500*time.Millisecond)
+				})
+				return connContext(ctx, c)
+			}
+			addr, pool := startProxyTLS(t, p, ca)
+			conn, err := tls.Dial("tcp", addr, &tls.Config{RootCAs: pool, ServerName: "127.0.0.1", NextProtos: []string{proto}})
+			require.NoError(t, err)
+			defer conn.Close()
+			if proto == "h2" {
+				_, err = io.WriteString(conn, h2Preface)
+				require.NoError(t, err)
+				require.NoError(t, http2.NewFramer(conn, nil).WriteSettings())
+			} else {
+				_, err = io.WriteString(conn, "GET http://allowed.test/ HTTP/1.1\r\nHost: allowed.test\r\n\r\n")
+				require.NoError(t, err)
+			}
+			<-entered
+
+			require.NoError(t, p.Close())
+			p.srv.mu.Lock()
+			fronts, frontSess, sessions := len(p.srv.fronts), len(p.srv.frontSess), len(p.srv.sessions)
+			p.srv.mu.Unlock()
+			assert.Zero(t, fronts)
+			assert.Zero(t, frontSess)
+			assert.Zero(t, sessions)
+			_ = conn.SetReadDeadline(time.Now().Add(3 * alertWriteTimeout))
+			b, err := io.ReadAll(conn)
+			assert.NoError(t, err, "the end is a close_notify")
+			assert.Empty(t, b, "the connection was served after the start of the cut")
+			assert.Zero(t, served.Load())
+		})
+	}
+}
+
 func TestClose_LeavesNoFrontConnectionOfAHandlerIgnoringItsCancel(t *testing.T) {
 	p := testProxy(t)
 	release := make(chan struct{})
@@ -4479,6 +4547,20 @@ func (l noDeadlineListener) Accept() (net.Conn, error) {
 		return nil, err
 	}
 	return noDeadlineConn{c}, nil
+}
+
+// delayAcceptListener runs delay on each connection it accepted before it returns it.
+type delayAcceptListener struct {
+	net.Listener
+	delay func()
+}
+
+func (l delayAcceptListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err == nil {
+		l.delay()
+	}
+	return c, err
 }
 
 // slowCloseListener takes 300 ms to close.

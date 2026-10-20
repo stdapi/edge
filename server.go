@@ -232,7 +232,10 @@ func newServer(p *Proxy) (*server, error) {
 					sc.sess.Store(sess)
 				}
 				s.mu.Lock()
-				s.frontSess[c] = sess
+				if _, ok := s.fronts[c]; ok {
+					// The front stage may have ended the connection since it was handed over, I5.
+					s.frontSess[c] = sess
+				}
 				s.mu.Unlock()
 				return context.WithValue(ctx, sessionKey{}, sess)
 			},
@@ -335,10 +338,6 @@ func (p *Proxy) Serve(ln net.Listener) error {
 	return p.serveFront(cancelListener{ln})
 }
 
-// acceptedHook runs between the accept of a front connection and its record, set by tests
-// alone.
-var acceptedHook func()
-
 func (p *Proxy) serveFront(ln net.Listener) error {
 	// The drain or the cut closes the listener, and so does a failed accept, so the second
 	// close has to report nothing.
@@ -362,9 +361,6 @@ func (p *Proxy) serveFront(ln net.Listener) error {
 	var delay time.Duration
 	for {
 		c, err := sl.Accept()
-		if err == nil && acceptedHook != nil {
-			acceptedHook()
-		}
 		if err != nil {
 			if p.srv.closing.Load() {
 				return ErrProxyClosed
