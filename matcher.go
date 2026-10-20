@@ -137,12 +137,29 @@ type HeaderMatcher struct {
 	value string
 }
 
-// MatchHeader returns a [HeaderMatcher] for key and value. The key is canonicalized.
+// MatchHeader returns a [HeaderMatcher] for key and value. The key is canonicalized. An empty
+// key, an invalid header name, Host or Transfer-Encoding returns an error.
 func MatchHeader(key, value string) (HeaderMatcher, error) {
-	if key == "" {
-		return HeaderMatcher{}, fmt.Errorf("%w: empty header key", ErrInvalidMatcher)
+	key, err := matchableHeaderKey(key)
+	if err != nil {
+		return HeaderMatcher{}, err
 	}
-	return HeaderMatcher{key: textproto.CanonicalMIMEHeaderKey(key), value: value}, nil
+	return HeaderMatcher{key: key, value: value}, nil
+}
+
+func matchableHeaderKey(key string) (string, error) {
+	if key == "" {
+		return "", fmt.Errorf("%w: empty header key", ErrInvalidMatcher)
+	}
+	if !httpguts.ValidHeaderFieldName(key) {
+		return "", fmt.Errorf("%w: invalid header key", ErrInvalidMatcher)
+	}
+	switch key = textproto.CanonicalMIMEHeaderKey(key); key {
+	case "Host", "Transfer-Encoding":
+		// net/http removes both from the header map before a request is routed.
+		return "", fmt.Errorf("%w: unmatchable header key", ErrInvalidMatcher)
+	}
+	return key, nil
 }
 
 // Key returns the canonicalized header name.
@@ -169,16 +186,17 @@ type HeaderRegexpMatcher struct {
 }
 
 // MatchHeaderRegexp returns a [HeaderRegexpMatcher] for key and expr. The expression is
-// anchored and must not contain a capture group.
+// anchored and must not contain a capture group. The key is refused as by [MatchHeader].
 func MatchHeaderRegexp(key, expr string) (HeaderRegexpMatcher, error) {
-	if key == "" {
-		return HeaderRegexpMatcher{}, fmt.Errorf("%w: empty header key", ErrInvalidMatcher)
+	key, err := matchableHeaderKey(key)
+	if err != nil {
+		return HeaderRegexpMatcher{}, err
 	}
 	re, err := compileAnchoredRegexp(expr)
 	if err != nil {
 		return HeaderRegexpMatcher{}, err
 	}
-	return HeaderRegexpMatcher{key: textproto.CanonicalMIMEHeaderKey(key), re: re}, nil
+	return HeaderRegexpMatcher{key: key, re: re}, nil
 }
 
 // Key returns the canonicalized header name.
