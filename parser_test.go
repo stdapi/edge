@@ -1502,6 +1502,47 @@ func TestParser_CanonicalEncoding(t *testing.T) {
 	}
 }
 
+func TestParser_MinRegexpSize(t *testing.T) {
+	cases := []struct {
+		expr  string
+		limit int
+		want  int
+	}{
+		{expr: `a`, limit: 1000, want: 1},
+		{expr: `abc`, limit: 1000, want: 3},
+		{expr: `[a-z]+`, limit: 1000, want: 1},
+		{expr: `a{3}`, limit: 1000, want: 3},
+		{expr: `a{2,5}`, limit: 1000, want: 5},
+		{expr: `a{2,}`, limit: 1000, want: 2},
+		{expr: `a{0}`, limit: 1000, want: 1},
+		{expr: `a*`, limit: 1000, want: 1},
+		{expr: `(?:)`, limit: 1000, want: 1},
+		{expr: `(?:a|bc)`, limit: 1000, want: 3},
+		{expr: `\b`, limit: 1000, want: 1},
+		{expr: `(?i)k`, limit: 1000, want: 1},
+		{expr: `[^\x00-\x{10FFFF}]`, limit: 1000, want: 1},
+		{expr: `(?:a{0,3}){2,}`, limit: 1000, want: 6},
+		{expr: `(?:(?:)*){10}`, limit: 1000, want: 10},
+		{expr: `(?:a{10}){100}`, limit: 1000, want: 1000},
+		{expr: `(?:a{10}){100}`, limit: 999, want: 1000},
+		{expr: strings.Repeat("a{1000}", 3000), limit: 1000, want: 1001},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.expr[:min(len(tc.expr), 32)], func(t *testing.T) {
+			re, err := syntax.Parse(tc.expr, syntax.Perl)
+			require.NoError(t, err)
+			got := minRegexpSize(re, tc.limit)
+			assert.Equal(t, tc.want, got)
+			if got <= tc.limit {
+				prog, err := syntax.Compile(re.Simplify())
+				require.NoError(t, err)
+				assert.LessOrEqual(t, got, len(prog.Inst))
+			}
+		})
+	}
+}
+
 func TestParser_ParamLimits(t *testing.T) {
 	t.Run("param count", func(t *testing.T) {
 		p := testProxy(t, WithMaxPatternParams(3))
@@ -2077,6 +2118,36 @@ func TestPatternError_Position(t *testing.T) {
 			wantMsg:    "error parsing regexp",
 		},
 		{
+			name:       "regexp too large",
+			pattern:    "a.test/foo/{a:[a-z]{1,1000}}",
+			options:    []ProxyOption{WithRegexpParam(true)},
+			wantType:   "path",
+			wantReason: "regexp",
+			wantStart:  14,
+			wantEnd:    27,
+			wantMsg:    "expression too large",
+		},
+		{
+			name:       "regexp exceeds max size",
+			pattern:    "a.test/foo/{a:[0-9]+}",
+			options:    []ProxyOption{WithRegexpParam(true), WithMaxRegexpSize(3)},
+			wantType:   "path",
+			wantReason: "regexp",
+			wantStart:  14,
+			wantEnd:    20,
+			wantMsg:    "expression too large",
+		},
+		{
+			name:       "hostname regexp too large",
+			pattern:    "{a:[a-z]{1,1000}}.test/",
+			options:    []ProxyOption{WithRegexpParam(true)},
+			wantType:   "hostname",
+			wantReason: "regexp",
+			wantStart:  3,
+			wantEnd:    16,
+			wantMsg:    "expression too large",
+		},
+		{
 			name:       "hostname label exceeds 63 chars before dot with param",
 			pattern:    strings.Repeat("a", 64) + "{b}.com/",
 			wantType:   "hostname",
@@ -2195,6 +2266,14 @@ func TestPatternError_Unwrap(t *testing.T) {
 		require.ErrorAs(t, err, &pe)
 		var syntaxErr *syntax.Error
 		assert.ErrorAs(t, pe, &syntaxErr)
+	})
+
+	t.Run("regexp too large wraps ErrLarge", func(t *testing.T) {
+		p := testProxy(t, WithRegexpParam(true))
+		_, _, err := p.parsePattern("a.test/foo/{a:[a-z]{1,1000}}", KindHTTP)
+		var syntaxErr *syntax.Error
+		require.ErrorAs(t, err, &syntaxErr)
+		assert.Equal(t, syntax.ErrLarge, syntaxErr.Code)
 	})
 
 	t.Run("syntax error wraps nothing", func(t *testing.T) {

@@ -101,7 +101,8 @@ type QueryRegexpMatcher struct {
 }
 
 // MatchQueryRegexp returns a [QueryRegexpMatcher] for key and expr. The expression is
-// anchored and must not contain a capture group.
+// anchored and must not contain a capture group. An expression that compiles to more than 1000
+// instructions returns an error.
 func MatchQueryRegexp(key, expr string) (QueryRegexpMatcher, error) {
 	if key == "" {
 		return QueryRegexpMatcher{}, fmt.Errorf("%w: empty query key", ErrInvalidMatcher)
@@ -186,7 +187,8 @@ type HeaderRegexpMatcher struct {
 }
 
 // MatchHeaderRegexp returns a [HeaderRegexpMatcher] for key and expr. The expression is
-// anchored and must not contain a capture group. The key is refused as by [MatchHeader].
+// anchored and must not contain a capture group. The key is refused as by [MatchHeader], and the
+// expression as by [MatchQueryRegexp].
 func MatchHeaderRegexp(key, expr string) (HeaderRegexpMatcher, error) {
 	key, err := matchableHeaderKey(key)
 	if err != nil {
@@ -322,13 +324,19 @@ func (m MethodMatcher) Equal(matcher RequestMatcher) bool {
 
 func (m MethodMatcher) String() string { return "method=" + strings.Join(m.methods, ",") }
 
+const maxRegexpSize = 1000
+
 func compileAnchoredRegexp(expr string) (*regexp.Regexp, error) {
 	if expr == "" {
 		return nil, fmt.Errorf("%w: empty expression", ErrInvalidMatcher)
 	}
 	// A source that is invalid on its own can still balance inside the wrapper, such as
 	// "a)|(?:", and defeat the anchoring, so it must compile standalone first.
-	if _, err := syntax.Parse(expr, syntax.Perl); err != nil {
+	parsed, err := syntax.Parse(expr, syntax.Perl)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidMatcher, err)
+	}
+	if err = checkRegexpSize(expr, parsed, maxRegexpSize); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrInvalidMatcher, err)
 	}
 	re, err := regexp.Compile("^(?:" + expr + ")$")

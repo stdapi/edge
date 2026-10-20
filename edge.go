@@ -81,6 +81,7 @@ type config struct {
 	maxParams        int
 	maxParamKeyBytes int
 	maxMatchers      int
+	maxRegexpSize    int
 
 	relaxedSlash [KindUDP + 1]bool
 	allowRegexp  bool
@@ -94,6 +95,7 @@ func newConfig() *config {
 		maxParams:        math.MaxUint8,
 		maxParamKeyBytes: math.MaxUint8,
 		maxMatchers:      math.MaxUint8,
+		maxRegexpSize:    maxRegexpSize,
 		transport:        DefaultTransport(),
 		resolver:         net.DefaultResolver,
 		server:           defaultServerConfig(),

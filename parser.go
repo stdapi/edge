@@ -873,12 +873,22 @@ func (p *Proxy) compileParamRegexp(rawRegex string, ignoreCase bool) (*regexp.Re
 
 	// A source that is invalid on its own can still balance inside the wrapper
 	// (e.g. "a)|(?:") and defeat the anchoring, so it must compile standalone.
-	if _, err := syntax.Parse(rawRegex, syntax.Perl); err != nil {
+	parsed, err := syntax.Parse(rawRegex, syntax.Perl)
+	if err != nil {
 		return nil, &PatternError{
 			Reason: "regexp",
 			Start:  0,
 			End:    len(rawRegex),
 			Hint:   err.Error(),
+			err:    err,
+		}
+	}
+	if err = checkRegexpSize(rawRegex, parsed, p.cfg.maxRegexpSize); err != nil {
+		return nil, &PatternError{
+			Reason: "regexp",
+			Start:  0,
+			End:    len(rawRegex),
+			Hint:   "expression too large",
 			err:    err,
 		}
 	}
@@ -902,6 +912,51 @@ func (p *Proxy) compileParamRegexp(rawRegex string, ignoreCase bool) (*regexp.Re
 	}
 
 	return re, nil
+}
+
+func checkRegexpSize(expr string, re *syntax.Regexp, max int) error {
+	if minRegexpSize(re, max) > max {
+		return &syntax.Error{Code: syntax.ErrLarge, Expr: expr}
+	}
+	prog, err := syntax.Compile(re.Simplify())
+	if err != nil {
+		return err
+	}
+	if len(prog.Inst) > max {
+		return &syntax.Error{Code: syntax.ErrLarge, Expr: expr}
+	}
+	return nil
+}
+
+// minRegexpSize returns a lower bound on the number of instructions re compiles to, capped at limit+1.
+// It never exceeds the compiled size, so a regexp within the limit is never rejected.
+func minRegexpSize(re *syntax.Regexp, limit int) int {
+	switch re.Op {
+	case syntax.OpNoMatch:
+		return 0
+	case syntax.OpLiteral:
+		return min(max(len(re.Rune), 1), limit+1)
+	case syntax.OpRepeat:
+		copies := re.Max
+		if copies < 0 {
+			copies = re.Min
+		}
+		if copies == 0 {
+			return 1
+		}
+		return min(copies*minRegexpSize(re.Sub[0], limit), limit+1)
+	}
+	if len(re.Sub) == 0 {
+		return 1
+	}
+	n := 0
+	for _, sub := range re.Sub {
+		n += minRegexpSize(sub, limit)
+		if n > limit {
+			return limit + 1
+		}
+	}
+	return n
 }
 
 // isASCIIControl reports whether c is an ASCII control character: a C0 byte

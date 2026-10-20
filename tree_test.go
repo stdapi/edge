@@ -3210,7 +3210,7 @@ func TestRouting_InfixWildcardLinear(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			p := testProxy(t, WithRegexpParam(true), WithRelaxedTrailingSlash[HTTP](tc.relaxed))
+			p := testProxy(t, WithRegexpParam(true), WithMaxRegexpSize(math.MaxUint16), WithRelaxedTrailingSlash[HTTP](tc.relaxed))
 			for _, pattern := range tc.patterns {
 				var err error
 				if tc.admit == KindTCP {
@@ -3327,7 +3327,7 @@ func TestRouting_InfixWildcardMemoryAllocs(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.patterns[0], func(t *testing.T) {
-			p := testProxy(t, WithRegexpParam(true))
+			p := testProxy(t, WithRegexpParam(true), WithMaxRegexpSize(math.MaxUint16))
 			for _, pattern := range tc.patterns {
 				var err error
 				if tc.admit == KindTCP {
@@ -4676,7 +4676,9 @@ func BenchmarkLookupInfixNearMiss(b *testing.B) {
 	for _, tc := range cases {
 		b.Run(tc.name, func(b *testing.B) {
 			b.Run("edge", func(b *testing.B) {
-				p := mustFuzzProxy(b)
+				ca, err := GenerateCA()
+				require.NoError(b, err)
+				p := Must(WithCA(ca), WithRegexpParam(true), WithMaxRegexpSize(math.MaxUint16))
 				for _, pattern := range tc.patterns {
 					p.MustAdd(pattern, noopHandler)
 				}

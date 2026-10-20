@@ -214,6 +214,8 @@ func TestMatcher_InvalidArguments(t *testing.T) {
 			_, err := MatchHeaderRegexp("k", "a)|(?:")
 			return err
 		},
+		"query expression too large":      func() error { _, err := MatchQueryRegexp("k", "[a-z]{1,1000}"); return err },
+		"header expression too large":     func() error { _, err := MatchHeaderRegexp("k", "[a-z]{1,1000}"); return err },
 		"header key with a space":         func() error { _, err := MatchHeader("X Foo", "v"); return err },
 		"header key with a colon":         func() error { _, err := MatchHeader("X-Foo:", "v"); return err },
 		"header Host":                     func() error { _, err := MatchHeader("host", "v"); return err },

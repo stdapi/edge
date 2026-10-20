@@ -50,6 +50,7 @@ func TestOptions_Rejected(t *testing.T) {
 		{"nil logger", WithLogger(nil)},
 		{"zero max params", WithMaxPatternParams(0)},
 		{"zero max param key bytes", WithMaxPatternParamKeyBytes(0)},
+		{"zero max regexp size", WithMaxRegexpSize(0)},
 		{"negative read header timeout", WithReadHeaderTimeout(-time.Second)},
 		{"negative idle timeout", WithIdleTimeout(-time.Second)},
 		{"negative sniff timeout", WithSniffTimeout(-time.Second)},
@@ -79,6 +80,7 @@ func TestOptions_Applied(t *testing.T) {
 		WithMaxPatternParams(4),
 		WithMaxPatternParamKeyBytes(8),
 		WithMaxMatchers(2),
+		WithMaxRegexpSize(16),
 		WithRelaxedTrailingSlash[HTTP](true),
 		WithRegexpParam(true),
 		WithLogger(slog.New(slog.DiscardHandler)),
@@ -90,6 +92,7 @@ func TestOptions_Applied(t *testing.T) {
 	assert.Equal(t, 4, cfg.maxParams)
 	assert.Equal(t, 8, cfg.maxParamKeyBytes)
 	assert.Equal(t, 2, cfg.maxMatchers)
+	assert.Equal(t, 16, cfg.maxRegexpSize)
 	assert.True(t, cfg.relaxedSlash[KindHTTP])
 	assert.True(t, cfg.allowRegexp)
 }

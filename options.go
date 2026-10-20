@@ -280,6 +280,18 @@ func WithMaxPatternParamKeyBytes(n uint8) ProxyOption {
 	})
 }
 
+// WithMaxRegexpSize bounds the size of a regular expression in a pattern, as the number of
+// instructions of its compiled program. It defaults to 1000.
+func WithMaxRegexpSize(n uint16) ProxyOption {
+	return proxyOption(func(s sealedOption) error {
+		if n == 0 {
+			return fmt.Errorf("%w: max regexp size must be greater than zero", ErrInvalidConfig)
+		}
+		s.proxy.cfg.maxRegexpSize = int(n)
+		return nil
+	})
+}
+
 // WithMaxMatchers bounds how many matchers an entry may carry, the implicit scheme and method
 // matchers included. It defaults to 255.
 func WithMaxMatchers(n uint8) ProxyOption {
