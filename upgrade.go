@@ -85,7 +85,7 @@ func (p *Proxy) spliceWebSocket(c *routeCtx, w http.ResponseWriter, r *http.Requ
 	// The handler owns the request it is handed, so the copy is what a later decision reads.
 	sess.upgrade = r.Clone(r.Context())
 
-	if !p.srv.trackRegistered(pipe) {
+	if !p.srv.takeFront(client, pipe) {
 		// The cut started, which gives both connections their failed end.
 		abort(client)
 		if raw != nil {
@@ -241,7 +241,7 @@ func (p *Proxy) serveUpgradedStream(c *routeCtx, w http.ResponseWriter, r *http.
 	sc.dialOnce.Do(func() {})
 	upSess.closer = (*tcpCloser)(sc)
 
-	if !p.srv.trackRegistered(pipe) {
+	if !p.srv.takeFront(client, pipe) {
 		// The cut started, which gives both connections their failed end.
 		abort(client)
 		if raw != nil {

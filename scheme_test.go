@@ -252,6 +252,57 @@ func TestSchemeConn_HeldFrameResumesAfterADeadline(t *testing.T) {
 	}, fields)
 }
 
+func TestSchemeConn_WakeEndsEveryReadUntilItsEndBegins(t *testing.T) {
+	cli, srv := net.Pipe()
+	defer func() { _ = cli.Close() }()
+	defer func() { _ = srv.Close() }()
+	sc := schemeConnOf(newSchemeConn(srv, 1<<20))
+
+	blocked := make(chan error, 1)
+	go func() {
+		_, err := sc.Read(make([]byte, 1))
+		blocked <- err
+	}()
+	time.Sleep(20 * time.Millisecond)
+	sc.wake()
+	select {
+	case err := <-blocked:
+		require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+	case <-time.After(time.Second):
+		t.Fatal("the wake left a read blocked")
+	}
+	// No deadline set after the wake gives a read time.
+	require.NoError(t, sc.SetDeadline(time.Time{}))
+	sc.boundHeader(time.Now().Add(time.Hour))
+	sc.boundHeader(time.Time{})
+	start := time.Now()
+	_, err := sc.Read(make([]byte, 1))
+	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+	assert.Less(t, time.Since(start), 20*time.Millisecond)
+
+	// From its end on, the connection keeps the deadlines it is given.
+	sc.beginEnd()
+	require.NoError(t, sc.SetReadDeadline(time.Now().Add(50*time.Millisecond)))
+	start = time.Now()
+	_, err = sc.Read(make([]byte, 1))
+	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+	assert.GreaterOrEqual(t, time.Since(start), 40*time.Millisecond)
+}
+
+func TestSchemeConn_WakeLeavesAnEndBegun(t *testing.T) {
+	cli, srv := net.Pipe()
+	defer func() { _ = cli.Close() }()
+	defer func() { _ = srv.Close() }()
+	sc := schemeConnOf(newSchemeConn(srv, 1<<20))
+	sc.beginEnd()
+	require.NoError(t, sc.SetReadDeadline(time.Now().Add(100*time.Millisecond)))
+	sc.wake()
+	start := time.Now()
+	_, err := sc.Read(make([]byte, 1))
+	require.ErrorIs(t, err, os.ErrDeadlineExceeded)
+	assert.GreaterOrEqual(t, time.Since(start), 80*time.Millisecond)
+}
+
 // eofConn returns io.EOF with its last bytes.
 type eofConn struct {
 	net.Conn
@@ -265,6 +316,8 @@ func (c *eofConn) Read(p []byte) (int, error) {
 	}
 	return n, err
 }
+
+func (c *eofConn) SetReadDeadline(time.Time) error { return nil }
 
 func TestSchemeConn_FrameEndingWithEOFGetsItsField(t *testing.T) {
 	var wire bytes.Buffer

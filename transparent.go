@@ -192,7 +192,7 @@ func (p *Proxy) serveTransparentTLS(ctx context.Context, cancel context.CancelFu
 	if registered != nil {
 		*registered = sess
 	}
-	defer p.srv.untrackSession(sess)
+	defer p.srv.untrackEnded(sess)
 	return p.terminate(ctx, conn, sess)
 }
 
@@ -219,7 +219,7 @@ func (p *Proxy) serveTransparentPlain(ctx context.Context, cancel context.Cancel
 	if registered != nil {
 		*registered = sess
 	}
-	defer p.srv.untrackSession(sess)
+	defer p.srv.untrackEnded(sess)
 	if silent {
 		return p.serveSilent(ctx, conn, sess)
 	}

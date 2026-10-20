@@ -139,7 +139,11 @@ func (p *Proxy) serveConnectUDP(w http.ResponseWriter, r *http.Request, identity
 		if errors.Is(err, errSessionEnded) {
 			panic(http.ErrAbortHandler)
 		}
-		p.writeStatus(w, r, http.StatusForbidden, "the entries changed while the tunnel was admitted")
+		// A refusal is a cause, which the closer of the tunnel ends it with, I1.
+		tun.noSender()
+		_ = sess.endAfter(causeRefused, time.Now().Add(alertWriteTimeout), func() {
+			p.writeStatus(w, r, http.StatusForbidden, "the entries changed while the tunnel was admitted")
+		})
 		return
 	}
 	defer p.srv.untrackSession(sess)
@@ -233,6 +237,8 @@ func (p *Proxy) openTunnel(ctx context.Context, w http.ResponseWriter, r *http.R
 			return nil
 		}
 		sessionFromRequest(r).handOver()
+		// The tunnel registered before the hijack.
+		p.srv.removeFront(client)
 		// Anything the reader buffered past the request is already capsule data.
 		pipe := newSocketCapsulePipe(client, brw.Reader)
 		tun.accept(pipe)
@@ -399,7 +405,10 @@ type connectUDPTunnel struct {
 	// answered is closed once the handler stored the pipe or gave up.
 	answered chan struct{}
 	// readEnd is closed once serve read its stream to an error, readErr.
-	readEnd  chan struct{}
+	readEnd chan struct{}
+	// refused is closed once refusing is set, which ends the wait of an inner closer for a
+	// handshake.
+	refused  chan struct{}
 	readErr  error
 	key      flowKey
 	upstream netip.AddrPort
@@ -431,6 +440,7 @@ func newConnectUDPTunnel(d *quicDemux, sess *Session, framing tunnelFraming, can
 		sent:     make(chan struct{}),
 		answered: make(chan struct{}),
 		readEnd:  make(chan struct{}),
+		refused:  make(chan struct{}),
 	}
 	client := addrPort(sess.remoteAddr)
 	t.addr = &tunnelAddr{
@@ -461,13 +471,20 @@ func (t *connectUDPTunnel) accept(pipe tunnelPipe) {
 	t.answer()
 }
 
+// refuse begins the end of the tunnel for its inner units, I3.
+func (t *connectUDPTunnel) refuse() {
+	if !t.refusing.Swap(true) {
+		close(t.refused)
+	}
+}
+
 // streamFailed reports whether the peer reset the stream of the tunnel or broke its framing, on
 // HTTP/2 and HTTP/3, waiting until deadline for the read of the stream the end of its connection
 // ends. A read still running at deadline gives the failed end, I4.
 func (t *connectUDPTunnel) streamFailed(deadline time.Time) bool {
 	// The end of the tunnel began, so the read drains the stream without opening an inner unit,
 	// I3.
-	t.refusing.Store(true)
+	t.refuse()
 	pipe := t.pipe.Load()
 	if pipe == nil {
 		return false
@@ -668,7 +685,7 @@ func (t *connectUDPTunnel) closeInner(c cause, deadline time.Time) {
 	d := t.d
 	d.mu.Lock()
 	// Refused from here on, no inner unit joins the ones closed below.
-	t.refusing.Store(true)
+	t.refuse()
 	var sessions []*Session
 	if flow := d.flows[t.key]; flow != nil {
 		for _, conn := range flow.conns {
@@ -702,7 +719,7 @@ func (t *connectUDPTunnel) closeWith(failed bool) {
 		d := t.d
 		d.mu.Lock()
 		t.failed.Store(failed)
-		t.refusing.Store(true)
+		t.refuse()
 		t.closed.Store(true)
 		var inner []innerConn
 		var sockets []net.Conn

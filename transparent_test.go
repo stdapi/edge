@@ -16,8 +16,10 @@ import (
 	"net/netip"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1493,4 +1495,79 @@ func TestTransparent_ServeConnReportsAPeerReset(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestServeConn_ReturnsTheFailureOfASessionServedAsHTTP(t *testing.T) {
+	for _, timeout := range []bool{false, true} {
+		t.Run("read header timeout "+strconv.FormatBool(timeout), func(t *testing.T) {
+			ca, err := GenerateCA()
+			require.NoError(t, err)
+			opts := []ProxyOption{WithCA(ca)}
+			if timeout {
+				opts = append(opts, WithReadHeaderTimeout(300*time.Millisecond))
+			}
+			p, err := New(opts...)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = p.Close() })
+			p.MustAdd("svc.test/", okHandler)
+			conn, server := tcpPair(t)
+			served := make(chan error, 1)
+			go func() { served <- p.ServeConn(server) }()
+			tc := tls.Client(conn, &tls.Config{ServerName: "svc.test", RootCAs: poolOf(ca), NextProtos: []string{"http/1.1"}, MinVersion: tls.VersionTLS12})
+			require.NoError(t, tc.Handshake())
+			if timeout {
+				_, err = tc.Write([]byte("GET / HTTP/1.1\r\n"))
+				require.NoError(t, err)
+			} else {
+				_, err = tc.Write([]byte("GET / HTTP/1.1\r\nHost: svc.test\r\n\r\n"))
+				require.NoError(t, err)
+				resp, err := http.ReadResponse(bufio.NewReader(tc), nil)
+				require.NoError(t, err)
+				require.Equal(t, http.StatusOK, resp.StatusCode)
+				require.NoError(t, conn.SetLinger(0))
+				require.NoError(t, conn.Close())
+			}
+			select {
+			case err := <-served:
+				if timeout {
+					require.True(t, isTimeout(err), "%v", err)
+				} else {
+					require.ErrorIs(t, err, syscall.ECONNRESET)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("ServeConn did not return")
+			}
+		})
+	}
+}
+
+func TestServeConn_ResetDuringTheNormalEndOfADrainIsNoFailure(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = p.Close() })
+	p.MustAdd("svc.test/", okHandler)
+	conn, server := tcpPair(t)
+	served := make(chan error, 1)
+	go func() { served <- p.ServeConn(server) }()
+	tc := tls.Client(conn, &tls.Config{ServerName: "svc.test", RootCAs: poolOf(ca), NextProtos: []string{"http/1.1"}, MinVersion: tls.VersionTLS12})
+	require.NoError(t, tc.Handshake())
+	time.Sleep(100 * time.Millisecond)
+	shut := make(chan error, 1)
+	go func() { shut <- p.Shutdown(context.Background()) }()
+	// The drain ends the connection, which began no request, normally, and the client resets
+	// it during the read that follows its close_notify.
+	_ = tc.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_, err = tc.Read(make([]byte, 1))
+	require.ErrorIs(t, err, io.EOF)
+	require.NoError(t, conn.SetLinger(0))
+	require.NoError(t, conn.Close())
+	select {
+	case err := <-served:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("ServeConn did not return")
+	}
+	require.NoError(t, <-shut)
 }

@@ -233,8 +233,9 @@ func (c *TCPCtx) upgradeTLS(ctx context.Context, conn net.Conn, addr, serverName
 // return the state of the client handshake, and [TCPCtx.Target] is not affected.
 //
 // StartTLS returns an error if the stream is already using TLS, if the proxy has no
-// certificate authority, if it refuses the ClientHello under [WithRejectECH] or
-// [WithNameVerification], or if either handshake fails. Without a certificate authority or on a
+// certificate authority, if the read of the ClientHello fails, if it refuses a ClientHello the
+// stream ended inside or one [WithRejectECH] or [WithNameVerification] rejects, or if either
+// handshake fails. Without a certificate authority or on a
 // refused ClientHello, the client is sent a fatal TLS alert. The connection returned by
 // [TCPCtx.Client] remains open.
 func (c *TCPCtx) StartTLS() error {
@@ -261,7 +262,7 @@ func (c *TCPCtx) StartTLS() error {
 	}
 
 	hello, alert, err := p.peekClientHello(conn)
-	if isTimeout(err) || isPeerReadFailure(err) {
+	if err != nil && alert == 0 {
 		return err
 	}
 	if err != nil {

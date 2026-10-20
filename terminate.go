@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"os"
 	"slices"
 	"time"
 
@@ -151,6 +152,9 @@ func (p *Proxy) terminate(ctx context.Context, conn *peekConn, sess *Session) er
 		// the payload is in the clear, which is exactly what the sniff reads.
 		peeked := newPeekConn(tc, nil, defaultPeekSize)
 		candidates = sniffStreamCandidates(peeked, p.cfg.server.sniffTimeout)
+		if err := sniffFailed(sess, peeked); err != nil {
+			return err
+		}
 		served := p.serveCandidates(ctx, peeked, sess, candidates, &state)
 		closeRefused(sess, tc, served)
 		return served
@@ -158,6 +162,16 @@ func (p *Proxy) terminate(ctx context.Context, conn *peekConn, sess *Session) er
 	served := p.serveCandidates(ctx, tc, sess, candidates, &state)
 	closeRefused(sess, tc, served)
 	return served
+}
+
+// sniffFailed gives sess its failed end when the peer failed its leg during the sniff of conn, a
+// session that runs no handler, I1, and returns the error of that failure.
+func sniffFailed(sess *Session, conn *peekConn) error {
+	err := conn.peerFailure()
+	if err != nil {
+		_ = sess.endBy(causePeerFailed, time.Now().Add(alertWriteTimeout))
+	}
+	return err
 }
 
 // closeRefused ends a session refused after its handshake: the failed end when the cut or its
@@ -179,18 +193,18 @@ func closeRefused(sess *Session, tc *tlsConn, err error) {
 // the two. Nothing is consumed, the handshake reads the same bytes after.
 func (p *Proxy) placeTLS(ctx context.Context, conn *peekConn, sess *Session) error {
 	hello, alert, err := p.peekClientHello(conn)
-	if isTimeout(err) {
+	switch {
+	case err == nil:
+	case alert != 0:
+		return refuseHello(sess, conn, alert, err)
+	case isTimeout(err):
 		// The read header timeout is a failed cause, I2.
 		_ = sess.endBy(causeTimeout, time.Now().Add(alertWriteTimeout))
 		return err
-	}
-	if isPeerReadFailure(err) {
+	default:
 		// The peer failed its leg inside the ClientHello, no refusal to answer.
 		_ = sess.endBy(causePeerFailed, time.Now().Add(alertWriteTimeout))
 		return err
-	}
-	if err != nil {
-		return refuseHello(sess, conn, alert, err)
 	}
 
 	target := sess.target
@@ -234,14 +248,27 @@ func (p *Proxy) placeTLS(ctx context.Context, conn *peekConn, sess *Session) err
 	return nil
 }
 
+// errHelloCutShort refuses a ClientHello its stream ended inside, a malformed message.
+var errHelloCutShort = errors.New("edge: a ClientHello cut short by the end of its stream")
+
 // peekClientHello reads the ClientHello waiting on conn without consuming it, nil when there
-// is none it can read, with the alert of clientHelloFromRecords. It refuses the connection with
-// the alert to send when the hello offers Encrypted Client Hello and the proxy rejects that.
+// is none it can read, with the alert of clientHelloFromRecords. An error with an alert is a
+// refusal, of a ClientHello its stream ended inside or of one offering Encrypted Client Hello
+// the proxy rejects. An error with none is that of a read, which timed out, which the peer
+// failed, or which ended before a TLS record began.
 func (p *Proxy) peekClientHello(conn *peekConn) (*ClientHello, byte, error) {
 	raw, err := peekHandshakeRecords(conn)
-	if isTimeout(err) || isPeerReadFailure(err) {
-		// A timer or a failure of the peer inside the ClientHello, which no alert answers.
+	if isTimeout(err) {
 		return nil, 0, err
+	}
+	if ferr := conn.peerFailure(); ferr != nil {
+		return nil, 0, ferr
+	}
+	if errors.Is(conn.err, io.EOF) {
+		if conn.Buffered() == 0 || conn.buf[0] != tlsHandshakeRecord {
+			return nil, 0, conn.err
+		}
+		return nil, alertDecodeError, errHelloCutShort
 	}
 	if p.cfg.rejectECH {
 		if err != nil {
@@ -259,16 +286,6 @@ func (p *Proxy) peekClientHello(conn *peekConn) (*ClientHello, byte, error) {
 	}
 	hello, alert := clientHelloFromRecords(raw)
 	return hello, alert, nil
-}
-
-// isPeerReadFailure reports a read the peer failed, a reset, where a malformed message, an end
-// of the peer or a timeout is none.
-func isPeerReadFailure(err error) bool {
-	if err == nil || isTimeout(err) || errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
-		return false
-	}
-	_, ok := errors.AsType[*net.OpError](err)
-	return ok
 }
 
 // peekFirst waits for the first byte of conn for at most sniff.
@@ -298,6 +315,9 @@ func (p *Proxy) serveSilent(ctx context.Context, conn *peekConn, sess *Session) 
 // stream nothing admits is reset.
 func (p *Proxy) servePlain(ctx context.Context, conn *peekConn, sess *Session) error {
 	candidates := sniffStreamCandidates(conn, p.cfg.server.sniffTimeout)
+	if err := sniffFailed(sess, conn); err != nil {
+		return err
+	}
 	sess.servableAs = candidates
 	if !slices.Contains(candidates, KindHTTP) {
 		err := p.serveCandidates(ctx, conn, sess, candidates, nil)
@@ -320,7 +340,15 @@ func (p *Proxy) servePlain(ctx context.Context, conn *peekConn, sess *Session) e
 		return err
 	}
 	if placed != plainRefused && p.admitsAny(sess.target, candidates...) {
-		return p.serveCandidates(ctx, conn, sess, candidates, nil)
+		err := p.serveCandidates(ctx, conn, sess, candidates, nil)
+		if errors.Is(err, ErrConnectionRejected) {
+			// The entries changed while the session was admitted, a refusal of its first
+			// request, docs/lifecycle.md Refusals.
+			_ = sess.endAfter(causeRefused, time.Now().Add(alertWriteTimeout), func() {
+				_ = writeRawStatus(conn, http.StatusForbidden)
+			})
+		}
+		return err
 	}
 	// Refused in HTTP, once for all when the first request has a host, as a handshake ends on a
 	// server name nothing admits. Without a host, each request is routed on its own.
@@ -359,8 +387,8 @@ func (p *Proxy) placePlain(ctx context.Context, conn *peekConn, sess *Session) (
 	if isTimeout(err) {
 		return plainTimedOut, err
 	}
-	if isPeerReadFailure(err) {
-		return plainFailed, err
+	if ferr := conn.peerFailure(); ferr != nil {
+		return plainFailed, ferr
 	}
 	host, _, ok := splitAuthority(authority)
 	if !ok || host == "" {
@@ -511,6 +539,7 @@ func (p *Proxy) serveTerminatedHTTP(conn net.Conn, sess *Session, state *tls.Con
 	defer p.srv.untrackSession(sess)
 
 	ln := newSingleConnListener(conn, sess, state)
+	served := servedOf(ln.conn)
 	srv := p.srv.term
 	if p.terminatedHTTP2(conn, state) {
 		srv = p.srv.term2
@@ -529,11 +558,30 @@ func (p *Proxy) serveTerminatedHTTP(conn net.Conn, sess *Session, state *tls.Con
 		err = late.Serve(ln)
 	}
 	ln.wait()
+	if sess.end.first() == causeNone {
+		// The session ends with its connection, which gives it its cause, I1.
+		_ = sess.endBy(served.causeOfEnd(), time.Now().Add(alertWriteTimeout))
+	}
 	if errors.Is(err, net.ErrClosed) || errors.Is(err, http.ErrServerClosed) {
-		return nil
+		err = nil
+	}
+	if err == nil {
+		// net/http reports no error of the connection it served.
+		switch sess.end.first() {
+		case causePeerFailed:
+			if f := served.failure.Load(); f != nil {
+				err = *f
+			}
+		case causeTimeout:
+			err = errReadHeaderTimeout
+		}
 	}
 	return err
 }
+
+// errReadHeaderTimeout ends a session served as HTTP when its first request header did not
+// arrive within the read header timeout.
+var errReadHeaderTimeout = fmt.Errorf("edge: read header timeout: %w", os.ErrDeadlineExceeded)
 
 // terminatedHTTP2 reports whether a terminated connection uses HTTP/2, from the ALPN of its
 // handshake or the preface of a plaintext one, read within the read header timeout.

@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"iter"
 	"log"
@@ -28,6 +29,7 @@ import (
 	"github.com/quic-go/quic-go/qlogwriter"
 	"github.com/stdapi/edge/internal/stringsutil"
 	"golang.org/x/net/http/httpguts"
+	"golang.org/x/net/http2"
 )
 
 type sessionKey struct{}
@@ -78,6 +80,8 @@ type server struct {
 	term2     *http.Server
 	newTerm   func(*http.Protocols) *http.Server
 	newFront2 func() *http.Server
+	// late tracks the servers of serveLate, which the cut closes with its own.
+	late map[*http.Server]struct{}
 
 	listeners map[*net.Listener]struct{}
 	// active tracks connections the proxy owns outside of http.Server, which is every
@@ -91,10 +95,13 @@ type server struct {
 	// one.
 	fronts map[net.Conn]struct{}
 	// frontSess is the session of each front connection, net.Conn or *quic.Conn, whose closer
-	// the cut runs.
-	frontSess map[any]*Session
-	// waiting keeps the front connections before their first bytes or handshake, and
-	// fresh the terminated HTTP/1.1 connections that have read no byte, which the drain ends.
+	// the cut runs. dispatching keeps a front connection not yet handed to its server until
+	// dispatchFront lets it go and closes its channel: until then its end belongs to
+	// dispatchFront alone.
+	frontSess   map[any]*Session
+	dispatching map[net.Conn]chan struct{}
+	// waiting keeps the front connections until they are handed to their server, and fresh the
+	// terminated HTTP/1.1 connections that have read no byte, which the drain ends.
 	waiting map[net.Conn]struct{}
 	fresh   sync.Map
 	// quics tracks the QUIC demultiplexers. Their connections own their sessions under a
@@ -107,7 +114,9 @@ type server struct {
 	cutCancel context.CancelCauseFunc
 	// cutEnded is closed once a cut has ended, whoever started it.
 	cutEnded chan struct{}
-	cancel   context.CancelFunc
+	// frontStage is closed once the front stage of the cut began.
+	frontStage chan struct{}
+	cancel     context.CancelFunc
 	// done is closed once Shutdown or Close has returned, when a front may close the socket
 	// its connections run on.
 	done chan struct{}
@@ -123,10 +132,14 @@ type server struct {
 	tracked    gauge
 	frontsLive gauge
 	h3Live     gauge
+	h3Gate     h3Gate
 	doneOne    sync.Once
 	cutOnce    sync.Once
 	// cutStarter records who started the cut, cutByDeadline or cutByClose.
 	cutStarter atomic.Uint32
+	// frontStageBy is the deadline of the front stage of the cut in nanoseconds since the epoch,
+	// zero before it, which the end dispatchFront gives a connection does not pass, I4.
+	frontStageBy atomic.Int64
 
 	mu      sync.Mutex
 	closing atomic.Bool
@@ -143,18 +156,21 @@ func newServer(p *Proxy) (*server, error) {
 	}
 
 	s := &server{
-		p:         p,
-		fwd:       fwd,
-		listeners: make(map[*net.Listener]struct{}),
-		active:    make(map[io.Closer]struct{}),
-		sessions:  make(map[*Session]struct{}),
-		fronts:    make(map[net.Conn]struct{}),
-		frontSess: make(map[any]*Session),
-		waiting:   make(map[net.Conn]struct{}),
-		quics:     make(map[*quicDemux]struct{}),
-		done:      make(chan struct{}),
-		cutEnded:  make(chan struct{}),
-		requests:  newRequestList(),
+		p:           p,
+		fwd:         fwd,
+		listeners:   make(map[*net.Listener]struct{}),
+		active:      make(map[io.Closer]struct{}),
+		sessions:    make(map[*Session]struct{}),
+		fronts:      make(map[net.Conn]struct{}),
+		frontSess:   make(map[any]*Session),
+		dispatching: make(map[net.Conn]chan struct{}),
+		late:        make(map[*http.Server]struct{}),
+		frontStage:  make(chan struct{}),
+		waiting:     make(map[net.Conn]struct{}),
+		quics:       make(map[*quicDemux]struct{}),
+		done:        make(chan struct{}),
+		cutEnded:    make(chan struct{}),
+		requests:    newRequestList(),
 	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	s.cutCtx, s.cutCancel = context.WithCancelCause(context.Background())
@@ -232,6 +248,7 @@ func newServer(p *Proxy) (*server, error) {
 		IdleTimeout:     p.cfg.server.idleTimeout,
 		Logger:          p.cfg.logger,
 		ConnContext: func(ctx context.Context, c *quic.Conn) context.Context {
+			s.h3Gate.counted(c)
 			// The handshake is over by the time a connection is handed here, so the session
 			// has its TLS state from the start.
 			sess := newSession(p, ctx, nil, Target{}, KindHTTP, HTTP3)
@@ -375,57 +392,85 @@ func (p *Proxy) serveFront(ln net.Listener) error {
 
 // dispatchFront hands c to the server of its protocol, the ALPN of a TLS connection or the
 // preface of a plaintext one, read under the deadline net/http gives a handshake. An HTTP/2
-// connection that reaches its server once the drain shut it down gets a server of its own.
+// connection that reaches its server once the drain shut it down gets a server of its own, and
+// one decided once a cut started gets its end here.
 func (p *Proxy) dispatchFront(c net.Conn, q1, q2 *connQueue) {
 	h2, err := p.frontHTTP2(c)
-	if isTimeout(err) && schemeConnOf(c) != nil {
-		// No request arrived within the read header timeout, a failed cause, or within the T
-		// the drain gives a connection to begin one, a normal end.
-		p.srv.removeFront(c)
-		if p.srv.closing.Load() {
-			closeNormally(c)
-		} else {
-			abortBy(c, time.Now().Add(alertWriteTimeout))
+	sc := schemeConnOf(c)
+	if (!isTimeout(err) || sc == nil) && p.srv.handOver(c) {
+		// Handed to its server, which ends it from here.
+		if err != nil || !h2 {
+			// A failed handshake goes to the HTTP/1.1 server, which answers it as net/http does.
+			if !q1.push(c) {
+				p.srv.removeFront(c)
+				_ = c.Close()
+			}
+			return
+		}
+		if sc != nil {
+			// HTTP/2 has no header timeout of its own to bound.
+			sc.boundHeader(time.Time{})
+		}
+		if !q2.push(c) {
+			p.serveLate(c)
 		}
 		return
 	}
-	if err != nil || !h2 {
-		// A failed handshake goes to the HTTP/1.1 server, which answers it as net/http does.
-		if !q1.push(c) {
-			p.srv.removeFront(c)
-			_ = c.Close()
-		}
-		return
+	// No request arrived within the read header timeout, a failed cause, or within the T the drain
+	// gives a connection to begin one, or the cut started, a normal end each. The connection stays
+	// registered until its end returned, I5.
+	if sc != nil {
+		sc.beginEnd()
 	}
-	if sc := schemeConnOf(c); sc != nil {
-		// HTTP/2 has no header timeout of its own to bound.
-		sc.boundHeader(time.Time{})
+	switch {
+	case errors.Is(err, errReadHeaderTimeout):
+		abortBy(c, p.srv.frontEndBy())
+	case p.srv.cutting():
+		// The front connections end in the front stage, once the units ended.
+		<-p.srv.frontStage
+		closeNormallyBy(c, p.srv.frontEndBy())
+	case p.srv.closing.Load():
+		p.srv.endDrained(c)
+	default:
+		abortBy(c, p.srv.frontEndBy())
 	}
-	if !q2.push(c) {
-		p.serveLate(p.srv.newFront2(), c)
-	}
+	p.srv.removeFront(c)
+	p.srv.letGo(c)
 }
 
-func (p *Proxy) frontHTTP2(c net.Conn) (bool, error) {
-	var deadline time.Time
+func (p *Proxy) frontHTTP2(c net.Conn) (h2 bool, err error) {
+	var header time.Time
 	if d := p.cfg.server.readHeaderTimeout; d > 0 {
-		deadline = time.Now().Add(d)
+		header = time.Now().Add(d)
 	}
+	defer func() {
+		if isTimeout(err) && !header.IsZero() && !time.Now().Before(header) {
+			// The read header timeout expired, and not the T of the drain, which endWaiting
+			// may have set since.
+			err = fmt.Errorf("%w: %w", errReadHeaderTimeout, err)
+		}
+	}()
+	hs, isTLS := c.(interface {
+		HandshakeContext(context.Context) error
+	})
+	sc := schemeConnOf(c)
 	// Under the lock of endWaiting, so a drain that starts meanwhile cannot have its deadline
 	// replaced.
 	p.srv.mu.Lock()
-	if p.srv.closing.Load() {
-		// The drain started before the wait, and ends it as endWaiting does.
-		if drained := time.Now().Add(alertWriteTimeout); deadline.IsZero() || drained.Before(deadline) {
-			deadline = drained
+	if !header.IsZero() {
+		// The read header timeout bounds the handshake and the first request header, and the
+		// one of net/http counts from its own read, after this one.
+		_ = c.SetDeadline(header)
+		if sc != nil {
+			sc.boundHeader(header)
 		}
 	}
-	if !deadline.IsZero() {
-		_ = c.SetDeadline(deadline)
-		if sc := schemeConnOf(c); sc != nil {
-			// The read header timeout of net/http counts from its own read, after this one.
-			sc.boundHeader(deadline)
-		}
+	if !isTLS {
+		// A plaintext connection reaches its server at its accept.
+		p.reachedLocked(c, sc, header, false)
+	} else if header.IsZero() && p.srv.closing.Load() {
+		// The drain bounds a handshake that no read header timeout bounds, as drainBy does.
+		_ = c.SetDeadline(time.Now().Add(alertWriteTimeout))
 	}
 	p.srv.mu.Unlock()
 	// Off the waits first, so the drain sets no deadline past the reset.
@@ -433,31 +478,95 @@ func (p *Proxy) frontHTTP2(c net.Conn) (bool, error) {
 		p.srv.served(c)
 		_ = c.SetDeadline(time.Time{})
 	}()
-	if hs, ok := c.(interface {
-		HandshakeContext(context.Context) error
-	}); ok {
+	if isTLS {
 		if err := hs.HandshakeContext(context.Background()); err != nil {
 			return false, err
 		}
+		// Read before the lock, so a handshake still running blocks no drain.
+		cs, ok := c.(connectionStater)
+		h2 := ok && cs.ConnectionState().NegotiatedProtocol == "h2"
+		p.srv.mu.Lock()
+		p.reachedLocked(c, sc, header, h2)
+		p.srv.mu.Unlock()
 	}
-	if sc := schemeConnOf(c); sc != nil {
+	if sc != nil {
 		return sc.http2()
 	}
 	return false, nil
 }
 
-// serveLate serves c on srv, its own server, shut down once it has the connection, which writes
-// its GOAWAY.
-func (p *Proxy) serveLate(srv *http.Server, c net.Conn) {
+// reachedLocked records that c reached its server, past which the drain bounds the wait for its
+// first request, and gives it T from here when the drain already started, docs/lifecycle.md The
+// drain. It runs under the server lock, which endWaiting takes.
+func (p *Proxy) reachedLocked(c net.Conn, sc *schemeConn, header time.Time, h2 bool) {
+	if sc != nil {
+		sc.markReached(p.srv.closing.Load(), h2)
+	}
+	if p.srv.closing.Load() {
+		deadline := time.Now().Add(alertWriteTimeout)
+		if !header.IsZero() && header.Before(deadline) {
+			deadline = header
+		}
+		_ = c.SetDeadline(deadline)
+	}
+}
+
+// endDrained gives c, a front connection the drain ends before it began a request, its normal
+// end. A TLS connection that negotiated h2 gets an empty SETTINGS and a GOAWAY first, what the
+// client sends before it read them is discarded, and its normal end follows within T,
+// docs/lifecycle.md The drain.
+func (s *server) endDrained(c net.Conn) {
+	sc := schemeConnOf(c)
+	cs, ok := c.(connectionStater)
+	if sc != nil && ok {
+		if state := cs.ConnectionState(); state.HandshakeComplete && state.NegotiatedProtocol == "h2" {
+			deadline := s.frontEndBy()
+			_ = sc.SetWriteDeadline(deadline)
+			fr := http2.NewFramer(sc.Conn, nil)
+			if fr.WriteSettings() == nil && fr.WriteGoAway(0, http2.ErrCodeNo, nil) == nil {
+				_ = sc.Conn.SetReadDeadline(deadline)
+				_, _ = io.Copy(io.Discard, sc.Conn)
+			}
+		}
+	}
+	closeNormallyBy(c, s.frontEndBy())
+}
+
+// frontEndBy is the deadline of an end dispatchFront begins now, T from now, or the deadline of
+// the front stage of the cut when that one comes first, I4.
+func (s *server) frontEndBy() time.Time {
+	deadline := time.Now().Add(alertWriteTimeout)
+	if n := s.frontStageBy.Load(); n != 0 && n < deadline.UnixNano() {
+		deadline = time.Unix(0, n)
+	}
+	return deadline
+}
+
+// serveLate serves c on a server of its own, shut down once it has the connection, which writes
+// its GOAWAY. Once a cut started it leaves c to the front stage.
+func (p *Proxy) serveLate(c net.Conn) {
+	srv := p.srv.newFront2()
+	p.srv.mu.Lock()
+	if p.srv.refusing {
+		p.srv.mu.Unlock()
+		return
+	}
+	p.srv.late[srv] = struct{}{}
+	p.srv.mu.Unlock()
+	defer func() {
+		p.srv.mu.Lock()
+		delete(p.srv.late, srv)
+		p.srv.mu.Unlock()
+	}()
 	shutdownOnceServing(srv)
 	q := newConnQueue(c.LocalAddr())
 	go func() { _ = q.push(c) }()
 	_ = srv.Serve(q)
 }
 
-// shutdownOnceServing shuts srv, the server of one connection, down at its first request, or T
-// after the HTTP/2 server registered the connection, which it has once the connection is idle or
-// active. Its GOAWAY then lets in the requests read by then.
+// shutdownOnceServing shuts srv, the server of one connection, down at its first request, T after
+// the HTTP/2 server registered the connection, which it has once the connection is idle or active,
+// or at its close. Its GOAWAY then lets in the requests read by then.
 func shutdownOnceServing(srv *http.Server) {
 	var once sync.Once
 	shutdown := func() { once.Do(func() { go func() { _ = srv.Shutdown(context.Background()) }() }) }
@@ -472,8 +581,11 @@ func shutdownOnceServing(srv *http.Server) {
 		if next != nil {
 			next(c, state)
 		}
-		if state == http.StateIdle || state == http.StateActive {
+		switch state {
+		case http.StateIdle, http.StateActive:
 			armed.Do(func() { time.AfterFunc(alertWriteTimeout, shutdown) })
+		case http.StateClosed:
+			shutdown()
 		}
 	}
 }
@@ -550,7 +662,7 @@ func (p *Proxy) ServeQUIC(pc net.PacketConn, cert tls.Certificate) error {
 		return context.WithValue(ctx, h3TokenKey{}, t), nil
 	}}
 	acceptCtx, stopAccept := context.WithCancel(context.Background())
-	front := &quicFront{late: p.srv.lateH3, logger: p.cfg.logger, own: p.srv.fwd.up.own, conns: make(map[*quic.Conn]struct{}),
+	front := &quicFront{late: p.srv.lateH3, gate: &p.srv.h3Gate, logger: p.cfg.logger, own: p.srv.fwd.up.own, conns: make(map[*quic.Conn]struct{}),
 		sessOf: func(c *quic.Conn) *Session { return p.srv.frontSessionOf(c) },
 		tr:     tr, pc: pc, closed: make(chan struct{}), stopAccept: stopAccept}
 	if !p.srv.tryTrackFront(front) {
@@ -616,12 +728,57 @@ func h3Trace(ctx context.Context, _ bool, _ quic.ConnectionID) qlogwriter.Trace 
 	return nil
 }
 
+// h3Gate orders the start of the service of a connection on an HTTP/3 server before the
+// shutdown of that server. quic-go counts a connection only after it checked that its server is
+// open, and a shutdown between the two closes the connection with H3_NO_ERROR and no answer.
+type h3Gate struct {
+	// counting maps the connections between the start of their service and their count.
+	counting sync.Map
+	mu       sync.RWMutex
+	shut     bool
+}
+
+// serve serves c on srv, and returns http.ErrServerClosed once the shutdown of srv began. The
+// shutdown waits while c is between the check of its server and its count.
+func (g *h3Gate) serve(srv *http3.Server, c *quic.Conn) error {
+	g.mu.RLock()
+	if g.shut {
+		g.mu.RUnlock()
+		return http.ErrServerClosed
+	}
+	held := new(atomic.Bool)
+	held.Store(true)
+	g.counting.Store(c, held)
+	err := srv.ServeQUICConn(c)
+	g.counting.Delete(c)
+	if held.Swap(false) {
+		g.mu.RUnlock()
+	}
+	return err
+}
+
+// counted runs in the ConnContext of the server, once quic-go counted c.
+func (g *h3Gate) counted(c *quic.Conn) {
+	if v, ok := g.counting.Load(c); ok && v.(*atomic.Bool).Swap(false) {
+		g.mu.RUnlock()
+	}
+}
+
+// shutdown shuts srv down once no connection is between the check of its server and its count.
+func (g *h3Gate) shutdown(ctx context.Context, srv *http3.Server) error {
+	g.mu.Lock()
+	g.shut = true
+	g.mu.Unlock()
+	return srv.Shutdown(ctx)
+}
+
 // quicFront records the connections accepted on an HTTP/3 front, so a cut closes them with
 // a CONNECTION_CLOSE before the transport under them.
 type quicFront struct {
 	// late returns a server of its own for a connection that reaches the shared one after the
 	// start of the drain, nil once a cut started.
 	late   func() *http3.Server
+	gate   *h3Gate
 	logger *slog.Logger
 	own    *ownSockets
 	conns  map[*quic.Conn]struct{}
@@ -663,7 +820,7 @@ func (f *quicFront) accept(ctx context.Context, ln *quic.Listener, h3 *http3.Ser
 }
 
 func (f *quicFront) serve(h3 *http3.Server, c *quic.Conn) {
-	err := h3.ServeQUICConn(c)
+	err := f.gate.serve(h3, c)
 	if errors.Is(err, http.ErrServerClosed) && c.Context().Err() == nil && f.late != nil {
 		// The drain shut the server down before it had the connection.
 		if late := f.late(); late != nil {
@@ -730,11 +887,14 @@ func (p *Proxy) Shutdown(ctx context.Context) error {
 		return nil
 	default:
 	}
-	p.srv.beginClose()
+	first := p.srv.beginClose()
 	defer p.srv.endClose()
 
 	err := p.srv.closeListeners()
-	p.srv.endWaiting()
+	if first {
+		// The drain takes its deadline once.
+		p.srv.endWaiting()
+	}
 
 	// Past the deadline, whatever draining could not end is cut: streams, upgraded pipes, and
 	// connections still handshaking. Cutting them is what unblocks the waits below.
@@ -756,7 +916,7 @@ func (p *Proxy) Shutdown(ctx context.Context) error {
 	drains.Go(func() { errs[0] = p.srv.h2.Shutdown(ctx) })
 	// quic-go closes every connection once the context of its Shutdown ends, before the cut
 	// has ended their requests, so the cut ends them instead.
-	drains.Go(func() { errs[1] = p.srv.h3.Shutdown(context.WithoutCancel(ctx)) })
+	drains.Go(func() { errs[1] = p.srv.h3Gate.shutdown(context.WithoutCancel(ctx), p.srv.h3) })
 	drains.Go(func() { errs[2] = p.srv.term2.Shutdown(ctx) })
 	drains.Go(func() { errs[3] = p.srv.frontsLive.waitCtx(ctx) })
 	for i, d := range demuxes {
@@ -922,10 +1082,11 @@ func (p *Proxy) Sessions() iter.Seq[*Session] {
 
 	// A demux owns its connections under a lock of its own, taken here only once the server
 	// lock is released, so the two are never held at once.
+	var inner []*Session
 	for _, d := range demuxes {
-		out = d.appendSessions(out, true)
+		out, inner = d.appendSessions(out, inner)
 	}
-	return slices.Values(out)
+	return slices.Values(append(out, inner...))
 }
 
 // serveProxyRequest is the explicit forward proxy entry point: a CONNECT opens a connection,
@@ -1196,14 +1357,16 @@ func (s *server) idle(sess *Session) bool {
 	return len(sess.carried) == 0
 }
 
-// beginClose marks the proxy as stopping. Writing closing under the lock orders it against
-// every registration: one that saw it unset committed inside a critical section that ran
-// first, so the snapshots a shutdown takes under the same lock cannot miss it.
-func (s *server) beginClose() {
+// beginClose marks the proxy as stopping and reports whether this call did. Writing closing
+// under the lock orders it against every registration: one that saw it unset committed inside a
+// critical section that ran first, so the snapshots a shutdown takes under the same lock cannot
+// miss it.
+func (s *server) beginClose() bool {
 	s.mu.Lock()
-	s.closing.Store(true)
+	first := !s.closing.Swap(true)
 	s.mu.Unlock()
 	s.cancel()
+	return first
 }
 
 // endClose marks the shutdown as over, drained or cut at the deadline.
@@ -1329,6 +1492,15 @@ func (s *server) untrackDemux(d *quicDemux) {
 	delete(s.active, d)
 	delete(s.quics, d)
 	s.mu.Unlock()
+}
+
+// untrackEnded is untrackSession once a closer of sess that began has ended, so the socket that
+// its owner closes next has its closer as its one ender, I1.
+func (s *server) untrackEnded(sess *Session) {
+	if sess.end.first() != causeNone {
+		<-sess.end.done
+	}
+	s.untrackSession(sess)
 }
 
 // untrackSession removes a session once the goroutine serving it is done with it.
@@ -1470,7 +1642,7 @@ func pendingCloser(c sessionCloser) bool {
 	return false
 }
 
-// pendingSocket ends a session not yet admitted with the failed end of its socket.
+// pendingSocket ends the socket of a session not yet admitted with the form of its cause.
 type pendingSocket peekConn
 
 func (c *pendingSocket) endBy(cs cause, deadline time.Time) error {
@@ -1869,7 +2041,7 @@ func (s *server) cutAll() {
 	cancel()
 	go func() { _ = s.h2.Shutdown(done) }()
 	go func() { _ = s.term2.Shutdown(done) }()
-	go func() { _ = s.h3.Shutdown(context.Background()) }()
+	go func() { _ = s.h3Gate.shutdown(context.Background(), s.h3) }()
 
 	// The units end first, the requests and the sessions together, so their origin reads a cut
 	// and a stream is reset or a TLS connection writes its close_notify before the carrier or
@@ -1886,9 +2058,11 @@ func (s *server) cutAll() {
 	s.mu.Unlock()
 	s.cutCancel(errCut)
 	// A demultiplexer lists its sessions under its own lock, never held with the server lock.
+	// The closer of a tunnel ends its units before its stream, I3, and the stage waits for
+	// their handlers too.
+	var inner []*Session
 	for _, d := range demuxes {
-		// The closer of a tunnel ends what it carries before its stream, I3.
-		sessions = d.appendSessions(sessions, false)
+		sessions, inner = d.appendSessions(sessions, inner)
 	}
 	var closed sync.WaitGroup
 	for _, c := range sessions {
@@ -1896,7 +2070,7 @@ func (s *server) cutAll() {
 	}
 	s.requests.wait(expired)
 	s.serving.wait(expired)
-	s.waitHandling(sessions, expired)
+	s.waitHandling(append(sessions, inner...), expired)
 	stop()
 	closed.Wait()
 
@@ -1910,17 +2084,50 @@ func (s *server) cutAll() {
 	}
 	fronts := make([]net.Conn, 0, len(s.fronts))
 	frontSess := make([]*Session, 0, len(s.fronts))
+	type owned struct {
+		c    net.Conn
+		done chan struct{}
+	}
+	var dispatched []owned
 	for c := range s.fronts {
+		if done := s.dispatching[c]; done != nil {
+			dispatched = append(dispatched, owned{c, done})
+			continue
+		}
 		fronts = append(fronts, c)
 		frontSess = append(frontSess, s.frontSess[c])
 	}
+	stageBy := time.Now().Add(alertWriteTimeout)
+	s.frontStageBy.Store(stageBy.UnixNano())
+	close(s.frontStage)
 	s.mu.Unlock()
+	for _, o := range dispatched {
+		closed.Go(func() {
+			// Its end belongs to dispatchFront, which the wake hands the connection to unless its
+			// end began, the drain's or the cut's, each bounded by the deadline of the stage. A
+			// socket that ignores its deadlines keeps the wake from its read until that deadline.
+			sc := schemeConnOf(o.c)
+			sc.wake()
+			if !waitUntil(o.done, stageBy) {
+				sc.expire()
+				<-o.done
+			}
+		})
+	}
 	for i, c := range fronts {
+		// A handler that ignores its cancel keeps net/http from reporting the close, and the
+		// registry is empty once the stage ended, I5.
 		if sess := frontSess[i]; sess != nil {
-			closed.Go(func() { _ = sess.endBy(causeCut, time.Now().Add(alertWriteTimeout)) })
+			closed.Go(func() {
+				_ = sess.endBy(causeCut, time.Now().Add(alertWriteTimeout))
+				s.removeFront(c)
+			})
 			continue
 		}
-		closed.Go(func() { closeNormally(c) })
+		closed.Go(func() {
+			closeNormally(c)
+			s.removeFront(c)
+		})
 	}
 	for _, c := range conns {
 		if nc, isConn := c.(net.Conn); isConn {
@@ -1937,22 +2144,41 @@ func (s *server) cutAll() {
 // closeHTTPServers ends the HTTP servers once the front stage ended their connections, so they stop
 // accepting from the queues of the fronts.
 func (s *server) closeHTTPServers() {
+	s.mu.Lock()
+	late := make([]*http.Server, 0, len(s.late))
+	for srv := range s.late {
+		late = append(late, srv)
+	}
+	s.mu.Unlock()
+	for _, srv := range late {
+		_ = srv.Close()
+	}
 	_ = s.h1.Close()
 	_ = s.h2.Close()
 	_ = s.term.Close()
 	_ = s.term2.Close()
 }
 
-// trackFront is the ConnState of the front servers. It removes a connection hijacked or closed.
+// trackFront is the ConnState of the front servers. It removes a connection closed. A hijacked
+// one stays until the session that owns its socket registered, [server.takeFront].
 func (s *server) trackFront(c net.Conn, state http.ConnState) {
 	switch state {
 	case http.StateActive:
 		if sc := schemeConnOf(c); sc != nil {
 			sc.boundHeader(time.Time{})
 		}
-	case http.StateHijacked, http.StateClosed:
+	case http.StateClosed:
 		s.removeFront(c)
 	}
+}
+
+// takeFront registers owner, what ends the socket of the connection c a handler hijacked, and
+// only then removes c from the fronts, so no drain finds the socket in neither registry, I5. It
+// reports false once a cut has started, c removed all the same.
+func (s *server) takeFront(c net.Conn, owner io.Closer) bool {
+	ok := s.trackRegistered(owner)
+	s.removeFront(c)
+	return ok
 }
 
 // trackTerm is the ConnState of the servers of terminated connections.
@@ -1975,9 +2201,39 @@ func (s *server) addFront(c net.Conn) bool {
 	}
 	s.fronts[c] = struct{}{}
 	s.waiting[c] = struct{}{}
+	s.dispatching[c] = make(chan struct{})
 	s.mu.Unlock()
 	s.frontsLive.add()
 	return true
+}
+
+// handOver hands the front connection c to its server, unless a cut started, which refuses it,
+// and reports whether it did.
+func (s *server) handOver(c net.Conn) bool {
+	s.mu.Lock()
+	if s.refusing {
+		s.mu.Unlock()
+		return false
+	}
+	done := s.dispatching[c]
+	delete(s.dispatching, c)
+	s.mu.Unlock()
+	if done != nil {
+		close(done)
+	}
+	return true
+}
+
+// letGo records that dispatchFront no longer owns the end of the front connection c, its end
+// having returned.
+func (s *server) letGo(c net.Conn) {
+	s.mu.Lock()
+	done := s.dispatching[c]
+	delete(s.dispatching, c)
+	s.mu.Unlock()
+	if done != nil {
+		close(done)
+	}
 }
 
 // addFresh records c until it begins a request. Past the start of the drain it ends within T
@@ -2007,13 +2263,19 @@ func (s *server) served(c net.Conn) {
 	s.mu.Unlock()
 }
 
-// endWaiting is the drain of the connections that have not begun a request: within T they
-// begin one or end. Bytes already on their way are still read.
+// endWaiting is the drain of the front connections that have not begun a request, schemeConn
+// drainBy, and of the terminated HTTP/1.1 connections that have read no byte. The bytes already
+// on their way are still read, except by a TLS connection that reached its server as HTTP/2
+// before the start, which gets its GOAWAY at once.
 func (s *server) endWaiting() {
 	deadline := time.Now().Add(alertWriteTimeout)
 	s.mu.Lock()
 	for c := range s.waiting {
-		_ = c.SetDeadline(deadline)
+		if sc := schemeConnOf(c); sc != nil {
+			sc.drainBy(c, deadline)
+		} else {
+			_ = c.SetDeadline(deadline)
+		}
 	}
 	s.mu.Unlock()
 	s.fresh.Range(func(c, _ any) bool {

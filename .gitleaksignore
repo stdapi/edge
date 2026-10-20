@@ -7,3 +7,13 @@ bc826e733585b7585ba573180ba116fed65b30a0:kinds_test.go:generic-api-key:149
 fbe2ea1418966a9ef84f47bb296097b24a153bfc:README.md:generic-api-key:97
 f0ca08c593f062427d3ddbc000892a43054aa467:parser_test.go:generic-api-key:33
 fbe2ea1418966a9ef84f47bb296097b24a153bfc:path_test.go:generic-api-key:153
+d099571c368382374f765f9d3716b6cfbd5250b5:session_test.go:generic-api-key:295
+d099571c368382374f765f9d3716b6cfbd5250b5:session_test.go:generic-api-key:1291
+d099571c368382374f765f9d3716b6cfbd5250b5:upgrade_test.go:generic-api-key:1979
+d099571c368382374f765f9d3716b6cfbd5250b5:upgrade_test.go:generic-api-key:2106
+d099571c368382374f765f9d3716b6cfbd5250b5:upgrade_test.go:generic-api-key:2159
+d099571c368382374f765f9d3716b6cfbd5250b5:upgrade_test.go:generic-api-key:2182
+d099571c368382374f765f9d3716b6cfbd5250b5:upgrade_test.go:generic-api-key:2357
+d099571c368382374f765f9d3716b6cfbd5250b5:upgrade_test.go:generic-api-key:2490
+d099571c368382374f765f9d3716b6cfbd5250b5:upgrade_test.go:generic-api-key:2578
+d099571c368382374f765f9d3716b6cfbd5250b5:server_test.go:generic-api-key:2016

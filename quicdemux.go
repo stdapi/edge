@@ -207,6 +207,7 @@ type quicDemux struct {
 	// ending lists the datagram flows taken off their client's flow, by eviction or at
 	// udpFlowIdle, until their closer ended, so the drain and the cut find them, I5.
 	ending map[*udpFlow]flowKey
+	h3Gate h3Gate
 
 	wg sync.WaitGroup
 
@@ -222,7 +223,8 @@ type quicDemux struct {
 
 	mu sync.Mutex
 	// draining refuses the connections and the flows that arrive after the start of a drain,
-	// and closing, set from the start of the cut, refuses every placement. Both are written and,
+	// but a flow in a tunnel that arrived before it, and closing, set from the start of the
+	// cut, refuses every placement. Both are written and,
 	// on the paths that publish state, read under mu, so a publication is either refused or
 	// visible to the first snapshot the shutdown or the cut takes.
 	draining atomic.Bool
@@ -467,10 +469,10 @@ func (d *quicDemux) closeIntercept(it *quicIntercept) {
 	_ = it.transport.Close()
 }
 
-// waitHandshake waits for the handshake of qc to complete, until deadline at most. A
+// waitHandshake waits for the handshake of qc to complete, until deadline or stop at most. A
 // connection closed in its handshake gets APPLICATION_ERROR in place of its own code, and the
 // client's last flight is usually one round trip away.
-func waitHandshake(qc *quic.Conn, deadline time.Time) {
+func waitHandshake(qc *quic.Conn, deadline time.Time, stop <-chan struct{}) {
 	select {
 	case <-qc.HandshakeComplete():
 		return
@@ -481,6 +483,7 @@ func waitHandshake(qc *quic.Conn, deadline time.Time) {
 	select {
 	case <-qc.HandshakeComplete():
 	case <-qc.Context().Done():
+	case <-stop:
 	case <-t.C:
 	}
 }
@@ -595,6 +598,13 @@ type quicConnCloser struct {
 	ran atomic.Bool
 }
 
+// onFlowLocked returns the flow of the connection while the connection is still on it, compared
+// by identity, the key may be held by a later connection of the same client. d.mu must be held.
+func (c *quicConnCloser) onFlowLocked() (*quicFlow, bool) {
+	flow := c.d.flows[c.flow]
+	return flow, flow != nil && flow.conns[c.odcid] == c.conn
+}
+
 // inFlight reports whether a stream of the connection is in flight.
 func (c *quicConnCloser) inFlight() bool {
 	q := c.legs.Load()
@@ -613,16 +623,27 @@ func (c *quicConnCloser) endBy(cs cause, deadline time.Time) error {
 		q.endLegs(formOf(framed, cs, false) == formFailed, deadline)
 	}
 	c.d.mu.Lock()
-	flow := c.d.flows[c.flow]
-	if flow == nil {
+	flow, ok := c.onFlowLocked()
+	if !ok {
 		c.d.mu.Unlock()
 		return nil
 	}
-	// Compared by identity, the key may be held by a later connection of the same client.
-	conn := flow.conns[c.odcid]
-	if conn != c.conn {
+	conn := c.conn
+	if qc := conn.qc; qc != nil && !c.d.closing.Load() {
+		var stop <-chan struct{}
+		if t := c.flow.tunnel; t != nil {
+			stop = t.refused
+		}
+		// Session.Close of the connection waits for its handshake, on its flow, so the end of
+		// its tunnel finds the connection and ends it first, I3. Neither the cut nor the end of
+		// its tunnel waits, which keeps the deadline for the normal end of the tunnel, I2.
 		c.d.mu.Unlock()
-		return nil
+		waitHandshake(qc, deadline, stop)
+		c.d.mu.Lock()
+		if flow, ok = c.onFlowLocked(); !ok {
+			c.d.mu.Unlock()
+			return nil
+		}
 	}
 	if conn.state == connTerminated && conn.qc == nil {
 		// The tag delivers this connection's packets with no state to drop, so removing it
@@ -640,10 +661,6 @@ func (c *quicConnCloser) endBy(cs cause, deadline time.Time) error {
 
 	var err error
 	if qc != nil {
-		if !c.d.closing.Load() {
-			// A cut does not wait.
-			waitHandshake(qc, deadline)
-		}
 		// Outside the lock, quic-go writes a CONNECTION_CLOSE from here.
 		if cs == causeReturned && !c.inFlight() {
 			// The return of a QUIC handler ends a connection its peer may still be reading,
@@ -678,32 +695,39 @@ func (c *udpFlowCloser) endBy(cs cause, deadline time.Time) error {
 // handler of any other unit.
 func (c *udpFlowCloser) handling() bool { return c.u.handling.Load() > 0 }
 
-// appendSessions adds the sessions of what this demux serves to out, those a tunnel carries
-// only when carried is set.
-func (d *quicDemux) appendSessions(out []*Session, carried bool) []*Session {
+// appendSessions adds the sessions of what this demux serves to own, and those of the units in a
+// tunnel to inner, which the cut leaves to the closer of the tunnel, or to their own closer for
+// a flow already ending.
+func (d *quicDemux) appendSessions(own, inner []*Session) ([]*Session, []*Session) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	for from, flow := range d.flows {
-		if from.tunnel != nil && !carried {
-			continue
+		out := &own
+		if from.tunnel != nil {
+			out = &inner
 		}
 		for _, conn := range flow.conns {
 			if conn.sess != nil {
-				out = append(out, conn.sess)
+				*out = append(*out, conn.sess)
 			}
 		}
 		for _, u := range flow.udp {
 			if u.sess != nil {
-				out = append(out, u.sess)
+				*out = append(*out, u.sess)
 			}
 		}
 	}
 	for u, from := range d.ending {
-		if u.sess != nil && (from.tunnel == nil || carried) {
-			out = append(out, u.sess)
+		if u.sess == nil {
+			continue
+		}
+		if from.tunnel != nil {
+			inner = append(inner, u.sess)
+		} else {
+			own = append(own, u.sess)
 		}
 	}
-	return out
+	return own, inner
 }
 
 func newQUICDemux(p *Proxy, pc net.PacketConn) (*quicDemux, error) {
@@ -788,6 +812,7 @@ func (d *quicDemux) startTermination() error {
 		IdleTimeout:    d.p.cfg.server.idleTimeout,
 		Logger:         d.p.cfg.logger,
 		ConnContext: func(ctx context.Context, c *quic.Conn) context.Context {
+			d.h3Gate.counted(c)
 			ctx = d.p.srv.cutChild(ctx)
 			carrier, _ := c.Context().Value(quicCarrierKey{}).(*quicCarrier)
 			if carrier == nil || carrier.sess == nil {
@@ -802,7 +827,7 @@ func (d *quicDemux) startTermination() error {
 	}
 	if d.draining.Load() {
 		// Brought up for a connection that arrived before the drain, it drains at once.
-		go func(h3 *http3.Server) { _ = h3.Shutdown(context.Background()) }(d.h3)
+		go func(h3 *http3.Server) { _ = d.h3Gate.shutdown(context.Background(), h3) }(d.h3)
 	}
 	d.resetSecret = resetSecret
 	d.socketResetKey = socketResetKey
@@ -996,7 +1021,12 @@ func (d *quicDemux) serveQUICConn(qc *quic.Conn) {
 		if d.draining.Load() {
 			srv = d.lateH3()
 		}
-		err := srv.ServeQUICConn(qc)
+		var err error
+		if srv == d.h3 {
+			err = d.h3Gate.serve(srv, qc)
+		} else {
+			err = srv.ServeQUICConn(qc)
+		}
 		if errors.Is(err, http.ErrServerClosed) && qc.Context().Err() == nil && srv == d.h3 && !d.closing.Load() {
 			// The drain shut the server down between the check and the serve.
 			err = d.lateH3().ServeQUICConn(qc)
@@ -1654,8 +1684,12 @@ func (d *quicDemux) openUDPFlow(client net.Addr, from flowKey, origin netip.Addr
 	evicted, ok := d.publishUDPLocked(from, client, u)
 	d.mu.Unlock()
 	if evicted != nil {
-		// Off the read loop, the closer may wait for the normal end of a chained exit.
-		go d.endUDPFlow(from, evicted, causeIdle)
+		// Off the read loop, the closer may wait for the normal end of a chained exit, and the
+		// close of the demultiplexer waits for it, counted under the lock of the eviction.
+		go func() {
+			defer d.wg.Done()
+			d.endUDPFlow(from, evicted, causeIdle)
+		}()
 	}
 	if !ok {
 		cancel()
@@ -1740,8 +1774,9 @@ func (d *quicDemux) fillSession(sess *Session, client net.Addr) {
 }
 
 // publishUDPLocked places a datagram flow in its client's flow, and returns the flow it took off
-// to make room, the least recently used, for the caller to end off the lock. It shares the draining critical section with shutdown, so the flow is either refused
-// or in the snapshot a shutdown sweeps.
+// to make room, the least recently used, for the caller to end off the lock. It refuses every
+// flow once the cut started, and during a drain a flow in no tunnel, under the lock the drain
+// and the cut take, so the flow is either refused or in the snapshot they take.
 func (d *quicDemux) publishUDPLocked(from flowKey, client net.Addr, u *udpFlow) (*udpFlow, bool) {
 	// A tunnel that arrived before the drain serves its new flows during it.
 	if d.closing.Load() || (d.draining.Load() && from.tunnel == nil) || d.udps >= maxUDPFlows {
@@ -1769,6 +1804,8 @@ func (d *quicDemux) publishUDPLocked(from flowKey, client net.Addr, u *udpFlow) 
 		delete(flow.udp, victim.id)
 		d.udps--
 		d.ending[victim] = from
+		// Under the lock close sets closing under, so the count comes before its wait.
+		d.wg.Add(1)
 	}
 	flow.udp[u.id] = u
 	d.udps++
@@ -2664,7 +2701,7 @@ func (d *quicDemux) shutdown(ctx context.Context) error {
 	if h3 != nil {
 		// quic-go closes every connection once the context of its Shutdown ends, before the cut
 		// has ended their requests.
-		err = h3.Shutdown(context.WithoutCancel(ctx))
+		err = d.h3Gate.shutdown(context.WithoutCancel(ctx), h3)
 	}
 
 	// A handler serving a raw QUIC connection or a datagram flow ends when its peers do.
@@ -2686,7 +2723,8 @@ poll:
 
 // refuseNew is the start of the cut: the demultiplexer admits no new connection or flow, and its
 // terminating stacks close their listeners, refusing a connection in its handshake that quic-go
-// has not handed over. What it already serves runs until the front stage.
+// has not handed over. The unit stage ends what it already serves, and its socket waits for the
+// front stage.
 func (d *quicDemux) refuseNew() {
 	d.mu.Lock()
 	d.draining.Store(true)
@@ -2720,7 +2758,7 @@ func (d *quicDemux) refuseNew() {
 	}
 	if h3 != nil {
 		// The GOAWAY of every HTTP/3 connection, which the front stage then closes.
-		go func() { _ = h3.Shutdown(context.Background()) }()
+		go func() { _ = d.h3Gate.shutdown(context.Background(), h3) }()
 	}
 }
 

@@ -77,7 +77,7 @@ func (p *Proxy) connectHijack(w http.ResponseWriter, r *http.Request, target Tar
 
 	// A hijacked connection is invisible to http.Server, so only the registry can end it.
 	front.handOver()
-	if !p.srv.trackRegistered(conn) {
+	if !p.srv.takeFront(client, conn) {
 		abort(conn)
 		return
 	}
@@ -89,7 +89,7 @@ func (p *Proxy) connectHijack(w http.ResponseWriter, r *http.Request, target Tar
 		abort(conn)
 		return
 	}
-	defer p.srv.untrackSession(sess)
+	defer p.srv.untrackEnded(sess)
 	p.srv.requests.release(rq)
 
 	// Termination answers before reaching the upstream: a handler may serve the whole

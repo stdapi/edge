@@ -19,6 +19,7 @@ import (
 	"net/url"
 	"os"
 	"slices"
+	"strconv"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -1267,4 +1268,131 @@ func TestTCP_RelayIdleTimeoutFailsEveryLeg(t *testing.T) {
 		t.Fatal("relay did not end")
 	}
 	assert.Equal(t, "RST", peerEnd(sideConn, 2*time.Second), "a leg of a unit a failed timer ended")
+}
+
+func TestTCP_StartTLS_ClientResetInsideTheClientHelloGetsNoAlert(t *testing.T) {
+	for _, reject := range []bool{false, true} {
+		t.Run("reject ECH "+strconv.FormatBool(reject), func(t *testing.T) {
+			ca, err := GenerateCA()
+			require.NoError(t, err)
+			p, err := New(WithCA(ca), WithSniffTimeout(100*time.Millisecond), WithRejectECH(reject))
+			require.NoError(t, err)
+			type result struct {
+				err     error
+				alerted bool
+			}
+			got := make(chan result, 1)
+			p.MustAdd[TCP]("127.0.0.1:9", func(c *TCPCtx) error {
+				if _, err := io.ReadFull(c.Client(), make([]byte, 1)); err != nil {
+					got <- result{err: err}
+					return err
+				}
+				err := c.StartTLS()
+				got <- result{err: err, alerted: c.alerted}
+				return err
+			})
+			conn := connectRaw(t, startProxy(t, p), "127.0.0.1:9")
+			_, err = conn.Write([]byte{0})
+			require.NoError(t, err)
+			time.Sleep(200 * time.Millisecond)
+			_, err = conn.Write([]byte{0x16, 0x03, 0x01, 0x01, 0x00, 0x01})
+			require.NoError(t, err)
+			time.Sleep(100 * time.Millisecond)
+			require.NoError(t, conn.(*net.TCPConn).SetLinger(0))
+			require.NoError(t, conn.Close())
+			select {
+			case r := <-got:
+				require.ErrorIs(t, r.err, syscall.ECONNRESET)
+				require.False(t, r.alerted)
+			case <-time.After(5 * time.Second):
+				t.Fatal("the handler did not return")
+			}
+		})
+	}
+}
+
+func TestTCP_StartTLS_EndOfTheStreamBeforeTheHandshake(t *testing.T) {
+	cases := []struct {
+		name    string
+		sent    []byte
+		reject  bool
+		alerted bool
+	}{
+		{name: "nothing, reject ECH", reject: true},
+		{name: "bytes of no TLS record", sent: []byte("QU")},
+		{name: "a ClientHello cut short", sent: []byte{0x16, 0x03, 0x01, 0x01, 0x00, 0x01}, alerted: true},
+		{name: "a ClientHello cut short, reject ECH", sent: []byte{0x16, 0x03, 0x01, 0x01, 0x00, 0x01}, reject: true, alerted: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ca, err := GenerateCA()
+			require.NoError(t, err)
+			p, err := New(WithCA(ca), WithSniffTimeout(100*time.Millisecond), WithRejectECH(tc.reject))
+			require.NoError(t, err)
+			type result struct {
+				err     error
+				alerted bool
+			}
+			got := make(chan result, 1)
+			p.MustAdd[TCP]("127.0.0.1:9", func(c *TCPCtx) error {
+				if _, err := io.ReadFull(c.Client(), make([]byte, 1)); err != nil {
+					got <- result{err: err}
+					return err
+				}
+				err := c.StartTLS()
+				got <- result{err: err, alerted: c.alerted}
+				return err
+			})
+			conn := connectRaw(t, startProxy(t, p), "127.0.0.1:9")
+			_, err = conn.Write([]byte{0})
+			require.NoError(t, err)
+			time.Sleep(200 * time.Millisecond)
+			if len(tc.sent) > 0 {
+				_, err = conn.Write(tc.sent)
+				require.NoError(t, err)
+			}
+			require.NoError(t, conn.(*net.TCPConn).CloseWrite())
+			select {
+			case r := <-got:
+				require.Error(t, r.err)
+				require.Equal(t, tc.alerted, r.alerted, "%v", r.err)
+				if tc.alerted {
+					require.ErrorIs(t, r.err, errHelloCutShort)
+				} else {
+					require.ErrorIs(t, r.err, io.EOF)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("the handler did not return")
+			}
+		})
+	}
+}
+
+func TestTCP_NormalEndOfATerminatedConnectionGivesTheFINAtOnce(t *testing.T) {
+	for _, version := range []uint16{tls.VersionTLS13, tls.VersionTLS12} {
+		t.Run(tls.VersionName(version), func(t *testing.T) {
+			ca, err := GenerateCA()
+			require.NoError(t, err)
+			p, err := New(WithCA(ca))
+			require.NoError(t, err)
+			p.MustAdd[TCP]("review.test:443", func(c *TCPCtx) error { return nil })
+			raw, err := net.Dial("tcp", startProxy(t, p))
+			require.NoError(t, err)
+			defer raw.Close()
+			_, err = fmt.Fprintf(raw, "CONNECT review.test:443 HTTP/1.1\r\nHost: review.test:443\r\n\r\n")
+			require.NoError(t, err)
+			br := bufio.NewReader(raw)
+			resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+			require.NoError(t, err)
+			require.Equal(t, 200, resp.StatusCode)
+			tc := tls.Client(raw, &tls.Config{ServerName: "review.test", RootCAs: ca.CertPool(), MinVersion: version, MaxVersion: version, NextProtos: []string{"x-review"}})
+			require.NoError(t, tc.Handshake())
+			start := time.Now()
+			_ = raw.SetReadDeadline(time.Now().Add(3 * time.Second))
+			_, _ = io.ReadAll(tc)
+			_, rerr := raw.Read(make([]byte, 1))
+			require.ErrorIs(t, rerr, io.EOF)
+			require.Less(t, time.Since(start), alertWriteTimeout/2, "the FIN waited for the client")
+		})
+	}
 }

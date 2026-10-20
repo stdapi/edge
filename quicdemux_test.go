@@ -2128,10 +2128,12 @@ func TestUDPFlow_FlowTakenOffItsClientStaysRegisteredUntilItsCloserEnded(t *test
 		close(ended)
 	}()
 	time.Sleep(50 * time.Millisecond)
-	require.Contains(t, d.appendSessions(nil, false), sess, "the cut misses a flow whose closer runs")
+	own, _ := d.appendSessions(nil, nil)
+	require.Contains(t, own, sess, "the cut misses a flow whose closer runs")
 	require.True(t, d.serving(), "the drain misses a flow whose closer runs")
 	close(leg.release)
 	<-ended
-	require.NotContains(t, d.appendSessions(nil, false), sess)
+	own, _ = d.appendSessions(nil, nil)
+	require.NotContains(t, own, sess)
 	require.False(t, d.serving())
 }

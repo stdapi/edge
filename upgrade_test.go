@@ -27,6 +27,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1812,9 +1813,11 @@ func TestUpgrade_CloseDoesNotWaitForAnOpenWebSocket(t *testing.T) {
 	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
 	waitForSessions(t, p, 1)
 
+	// The client neither answers the Close 1001 nor ends its side, so the normal end of its TCP
+	// lasts until the deadline.
 	start := time.Now()
 	require.NoError(t, p.Close())
-	assert.Less(t, time.Since(start), alertWriteTimeout/2)
+	assert.Less(t, time.Since(start), alertWriteTimeout+500*time.Millisecond)
 }
 
 func TestUpgrade_CloseDoesNotWaitForAnOpenPipe(t *testing.T) {
@@ -2708,5 +2711,491 @@ func TestUpgrade_PipeOnAnH2ConnectEndsWithItsCarrier(t *testing.T) {
 	case <-returned:
 	case <-time.After(3 * time.Second):
 		t.Fatal("the pipe on a stream outlived the peer reset of its carrier, I3")
+	}
+}
+
+func TestUpgrade_WebSocketSessionCloseEndsOnceTheClientEnded(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	client, p := wsThroughProxy(t, func(*WebSocketCtx) error {
+		<-release
+		return nil
+	})
+	sess := waitForSessions(t, p, 1)[0]
+	closed := make(chan time.Duration, 1)
+	go func() {
+		start := time.Now()
+		_ = sess.Close()
+		closed <- time.Since(start)
+	}()
+	f := client.read()
+	require.Equal(t, byte(0x88), f.head)
+	client.send(client.frame(0x88, closePayload(1001, "")))
+	require.NoError(t, client.conn.(*net.TCPConn).CloseWrite())
+	require.Less(t, <-closed, alertWriteTimeout/2, "the handler reads nothing, and the closer still read the end of the client")
+}
+
+func TestUpgrade_WebSocketEndReadsWhatThePeerStillSends(t *testing.T) {
+	t.Run("session closed with no reader", func(t *testing.T) {
+		release := make(chan struct{})
+		t.Cleanup(func() { close(release) })
+		client, p := wsThroughProxy(t, func(*WebSocketCtx) error {
+			<-release
+			return nil
+		})
+		sess := waitForSessions(t, p, 1)[0]
+		go func() { _ = sess.Close() }()
+		time.Sleep(100 * time.Millisecond)
+		client.send(client.frame(0x81, []byte("late")))
+		// Past the deadline of the end, so a close with the frame unread would have reset.
+		time.Sleep(alertWriteTimeout + 500*time.Millisecond)
+		requireCloseThenFIN(t, client, closePayload(1001, ""))
+	})
+	t.Run("protocol error with data behind it", func(t *testing.T) {
+		client, _ := wsThroughProxy(t, func(c *WebSocketCtx) error { return c.Relay() })
+		// An unmasked frame from the client breaks RFC 6455, and more data follows it.
+		bad := wsFrame{head: 0x82, payload: []byte("x")}.bytes()
+		more := make([]byte, 0, 256<<10)
+		for len(more) < 200<<10 {
+			more = append(more, client.frame(0x82, make([]byte, 4096)).bytes()...)
+		}
+		go func() {
+			_ = client.conn.SetWriteDeadline(time.Now().Add(3 * time.Second))
+			_, _ = client.conn.Write(append(bad, more...))
+		}()
+		time.Sleep(alertWriteTimeout / 2)
+		requireCloseThenFIN(t, client, closePayload(1002, ""))
+	})
+}
+
+// requireCloseThenFIN reads a Close frame with payload from e, then the end of its connection,
+// which must be a FIN.
+func requireCloseThenFIN(t *testing.T, e *wsEnd, payload []byte) {
+	t.Helper()
+	f, err := e.next(3 * time.Second)
+	require.NoError(t, err)
+	require.Equal(t, byte(0x88), f.head)
+	require.Equal(t, payload, f.payload)
+	_, err = e.next(3 * time.Second)
+	require.ErrorIs(t, err, io.EOF, "the end after the Close")
+}
+
+// wsOriginWriting answers the upgrade with the 101 and after in one write, so the body the
+// transport hands over keeps the bytes past the 101 in its reader.
+func wsOriginWriting(t *testing.T, after []byte) *httptest.Server {
+	t.Helper()
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		conn, brw, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, _ = brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n" + string(after))
+		_ = brw.Flush()
+		_, _ = io.Copy(io.Discard, brw)
+	}))
+	t.Cleanup(origin.Close)
+	return origin
+}
+
+func TestUpgrade_WebSocketEndReadsTheOriginThroughOneReaderAtATime(t *testing.T) {
+	var burst []byte
+	for i := range 500 {
+		burst = append(burst, wsFrame{head: 0x81, payload: []byte(fmt.Sprintf("m%03d", i))}.bytes()...)
+	}
+	hello := wsFrame{head: 0x81, payload: []byte("hello")}.bytes()
+	cases := []struct {
+		handler func(c *WebSocketCtx) error
+		name    string
+		after   []byte
+		close   bool
+	}{
+		{name: "client FIN under Relay", after: burst, handler: func(c *WebSocketCtx) error { return c.Relay() }},
+		{name: "client FIN with the origin hop in a read", after: hello, handler: func(c *WebSocketCtx) error { return c.Relay() }},
+		{name: "Session.Close under a slow reader", after: burst, close: true, handler: func(c *WebSocketCtx) error {
+			for {
+				f, err := c.Inbound().ReadFrame()
+				if err != nil {
+					return nil
+				}
+				_ = f.Forward()
+				time.Sleep(20 * time.Millisecond)
+			}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			origin := wsOriginWriting(t, tc.after)
+			originURL, err := url.Parse(origin.URL)
+			require.NoError(t, err)
+			p := testProxy(t)
+			returned := make(chan struct{})
+			p.MustAdd(originHost(originURL)+"/ws", func(c *WebSocketCtx) error {
+				defer close(returned)
+				return tc.handler(c)
+			})
+			raw, br, resp := wsDial(t, startProxy(t, p), origin, "")
+			require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+			client := &wsEnd{t: t, conn: raw, br: br, client: true}
+			client.read()
+			if tc.close {
+				require.NoError(t, waitForSessions(t, p, 1)[0].Close())
+			} else {
+				require.NoError(t, raw.(*net.TCPConn).CloseWrite())
+			}
+			go func() { _, _ = io.Copy(io.Discard, br) }()
+			select {
+			case <-returned:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the handler did not return")
+			}
+		})
+	}
+}
+
+func TestUpgrade_WebSocketClientCloseReachesTheOriginAtOnce(t *testing.T) {
+	got := make(chan time.Duration, 1)
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		conn, brw, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, _ = brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+		_ = brw.Flush()
+		time.Sleep(200 * time.Millisecond)
+		start := time.Now()
+		_, _ = conn.Write(wsFrame{head: 0x88, payload: closePayload(1000, "")}.bytes())
+		e := &wsEnd{t: t, conn: conn, br: brw.Reader}
+		if f, err := e.next(5 * time.Second); err == nil && f.head == 0x88 {
+			got <- time.Since(start)
+		}
+		_, _ = io.Copy(io.Discard, brw)
+	}))
+	t.Cleanup(origin.Close)
+	originURL, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+	p := testProxy(t)
+	p.MustAdd(originHost(originURL)+"/ws", func(c *WebSocketCtx) error { return c.Relay() })
+	raw, br, resp := wsDial(t, startProxy(t, p), origin, "")
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+	client := &wsEnd{t: t, conn: raw, br: br, client: true}
+	client.want(0x88, closePayload(1000, ""))
+	// The client answers the Close and keeps its socket open, as a client waits for its server
+	// to end TCP first.
+	client.send(client.frame(0x88, closePayload(1000, "")))
+	select {
+	case d := <-got:
+		require.Less(t, d, alertWriteTimeout/2, "the end of the client hop held the Close it read")
+	case <-time.After(5 * time.Second):
+		t.Fatal("the Close of the client did not reach the origin")
+	}
+}
+
+func TestUpgrade_WebSocketEndKeepsTheDeadlineOfItsCloser(t *testing.T) {
+	proxySide, clientSide := tcpPair(t)
+	backA, backB := net.Pipe()
+	t.Cleanup(func() { _ = backA.Close(); _ = backB.Close() })
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(nil)
+	c := &WebSocketCtx{ctx: ctx, cancel: cancel}
+	c.setHops(proxySide, proxySide, backA, nil, nil)
+	// The handler read the Close of the client and has not answered it, and the client stopped
+	// reading, so the Close of the end takes most of the deadline.
+	c.toClient.recvClose, c.toClient.recvCode = true, 1000
+	writeUntilFull(proxySide)
+	_ = proxySide.SetWriteDeadline(time.Time{})
+	go func() {
+		time.Sleep(800 * time.Millisecond)
+		buf := make([]byte, 64<<10)
+		for {
+			_ = clientSide.SetReadDeadline(time.Now().Add(4 * time.Second))
+			if _, err := clientSide.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+	start := time.Now()
+	c.toClient.end(true, start.Add(alertWriteTimeout))
+	require.LessOrEqual(t, time.Since(start), alertWriteTimeout+100*time.Millisecond, "the end ran past the deadline of its closer, I4")
+}
+
+func TestUpgrade_WebSocketCloseOfTheClientGetsTheFINOfTheProxyAtOnce(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		conn, brw, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, _ = brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+		_ = brw.Flush()
+		e := &wsEnd{t: t, conn: conn, br: brw.Reader}
+		if f, err := e.next(5 * time.Second); err == nil && f.head == 0x88 {
+			_, _ = conn.Write(wsFrame{head: 0x88, payload: closePayload(1000, "")}.bytes())
+		}
+		_, _ = io.Copy(io.Discard, brw)
+	}))
+	t.Cleanup(origin.Close)
+	originURL, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+	p := testProxy(t)
+	p.MustAdd(originHost(originURL)+"/ws", func(c *WebSocketCtx) error { return c.Relay() })
+	raw, br, resp := wsDial(t, startProxy(t, p), origin, "")
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+	client := &wsEnd{t: t, conn: raw, br: br, client: true}
+	time.Sleep(100 * time.Millisecond)
+	client.send(client.frame(0x88, closePayload(1000, "")))
+	client.want(0x88, closePayload(1000, ""))
+	start := time.Now()
+	end := peerEnd(raw, 5*time.Second)
+	require.Equal(t, "FIN", end)
+	require.Less(t, time.Since(start), alertWriteTimeout/2, "the client waited for the server to end TCP")
+}
+
+func TestUpgrade_WebSocketFINOfTheClientReachesAnIdleOriginAtOnce(t *testing.T) {
+	got := make(chan string, 1)
+	took := make(chan time.Duration, 1)
+	sent := make(chan time.Time, 1)
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		conn, brw, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, _ = brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+		_ = brw.Flush()
+		_ = conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		var frames []byte
+		buf := make([]byte, 1024)
+		var rerr error
+		for {
+			n, err := brw.Read(buf)
+			frames = append(frames, buf[:n]...)
+			if err != nil {
+				rerr = err
+				break
+			}
+		}
+		start := <-sent
+		took <- time.Since(start)
+		got <- fmt.Sprintf("%v after %d bytes", rerr, len(frames))
+	}))
+	t.Cleanup(origin.Close)
+	originURL, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+	p := testProxy(t)
+	p.MustAdd(originHost(originURL)+"/ws", func(c *WebSocketCtx) error { return c.Relay() })
+	raw, _, resp := wsDial(t, startProxy(t, p), origin, "")
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+	time.Sleep(100 * time.Millisecond)
+	sent <- time.Now()
+	require.NoError(t, raw.(*net.TCPConn).CloseWrite())
+	d := <-took
+	require.Less(t, d, alertWriteTimeout/2)
+}
+
+func TestUpgrade_WebSocketFailedEndAfterTheClosingHandshakeHasOneEnder(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		conn, brw, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, _ = brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+		_ = brw.Flush()
+		_, _ = conn.Write(wsFrame{head: 0x88, payload: closePayload(1000, "")}.bytes())
+		time.Sleep(3 * time.Second)
+	}))
+	t.Cleanup(origin.Close)
+	originURL, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+	p := testProxy(t)
+	returned := make(chan struct{})
+	p.MustAdd(originHost(originURL)+"/ws", func(c *WebSocketCtx) error {
+		defer close(returned)
+		f, err := c.Inbound().ReadFrame()
+		if err != nil {
+			return err
+		}
+		_ = f.Forward()
+		if _, err := c.Outbound().ReadFrame(); err != nil {
+			return err
+		}
+		return errors.New("the handler fails after the closing handshake")
+	})
+	raw, br, resp := wsDial(t, startProxy(t, p), origin, "")
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+	client := &wsEnd{t: t, conn: raw, br: br, client: true}
+	client.want(0x88, closePayload(1000, ""))
+	client.send(client.frame(0x88, closePayload(1000, "")))
+	select {
+	case <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the handler did not return")
+	}
+	_ = raw.SetReadDeadline(time.Now().Add(alertWriteTimeout / 2))
+	_, first := br.ReadByte()
+	time.Sleep(200 * time.Millisecond)
+	_ = raw.SetReadDeadline(time.Now().Add(alertWriteTimeout / 4))
+	_, second := raw.Read(make([]byte, 1))
+	require.ErrorIs(t, first, io.EOF)
+	require.NotErrorIs(t, second, syscall.ECONNRESET, "the proxy wrote a FIN, the normal end of TCP, then an RST, the failed end, on the same hop")
+}
+
+func TestUpgrade_WebSocketFailedEndOfTheOriginHopWaitsForNoClient(t *testing.T) {
+	type result struct {
+		end  string
+		when time.Time
+	}
+	got := make(chan result, 1)
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		conn, brw, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, _ = brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+		_ = brw.Flush()
+		_, _ = conn.Write(wsFrame{head: 0x88, payload: closePayload(1000, "")}.bytes())
+		end := peerEnd(conn, 4*time.Second)
+		got <- result{end, time.Now()}
+	}))
+	t.Cleanup(origin.Close)
+	originURL, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+	p := testProxy(t)
+	var returnedAt atomic.Int64
+	p.MustAdd(originHost(originURL)+"/ws", func(c *WebSocketCtx) error {
+		defer func() { returnedAt.Store(time.Now().UnixNano()) }()
+		f, err := c.Inbound().ReadFrame()
+		if err != nil {
+			return err
+		}
+		_ = f.Forward()
+		if _, err := c.Outbound().ReadFrame(); err != nil {
+			return err
+		}
+		return errors.New("the handler fails after the closing handshake")
+	})
+	raw, br, resp := wsDial(t, startProxy(t, p), origin, "")
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+	client := &wsEnd{t: t, conn: raw, br: br, client: true}
+	client.want(0x88, closePayload(1000, ""))
+	client.send(client.frame(0x88, closePayload(1000, "")))
+	// The client keeps its socket open and never sends its FIN.
+	r := <-got
+	took := r.when.Sub(time.Unix(0, returnedAt.Load()))
+	require.Less(t, took, alertWriteTimeout/2, "the failed end of the origin hop waited for the client")
+}
+
+func TestUpgrade_WebSocketCloseOfATerminatedSessionGetsTheFINAtOnce(t *testing.T) {
+	for _, version := range []uint16{tls.VersionTLS13, tls.VersionTLS12} {
+		t.Run(tls.VersionName(version), func(t *testing.T) {
+			origin := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				conn, brw, err := http.NewResponseController(w).Hijack()
+				if err != nil {
+					return
+				}
+				defer func() { _ = conn.Close() }()
+				_, _ = brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+				_ = brw.Flush()
+				e := &wsEnd{t: t, conn: conn, br: brw.Reader}
+				if f, err := e.next(5 * time.Second); err == nil && f.head == 0x88 {
+					_, _ = conn.Write(wsFrame{head: 0x88, payload: closePayload(1000, "")}.bytes())
+				}
+				_, _ = io.Copy(io.Discard, brw)
+			}))
+			origin.StartTLS()
+			t.Cleanup(origin.Close)
+			originURL, err := url.Parse(origin.URL)
+			require.NoError(t, err)
+			ca, err := GenerateCA()
+			require.NoError(t, err)
+			tr := DefaultTransport()
+			tr.RootCAs = originPool(t, origin)
+			p, err := New(WithCA(ca), WithTransport(tr))
+			require.NoError(t, err)
+			p.MustAdd(originHost(originURL)+"/ws", func(c *WebSocketCtx) error { return c.Relay() })
+			addr := startProxy(t, p)
+			raw, err := net.Dial("tcp", addr)
+			require.NoError(t, err)
+			defer raw.Close()
+			_, err = fmt.Fprintf(raw, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", originURL.Host, originURL.Host)
+			require.NoError(t, err)
+			br := bufio.NewReader(raw)
+			resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+			require.NoError(t, err)
+			require.Equal(t, 200, resp.StatusCode)
+			host, _ := splitHostPort(originURL.Host)
+			tc := tls.Client(raw, &tls.Config{ServerName: host, RootCAs: ca.CertPool(), MinVersion: version, MaxVersion: version, NextProtos: []string{"http/1.1"}})
+			require.NoError(t, tc.Handshake())
+			_, err = fmt.Fprintf(tc, "GET /ws HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n", originURL.Host) // gitleaks:allow
+			require.NoError(t, err)
+			tbr := bufio.NewReader(tc)
+			up, err := http.ReadResponse(tbr, nil)
+			require.NoError(t, err)
+			require.Equal(t, 101, up.StatusCode)
+			client := &wsEnd{t: t, conn: tc, br: tbr, client: true}
+			time.Sleep(100 * time.Millisecond)
+			client.send(client.frame(0x88, closePayload(1000, "")))
+			client.want(0x88, closePayload(1000, ""))
+			start := time.Now()
+			_ = raw.SetReadDeadline(time.Now().Add(3 * time.Second))
+			_, _ = io.ReadAll(tbr)
+			_, rerr := raw.Read(make([]byte, 1))
+			require.ErrorIs(t, rerr, io.EOF)
+			require.Less(t, time.Since(start), alertWriteTimeout/2, "the FIN waited for the client")
+		})
+	}
+}
+
+func TestUpgrade_WebSocketFailedEndAfterTheClosingHandshakeResetsNoFIN(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		conn, brw, err := http.NewResponseController(w).Hijack()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, _ = brw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+		_ = brw.Flush()
+		_, _ = conn.Write(wsFrame{head: 0x88, payload: closePayload(1000, "")}.bytes())
+		time.Sleep(3 * time.Second)
+	}))
+	t.Cleanup(origin.Close)
+	originURL, err := url.Parse(origin.URL)
+	require.NoError(t, err)
+	p := testProxy(t)
+	returned := make(chan struct{})
+	p.MustAdd(originHost(originURL)+"/ws", func(c *WebSocketCtx) error {
+		defer close(returned)
+		f, err := c.Inbound().ReadFrame()
+		if err != nil {
+			return err
+		}
+		_ = f.Forward()
+		if _, err := c.Outbound().ReadFrame(); err != nil {
+			return err
+		}
+		return errors.New("the handler fails after the closing handshake")
+	})
+	raw, br, resp := wsDial(t, startProxy(t, p), origin, "")
+	require.Equal(t, http.StatusSwitchingProtocols, resp.StatusCode)
+	client := &wsEnd{t: t, conn: raw, br: br, client: true}
+	client.want(0x88, closePayload(1000, ""))
+	client.send(client.frame(0x88, closePayload(1000, "")))
+	select {
+	case <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the handler did not return")
+	}
+	start := time.Now()
+	_ = raw.SetReadDeadline(time.Now().Add(alertWriteTimeout / 2))
+	_, first := br.ReadByte()
+	require.ErrorIs(t, first, io.EOF)
+	for time.Since(start) < alertWriteTimeout+300*time.Millisecond {
+		_ = raw.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
+		_, err := raw.Read(make([]byte, 1))
+		require.NotErrorIs(t, err, syscall.ECONNRESET, "an RST after the FIN, %v after the handler returned", time.Since(start))
+		time.Sleep(10 * time.Millisecond)
 	}
 }

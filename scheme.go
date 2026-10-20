@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -81,14 +82,25 @@ type schemeConn struct {
 	// once it is read. asked is the read deadline last asked for, applied once the bound goes.
 	headerBy atomic.Int64
 	asked    atomic.Int64
-	outPos   int
-	maxStr   int
+	// dmu guards reached, set once the connection reached its server, inDrain, once it reached it
+	// after the start of the drain, h2, once it reached it over TLS as HTTP/2, and begun, once the
+	// first byte of a request arrived. The drain bounds the connection between reached and begun
+	// alone.
+	dmu sync.Mutex
+	// wmu orders the wake of the front stage of the cut against the deadlines set meanwhile.
+	wmu    sync.Mutex
+	outPos int
+	maxStr int
 
 	// The frame being read.
 	left      int
 	pos       int
 	fragStart int
 	fragEnd   int
+
+	// stage is stageWoken from the wake, which keeps every deadline of the connection in the past,
+	// to stageEnding, once dispatchFront began its end.
+	stage atomic.Uint32
 
 	// The header block being read.
 	stream  uint32
@@ -99,10 +111,20 @@ type schemeConn struct {
 	request bool
 	skip    bool
 	desync  bool
+	reached bool
+	inDrain bool
+	h2      bool
+	begun   bool
 	// held marks the frame ending a request block, kept in out until it is read in full since
 	// the field is added only to a block that decodes.
 	held bool
 }
+
+const (
+	stageNone uint32 = iota
+	stageWoken
+	stageEnding
+)
 
 // tlsSchemeConn is a schemeConn over TLS. Its ConnectionState and HandshakeContext have
 // net/http negotiate h2 on it as on a *tls.Conn.
@@ -146,6 +168,88 @@ func schemeConnOf(c net.Conn) *schemeConn {
 
 func (c *schemeConn) NetConn() net.Conn { return c.Conn }
 
+// markBegun records that the first byte of a request arrived, and gives the read the cap of the
+// first request header when toHeader is set.
+func (c *schemeConn) markBegun(toHeader bool) {
+	c.dmu.Lock()
+	defer c.dmu.Unlock()
+	c.begun = true
+	if toHeader {
+		var header time.Time
+		if n := c.headerBy.Load(); n != 0 {
+			header = time.Unix(0, n)
+		}
+		_ = c.Conn.SetReadDeadline(header)
+		c.keepWoken()
+	}
+}
+
+// markReached records that the connection reached its server, after the start of the drain when
+// inDrain is set, and over TLS as HTTP/2 when h2 is.
+func (c *schemeConn) markReached(inDrain, h2 bool) {
+	c.dmu.Lock()
+	c.reached, c.inDrain, c.h2 = true, inDrain, h2
+	c.dmu.Unlock()
+}
+
+// wake ends the read or write in progress and every later one, as net/http's abortPendingRead
+// wakes its reader, unless the end of the connection began.
+func (c *schemeConn) wake() {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	if c.stage.CompareAndSwap(stageNone, stageWoken) {
+		_ = c.Conn.SetDeadline(time.Unix(1, 0))
+	}
+}
+
+// beginEnd gives the deadlines back to the end of the connection, which bounds itself.
+func (c *schemeConn) beginEnd() {
+	c.wmu.Lock()
+	c.stage.Store(stageEnding)
+	c.wmu.Unlock()
+}
+
+// expire gives the connection its failed end at the deadline of the front stage of the cut unless
+// its end began, which bounds itself, I4.
+func (c *schemeConn) expire() {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
+	if c.stage.Load() == stageWoken {
+		abort(c.Conn)
+	}
+}
+
+// keepWoken puts back the past deadline of the wake over a deadline just set.
+func (c *schemeConn) keepWoken() {
+	if c.stage.Load() != stageWoken {
+		return
+	}
+	c.wmu.Lock()
+	if c.stage.Load() == stageWoken {
+		_ = c.Conn.SetDeadline(time.Unix(1, 0))
+	}
+	c.wmu.Unlock()
+}
+
+// drainBy sets the deadline of the drain on conn, the front connection over this one, until the
+// first byte of a request arrived, docs/lifecycle.md The drain. A TLS handshake still in progress
+// is bounded by the read header timeout, T then counting from its end, and by the deadline of the
+// drain when there is none.
+func (c *schemeConn) drainBy(conn net.Conn, deadline time.Time) {
+	c.dmu.Lock()
+	defer c.dmu.Unlock()
+	if c.inDrain || (!c.reached && c.headerBy.Load() != 0) || c.begun {
+		// One that reached its server after the start has its T from then already.
+		return
+	}
+	if c.reached && c.h2 {
+		// An HTTP/2 connection gets its GOAWAY at the start, endDrained, which the read that
+		// ends now hands it to.
+		deadline = time.Now()
+	}
+	_ = conn.SetDeadline(deadline)
+}
+
 // SetReadDeadline is the read deadline of the connection, capped by the bound of its first
 // request header, which counts from the accept.
 func (c *schemeConn) SetReadDeadline(t time.Time) error {
@@ -157,7 +261,15 @@ func (c *schemeConn) SetReadDeadline(t time.Time) error {
 	if by := c.headerBy.Load(); by != 0 && (t.IsZero() || t.UnixNano() > by) {
 		t = time.Unix(0, by)
 	}
-	return c.Conn.SetReadDeadline(t)
+	err := c.Conn.SetReadDeadline(t)
+	c.keepWoken()
+	return err
+}
+
+func (c *schemeConn) SetWriteDeadline(t time.Time) error {
+	err := c.Conn.SetWriteDeadline(t)
+	c.keepWoken()
+	return err
 }
 
 func (c *schemeConn) SetDeadline(t time.Time) error {
@@ -182,6 +294,7 @@ func (c *schemeConn) boundHeader(t time.Time) {
 		asked = time.Unix(0, n)
 	}
 	_ = c.Conn.SetReadDeadline(asked)
+	c.keepWoken()
 }
 
 func (c *schemeConn) CloseWrite() error { return closeWrite(c.Conn) }
@@ -259,6 +372,7 @@ func (c *schemeConn) decide() error {
 		if _, err := c.br.Peek(1); err != nil {
 			return err
 		}
+		c.markBegun(false)
 	}
 	// net/http has run the handshake of a TLS connection before its first read.
 	if c.p != nil && c.p.fromItself(c.RemoteAddr(), c.LocalAddr(), netip.AddrPort{}) {
@@ -275,11 +389,20 @@ func (c *schemeConn) decide() error {
 		if _, err := c.br.Peek(1); err != nil {
 			return err
 		}
+		c.markBegun(false)
 		c.state = schemeRaw
 		return nil
 	}
 	if c.br == nil {
 		c.br = bufio.NewReader(c.Conn)
+	}
+	if _, err := c.br.Peek(1); err != nil {
+		return err
+	}
+	if !isTLS {
+		// The first byte may begin an HTTP/1.1 request, so the rest of the preface waits under the
+		// cap of the first request header. Over TLS, ALPN gave h2, and the preface begins none.
+		c.markBegun(true)
 	}
 	n := max(c.br.Buffered(), 1)
 	for {

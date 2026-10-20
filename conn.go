@@ -96,6 +96,14 @@ func (c *peekConn) clientHello() (bool, error) {
 
 func (c *peekConn) Buffered() int { return len(c.buf) }
 
+// peerFailure returns the error of a peek the peer failed, nil for none.
+func (c *peekConn) peerFailure() error {
+	if peerEndIn(c.err) == peerFailed {
+		return c.err
+	}
+	return nil
+}
+
 // Peek returns the next n bytes without consuming them, [bufio.ErrBufferFull] past max, and
 // what arrived before a read error.
 func (c *peekConn) Peek(n int) ([]byte, error) {
@@ -221,6 +229,7 @@ func newSingleConnListener(c net.Conn, sess *Session, state *tls.ConnectionState
 	// Closing the connection closes the listener, so the accept loop set up for it returns
 	// instead of blocking forever on a second Accept that will never be served.
 	sc := &servedConn{Conn: c, sess: sess, l: l}
+	sc.sessionCancel.sess.Store(sess)
 	l.conn = sc
 	if state != nil {
 		l.conn = &tlsServedConn{servedConn: sc, state: state}
@@ -276,25 +285,22 @@ func (l *singleConnListener) wait() {
 
 // servedConn is the connection handed to http.Server for an intercepted connection. It
 // carries the session so ConnContext can attach it to every request read off the
-// connection, and it closes its listener so the accept loop ends with it.
+// connection, and it closes its listener so the accept loop ends with it. Its sessionCancel
+// records how its reads and writes ended, the cause its session gets when the connection ends
+// it, and runs no cancel.
 type servedConn struct {
 	net.Conn
 	sess *Session
 	l    *singleConnListener
 	// begun runs at the first byte read, set while the drain may end the connection.
 	begun atomic.Pointer[func()]
-	once  sync.Once
-	// timedOut is that of sessionCancel, for the read header timeout, and ending that of
-	// sessionCancel, past which a timeout is no read header timeout.
-	timedOut atomic.Bool
-	ending   atomic.Bool
+	sessionCancel
+	once sync.Once
 }
 
 func (c *servedConn) Read(b []byte) (int, error) {
 	n, err := c.Conn.Read(b)
-	if err != nil && isTimeout(err) {
-		c.timedOut.Store(true)
-	}
+	c.noteRead(err)
 	if n > 0 && c.begun.Load() != nil {
 		if f := c.begun.Swap(nil); f != nil {
 			(*f)()
@@ -303,8 +309,16 @@ func (c *servedConn) Read(b []byte) (int, error) {
 	return n, err
 }
 
+func (c *servedConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	if err != nil {
+		c.noteWrite(err)
+	}
+	return n, err
+}
+
 func (c *servedConn) Close() error {
-	if c.timedOut.Load() && !c.ending.Load() && (c.sess == nil || !c.sess.requested.Load() && c.sess.end.first() == causeNone) {
+	if c.headerTimedOut() {
 		// The read header timeout is a failed cause, docs/lifecycle.md Timers.
 		c.Abort()
 		return nil
@@ -356,13 +370,16 @@ func servedConnOf(c net.Conn) *servedConn {
 // path in net/http and in this package funnels through Close, so one hook covers them all.
 type sessionCancel struct {
 	cancel context.CancelFunc
-	// sess is the session of the connection, set by the ConnContext of its server while a cut
-	// may close the connection, and timedOut is set once a read of it timed out.
+	// sess is the session of the connection, set once the connection has one, while a cut may
+	// close the connection.
 	sess atomic.Pointer[Session]
+	// failure is the first error of a read the peer failed or of a write it refused.
+	failure atomic.Pointer[error]
 	// done is closed once the connection closed, made on first use under mu.
-	done     chan struct{}
-	mu       sync.Mutex
-	closed   bool
+	done   chan struct{}
+	mu     sync.Mutex
+	closed bool
+	// timedOut is set once a read of the connection timed out.
 	timedOut atomic.Bool
 	// ending is set once the normal end of the connection began, the timeouts of its read and
 	// discard then being no read header timeout.
@@ -393,13 +410,28 @@ const (
 	peerFailed
 )
 
-// noteRead records how a read of the connection ended.
+// noteRead records how a read of the connection ended, before its normal end began, the read
+// and discard of that end deciding nothing.
 func (s *sessionCancel) noteRead(err error) {
-	if err != nil && isTimeout(err) {
+	if err == nil || s.ending.Load() {
+		return
+	}
+	if isTimeout(err) {
 		s.timedOut.Store(true)
 		return
 	}
+	if peerEndIn(err) == peerFailed {
+		s.fail(err)
+	}
 	notePeerEnd(&s.peer, err)
+}
+
+// fail records err as the failure of the connection unless one came first.
+func (s *sessionCancel) fail(err error) {
+	if s.failure.Load() == nil {
+		e := err
+		s.failure.CompareAndSwap(nil, &e)
+	}
 }
 
 // noteWrite records a failed write as the failed end of the peer, as noteRead does a failed
@@ -409,6 +441,7 @@ func (s *sessionCancel) noteWrite(err error) {
 	if peerEndIn(err) == 0 || s.ending.Load() || s.halfClosed.Load() {
 		return
 	}
+	s.fail(err)
 	s.peer.CompareAndSwap(0, peerFailed)
 }
 
@@ -1513,6 +1546,12 @@ func tlsClient(c net.Conn, cfg *tls.Config) *tlsConn {
 func (c *tlsConn) Close() error {
 	err := net.ErrClosed
 	c.once.Do(func() {
+		if sc := cancelConnOf(c.socket.Conn); sc != nil && sc.headerTimedOut() {
+			// The read header timeout is the failed end, no close_notify, docs/lifecycle.md
+			// Timers, and the close of the socket resets it.
+			err = c.socket.Close()
+			return
+		}
 		if c.noNotify.Load() {
 			err = c.socket.Close()
 			return
@@ -1664,6 +1703,15 @@ func closeNormally(c net.Conn) { closeNormallyBy(c, time.Now().Add(alertWriteTim
 
 // closeNormallyBy is closeNormally ending at deadline.
 func closeNormallyBy(c net.Conn, deadline time.Time) {
+	if sock, t, half := beginNormalEnd(c, deadline); sock != nil {
+		finishNormalEnd(sock, t, half, deadline)
+	}
+}
+
+// beginNormalEnd writes the normal end of c, its close_notify then its FIN, and returns the
+// connection the end reads and closes next, with the timer that closes it at deadline and
+// whether its FIN went out. It returns nil once it gave c the failed end of TLS instead.
+func beginNormalEnd(c net.Conn, deadline time.Time) (net.Conn, *time.Timer, bool) {
 	// The timeouts of the reads and of the discard below are no read header timeout.
 	w := c
 	for range 8 {
@@ -1704,7 +1752,7 @@ func closeNormallyBy(c net.Conn, deadline time.Time) {
 		if tc.socket.cut.Load() {
 			// A record cut short, the failed end of TLS.
 			abort(tc.socket.Conn)
-			return
+			return nil, nil, false
 		}
 		c = tc.NetConn()
 	case *boundedTLSConn:
@@ -1716,11 +1764,13 @@ func closeNormallyBy(c net.Conn, deadline time.Time) {
 		c = tc.NetConn()
 	default:
 		// A wrapper that keeps its own Close still has its close_notify go first, on TLS 1.2
-		// too, under the same deadline.
+		// too, under the same deadline, and its FIN goes on the socket, which the half-close of
+		// TLS 1.2 leaves open.
 		if bc := boundedTLSOf(c); bc != nil {
 			if !bc.noNotify.Load() {
 				bc.boundedBy(deadline, bc.Conn.CloseWrite)
 			}
+			return finWith(c, bc.NetConn(), deadline)
 		} else if tc := tlsOf(c); tc != nil {
 			if !tc.noNotify.Load() && !tc.socket.failed.Load() {
 				tc.socket.limit.Store(deadline.UnixNano())
@@ -1728,18 +1778,35 @@ func closeNormallyBy(c net.Conn, deadline time.Time) {
 			}
 			if tc.socket.cut.Load() {
 				abort(c)
-				return
+				return nil, nil, false
 			}
+			return finWith(c, tc.NetConn(), deadline)
 		}
 	}
-	if cw, ok := c.(closeWriter); ok {
-		// The close at the deadline also ends a half-close stuck behind a write, and a read with
-		// a deadline that does nothing.
-		t := time.AfterFunc(time.Until(deadline), func() { _ = c.Close() })
-		if cw.CloseWrite() == nil {
-			_ = c.SetReadDeadline(deadline)
-			_, _ = io.Copy(io.Discard, c)
-		}
+	return finWith(c, c, deadline)
+}
+
+// finWith writes the FIN of c on sock, the socket under it or c itself, and returns c with the
+// timer that closes it at deadline and whether the FIN went out.
+func finWith(c, sock net.Conn, deadline time.Time) (net.Conn, *time.Timer, bool) {
+	cw, ok := sock.(closeWriter)
+	if !ok {
+		return c, nil, false
+	}
+	// The close at the deadline also ends a half-close stuck behind a write, and a read with a
+	// deadline that does nothing.
+	t := time.AfterFunc(time.Until(deadline), func() { _ = c.Close() })
+	return c, t, cw.CloseWrite() == nil
+}
+
+// finishNormalEnd ends what beginNormalEnd began on c: what the peer still sends read and
+// discarded until its own FIN when the FIN of c went out, then the close.
+func finishNormalEnd(c net.Conn, t *time.Timer, half bool, deadline time.Time) {
+	if half {
+		_ = c.SetReadDeadline(deadline)
+		_, _ = io.Copy(io.Discard, c)
+	}
+	if t != nil {
 		t.Stop()
 	}
 	_ = c.Close()

@@ -757,6 +757,13 @@ func wsOrigin(t *testing.T, before func()) (*httptest.Server, *url.URL) {
 // wsUpgrade sends an upgrade request for /ws through the proxy and returns the answer.
 func wsUpgrade(t *testing.T, proxyAddr string, origin *httptest.Server, extraHeaders string) *http.Response {
 	t.Helper()
+	_, _, resp := wsDial(t, proxyAddr, origin, extraHeaders)
+	return resp
+}
+
+// wsDial is wsUpgrade, which also returns the connection and the reader of its answer.
+func wsDial(t *testing.T, proxyAddr string, origin *httptest.Server, extraHeaders string) (net.Conn, *bufio.Reader, *http.Response) {
+	t.Helper()
 	originURL, err := url.Parse(origin.URL)
 	require.NoError(t, err)
 	raw, err := net.Dial("tcp", proxyAddr)
@@ -766,9 +773,10 @@ func wsUpgrade(t *testing.T, proxyAddr string, origin *httptest.Server, extraHea
 		extraHeaders+"Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
 		origin.URL, originURL.Host)
 	require.NoError(t, err)
-	resp, err := http.ReadResponse(bufio.NewReader(raw), nil)
+	br := bufio.NewReader(raw)
+	resp, err := http.ReadResponse(br, nil)
 	require.NoError(t, err)
-	return resp
+	return raw, br, resp
 }
 
 func TestSession_StaleReadsACopyOfTheUpgrade(t *testing.T) {

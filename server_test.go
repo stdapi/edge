@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
 	"io"
@@ -2941,7 +2942,9 @@ func TestLifecycle_DrainEndsATLSFrontConnectionThatBeganNoRequest(t *testing.T) 
 			start := time.Now()
 			err = p.Shutdown(ctx)
 			require.NoError(t, err)
-			require.Less(t, time.Since(start), 2*time.Second)
+			// The drain ends it T after the start, and its normal end waits up to T for the FIN of
+			// a client that reads nothing.
+			require.Less(t, time.Since(start), 2*alertWriteTimeout+500*time.Millisecond)
 		})
 	}
 }
@@ -3822,4 +3825,666 @@ func TestServer_IdleFrontConnectionGetsItsNormalEnd(t *testing.T) {
 			require.Equal(t, "FIN", peerEnd(c, 2*time.Second), "a front connection that began no request got no normal end")
 		})
 	}
+}
+
+func TestServer_HijackedFrontStaysRegisteredUntilItsOwnerRegisters(t *testing.T) {
+	p, err := New()
+	require.NoError(t, err)
+	s := p.srv
+	count := func(g *gauge) int64 {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		return g.n
+	}
+	c, peer := net.Pipe()
+	defer peer.Close()
+	defer c.Close()
+	require.True(t, s.addFront(c))
+	s.trackFront(c, http.StateHijacked)
+	require.EqualValues(t, 1, count(&s.frontsLive), "the hijack took the socket off the fronts before its owner registered")
+	require.True(t, s.takeFront(c, c))
+	require.EqualValues(t, 0, count(&s.frontsLive))
+	require.EqualValues(t, 1, count(&s.tracked))
+	s.untrack(c)
+}
+
+func TestServer_ReadHeaderTimeoutFailsATLSFrontConnection(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p := testProxy(t, WithCA(ca), WithReadHeaderTimeout(300*time.Millisecond))
+	p.MustAdd("allowed.test/", okHandler)
+	conn := dialFront(t, startTLSFront(t, p, ca, "http/1.1"), ca, "http/1.1")
+	defer conn.Close()
+	_, err = io.WriteString(conn, "GET http://allowed.test/ HTTP/1.1\r\n")
+	require.NoError(t, err)
+	require.Equal(t, "RST", peerEnd(conn, 3*time.Second), "the read header timeout is a failed end, with no close_notify")
+}
+
+func TestShutdown_ServesTheFirstRequestOfAFrontConnectionThatReachedItsServerDuringTheDrain(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p := testProxyWithCA(t, ca, WithReadHeaderTimeout(6*time.Second))
+	p.MustAdd("allowed.test/", okHandler)
+	addr, pool := startProxyTLS(t, p, ca)
+	raw, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer raw.Close()
+	conn := tls.Client(raw, &tls.Config{RootCAs: pool, ServerName: "127.0.0.1", NextProtos: []string{"http/1.1"}, MinVersion: tls.VersionTLS12})
+	time.Sleep(100 * time.Millisecond)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		_ = p.Shutdown(ctx)
+	}()
+	// The handshake ends T/2 after the start, and the first request begins 0.7T after it,
+	// past T after the start and within T of reaching the server.
+	time.Sleep(alertWriteTimeout / 2)
+	require.NoError(t, conn.Handshake())
+	time.Sleep(alertWriteTimeout * 7 / 10)
+	_, err = io.WriteString(conn, "GET http://allowed.test/ HTTP/1.1\r\nHost: allowed.test\r\n\r\n")
+	require.NoError(t, err)
+	_ = conn.SetReadDeadline(time.Now().Add(4 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	require.NoError(t, err)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+func TestShutdown_ServesAFrontRequestWhoseHeaderEndsPastTAfterItsHandshake(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p := testProxyWithCA(t, ca, WithReadHeaderTimeout(6*time.Second))
+	p.MustAdd("allowed.test/", okHandler)
+	addr, pool := startProxyTLS(t, p, ca)
+	raw, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer raw.Close()
+	conn := tls.Client(raw, &tls.Config{RootCAs: pool, ServerName: "127.0.0.1", NextProtos: []string{"http/1.1"}, MinVersion: tls.VersionTLS12})
+	time.Sleep(100 * time.Millisecond)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		_ = p.Shutdown(ctx)
+	}()
+	time.Sleep(alertWriteTimeout / 2)
+	require.NoError(t, conn.Handshake())
+	// The request begins 0.8T after the handshake and its header ends 1.2T after it.
+	time.Sleep(alertWriteTimeout * 8 / 10)
+	_, err = io.WriteString(conn, "GET http://allowed.test/ HTTP/1.1\r\n")
+	require.NoError(t, err)
+	time.Sleep(alertWriteTimeout * 4 / 10)
+	_, err = io.WriteString(conn, "Host: allowed.test\r\n\r\n")
+	require.NoError(t, err)
+	_ = conn.SetReadDeadline(time.Now().Add(4 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	require.NoError(t, err, "the request began within T of the handshake")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+func TestShutdown_ReadHeaderTimeoutBeforeTheEndOfTheDrainFailsAFrontConnection(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p := testProxyWithCA(t, ca, WithReadHeaderTimeout(time.Second))
+	p.MustAdd("allowed.test/", okHandler)
+	addr, pool := startProxyTLS(t, p, ca)
+	raw, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer raw.Close()
+	conn := tls.Client(raw, &tls.Config{RootCAs: pool, ServerName: "127.0.0.1", NextProtos: []string{"http/1.1"}, MinVersion: tls.VersionTLS12})
+	time.Sleep(100 * time.Millisecond)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		_ = p.Shutdown(ctx)
+	}()
+	time.Sleep(400 * time.Millisecond)
+	require.NoError(t, conn.Handshake())
+	_ = conn.SetReadDeadline(time.Now().Add(4 * time.Second))
+	_, rerr := conn.Read(make([]byte, 1))
+	require.ErrorIs(t, rerr, syscall.ECONNRESET, "the read header timeout came first, a failed end")
+}
+
+// plainFrontRequestStraddlingTheDrain sends first 0.3T after the start of a drain and rest T
+// later, and requires the response of the request they make.
+func plainFrontRequestStraddlingTheDrain(t *testing.T, first, rest string) {
+	p := testProxy(t, WithReadHeaderTimeout(6*time.Second))
+	p.MustAdd("allowed.test/", okHandler)
+	conn, err := net.Dial("tcp", startProxy(t, p))
+	require.NoError(t, err)
+	defer conn.Close()
+	time.Sleep(100 * time.Millisecond)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		_ = p.Shutdown(ctx)
+	}()
+	// The request begins 0.3T after the start and goes on 1.3T after it.
+	time.Sleep(alertWriteTimeout * 3 / 10)
+	_, err = io.WriteString(conn, first)
+	require.NoError(t, err)
+	time.Sleep(alertWriteTimeout)
+	_, _ = io.WriteString(conn, rest)
+	_ = conn.SetReadDeadline(time.Now().Add(4 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	require.NoError(t, err, "the request began within T of the start")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+func TestShutdown_ServesAPlainFrontRequestWhoseFirstByteCameWithinT(t *testing.T) {
+	t.Run("HTTP/1.1 request line", func(t *testing.T) {
+		plainFrontRequestStraddlingTheDrain(t, "G", "ET http://allowed.test/ HTTP/1.1\r\nHost: allowed.test\r\n\r\n")
+	})
+	t.Run("first byte of the HTTP/2 preface", func(t *testing.T) {
+		plainFrontRequestStraddlingTheDrain(t, "P", "OST http://allowed.test/ HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 0\r\n\r\n")
+	})
+}
+
+func TestShutdown_FirstByteBeforeTheDrainKeepsTheBoundOfItsHeader(t *testing.T) {
+	p := testProxy(t, WithReadHeaderTimeout(6*time.Second))
+	p.MustAdd("allowed.test/", okHandler)
+	conn, err := net.Dial("tcp", startProxy(t, p))
+	require.NoError(t, err)
+	defer conn.Close()
+	time.Sleep(100 * time.Millisecond)
+	// The first byte of the HTTP/2 preface arrives before the start, the rest 1.3T after it.
+	_, err = io.WriteString(conn, "P")
+	require.NoError(t, err)
+	time.Sleep(100 * time.Millisecond)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		_ = p.Shutdown(ctx)
+	}()
+	time.Sleep(alertWriteTimeout * 13 / 10)
+	_, err = io.WriteString(conn, "OST http://allowed.test/ HTTP/1.1\r\nHost: allowed.test\r\nContent-Length: 0\r\n\r\n")
+	require.NoError(t, err)
+	_ = conn.SetReadDeadline(time.Now().Add(4 * time.Second))
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	require.NoError(t, err, "the request began before the start of the drain")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+// delayedWrites delays every write from the from-th one until the time until.
+type delayedWrites struct {
+	net.Conn
+	until time.Time
+	n     int
+	from  int
+}
+
+func (c *delayedWrites) Write(b []byte) (int, error) {
+	c.n++
+	if c.n >= c.from {
+		time.Sleep(time.Until(c.until))
+	}
+	return c.Conn.Write(b)
+}
+
+func TestShutdown_TLSFrontConnectionGetsItsTOnceItsHandshakeEnded(t *testing.T) {
+	cases := []struct {
+		name  string
+		delay time.Duration
+		from  int
+	}{
+		{name: "ClientHello after T", delay: alertWriteTimeout * 13 / 10, from: 1},
+		{name: "Finished after T", delay: alertWriteTimeout * 13 / 10, from: 2},
+		{name: "handshake within T", delay: alertWriteTimeout / 2, from: 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ca, err := GenerateCA()
+			require.NoError(t, err)
+			p := testProxyWithCA(t, ca, WithReadHeaderTimeout(6*time.Second))
+			p.MustAdd("allowed.test/", okHandler)
+			addr, pool := startProxyTLS(t, p, ca)
+			raw, err := net.Dial("tcp", addr)
+			require.NoError(t, err)
+			defer raw.Close()
+			time.Sleep(50 * time.Millisecond)
+			start := time.Now().Add(100 * time.Millisecond)
+			dw := &delayedWrites{Conn: raw, from: tc.from, until: start.Add(tc.delay)}
+			conn := tls.Client(dw, &tls.Config{RootCAs: pool, ServerName: "127.0.0.1", MinVersion: tls.VersionTLS13, NextProtos: []string{"http/1.1"}})
+			hs := make(chan error, 1)
+			go func() { hs <- conn.Handshake() }()
+			time.Sleep(time.Until(start))
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+				defer cancel()
+				_ = p.Shutdown(ctx)
+			}()
+			require.NoError(t, <-hs)
+			_, err = io.WriteString(conn, "GET http://allowed.test/ HTTP/1.1\r\nHost: allowed.test\r\n\r\n")
+			require.NoError(t, err)
+			_ = raw.SetReadDeadline(time.Now().Add(4 * time.Second))
+			resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+			require.NoError(t, err, "the connection reached its server %v after the start", time.Since(start))
+			require.Equal(t, http.StatusOK, resp.StatusCode)
+		})
+	}
+}
+
+func TestShutdown_PartialPrefaceOfAnH2FrontConnectionGetsItsGOAWAY(t *testing.T) {
+	for _, reachedAfter := range []bool{false, true} {
+		t.Run("reached after the start "+strconv.FormatBool(reachedAfter), func(t *testing.T) {
+			ca, err := GenerateCA()
+			require.NoError(t, err)
+			p := testProxyWithCA(t, ca, WithReadHeaderTimeout(6*time.Second))
+			p.MustAdd("allowed.test/", okHandler)
+			addr, pool := startProxyTLS(t, p, ca)
+			cfg := &tls.Config{RootCAs: pool, ServerName: "127.0.0.1", MinVersion: tls.VersionTLS13, NextProtos: []string{"h2"}}
+			shutdown := func() {
+				go func() {
+					ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+					defer cancel()
+					_ = p.Shutdown(ctx)
+				}()
+			}
+			raw, err := net.Dial("tcp", addr)
+			require.NoError(t, err)
+			defer raw.Close()
+			if reachedAfter {
+				time.Sleep(50 * time.Millisecond)
+				shutdown()
+				time.Sleep(300 * time.Millisecond)
+			}
+			conn := tls.Client(raw, cfg)
+			require.NoError(t, conn.Handshake())
+			require.Equal(t, "h2", conn.ConnectionState().NegotiatedProtocol)
+			// Over TLS, ALPN gave h2, so a preface begins no request.
+			_, err = io.WriteString(conn, h2Preface[:16])
+			require.NoError(t, err)
+			if !reachedAfter {
+				time.Sleep(100 * time.Millisecond)
+				shutdown()
+			}
+			start := time.Now()
+			_ = conn.SetReadDeadline(time.Now().Add(6 * time.Second))
+			fr := http2.NewFramer(io.Discard, conn)
+			f, err := fr.ReadFrame()
+			require.NoError(t, err)
+			require.IsType(t, &http2.SettingsFrame{}, f)
+			f, err = fr.ReadFrame()
+			require.NoError(t, err)
+			goAway, ok := f.(*http2.GoAwayFrame)
+			require.True(t, ok, "%T", f)
+			require.Equal(t, http2.ErrCodeNo, goAway.ErrCode)
+			_, err = fr.ReadFrame()
+			require.ErrorIs(t, err, io.EOF, "the normal end follows the GOAWAY")
+			require.Less(t, time.Since(start), 3*alertWriteTimeout)
+		})
+	}
+}
+
+func TestShutdown_EndsAStalledTLSHandshakeAtTWithNoReadHeaderTimeout(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p := testProxyWithCA(t, ca, WithReadHeaderTimeout(0))
+	p.MustAdd("allowed.test/", okHandler)
+	addr, _ := startProxyTLS(t, p, ca)
+	// A TCP connection that never sends its ClientHello.
+	raw, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer raw.Close()
+	time.Sleep(50 * time.Millisecond)
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	require.NoError(t, p.Shutdown(ctx))
+	// The drain ends it T after the start, and its normal end waits up to T for the FIN of a
+	// client that reads nothing.
+	require.Less(t, time.Since(start), 2*alertWriteTimeout+500*time.Millisecond)
+	require.Equal(t, "FIN", peerEnd(raw, time.Second), "the drain gives a connection with no request its normal end")
+}
+
+// partialH2Front returns a TLS front connection that negotiated h2 and sent part of its preface.
+func partialH2Front(t *testing.T, addr string, pool *x509.CertPool) *tls.Conn {
+	t.Helper()
+	conn, err := tls.Dial("tcp", addr, &tls.Config{RootCAs: pool, ServerName: "127.0.0.1", MinVersion: tls.VersionTLS13, NextProtos: []string{"h2"}})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	require.Equal(t, "h2", conn.ConnectionState().NegotiatedProtocol)
+	_, err = io.WriteString(conn, h2Preface[:16])
+	require.NoError(t, err)
+	return conn
+}
+
+func TestShutdown_DrainedEndOfAFrontConnectionStaysRegistered(t *testing.T) {
+	for _, how := range []string{"Shutdown", "a cut during the drain"} {
+		t.Run(how, func(t *testing.T) {
+			ca, err := GenerateCA()
+			require.NoError(t, err)
+			p := testProxyWithCA(t, ca, WithReadHeaderTimeout(6*time.Second))
+			p.MustAdd("allowed.test/", okHandler)
+			addr, pool := startProxyTLS(t, p, ca)
+			conn := partialH2Front(t, addr, pool)
+			time.Sleep(100 * time.Millisecond)
+			start := time.Now()
+			shut := make(chan error, 1)
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+				defer cancel()
+				shut <- p.Shutdown(ctx)
+			}()
+			_ = conn.SetReadDeadline(time.Now().Add(6 * time.Second))
+			fr := http2.NewFramer(io.Discard, conn)
+			_, err = fr.ReadFrame()
+			require.NoError(t, err)
+			f, err := fr.ReadFrame()
+			require.NoError(t, err)
+			require.IsType(t, &http2.GoAwayFrame{}, f)
+			// It reached its server before the start, so its GOAWAY goes out at the start.
+			require.Less(t, time.Since(start), alertWriteTimeout/2)
+			if how == "Shutdown" {
+				require.NoError(t, <-shut)
+			} else {
+				closing := time.Now()
+				require.NoError(t, p.Close())
+				// The front stage waits for the end the drain started within its T, I4.
+				require.Less(t, time.Since(closing), alertWriteTimeout+500*time.Millisecond)
+			}
+			// Shutdown and the cut return once the end they waited for wrote its last byte.
+			_ = conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+			_, err = fr.ReadFrame()
+			require.ErrorIs(t, err, io.EOF)
+		})
+	}
+}
+
+func TestShutdown_TLSFrontConnectionRecordedAfterTheStartWithNoReadHeaderTimeout(t *testing.T) {
+	var once sync.Once
+	accepted := make(chan struct{})
+	release := make(chan struct{})
+	acceptedHook = func() {
+		once.Do(func() {
+			close(accepted)
+			<-release
+		})
+	}
+	defer func() { acceptedHook = nil }()
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p := testProxyWithCA(t, ca, WithReadHeaderTimeout(0))
+	p.MustAdd("allowed.test/", okHandler)
+	addr, _ := startProxyTLS(t, p, ca)
+	// Accepted before the start, recorded once endWaiting ran, and silent.
+	raw, err := net.Dial("tcp", addr)
+	require.NoError(t, err)
+	defer raw.Close()
+	<-accepted
+	go func() {
+		for !p.srv.closing.Load() {
+			time.Sleep(time.Millisecond)
+		}
+		time.Sleep(100 * time.Millisecond)
+		close(release)
+	}()
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	require.NoError(t, p.Shutdown(ctx))
+	require.Less(t, time.Since(start), 2*alertWriteTimeout+500*time.Millisecond)
+}
+
+// handshakeInReadConn is a caller's TLS connection with no HandshakeContext, which runs its
+// handshake in its first read.
+type handshakeInReadConn struct {
+	net.Conn
+	tc *tls.Conn
+}
+
+func (c handshakeInReadConn) ConnectionState() tls.ConnectionState { return c.tc.ConnectionState() }
+
+type handshakeInReadListener struct {
+	net.Listener
+	cfg *tls.Config
+}
+
+func (l handshakeInReadListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	tc := tls.Server(c, l.cfg)
+	return handshakeInReadConn{Conn: tc, tc: tc}, nil
+}
+
+func TestShutdown_DrainHoldsNoLockOnAHandshakeInItsFirstRead(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p := testProxyWithCA(t, ca, WithReadHeaderTimeout(0))
+	p.MustAdd("allowed.test/", okHandler)
+	cert, err := ca.Leaf("127.0.0.1")
+	require.NoError(t, err)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	go func() {
+		_ = p.Serve(handshakeInReadListener{Listener: ln, cfg: &tls.Config{Certificates: []tls.Certificate{*cert}, NextProtos: []string{"h2", "http/1.1"}}})
+	}()
+	// A client silent in its handshake.
+	raw, err := net.Dial("tcp", ln.Addr().String())
+	require.NoError(t, err)
+	defer raw.Close()
+	time.Sleep(200 * time.Millisecond)
+	shut := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		defer cancel()
+		shut <- p.Shutdown(ctx)
+	}()
+	time.Sleep(100 * time.Millisecond)
+	locked := make(chan struct{})
+	go func() {
+		p.srv.mu.Lock()
+		p.srv.mu.Unlock()
+		close(locked)
+	}()
+	select {
+	case <-locked:
+	case <-time.After(time.Second):
+		t.Fatal("the drain kept the server lock while a handshake runs")
+	}
+	select {
+	case err := <-shut:
+		require.NoError(t, err)
+	case <-time.After(3 * alertWriteTimeout):
+		t.Fatal("Shutdown did not return")
+	}
+}
+
+func TestShutdown_H2FrontConnectionThatReachedItsServerAfterTheStartKeepsItsT(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p := testProxyWithCA(t, ca)
+	p.MustAdd("allowed.test/", okHandler)
+	cert, err := ca.Leaf("127.0.0.1")
+	require.NoError(t, err)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	// The listener closes slowly, so endWaiting runs after the connection reached its server.
+	go func() { _ = p.ServeTLS(slowCloseListener{ln}, *cert) }()
+	t.Cleanup(func() { _ = p.Close() })
+	raw, err := net.Dial("tcp", ln.Addr().String())
+	require.NoError(t, err)
+	defer raw.Close()
+	time.Sleep(100 * time.Millisecond)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		_ = p.Shutdown(ctx)
+	}()
+	for !p.srv.closing.Load() {
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	conn := tls.Client(raw, &tls.Config{RootCAs: ca.CertPool(), ServerName: "127.0.0.1", NextProtos: []string{"h2"}, MinVersion: tls.VersionTLS12})
+	require.NoError(t, conn.Handshake())
+	require.Equal(t, "h2", conn.ConnectionState().NegotiatedProtocol)
+	reached := time.Now()
+	_ = conn.SetReadDeadline(time.Now().Add(4 * time.Second))
+	fr := http2.NewFramer(io.Discard, conn)
+	_, err = fr.ReadFrame()
+	require.NoError(t, err)
+	f, err := fr.ReadFrame()
+	require.NoError(t, err)
+	require.IsType(t, &http2.GoAwayFrame{}, f)
+	require.Greater(t, time.Since(reached), alertWriteTimeout*8/10, "the GOAWAY came before T after it reached its server")
+}
+
+func TestClose_EndsAFrontConnectionItsWakeDoesNotReach(t *testing.T) {
+	p := testProxy(t, WithReadHeaderTimeout(0))
+	p.MustAdd("allowed.test/", okHandler)
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	go func() { _ = p.Serve(noDeadlineListener{ln}) }()
+	t.Cleanup(func() { _ = p.Close() })
+	c, err := net.Dial("tcp", ln.Addr().String())
+	require.NoError(t, err)
+	defer c.Close()
+	// The first byte of the preface, the rest never comes.
+	_, err = io.WriteString(c, "P")
+	require.NoError(t, err)
+	time.Sleep(100 * time.Millisecond)
+
+	start := time.Now()
+	closed := make(chan struct{})
+	go func() { _ = p.Close(); close(closed) }()
+	select {
+	case <-closed:
+	case <-time.After(3 * alertWriteTimeout):
+		t.Fatal("Close did not return")
+	}
+	assert.Less(t, time.Since(start), alertWriteTimeout+500*time.Millisecond)
+}
+
+func TestClose_FrontConnectionDecidedDuringTheUnitsStageEndsWithTheCut(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p := testProxyWithCA(t, ca)
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	started := make(chan struct{}, 1)
+	p.MustAdd("allowed.test/", blockingHandler(started, release))
+	addr, pool := startProxyTLS(t, p, ca)
+	busy, err := tls.Dial("tcp", addr, &tls.Config{RootCAs: pool, ServerName: "127.0.0.1", NextProtos: []string{"http/1.1"}})
+	require.NoError(t, err)
+	defer busy.Close()
+	_, err = io.WriteString(busy, "GET http://allowed.test/ HTTP/1.1\r\nHost: allowed.test\r\n\r\n")
+	require.NoError(t, err)
+	<-started
+	conn, err := tls.Dial("tcp", addr, &tls.Config{RootCAs: pool, ServerName: "127.0.0.1", MinVersion: tls.VersionTLS13, NextProtos: []string{"h2"}})
+	require.NoError(t, err)
+	defer conn.Close()
+
+	closed := make(chan struct{})
+	go func() { _ = p.Close(); close(closed) }()
+	for !p.srv.cutting() {
+		time.Sleep(time.Millisecond)
+	}
+	// The blocked handler keeps the units stage running while the connection shows itself HTTP/2.
+	time.Sleep(50 * time.Millisecond)
+	_, err = io.WriteString(conn, h2Preface)
+	require.NoError(t, err)
+	require.NoError(t, http2.NewFramer(conn, nil).WriteSettings())
+
+	_ = conn.SetReadDeadline(time.Now().Add(3 * alertWriteTimeout))
+	f, err := http2.NewFramer(io.Discard, conn).ReadFrame()
+	require.ErrorIs(t, err, io.EOF, "the connection was served after the start of the cut: %v", f)
+	assert.NotZero(t, p.srv.frontStageBy.Load(), "the connection ended before the front stage")
+	<-closed
+}
+
+func TestShutdown_SecondCallKeepsTheDrainOfTheFirst(t *testing.T) {
+	p := testProxy(t)
+	p.MustAdd("allowed.test/", okHandler)
+	c, err := net.Dial("tcp", startProxy(t, p))
+	require.NoError(t, err)
+	defer c.Close()
+	time.Sleep(100 * time.Millisecond)
+	start := time.Now()
+	shutdown := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		_ = p.Shutdown(ctx)
+	}
+	go shutdown()
+	time.Sleep(alertWriteTimeout * 8 / 10)
+	go shutdown()
+	_ = c.SetReadDeadline(time.Now().Add(4 * alertWriteTimeout))
+	_, err = c.Read(make([]byte, 1))
+	require.ErrorIs(t, err, io.EOF)
+	assert.Less(t, time.Since(start), alertWriteTimeout+300*time.Millisecond)
+}
+
+func TestClose_LeavesNoFrontConnectionOfAHandlerIgnoringItsCancel(t *testing.T) {
+	p := testProxy(t)
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	started := make(chan struct{}, 1)
+	p.MustAdd("allowed.test/", blockingHandler(started, release))
+	c, err := net.Dial("tcp", startProxy(t, p))
+	require.NoError(t, err)
+	defer c.Close()
+	_, err = io.WriteString(c, "GET http://allowed.test/ HTTP/1.1\r\nHost: allowed.test\r\n\r\n")
+	require.NoError(t, err)
+	<-started
+
+	require.NoError(t, p.Close())
+	p.srv.mu.Lock()
+	fronts := len(p.srv.fronts)
+	p.srv.mu.Unlock()
+	assert.Zero(t, fronts)
+}
+
+func TestClose_WaitsForTheDrainedEndOfAFrontConnection(t *testing.T) {
+	p := testProxy(t)
+	p.MustAdd("allowed.test/", okHandler)
+	c, err := net.Dial("tcp", startProxy(t, p))
+	require.NoError(t, err)
+	defer c.Close()
+	time.Sleep(100 * time.Millisecond)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		_ = p.Shutdown(ctx)
+	}()
+	_ = c.SetReadDeadline(time.Now().Add(3 * alertWriteTimeout))
+	_, err = io.Copy(io.Discard, c)
+	require.NoError(t, err, "the FIN of the drain")
+	fin := time.Now()
+	time.Sleep(100 * time.Millisecond)
+	closing := time.Now()
+	closed := make(chan struct{})
+	go func() { _ = p.Close(); close(closed) }()
+	// The end the drain began reads and discards until its deadline, T after its FIN, so what
+	// the client still sends draws no reset.
+	time.Sleep(50 * time.Millisecond)
+	_, err = c.Write([]byte("x"))
+	require.NoError(t, err)
+	time.Sleep(50 * time.Millisecond)
+	_, err = c.Write([]byte("y"))
+	require.NoError(t, err)
+	_ = c.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	_, err = c.Read(make([]byte, 1))
+	require.ErrorIs(t, err, io.EOF)
+	<-closed
+	assert.Greater(t, time.Since(fin), alertWriteTimeout*8/10)
+	assert.Less(t, time.Since(closing), alertWriteTimeout+500*time.Millisecond)
+}
+
+// noDeadlineListener accepts connections that ignore their read deadlines.
+type noDeadlineListener struct{ net.Listener }
+
+func (l noDeadlineListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+	return noDeadlineConn{c}, nil
+}
+
+// slowCloseListener takes 300 ms to close.
+type slowCloseListener struct{ net.Listener }
+
+func (l slowCloseListener) Close() error {
+	time.Sleep(300 * time.Millisecond)
+	return l.Listener.Close()
 }

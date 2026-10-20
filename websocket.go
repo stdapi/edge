@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -180,10 +181,14 @@ type WebSocketCtx struct {
 	params   []Param
 	toClient wsHop
 	toOrigin wsHop
+	// ends counts the ends of the transport of a hop a reader decided, which run off that
+	// reader, until closing is set and endBy waits for them.
+	ends     sync.WaitGroup
 	maxFrame int
 	initOnce sync.Once
 	mu       sync.Mutex
 	done     bool
+	closing  bool
 }
 
 // Context returns a context canceled when the connection ends.
@@ -257,6 +262,7 @@ func (c *WebSocketCtx) Inbound() *FrameReader {
 func (c *WebSocketCtx) setHops(client net.Conn, clientR io.Reader, backend io.ReadWriteCloser, raw, top net.Conn) {
 	c.toClient.c, c.toClient.peer, c.toClient.server = c, &c.toOrigin, true
 	c.toClient.done, c.toOrigin.done = make(chan struct{}), make(chan struct{})
+	c.toClient.reading, c.toOrigin.reading = make(chan struct{}, 1), make(chan struct{}, 1)
 	c.toClient.conn, c.toClient.r, c.toClient.w.w = client, clientR, client
 	c.toOrigin.c, c.toOrigin.peer = c, &c.toClient
 	c.toOrigin.conn, c.toOrigin.r, c.toOrigin.w.w, c.toOrigin.w.mask = pipeConn{ReadWriteCloser: backend, raw: raw, top: top}, backend, backend, true
@@ -273,9 +279,22 @@ func (c *WebSocketCtx) newFrameReader(src *wsHop, inbound bool) *FrameReader {
 	r := &wsReader{r: src.r, max: c.maxFrame, masked: src.server}
 	fc := &FrameCtx{w: src.peer, back: src}
 	return &FrameReader{ctx: c.ctx, read: func() (*FrameCtx, error) {
+		src.reading <- struct{}{}
+		if src.over.Load() {
+			// The end of the hop reads and discards what is left.
+			<-src.reading
+			return nil, io.EOF
+		}
 		f, err := r.read()
+		<-src.reading
 		if err != nil {
+			if src.over.Load() {
+				return nil, io.EOF
+			}
 			return nil, src.readEnded(err)
+		}
+		if src.over.Load() {
+			return nil, io.EOF
 		}
 		if f.opcode == OpClose {
 			src.closeReceived(closeCodeOf(f.payload))
@@ -316,12 +335,13 @@ func (c *WebSocketCtx) waitLocked() {
 }
 
 func (c *WebSocketCtx) expire() {
+	deadline := time.Now().Add(alertWriteTimeout)
 	c.mu.Lock()
 	client, origin := c.toClient.endLocked(hopClose), c.toOrigin.endLocked(hopClose)
 	c.cancelIfEndedLocked()
 	c.mu.Unlock()
-	c.toClient.finish(client)
-	c.toOrigin.finish(origin)
+	c.toClient.finish(client, deadline)
+	c.toOrigin.finish(origin, deadline)
 }
 
 // stop keeps the close timer from outliving the handler.
@@ -351,9 +371,17 @@ type wsHop struct {
 	r    io.Reader
 	c    *WebSocketCtx
 	peer *wsHop
-	// done is closed once the hop ended.
+	// done is closed once the hop ended, and over is set then, which a read checks without the
+	// lock.
 	done chan struct{}
-	w    wsWriter
+	// reading is a semaphore of one token, taken for each read of the hop, a frame by its
+	// reader or the discard of the end of its transport, so no two of them read at once.
+	reading chan struct{}
+	// transportEnded is closed once the end of the transport a reader began ended, nil while no
+	// reader began one, guarded by the mutex of c.
+	transportEnded chan struct{}
+	w              wsWriter
+	over           atomic.Bool
 	// recvCode is the status of the Close frame the peer sent, closeNormal when it had none.
 	recvCode  uint16
 	server    bool
@@ -361,6 +389,8 @@ type wsHop struct {
 	sentClose bool
 	eof       bool
 	ended     bool
+	// transportHow is the end of the transport a reader began, guarded by the mutex of c.
+	transportHow hopEnd
 }
 
 func (h *wsHop) write(f Frame) error {
@@ -371,7 +401,7 @@ func (h *wsHop) write(f Frame) error {
 		return err
 	}
 	if f.opcode == OpClose {
-		h.closeCrossed(&h.sentClose)
+		h.closeCrossed(&h.sentClose, time.Now().Add(alertWriteTimeout))
 	}
 	return nil
 }
@@ -381,17 +411,18 @@ func (h *wsHop) closeReceived(code uint16) {
 	h.c.mu.Lock()
 	h.recvCode = code
 	h.c.mu.Unlock()
-	h.closeCrossed(&h.recvClose)
+	h.closeCrossed(&h.recvClose, time.Now().Add(alertWriteTimeout))
 }
 
-// closeCrossed records a Close received from h or sent to h, flag being one of the two.
-func (h *wsHop) closeCrossed(flag *bool) {
+// closeCrossed records a Close received from h or sent to h, flag being one of the two, an end
+// of h it settles ending by deadline.
+func (h *wsHop) closeCrossed(flag *bool, deadline time.Time) {
 	h.c.mu.Lock()
 	*flag = true
 	end := h.settleLocked()
 	h.c.cancelIfEndedLocked()
 	h.c.mu.Unlock()
-	h.finish(end)
+	h.finish(end, deadline)
 }
 
 // settleLocked ends h once both Close frames crossed it. RFC 6455 section 7.1.1 has the
@@ -416,6 +447,7 @@ func (h *wsHop) settleLocked() hopEnd {
 // readEnded handles the error that ended a read of h and returns the one the reader returns.
 func (h *wsHop) readEnded(err error) error {
 	c := h.c
+	deadline := time.Now().Add(alertWriteTimeout)
 	if fe, ok := errors.AsType[*frameError](err); ok {
 		// Under RFC 6455 section 7.1.7 a Close precedes the end, and the other peer reads 1001
 		// because edge leaves it.
@@ -432,8 +464,8 @@ func (h *wsHop) readEnded(err error) error {
 		if toPeer {
 			h.peer.writeClose(peerCode)
 		}
-		h.finish(self)
-		h.peer.finish(peer)
+		h.finish(self, deadline)
+		h.peer.finish(peer, deadline)
 		return err
 	}
 
@@ -457,8 +489,8 @@ func (h *wsHop) readEnded(err error) error {
 	}
 	c.cancelIfEndedLocked()
 	c.mu.Unlock()
-	h.finish(self)
-	h.peer.finish(peer)
+	h.finish(self, deadline)
+	h.peer.finish(peer, deadline)
 	return err
 }
 
@@ -487,25 +519,31 @@ func (h *wsHop) writeCloseBy(code uint16, deadline time.Time, idle bool) bool {
 // transport, both before deadline. The Close has code 1001 when goingAway is set, and the code
 // of the peer's own Close or 1000 otherwise.
 //
-// A handler may still be reading h when its session closes, so h then only half-closes and
-// leaves the read to its reader, closing once that reader saw the end or at the deadline.
+// A handler may still be reading h when its session closes, and its read ends once h ended.
 func (h *wsHop) end(goingAway bool, deadline time.Time) {
 	h.c.mu.Lock()
-	send := !h.sentClose && !h.ended
+	if ended := h.transportEnded; ended != nil {
+		// A reader began the end of the transport, which stays its one end.
+		how := h.transportHow
+		h.c.mu.Unlock()
+		h.awaitEnd(ended, how, deadline)
+		return
+	}
+	// The first cause decides the forms, I1, so a hop a reader ended once the closer began still
+	// gets its Close.
+	send := !h.sentClose
 	code := h.closeCodeLocked(goingAway)
 	h.c.mu.Unlock()
 	if send {
 		if h.writeCloseBy(code, deadline, true) {
-			h.closeCrossed(&h.sentClose)
+			h.closeCrossed(&h.sentClose, deadline)
 		}
 	}
-	if !goingAway {
-		closeNormallyBy(h.conn, deadline)
-		return
-	}
-	_ = closeWrite(h.conn)
-	waitUntil(h.done, deadline)
-	_ = h.conn.Close()
+	h.c.mu.Lock()
+	h.endLocked(hopOpen)
+	h.c.cancelIfEndedLocked()
+	h.c.mu.Unlock()
+	h.endTransport(deadline)
 }
 
 // closeCodeLocked is the code of a Close frame the proxy writes to the peer of h: the code of
@@ -525,18 +563,61 @@ func (c *WebSocketCtx) end(goingAway bool) { c.endBy(goingAway, time.Now().Add(a
 
 // endBy is end by deadline.
 func (c *WebSocketCtx) endBy(goingAway bool, deadline time.Time) {
+	c.mu.Lock()
+	c.closing = true
+	c.mu.Unlock()
 	var wg sync.WaitGroup
 	wg.Go(func() { c.toClient.end(goingAway, deadline) })
 	c.toOrigin.end(goingAway, deadline)
 	wg.Wait()
+	c.stopEnds(deadline)
 }
 
 // abortHops gives both hops their failed end by deadline, with no Close frame.
 func (c *WebSocketCtx) abortHops(deadline time.Time) {
+	c.mu.Lock()
+	c.closing = true
+	toClient, clientHow := c.toClient.transportEnded, c.toClient.transportHow
+	toOrigin, originHow := c.toOrigin.transportEnded, c.toOrigin.transportHow
+	c.mu.Unlock()
 	var wg sync.WaitGroup
-	wg.Go(func() { abortBy(c.toClient.conn, deadline) })
-	abortBy(c.toOrigin.conn, deadline)
+	wg.Go(func() { c.toClient.failBy(toClient, clientHow, deadline) })
+	c.toOrigin.failBy(toOrigin, originHow, deadline)
 	wg.Wait()
+}
+
+// failBy gives the connection of h its failed end by deadline, unless a reader began the end how
+// of its transport, which ended closes and which stays its one end, awaitEnd.
+func (h *wsHop) failBy(ended chan struct{}, how hopEnd, deadline time.Time) {
+	if ended == nil {
+		abortBy(h.conn, deadline)
+		return
+	}
+	h.awaitEnd(ended, how, deadline)
+}
+
+// awaitEnd waits until deadline for the end how of the transport of h that a reader began, which
+// ended closes, then closes the connection, or resets it when that end is a reset, I4.
+func (h *wsHop) awaitEnd(ended chan struct{}, how hopEnd, deadline time.Time) {
+	if !waitUntil(ended, deadline) && how == hopAbort {
+		abort(h.conn)
+		return
+	}
+	_ = h.conn.Close()
+}
+
+// stopEnds keeps a reader from beginning the end of a hop, and waits until deadline for the ends
+// readers began.
+func (c *WebSocketCtx) stopEnds(deadline time.Time) {
+	c.mu.Lock()
+	c.closing = true
+	c.mu.Unlock()
+	ended := make(chan struct{})
+	go func() {
+		c.ends.Wait()
+		close(ended)
+	}()
+	waitUntil(ended, deadline)
 }
 
 // closeCodeOf returns the status of a Close frame payload, closeNormal when it has none.
@@ -548,6 +629,7 @@ func closeCodeOf(payload []byte) uint16 {
 }
 
 func (h *wsHop) writeFailed() {
+	deadline := time.Now().Add(alertWriteTimeout)
 	h.c.mu.Lock()
 	var self, peer hopEnd
 	if !h.ended {
@@ -559,16 +641,28 @@ func (h *wsHop) writeFailed() {
 	}
 	h.c.cancelIfEndedLocked()
 	h.c.mu.Unlock()
-	h.finish(self)
-	h.peer.finish(peer)
+	h.finish(self, deadline)
+	h.peer.finish(peer, deadline)
 }
 
+// endLocked ends h, and reserves for the caller the end how of its transport, which finish then
+// runs, in the critical section where the end is decided. Once the closer began, it ends the
+// transport itself and nothing is reserved.
 func (h *wsHop) endLocked(how hopEnd) hopEnd {
 	if h.ended {
 		return hopOpen
 	}
 	h.ended = true
+	h.over.Store(true)
 	close(h.done)
+	if how == hopOpen || h.c.closing {
+		return hopOpen
+	}
+	h.transportEnded = make(chan struct{})
+	h.transportHow = how
+	if how == hopClose {
+		h.c.ends.Add(1)
+	}
 	return how
 }
 
@@ -578,13 +672,46 @@ func (c *WebSocketCtx) cancelIfEndedLocked() {
 	}
 }
 
-func (h *wsHop) finish(how hopEnd) {
+// finish runs the end how of the transport of h that endLocked reserved: its failed end at once
+// for hopAbort, and for hopClose its normal end by deadline, off the caller, a reader that returns
+// the frame it read, which endBy waits for.
+func (h *wsHop) finish(how hopEnd, deadline time.Time) {
+	if how == hopOpen {
+		return
+	}
+	h.c.mu.Lock()
+	ended := h.transportEnded
+	h.c.mu.Unlock()
 	switch how {
 	case hopClose:
-		_ = h.conn.Close()
+		go func() {
+			defer h.c.ends.Done()
+			defer close(ended)
+			h.endTransport(deadline)
+		}()
 	case hopAbort:
 		abortAfterFlush(h.conn)
+		close(ended)
 	}
+}
+
+// endTransport gives the connection of h the normal end of its transport by deadline. Its FIN
+// goes out at once, and the read and discard that follows waits for a read of the hop in progress
+// to return, the close at the deadline ending that read.
+func (h *wsHop) endTransport(deadline time.Time) {
+	c, closer, half := beginNormalEnd(h.conn, deadline)
+	if c == nil {
+		return
+	}
+	t := time.NewTimer(time.Until(deadline))
+	defer t.Stop()
+	select {
+	case h.reading <- struct{}{}:
+		defer func() { <-h.reading }()
+	case <-t.C:
+		half = false
+	}
+	finishNormalEnd(c, closer, half, deadline)
 }
 
 func pumpFrames(r *FrameReader) error {

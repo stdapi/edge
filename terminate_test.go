@@ -2686,3 +2686,112 @@ func TestTerminate_TimeoutInsideTheClientHelloGetsNoAlert(t *testing.T) {
 		})
 	}
 }
+
+func TestTerminate_ClientResetDuringTheSniffRunsNoHandler(t *testing.T) {
+	for _, tlsFirst := range []bool{false, true} {
+		t.Run("tls "+strconv.FormatBool(tlsFirst), func(t *testing.T) {
+			ca, err := GenerateCA()
+			require.NoError(t, err)
+			p, err := New(WithCA(ca), WithSniffTimeout(2*time.Second))
+			require.NoError(t, err)
+			ran := make(chan struct{}, 1)
+			target := "127.0.0.1:9"
+			if tlsFirst {
+				target = "reset.test:443"
+			}
+			p.MustAdd[TCP](target, func(*TCPCtx) error {
+				ran <- struct{}{}
+				return nil
+			})
+			conn := connectRaw(t, startProxy(t, p), target)
+			var w io.Writer = conn
+			if tlsFirst {
+				// A TLS client with no ALPN, which the proxy sniffs past the handshake.
+				tc := tls.Client(conn, &tls.Config{ServerName: "reset.test", RootCAs: poolOf(ca), MinVersion: tls.VersionTLS12})
+				require.NoError(t, tc.Handshake())
+				w = tc
+			}
+			_, err = w.Write([]byte("GET / HT"))
+			require.NoError(t, err)
+			time.Sleep(200 * time.Millisecond)
+			require.NoError(t, conn.(*net.TCPConn).SetLinger(0))
+			require.NoError(t, conn.Close())
+			select {
+			case <-ran:
+				t.Fatal("a handler ran after the client reset its connection during the sniff")
+			case <-time.After(time.Second):
+			}
+		})
+	}
+}
+
+func TestTerminate_ClientResetDuringTheSniffIsTheErrorOfServeConn(t *testing.T) {
+	ca, err := GenerateCA()
+	require.NoError(t, err)
+	p, err := New(WithCA(ca), WithSniffTimeout(2*time.Second))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = p.Close() })
+	p.MustAdd("reset.test/", okHandler)
+	client, server := tcpPair(t)
+	done := make(chan error, 1)
+	go func() { done <- p.ServeConn(server) }()
+	_, err = client.Write([]byte("GET / HT"))
+	require.NoError(t, err)
+	time.Sleep(100 * time.Millisecond)
+	require.NoError(t, client.SetLinger(0))
+	require.NoError(t, client.Close())
+	select {
+	case err = <-done:
+		require.ErrorIs(t, err, syscall.ECONNRESET)
+	case <-time.After(5 * time.Second):
+		t.Fatal("ServeConn did not return")
+	}
+}
+
+func TestTerminate_ClientHelloCutShortByAFINGetsDecodeError(t *testing.T) {
+	// A record header announcing a ClientHello of 256 bytes, one of them sent.
+	hello := []byte{0x16, 0x03, 0x01, 0x01, 0x00, 0x01}
+	decodeError := []byte{tlsAlertRecord, 0x03, 0x03, 0x00, 0x02, alertLevelFatal, alertDecodeError}
+	for _, reject := range []bool{false, true} {
+		t.Run("admitted, reject ECH "+strconv.FormatBool(reject), func(t *testing.T) {
+			ca, err := GenerateCA()
+			require.NoError(t, err)
+			p, err := New(WithCA(ca), WithRejectECH(reject))
+			require.NoError(t, err)
+			p.MustAdd("reset.test/", okHandler)
+			conn := connectRaw(t, startProxy(t, p), "reset.test:443")
+			_, err = conn.Write(hello)
+			require.NoError(t, err)
+			time.Sleep(100 * time.Millisecond)
+			require.NoError(t, conn.(*net.TCPConn).CloseWrite())
+			_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+			got, err := io.ReadAll(conn)
+			require.NoError(t, err)
+			require.Equal(t, decodeError, got)
+		})
+	}
+	t.Run("no destination", func(t *testing.T) {
+		ca, err := GenerateCA()
+		require.NoError(t, err)
+		p, err := New(WithCA(ca))
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = p.Close() })
+		p.MustAdd("reset.test/", okHandler)
+		client, server := tcpPair(t)
+		done := make(chan error, 1)
+		go func() { done <- p.ServeConn(server) }()
+		_, err = client.Write(hello)
+		require.NoError(t, err)
+		time.Sleep(100 * time.Millisecond)
+		require.NoError(t, client.CloseWrite())
+		_ = client.SetReadDeadline(time.Now().Add(3 * time.Second))
+		got, err := io.ReadAll(client)
+		require.NoError(t, err)
+		require.Equal(t, decodeError, got)
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("ServeConn did not return")
+		}
+	})
+}

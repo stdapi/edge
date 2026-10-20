@@ -158,7 +158,7 @@ func (p *Proxy) serveSOCKS5(conn net.Conn) error {
 		abort(conn)
 		return ErrProxyClosed
 	}
-	defer p.srv.untrackSession(sess)
+	defer p.srv.untrackEnded(sess)
 
 	// The client sends its ClientHello only once it has the reply, so the reply comes before
 	// termination, as the 200 of a CONNECT does.
