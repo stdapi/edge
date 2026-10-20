@@ -3718,8 +3718,6 @@ func TestKindGRPC_OpenCallEnds(t *testing.T) {
 			},
 			want: func(r *endRun) endWant {
 				switch {
-				case (r.shape == "Merge" || r.shape == "TwoGoroutines") && !r.duplex():
-					return endWant{data: []byte{}, origin: []string{"m1"}, originEnd: originEOF, defect: defectH1Status}
 				case r.shape == "Merge" || r.shape == "TwoGoroutines":
 					return endWant{data: []byte{}, code: "8", origin: []string{"m1"}, originEnd: originEOF}
 				}
@@ -3977,9 +3975,6 @@ func TestKindGRPC_OpenCallEnds(t *testing.T) {
 			},
 			script: sendThenResult,
 			want: func(r *endRun) endWant {
-				if !r.duplex() {
-					return endWant{data: []byte{}, origin: []string{"m1"}, originEnd: originCanceled, defect: defectH1Status}
-				}
 				return endWant{data: []byte{}, code: "2", origin: []string{"m1"}, originEnd: originCanceled}
 			},
 		},
@@ -4128,9 +4123,6 @@ func TestKindGRPC_OpenCallEnds(t *testing.T) {
 			},
 			script: sendThenResult,
 			want: func(r *endRun) endWant {
-				if !r.duplex() {
-					return endWant{data: []byte{}, origin: []string{"m1"}, originEnd: originCanceled, defect: defectH1Status}
-				}
 				return endWant{data: []byte{}, code: "2", origin: []string{"m1"}, originEnd: originCanceled}
 			},
 		},
@@ -4603,9 +4595,8 @@ func TestKindGRPC_HTTP11CallEndsItsConnection(t *testing.T) {
 		}
 		return m.Forward()
 	}
-	// The status the proxy sets is lost where defectH1Status applies.
 	codes := map[string]string{
-		"Forward": "0", "OpenOnly": "0", "FailAfterTheAnswer": "", "ErrorAfterTheAnswer": "",
+		"Forward": "0", "OpenOnly": "0", "FailAfterTheAnswer": "10", "ErrorAfterTheAnswer": "2",
 		"CloseSendThenInbound": "0", "FailBeforeOpen": "7",
 	}
 	shapes := []endShape{
@@ -4794,15 +4785,9 @@ const (
 	originCanceled
 )
 
-// Defects of the current code. A row with a defect asserts the current behavior.
-const (
-	defectH1Status = "on an HTTP/1.1 client, the status the proxy sets is lost when no message reached the client and the origin announced no trailer"
-)
-
 type endWant struct {
 	alt          *endWant
 	returned     error
-	defect       string
 	data         []byte
 	origin       []string
 	code         string
@@ -4995,9 +4980,6 @@ func (fx *endFixture) run(t *testing.T, row *endRow, shape string, handler func(
 	}
 	res, read := row.script(t, r)
 	want := row.want(r)
-	if want.defect != "" {
-		t.Logf("known defect: %s", want.defect)
-	}
 	if want.alt != nil && res.reset != want.reset {
 		want.data, want.code, want.trailersOnly, want.reset = want.alt.data, want.alt.code, want.alt.trailersOnly, want.alt.reset
 	}

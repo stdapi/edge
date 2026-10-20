@@ -1519,6 +1519,10 @@ func (k *grpcCall) respond() error {
 	dst.Del("Content-Length")
 	if len(k.trailerNames) > 0 {
 		dst.Set("Trailer", strings.Join(k.trailerNames, ", "))
+	} else if k.h1 && !k.trailersOnly {
+		// net/http chunks an HTTP/1.1 response with no body, and so sends its trailers, only
+		// when its header declares a trailer.
+		dst.Set("Trailer", "Grpc-Status, Grpc-Message")
 	}
 	var w io.Writer
 	var late *lateHeader
