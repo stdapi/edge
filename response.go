@@ -48,7 +48,7 @@ func JSON(code int, v any) (*http.Response, error) {
 		return nil, fmt.Errorf("encode json response: %w", err)
 	}
 	h := http.Header{}
-	h.Set(HeaderContentType, MIMEApplicationJSONCharsetUTF8)
+	h.Set(HeaderContentType, MIMEApplicationJSON)
 	return newResponse(code, h, io.NopCloser(bytes.NewReader(b)), int64(len(b))), nil
 }
 

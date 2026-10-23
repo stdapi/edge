@@ -55,7 +55,7 @@ func TestResponse_Builders(t *testing.T) {
 	t.Run("json", func(t *testing.T) {
 		resp, err := JSON(http.StatusOK, map[string]int{"n": 1})
 		require.NoError(t, err)
-		assert.Equal(t, MIMEApplicationJSONCharsetUTF8, resp.Header.Get(HeaderContentType))
+		assert.Equal(t, MIMEApplicationJSON, resp.Header.Get(HeaderContentType))
 		assert.JSONEq(t, `{"n":1}`, readAll(t, resp))
 
 		_, err = JSON(http.StatusOK, make(chan int))
