@@ -42,6 +42,7 @@ type pattern struct {
 	// pathStart is the index in tokens where the path begins, len(tokens) for an authority
 	// pattern. The host tokens end on the node carrying the admission.
 	pathStart        int
+	hostParams       int
 	optionalCatchAll bool
 	catchAll         bool
 }
@@ -150,6 +151,7 @@ func (p *Proxy) parsePattern(raw string, kind Kind) (pattern, int, error) {
 		prefix:           ah.prefix,
 		tokens:           tokens,
 		pathStart:        len(ah.tokens),
+		hostParams:       ah.params,
 		optionalCatchAll: optCatchAll,
 		catchAll:         pathTokens[len(pathTokens)-1].typ == nodeWildcard,
 	}, paramCount, nil
@@ -364,13 +366,14 @@ func (p *Proxy) parseAuthorityPattern(raw string) (pattern, int, error) {
 	}
 
 	return pattern{
-		str:       raw,
-		key:       ah.key,
-		host:      ah.host,
-		port:      ah.port,
-		prefix:    ah.prefix,
-		tokens:    ah.tokens,
-		pathStart: len(ah.tokens),
+		str:        raw,
+		key:        ah.key,
+		host:       ah.host,
+		port:       ah.port,
+		prefix:     ah.prefix,
+		tokens:     ah.tokens,
+		pathStart:  len(ah.tokens),
+		hostParams: ah.params,
 	}, ah.params, nil
 }
 

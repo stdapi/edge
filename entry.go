@@ -217,6 +217,10 @@ func (r Entry[H]) Annotation(key any) any { return r.e.annots[key] }
 // ParamsLen returns the number of parameters in this entry's pattern.
 func (r Entry[H]) ParamsLen() int { return len(r.e.params) }
 
+// HostnameParamsLen returns the number of parameters in the hostname part of this entry's
+// pattern. Hostname parameters come first in [Entry.Params] and in the Params of a context.
+func (r Entry[H]) HostnameParamsLen() int { return r.e.pattern.hostParams }
+
 // Params returns an iterator over this entry's parameter names, in pattern order.
 func (r Entry[H]) Params() iter.Seq[string] { return slices.Values(r.e.params) }
 

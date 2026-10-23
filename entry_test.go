@@ -47,6 +47,67 @@ func TestEntry_Accessors(t *testing.T) {
 	assert.Contains(t, e.String(), "pattern:api.stripe.com:8443/")
 }
 
+func TestEntry_HostnameParamsLen(t *testing.T) {
+	cases := []struct {
+		name          string
+		pattern       string
+		wantParams    []string
+		wantHostCount int
+	}{
+		{
+			name:       "static host and path params",
+			pattern:    "a.b.c/users/{id}",
+			wantParams: []string{"id"},
+		},
+		{
+			name:       "address range and path params",
+			pattern:    "[10.0.0.0/8]:8080/users/{id}",
+			wantParams: []string{"id"},
+		},
+		{
+			name:          "host param and slash",
+			pattern:       "{sub}.example.com/",
+			wantParams:    []string{"sub"},
+			wantHostCount: 1,
+		},
+		{
+			name:          "host and path params",
+			pattern:       "{a}.{b}.example.com/users/{id}",
+			wantParams:    []string{"a", "b", "id"},
+			wantHostCount: 2,
+		},
+		{
+			name:          "host and path wildcards",
+			pattern:       "+{sub}.example.com/files/+{path}",
+			wantParams:    []string{"sub", "path"},
+			wantHostCount: 1,
+		},
+		{
+			name:          "regex host param",
+			pattern:       "{sub:[a-z]+}.example.com/{id:[0-9]+}",
+			wantParams:    []string{"sub", "id"},
+			wantHostCount: 1,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p := testProxy(t, WithRegexpParam(true))
+			e, err := p.Add(tc.pattern, noopHandler)
+			require.NoError(t, err)
+			assert.Equal(t, tc.wantParams, slices.Collect(e.Params()))
+			assert.Equal(t, tc.wantHostCount, e.HostnameParamsLen())
+		})
+	}
+
+	p := testProxy(t)
+	e := p.MustAdd[TCP]("{a}.{b}.example.com:443", noopStream)
+	assert.Equal(t, []string{"a", "b"}, slices.Collect(e.Params()))
+	assert.Equal(t, 2, e.HostnameParamsLen())
+	e = p.MustAdd[TCP]("[10.0.0.0/8]:443", noopStream)
+	assert.Equal(t, 0, e.HostnameParamsLen())
+}
+
 func TestEntry_KindComesFromTheHandler(t *testing.T) {
 	p := testProxy(t)
 
