@@ -33,7 +33,7 @@ require (
 	github.com/charmbracelet/lipgloss v0.5.0 // indirect
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
 	github.com/cncf/xds/go v0.0.0-20260202195803-dba9d589def2 // indirect
-	github.com/dkorunic/betteralign v0.15.3 // indirect
+	github.com/dkorunic/betteralign v0.15.4 // indirect
 	github.com/dnephin/pflag v1.0.7 // indirect
 	github.com/dsnet/compress v0.0.2-0.20230904184137-39efe44ab707 // indirect
 	github.com/envoyproxy/go-control-plane/envoy v1.37.0 // indirect
