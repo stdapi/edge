@@ -2044,7 +2044,8 @@ func (s *server) cutAll() {
 	// the socket under it closes, I3. The cancel of the request contexts runs the closer of a
 	// session opened on a stream. Each closer bounds itself.
 	expired, stop := expiry()
-	s.requests.cutAll()
+	// The units are listed before the cancel of the requests, which runs the closer of a tunnel
+	// and takes its units off the demultiplexer while their handlers may still run.
 	s.mu.Lock()
 	sessions := make([]*Session, 0, len(s.sessions))
 	for sess := range s.sessions {
@@ -2052,7 +2053,6 @@ func (s *server) cutAll() {
 	}
 	s.cut = true
 	s.mu.Unlock()
-	s.cutCancel(errCut)
 	// A demultiplexer lists its sessions under its own lock, never held with the server lock.
 	// The closer of a tunnel ends its units before its stream, I3, and the stage waits for
 	// their handlers too.
@@ -2060,6 +2060,8 @@ func (s *server) cutAll() {
 	for _, d := range demuxes {
 		sessions, inner = d.appendSessions(sessions, inner)
 	}
+	s.requests.cutAll()
+	s.cutCancel(errCut)
 	var closed sync.WaitGroup
 	for _, c := range sessions {
 		closed.Go(func() { _ = c.endBy(causeCut, time.Now().Add(alertWriteTimeout)) })
