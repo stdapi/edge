@@ -1206,7 +1206,7 @@ func (s *server) cutting() bool {
 func (p *Proxy) writeStatus(w http.ResponseWriter, r *http.Request, code int, reason string) {
 	if p.srv.cutting() {
 		// A cut ends a request with its failed end and no status the proxy writes, I2.
-		abortWith(w, r, http3.ErrCodeRequestCanceled, false)
+		abortWith(w, r, http3.ErrCodeRequestCanceled)
 	}
 	if r.ProtoMajor == 1 && (code == http.StatusBadRequest || r.Method == http.MethodConnect || isUpgrade(r)) {
 		w.Header().Set("Connection", "close")
@@ -1751,8 +1751,6 @@ type request struct {
 	byClose bool
 	// closed is set once the closer ran, so the response is reset when the handler returns.
 	closed atomic.Bool
-	// header is set once the response header is about to be written.
-	header atomic.Bool
 }
 
 var requestPool = sync.Pool{New: func() any { return new(request) }}
@@ -1858,13 +1856,11 @@ func (l *requestList) end(rq *request, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	closed := l.release(rq)
-	header := rq.header.Load()
 	rq.w, rq.sess, rq.callBody = nil, nil, nil
 	rq.closed.Store(false)
-	rq.header.Store(false)
 	requestPool.Put(rq)
 	if closed {
-		abortWith(w, r, http3.ErrCodeRequestCanceled, header)
+		abortWith(w, r, http3.ErrCodeRequestCanceled)
 	}
 }
 
@@ -2404,13 +2400,12 @@ func (s *server) frontSessionOf(c any) *Session {
 	return s.frontSess[c]
 }
 
-// markHeader records that the response header of rq is about to be written. A gRPC call over
+// markHeader runs as the response header of rq is about to be written. A gRPC call over
 // HTTP/1.1 with its body not read to its end announces the close of its connection.
 func (rq *request) markHeader() {
 	if rq == nil {
 		return
 	}
-	rq.header.Store(true)
 	if rq.callBody != nil && !rq.callBody.eof.Load() {
 		rq.w.Header().Set("Connection", "close")
 	}

@@ -147,8 +147,16 @@ func (p *Proxy) connectStream(w http.ResponseWriter, r *http.Request, target Tar
 		panic(http.ErrAbortHandler)
 	}
 	defer func() {
+		// The finish of a taken HTTP/3 stream sends a FIN, which would end a panic cleanly.
+		v := recover()
+		if v != nil {
+			stream.Abort()
+		}
 		stream.finish()
 		p.srv.untrack(cut)
+		if v != nil {
+			panic(v)
+		}
 		if stream.aborted.Load() {
 			// A return ends the stream cleanly, where the relay failed, and an HTTP/2 handler
 			// has no other way to reset it.

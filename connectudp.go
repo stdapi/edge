@@ -201,7 +201,7 @@ func (p *Proxy) openTunnel(ctx context.Context, w http.ResponseWriter, r *http.R
 			// or the cut ended is accepted first, docs/lifecycle.md End forms.
 			tun.noSender()
 			_ = tun.sess.endBy(causePeerFailed, time.Now().Add(alertWriteTimeout))
-			abortWith(w, r, http3.ErrCodeRequestCanceled, false)
+			abortWith(w, r, http3.ErrCodeRequestCanceled)
 			return nil
 		}
 		// A tunnel closed meanwhile is accepted all the same, and serve ends it with its normal
@@ -209,7 +209,15 @@ func (p *Proxy) openTunnel(ctx context.Context, w http.ResponseWriter, r *http.R
 		// HTTPStream writes the header, so the pipe exists only once the tunnel is accepted.
 		w.Header().Set(http3.CapsuleProtocolHeader, "?1")
 		w.WriteHeader(http.StatusOK)
-		pipe := newDatagramPipe(streamer.HTTPStream(), capsules)
+		str, err := streamer.HTTPStream()
+		if err != nil {
+			// The 200 did not go out, a failed end of the client.
+			tun.noSender()
+			_ = tun.sess.endBy(causePeerFailed, time.Now().Add(alertWriteTimeout))
+			abortWith(w, r, http3.ErrCodeRequestCanceled)
+			return nil
+		}
+		pipe := newDatagramPipe(str, capsules)
 		tun.accept(pipe)
 		pipe.run(func(failed bool) {
 			if failed {

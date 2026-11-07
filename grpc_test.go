@@ -1594,7 +1594,7 @@ func TestKindGRPC_CallOnTheHTTP3FrontIsForwarded(t *testing.T) {
 			}
 			code, ok := h3ResetCode(err)
 			require.True(t, ok, "the response ended with %v", err)
-			assert.Equal(t, http3.ErrCodeRequestCanceled, code)
+			assert.Equal(t, http3.ErrCodeInternalError, code)
 		}},
 		{name: "a message forwarded after the origin answered is dropped", run: func(t *testing.T) {
 			b := newGRPCBench(t, trailersOnlyOrigin(t, "12"), func(c *GRPCCtx) error {
@@ -1729,7 +1729,7 @@ func TestKindGRPC_CallOnTheHTTP3FrontIsForwarded(t *testing.T) {
 			}
 			code, ok := h3ResetCode(err)
 			require.True(t, ok, "the response ended with %v", err)
-			assert.Equal(t, http3.ErrCodeRequestCanceled, code)
+			assert.Equal(t, http3.ErrCodeInternalError, code)
 		}},
 		{name: "Fail after a trailers-only answer ends the call on its status alone", run: func(t *testing.T) {
 			b := newGRPCBench(t, trailersOnlyOrigin(t, "12"), func(c *GRPCCtx) error {
@@ -1797,10 +1797,10 @@ func TestKindGRPC_CallOnTheHTTP3FrontIsForwarded(t *testing.T) {
 				if err == nil {
 					_, err = io.ReadAll(c.str)
 				}
-				var h3err *http3.Error
-				require.ErrorAs(t, err, &h3err)
-				assert.True(t, h3err.Remote)
-				assert.Equal(t, http3.ErrCodeRequestCanceled, h3err.ErrorCode)
+				se, ok := errors.AsType[*quic.StreamError](err)
+				require.True(t, ok, "the response ended with %v", err)
+				assert.True(t, se.Remote)
+				assert.Equal(t, quic.StreamErrorCode(http3.ErrCodeInternalError), se.ErrorCode)
 			})
 		}},
 		{name: "a message over the bound ends on RESOURCE_EXHAUSTED", run: func(t *testing.T) {
@@ -2441,34 +2441,117 @@ func (c *grpcClient) awaitData(id uint32, r *grpcResult, n int) {
 	require.Len(c.t, r.data, n)
 }
 
-func (b *grpcBench) h3Client(t *testing.T) *http3.ClientConn {
+func (b *grpcBench) h3Client(t *testing.T) *quic.Conn {
 	t.Helper()
 	front, _ := startQUICFront(t, b.p, b.ca)
-	tr := &http3.Transport{DisableCompression: true}
-	t.Cleanup(func() { _ = tr.Close() })
-	return tr.NewClientConn(dialQUICFront(t, front, b.ca))
+	c, err := newH3Conn(dialQUICFront(t, front, b.ca))
+	require.NoError(t, err)
+	return c.Conn
 }
 
 // h3Call drives a request stream directly. A round trip cannot reset one direction of a call.
 type h3Call struct {
 	t    *testing.T
-	str  *http3.RequestStream
+	str  *grpcH3Stream
 	resp *http.Response
 }
 
-func (b *grpcBench) h3Call(t *testing.T, cc *http3.ClientConn, path string) *h3Call {
+func (b *grpcBench) h3Call(t *testing.T, qc *quic.Conn, path string) *h3Call {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel()
-	str, err := cc.OpenRequestStream(ctx)
-	require.NoError(t, err)
-	require.NoError(t, str.SetDeadline(time.Now().Add(10*time.Second)))
-	req, err := http.NewRequest(http.MethodPost, "https://"+b.authority+path, http.NoBody)
-	require.NoError(t, err)
-	req.Header.Set("Content-Type", "application/grpc")
-	req.Header.Set("Te", "trailers")
-	require.NoError(t, str.SendRequestHeader(req))
-	return &h3Call{t: t, str: str}
+	return &h3Call{t: t, str: openGRPCH3(t, qc, b.authority, path)}
+}
+
+// grpcH3Stream is a gRPC call on an HTTP/3 stream written frame by frame. quic-go announces a
+// Content-Length of zero for a POST sent with no body, which a streamed call exceeds.
+type grpcH3Stream struct {
+	*quic.Stream
+	br      *bufio.Reader
+	resp    *http.Response
+	pending []byte
+}
+
+func openGRPCH3(t *testing.T, qc *quic.Conn, authority, path string) *grpcH3Stream {
+	t.Helper()
+	s := h3Open(t, qc, false, h3Headers([]hpack.HeaderField{
+		hf(":method", "POST"), hf(":scheme", "https"), hf(":authority", authority), hf(":path", path),
+		hf("content-type", "application/grpc"), hf("te", "trailers"),
+	}))
+	return &grpcH3Stream{Stream: s.Stream, br: s.br}
+}
+
+func (s *grpcH3Stream) Write(b []byte) (int, error) {
+	if _, err := s.Stream.Write(capsuleOf(h3FrameData, b)); err != nil {
+		return 0, err
+	}
+	return len(b), nil
+}
+
+func (s *grpcH3Stream) frame() (uint64, []byte, error) {
+	if _, err := s.br.Peek(1); err != nil {
+		return 0, nil, err
+	}
+	return readCapsule(s.br)
+}
+
+func (s *grpcH3Stream) ReadResponse() (*http.Response, error) {
+	for {
+		typ, payload, err := s.frame()
+		if errors.Is(err, io.EOF) {
+			return nil, io.ErrUnexpectedEOF
+		}
+		if err != nil {
+			return nil, err
+		}
+		if typ != h3FrameHeaders {
+			continue
+		}
+		fields, err := qpackFields(payload)
+		if err != nil {
+			return nil, err
+		}
+		status, _ := h2Field(fields, ":status")
+		if strings.HasPrefix(status, "1") {
+			continue
+		}
+		code, err := strconv.Atoi(status)
+		if err != nil {
+			return nil, err
+		}
+		s.resp = &http.Response{StatusCode: code, Proto: "HTTP/3.0", ProtoMajor: 3,
+			Header: http.Header{}, Trailer: http.Header{}, Body: io.NopCloser(s)}
+		addFields(s.resp.Header, fields)
+		return s.resp, nil
+	}
+}
+
+func (s *grpcH3Stream) Read(b []byte) (int, error) {
+	for len(s.pending) == 0 {
+		typ, payload, err := s.frame()
+		if err != nil {
+			return 0, err
+		}
+		switch typ {
+		case h3FrameData:
+			s.pending = payload
+		case h3FrameHeaders:
+			fields, err := qpackFields(payload)
+			if err != nil {
+				return 0, err
+			}
+			addFields(s.resp.Trailer, fields)
+		}
+	}
+	n := copy(b, s.pending)
+	s.pending = s.pending[n:]
+	return n, nil
+}
+
+func addFields(h http.Header, fields []hpack.HeaderField) {
+	for _, f := range fields {
+		if !strings.HasPrefix(f.Name, ":") {
+			h.Add(f.Name, f.Value)
+		}
+	}
 }
 
 func (c *h3Call) send(b []byte) {
@@ -5463,7 +5546,7 @@ func (c *endH2) result(*testing.T) endResult {
 }
 
 type endH3 struct {
-	str  *http3.RequestStream
+	str  *grpcH3Stream
 	resp *http.Response
 	err  error
 	data []byte
@@ -5471,19 +5554,9 @@ type endH3 struct {
 
 func (fx *endFixture) h3Call(t *testing.T, path string) endCall {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	tr := &http3.Transport{DisableCompression: true}
-	t.Cleanup(func() { _ = tr.Close() })
-	str, err := tr.NewClientConn(dialQUICFront(t, fx.h3, fx.ca)).OpenRequestStream(ctx)
+	c, err := newH3Conn(dialQUICFront(t, fx.h3, fx.ca))
 	require.NoError(t, err)
-	require.NoError(t, str.SetDeadline(time.Now().Add(10*time.Second)))
-	req, err := http.NewRequest(http.MethodPost, "https://origin.test"+path, http.NoBody)
-	require.NoError(t, err)
-	req.Header.Set("Content-Type", "application/grpc")
-	req.Header.Set("Te", "trailers")
-	require.NoError(t, str.SendRequestHeader(req))
-	return &endH3{str: str}
+	return &endH3{str: openGRPCH3(t, c.Conn, "origin.test", path)}
 }
 
 func (c *endH3) send(b []byte) { _, _ = c.str.Write(b) }

@@ -490,12 +490,7 @@ func (f *forwarder) roundTrip(req *http.Request, proto Protocol, fixed string) (
 	}
 	switch {
 	case proto == HTTP3 && pool.h3 != nil:
-		resp, err := f.roundTripH3(pool.h3, req)
-		if err == nil && resp.ContentLength > 0 && resp.Body != nil && resp.Body != http.NoBody &&
-			bodyAllowed(req.Method, resp.StatusCode) {
-			resp.Body = &fullLength{ReadCloser: resp.Body, remaining: resp.ContentLength}
-		}
-		return resp, err
+		return f.roundTripH3(pool.h3, req)
 	case (proto == HTTP2 || proto == HTTP3) && pool.h2c != nil && isGRPCRequest(req):
 		return pool.h2c.RoundTrip(req)
 	case (proto == HTTP2 || proto == HTTP3) && pool.h2 != nil:
@@ -624,22 +619,6 @@ func (b *tailBody) Read(p []byte) (int, error) {
 	}
 	n, err := b.ReadCloser.Read(p)
 	b.remaining -= int64(n)
-	return n, err
-}
-
-// fullLength fails a body that ends before its Content-Length with io.ErrUnexpectedEOF. quic-go
-// ends it cleanly, and Go's HTTP/1.1 and HTTP/2 transports fail it.
-type fullLength struct {
-	io.ReadCloser
-	remaining int64
-}
-
-func (b *fullLength) Read(p []byte) (int, error) {
-	n, err := b.ReadCloser.Read(p)
-	b.remaining -= int64(n)
-	if err == io.EOF && b.remaining > 0 {
-		err = io.ErrUnexpectedEOF
-	}
 	return n, err
 }
 

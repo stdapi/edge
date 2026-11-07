@@ -2578,7 +2578,6 @@ type h3Upstream struct {
 type headTrace chan []h3qlog.HeaderField
 
 func (h headTrace) AddProducer() qlogwriter.Recorder { return h }
-func (h headTrace) SupportsSchemas(s string) bool    { return s == h3qlog.EventSchema }
 func (h headTrace) Close() error                     { return nil }
 
 func (h headTrace) RecordEvent(ev qlogwriter.Event) {
@@ -3427,7 +3426,10 @@ var connectUDPConformance = []conformanceCase{
 			up := startH3Upstream(t, ca, nil, true, func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set(http3.CapsuleProtocolHeader, "?1")
 				w.WriteHeader(http.StatusOK)
-				str := w.(http3.HTTPStreamer).HTTPStream()
+				str, err := w.(http3.HTTPStreamer).HTTPStream()
+				if err != nil {
+					return
+				}
 				_ = str.SendDatagram(httpDatagram(2, []byte("context 2")))
 				_ = str.SendDatagram(httpDatagram(0, []byte("context 0")))
 				<-r.Context().Done()
@@ -3857,10 +3859,13 @@ var connectUDPConformance = []conformanceCase{
 					up := startH3Upstream(t, ca, nil, true, func(w http.ResponseWriter, r *http.Request) {
 						w.Header().Set(http3.CapsuleProtocolHeader, "?1")
 						w.WriteHeader(http.StatusOK)
-						str := w.(http3.HTTPStreamer).HTTPStream()
+						str, err := w.(http3.HTTPStreamer).HTTPStream()
+						if err != nil {
+							return
+						}
 						_, _ = str.Write(truncated)
 						_ = str.Close()
-						_, err := io.ReadAll(str)
+						_, err = io.ReadAll(str)
 						read <- err
 					})
 					conn, err := exitTunnel(t, u, version, up.addr, "192.0.2.1:53")
@@ -3973,7 +3978,10 @@ var connectUDPConformance = []conformanceCase{
 			up := startH3Upstream(t, ca, nil, true, func(w http.ResponseWriter, r *http.Request) {
 				w.Header().Set(http3.CapsuleProtocolHeader, "?1")
 				w.WriteHeader(http.StatusOK)
-				str := w.(http3.HTTPStreamer).HTTPStream()
+				str, err := w.(http3.HTTPStreamer).HTTPStream()
+				if err != nil {
+					return
+				}
 				go func() {
 					buf := make([]byte, 4096)
 					for {

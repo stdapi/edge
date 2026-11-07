@@ -3491,7 +3491,7 @@ func TestLifecycle_CutResetsAnHTTP3RequestNoHandlerProcessed(t *testing.T) {
 	p.srv.requests.cutAll()
 	_, err = getThrough(cc, "https://"+h3Authority+"/")
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "H3_INTERNAL_ERROR", "quic-go gives a reset before the response header no other code")
+	assert.Contains(t, err.Error(), "H3_REQUEST_REJECTED")
 }
 
 func TestLifecycle_DrainServesTheFirstRequestOfALateHTTP2Connection(t *testing.T) {

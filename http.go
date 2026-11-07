@@ -259,7 +259,7 @@ func (c *HTTPCtx) ForwardRequest(r *http.Request) (*http.Response, error) {
 			out.Body = body
 		case out.ContentLength == 0:
 			// Content past a declared length of zero fails only a read, and every upstream transport
-			// sends a body of zero ContentLength as one of unknown length, quic-go even http.NoBody.
+			// sends a body of zero ContentLength other than http.NoBody as one of unknown length.
 			// Go's HTTP/2 transport leaves open a stream announcing trailers without a body.
 			if err = readEmptyBody(out.Body); err != nil {
 				return nil, fmt.Errorf("forward %s %s: %w", out.Method, out.URL.Redacted(), err)

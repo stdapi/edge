@@ -92,7 +92,7 @@ func (p *Proxy) serveHTTPEntry(c *routeCtx, w http.ResponseWriter, r *http.Reque
 		if resp != nil && resp.Body != nil {
 			_ = resp.Body.Close()
 		}
-		abortWith(w, r, http3.ErrCodeRequestCanceled, false)
+		abortWith(w, r, http3.ErrCodeRequestCanceled)
 	}
 	if resp == nil {
 		resp = Status(http.StatusBadGateway)
@@ -297,31 +297,32 @@ var errBodyCut = errors.New("response body cut short")
 // client would read a complete body.
 func abortIfCut(w http.ResponseWriter, r *http.Request, err error) {
 	if errors.Is(err, errBodyCut) {
-		abortWith(w, r, http3.ErrCodeRequestCanceled, true)
+		abortWith(w, r, http3.ErrCodeRequestCanceled)
 	}
 }
 
 // rejectRequest gives a request no handler processed its failed end.
 func rejectRequest(w http.ResponseWriter, r *http.Request) {
-	abortWith(w, r, http3.ErrCodeRequestRejected, false)
+	abortWith(w, r, http3.ErrCodeRequestRejected)
 }
 
 // abortWith gives the response to r its failed end: a reset stream, or the failed end of its
-// connection for a response delimited by the close. On HTTP/3 the reset has code once the
-// response header was written, and H3_INTERNAL_ERROR before, since quic-go writes a 200 first
-// for any other code, docs/lifecycle.md Limits.
-func abortWith(w http.ResponseWriter, r *http.Request, code http3.ErrCode, header bool) {
+// connection for a response delimited by the close. On HTTP/3 the reset has code until a body
+// byte went through w, and H3_INTERNAL_ERROR after, since quic-go hands over no stream past
+// that byte, docs/lifecycle.md Limits.
+func abortWith(w http.ResponseWriter, r *http.Request, code http3.ErrCode) {
 	if !r.ProtoAtLeast(1, 1) {
 		if sess := sessionFromRequest(r); sess != nil && sess.httpConn != nil {
 			abort(sess.httpConn)
 		}
 	}
-	if hs, ok := w.(http3.HTTPStreamer); ok && header {
+	if hs, ok := w.(http3.HTTPStreamer); ok {
 		// RFC 9114 4.1.1 resets an abandoned response with H3_REQUEST_CANCELLED, where quic-go
 		// resets an aborted handler with H3_INTERNAL_ERROR.
-		str := hs.HTTPStream()
-		str.CancelWrite(quic.StreamErrorCode(code))
-		str.CancelRead(quic.StreamErrorCode(code))
+		if str, err := hs.HTTPStream(); err == nil {
+			str.CancelWrite(quic.StreamErrorCode(code))
+			str.CancelRead(quic.StreamErrorCode(code))
+		}
 	}
 	panic(http.ErrAbortHandler)
 }

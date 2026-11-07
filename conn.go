@@ -779,6 +779,8 @@ type h2Stream struct {
 	flusher  http.Flusher
 	local    net.Addr
 	remote   net.Addr
+	// h3 is the response writer of an HTTP/3 stream, nil on HTTP/2.
+	h3 http3.HTTPStreamer
 	// str is the HTTP/3 stream once taken from its response writer, which is not safe for
 	// concurrent use, guarded by wmu.
 	str *http3.Stream
@@ -795,12 +797,12 @@ type h2Stream struct {
 	aborted  atomic.Bool
 	expired  atomic.Bool
 	sent     bool // guarded by wmu
-	header   bool // guarded by wmu, set once the response header is written
 	finished bool // guarded by cmu
 }
 
 func newH2Stream(w http.ResponseWriter, r *http.Request, local, remote net.Addr) *h2Stream {
 	s := &h2Stream{r: newDeadlineReader(r.Body), body: r.Body, w: w, local: local, remote: remote}
+	s.h3, _ = w.(http3.HTTPStreamer)
 	if f, ok := w.(flushErrorer); ok {
 		s.flushErr = f
 	} else if f, ok := w.(http.Flusher); ok {
@@ -830,8 +832,8 @@ func (s *h2Stream) Read(b []byte) (int, error) {
 	if err != nil {
 		if se, ok := errors.AsType[*quic.StreamError](err); ok && se.Remote {
 			// RFC 9114 4.4, a client resetting its direction has the proxy reset the other.
-			if hs, ok := s.w.(http3.HTTPStreamer); ok {
-				s.reset(hs, http3.ErrCodeConnectError)
+			if s.h3 != nil {
+				s.reset(http3.ErrCodeConnectError)
 			}
 		}
 	}
@@ -839,15 +841,20 @@ func (s *h2Stream) Read(b []byte) (int, error) {
 }
 
 // writeHeader writes and flushes the response header under the write lock, so a stream closed
-// first gets no header and a reset waits for a header being written before it flushes the writer.
+// first gets no header and a reset waits for a header being written. An HTTP/3 stream is taken
+// with its header, since quic-go hands over no stream once a body byte went through the writer.
 func (s *h2Stream) writeHeader(code int) {
 	s.wmu.Lock()
 	defer s.wmu.Unlock()
-	if s.closed.Load() {
+	if s.closed.Load() || s.str != nil {
 		return
 	}
 	s.w.WriteHeader(code)
-	s.header = true
+	if s.h3 != nil {
+		// A header that failed to go out is retried by the next write.
+		_, _ = s.takeLocked()
+		return
+	}
 	_ = s.flush()
 }
 
@@ -856,6 +863,18 @@ func (s *h2Stream) Write(b []byte) (int, error) {
 	defer s.wmu.Unlock()
 	if s.closed.Load() || s.sent {
 		return 0, net.ErrClosed
+	}
+	if s.h3 != nil {
+		str, err := s.takeLocked()
+		if err != nil {
+			return 0, err
+		}
+		n, err := str.Write(b)
+		if err != nil {
+			// The write may have left its DATA frame unfinished, which a FIN would truncate.
+			str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeConnectError))
+		}
+		return n, err
 	}
 	if s.expired.Load() {
 		return 0, os.ErrDeadlineExceeded
@@ -884,7 +903,7 @@ func (s *h2Stream) Close() error {
 // H3_REQUEST_CANCELLED, so the reads end with a read deadline there, and quic-go sends
 // STOP_SENDING H3_NO_ERROR, or its own code, as the handler returns. Called with cmu locked.
 func (s *h2Stream) endReads() error {
-	if _, ok := s.w.(http3.HTTPStreamer); !ok {
+	if s.h3 == nil {
 		return s.body.Close()
 	}
 	s.wmu.Lock()
@@ -898,12 +917,17 @@ func (s *h2Stream) endReads() error {
 	return http.NewResponseController(s.w).SetReadDeadline(time.Unix(1, 0))
 }
 
-// takeLocked returns the HTTP/3 stream of hs, taken once. The caller holds wmu.
-func (s *h2Stream) takeLocked(hs http3.HTTPStreamer) *http3.Stream {
+// takeLocked returns the HTTP/3 stream, taken once, with the response header when one was
+// written and with none otherwise. The caller holds wmu.
+func (s *h2Stream) takeLocked() (*http3.Stream, error) {
 	if s.str == nil {
-		s.str = hs.HTTPStream()
+		str, err := s.h3.HTTPStream()
+		if err != nil {
+			return nil, err
+		}
+		s.str = str
 	}
-	return s.str
+	return s.str, nil
 }
 
 // stop refuses every later write and reports whether the stream was open. With reset, or when a
@@ -922,18 +946,11 @@ func (s *h2Stream) stop(reset bool) bool {
 	return true
 }
 
-// idle returns once no write is in flight.
-func (s *h2Stream) idle() {
-	s.wmu.Lock()
-	s.wmu.Unlock() //nolint:staticcheck // an empty section is the barrier
-}
-
 // Abort closes the stream and resets it, an HTTP/3 stream with H3_CONNECT_ERROR and an HTTP/2
 // stream with INTERNAL_ERROR.
 func (s *h2Stream) Abort() {
-	hs, ok := s.w.(http3.HTTPStreamer)
-	if ok {
-		s.reset(hs, http3.ErrCodeConnectError)
+	if s.h3 != nil {
+		s.reset(http3.ErrCodeConnectError)
 		return
 	}
 	// A stream already closed is reset by its handler on return.
@@ -976,30 +993,26 @@ func (c *streamCut) endBy(cs cause, _ time.Time) error {
 	return nil
 }
 
-func (s *h2Stream) reset(hs http3.HTTPStreamer, code http3.ErrCode) {
+// reset resets both directions of an HTTP/3 stream with code, before its response header too.
+func (s *h2Stream) reset(code http3.ErrCode) {
 	s.cmu.Lock()
 	defer s.cmu.Unlock()
 	if s.finished {
 		return
 	}
-	// HTTPStream flushes the response writer, so stop first ends any write in flight. The reads
-	// end last.
+	// The take waits for the write lock, so stop first ends any write in flight.
 	open := s.stop(false)
 	s.wmu.Lock()
-	header := s.header
+	str, err := s.takeLocked()
 	s.wmu.Unlock()
-	if !header {
-		// HTTPStream would write a 200 first, so the handler resets the stream as it returns,
-		// with H3_INTERNAL_ERROR, docs/lifecycle.md Limits.
+	if err != nil {
+		// The header failed to go out, and the handler resets the stream as it returns.
 		s.aborted.Store(true)
 		if open {
 			_ = s.endReads()
 		}
 		return
 	}
-	s.wmu.Lock()
-	str := s.takeLocked(hs)
-	s.wmu.Unlock()
 	str.CancelWrite(quic.StreamErrorCode(code))
 	str.CancelRead(quic.StreamErrorCode(code))
 }
@@ -1019,13 +1032,17 @@ func (s *h2Stream) finish() {
 		s.wtimer.Stop()
 	}
 	s.dmu.Unlock()
-	s.idle()
+	// The lock waits for the write in flight. quic-go leaves a stream it handed over alone as
+	// the handler returns.
+	s.wmu.Lock()
+	if s.str != nil && !s.sent {
+		s.sent = true
+		_ = s.str.Close()
+	}
+	s.wmu.Unlock()
 }
 
-func (s *h2Stream) http3() bool {
-	_, ok := s.w.(http3.HTTPStreamer)
-	return ok
-}
+func (s *h2Stream) http3() bool { return s.h3 != nil }
 
 // CloseWrite ends the proxy-to-client direction of an HTTP/3 stream, which goes on receiving. An
 // HTTP/2 handler cannot end its half of a stream alone, so on HTTP/2 the stream stops reading,
@@ -1040,12 +1057,15 @@ func (s *h2Stream) CloseWrite() error {
 		return nil
 	}
 	s.sent = true
-	hs, ok := s.w.(http3.HTTPStreamer)
-	if !ok {
+	if s.h3 == nil {
 		s.r.end(io.EOF)
 		return s.body.Close()
 	}
-	return s.takeLocked(hs).Close()
+	str, err := s.takeLocked()
+	if err != nil {
+		return err
+	}
+	return str.Close()
 }
 
 func (s *h2Stream) LocalAddr() net.Addr  { return s.local }
@@ -1065,7 +1085,7 @@ func (s *h2Stream) SetReadDeadline(t time.Time) error {
 // SetWriteDeadline bounds the writes that follow, as on a socket. On HTTP/2 a write still
 // blocked when the deadline passes resets the stream, the only way it returns.
 func (s *h2Stream) SetWriteDeadline(t time.Time) error {
-	if _, ok := s.w.(http3.HTTPStreamer); ok {
+	if s.h3 != nil {
 		s.cmu.Lock()
 		defer s.cmu.Unlock()
 		if s.closed.Load() {

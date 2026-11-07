@@ -1375,9 +1375,9 @@ func (u *upstreamDialer) openProxyConn(ctx context.Context, proxy *url.URL, addr
 	return &h3ProxyConn{ClientConn: cc, qc: qc, local: qc.LocalAddr(), remote: qc.RemoteAddr()}, nil
 }
 
-// h3StreamConn is a CONNECT tunnel on an HTTP/3 stream as a net.Conn. The stream frames its
-// bytes in DATA frames and a deadline that cuts a frame short loses the parser's place, so a
-// read waits on a deadlineReader and a write the deadline cut resets the stream.
+// h3StreamConn is a CONNECT tunnel on an HTTP/3 stream as a net.Conn. A deadline that cuts a
+// DATA frame header short loses the parser's place, so a read waits on a deadlineReader, and a
+// write the deadline cut resets the stream, since a FIN would truncate the frame.
 type h3StreamConn struct {
 	str    *http3.RequestStream
 	r      *deadlineReader
@@ -1418,8 +1418,7 @@ func (c *h3StreamConn) Write(b []byte) (int, error) {
 	}
 	n, err := c.str.Write(b)
 	if err != nil && isTimeout(err) {
-		// The deadline may have cut a frame short, and the proxy cannot parse the stream past
-		// it.
+		// The frame may be unfinished, and a FIN would truncate it.
 		c.str.CancelWrite(quic.StreamErrorCode(http3.ErrCodeConnectError))
 	}
 	return n, err
